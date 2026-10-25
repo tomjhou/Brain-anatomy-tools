@@ -148,6 +148,12 @@ class ExportsMixin:
         w, h = c.size()
         return (c.cx - w / (2 * c.scale), c.cx + w / (2 * c.scale)), (c.cy - h / (2 * c.scale), c.cy + h / (2 * c.scale))
 
+    def export_channels(self):
+        """(the colours, the names) of the three genes' channels for the legend of a saved UMAP, in the theme on the screen."""
+        if self.var_theme.get() == "light":
+            return ("#00a8cc", "#d81b9a", "#d99a00") * 2, ("cyan", "magenta", "yellow") * 2
+        return ("red", "green", "#4040ff", "red", "green", "#4040ff"), ("red", "green", "blue", "red", "green", "blue")
+
     def build_umap_figure(self):
         from matplotlib.figure import Figure
         from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -164,6 +170,7 @@ class ExportsMixin:
         xlim, ylim = self.view_limits()
         ax.set_xlim(xlim)
         ax.set_ylim(ylim)
+        ax.set_facecolor(tuple(v / 255 for v in self.umap.bgcolor))                    # (the background on the screen, black to white)
         ax.set_xticks([])
         ax.set_yticks([])
         ax.set_xlabel("UMAP1", fontsize=EXPORT_FONTSIZE)
@@ -176,21 +183,23 @@ class ExportsMixin:
         if kind == "gene":
             gene, dataset, scale, vals = self.shown_values
             from matplotlib import colormaps
+            from matplotlib.colors import LinearSegmentedColormap
+            from abc_tk_umap import LIGHT_STOPS
             fin = np.isfinite(vals)
             vmin, vmax = (float(np.nanmin(vals)), float(np.nanmax(vals))) if fin.any() else (0.0, 1.0)
             order = np.argsort(np.where(fin, vals, -np.inf), kind="stable")
-            sc = ax.scatter(coords[order, 0], coords[order, 1], c=vals[order], cmap=colormaps["viridis"], vmin=vmin, vmax=vmax, s=size,
+            sc = ax.scatter(coords[order, 0], coords[order, 1], c=vals[order], cmap=(LinearSegmentedColormap.from_list("light_gene", [(s[0], tuple(v / 255 for v in s[1])) for s in LIGHT_STOPS])
+                                                                                    if self.var_theme.get() == "light" else colormaps["viridis"]), vmin=vmin, vmax=vmax, s=size,
                             alpha=POINT_ALPHA, linewidths=0)
             cb = fig.colorbar(sc, ax=ax)
             cb.set_label(gene, fontsize=EXPORT_FONTSIZE)
             cb.ax.tick_params(labelsize=EXPORT_FONTSIZE)
         elif kind == "multi":
-            ax.set_facecolor(tuple(v / 255 for v in (26, 26, 26)))
             for lay in self.umap.layers:
                 ax.scatter(lay["x"], lay["y"], c=lay["rgb"] / 255.0, s=size * (0.25 if lay.get("shape") != "half" and lay["size"] < 4 * self.dot_scale() else 1.0),
                            linewidths=0, alpha=None)
             handles = [Line2D([0], [0], marker="o", linestyle="", color=color, label=f"{g} ({name})")
-                       for i, (g, color, name) in enumerate(zip(self.multi_genes, ("red", "green", "#4040ff", "red", "green", "#4040ff"), ("red", "green", "blue", "red", "green", "blue")))
+                       for i, (g, color, name) in enumerate(zip(self.multi_genes, *self.export_channels()))
                        if i not in self.hidden]
             fig.legend(handles=handles, loc="center left", bbox_to_anchor=(1.02, 0.5), bbox_transform=ax.transAxes, fontsize=EXPORT_FONTSIZE, frameon=True)
         else:
@@ -210,10 +219,11 @@ class ExportsMixin:
                     else:
                         ax.scatter(coords[m, 0], coords[m, 1], c=color, marker=marker, s=size, alpha=POINT_ALPHA, linewidths=0)
                 entries = cat
+            from abc_tk_umap import ink_for
             by_count = self.var_label_scale.get()                 # (the "Label font size scales with cell count" checkbox: the saved UMAP follows it)
             for text, x, y, color, weight in getattr(self, "label_info", []):
                 if xlim[0] <= x <= xlim[1] and ylim[0] <= y <= ylim[1]:
-                    ax.text(x, y, text, fontsize=EXPORT_FONTSIZE * 0.6 * (weight if by_count else 1.0), color=color, fontweight="bold", ha="center", va="center", clip_on=True)
+                    ax.text(x, y, text, fontsize=EXPORT_FONTSIZE * 0.6 * (weight if by_count else 1.0), color=ink_for(color, self.umap.bgcolor), fontweight="bold", ha="center", va="center", clip_on=True)
             if entries is not None:
                 handles = self.legend_handles(entries, sort="id")
                 ncol = max(1, math.ceil(len(handles) / EXPORT_LEGEND_MAX_ROWS))

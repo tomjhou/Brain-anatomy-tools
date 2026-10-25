@@ -152,6 +152,169 @@ def choose_run_options(current="Neurons", counts=None, folder_for=None):
     return answer["value"]
 
 
+RUN_FILE = "umap_coords.csv"        # the one file a run needs (see required_cached_run_files in ABC_atlas_browser.py): a folder with it is a run
+
+
+def scan_runs(folder):
+    """The saved runs in `folder`: [(name, path, saved: the time umap_coords.csv was written)], the most recent first. A subfolder without
+    umap_coords.csv is not a run (the folder of old outputs, say) and is left out. Slow on a network drive: call it from a thread."""
+    runs = []
+    try:
+        entries = [e for e in os.scandir(folder) if e.is_dir()]
+    except OSError:
+        return runs
+    for e in entries:
+        try:
+            runs.append((e.name, Path(e.path), os.stat(os.path.join(e.path, RUN_FILE)).st_mtime))
+        except OSError:
+            continue
+    runs.sort(key=lambda r: r[2], reverse=True)
+    return runs
+
+
+class RunPicker:
+    """A list of the saved runs in a folder, by name to start with (a click on the Run or the Saved heading sorts by that, and again the other way
+    round): click one to highlight it (the most recent starts highlighted), then OK (or Enter, or a double-click) to take it; Cancel (or Escape)
+    to go back. Browse... picks a run folder from anywhere else with the system's dialog. A box above the list
+    narrows it to the names that hold what is typed. `result` is the chosen folder (a Path), or None."""
+
+    def __init__(self, parent, folder):
+        import queue
+        import threading
+        self.result = None
+        self.folder = folder
+        self.scanned = False                  # the folders have been looked into
+        self.runs = []
+        self.shown = []                       # the runs in the list now (the ones that match the filter)
+        self.top = top = tk.Toplevel(parent)
+        top.title("Load an existing run")
+        top.geometry(f"{min(1300, top.winfo_screenwidth() - 80)}x{min(760, top.winfo_screenheight() - 120)}")
+        top.minsize(640, 300)
+        self.sort = ("name", False)           # (the heading sorted by, and whether it runs downward)
+        body = ttk.Frame(top, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(body, text=f"Saved runs in {folder}", font=("Segoe UI", 11)).pack(anchor="w")
+        row = ttk.Frame(body)
+        row.pack(fill=tk.X, pady=(8, 6))
+        ttk.Label(row, text="Filter:").pack(side=tk.LEFT)
+        self.var_filter = tk.StringVar(top, "")
+        entry = ttk.Entry(row, textvariable=self.var_filter)
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+        self.var_filter.trace_add("write", lambda *a: self.fill())
+        frame = ttk.Frame(body)
+        frame.pack(fill=tk.BOTH, expand=True)
+        import tkinter.font as tkfont
+        style = ttk.Style(top)
+        style.configure("Runs.Treeview", rowheight=tkfont.nametofont("TkDefaultFont").metrics("linespace") + 12)      # (room around the text, at any screen scaling)
+        self.tree = ttk.Treeview(frame, columns=("name", "saved"), show="headings", selectmode="browse", style="Runs.Treeview")
+        self.tree.heading("name", command=lambda: self.sort_by("name"))
+        self.tree.heading("saved", command=lambda: self.sort_by("saved"))
+        self.mark_sort()
+        self.tree.column("name", width=720, stretch=True)
+        self.tree.column("saved", width=150, stretch=False)
+        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.tree.bind("<Double-Button-1>", lambda e: self.ok() if self.tree.identify_row(e.y) else None)
+        self.var_status = tk.StringVar(top, "Looking for runs...")
+        ttk.Label(body, textvariable=self.var_status, foreground="gray30").pack(anchor="w", pady=(6, 0))
+        buttons = ttk.Frame(body)
+        buttons.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(buttons, text="Browse…", command=self.browse).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Cancel", command=self.cancel).pack(side=tk.RIGHT)
+        self.btn_ok = ttk.Button(buttons, text="OK", command=self.ok, state="disabled")
+        self.btn_ok.pack(side=tk.RIGHT, padx=(0, 8))
+        top.bind("<Return>", lambda e: self.ok())
+        top.bind("<Escape>", lambda e: self.cancel())
+        top.protocol("WM_DELETE_WINDOW", self.cancel)
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self.btn_ok.config(state="normal" if self.tree.selection() else "disabled"))
+        top.transient(parent)
+        entry.focus_set()
+        # the folders are looked into on a thread (a network drive can take a while), and the list is filled when that is done
+        self.found = queue.Queue()
+        threading.Thread(target=lambda: self.found.put(scan_runs(folder)), daemon=True).start()
+        self.poll()
+
+    def poll(self):
+        try:
+            self.runs = self.found.get_nowait()
+        except Exception:
+            try:
+                self.top.after(100, self.poll)
+            except tk.TclError:
+                pass
+            return
+        self.scanned = True
+        self.fill()
+
+    def mark_sort(self):
+        """The headings: an arrow on the one the list is sorted by."""
+        column, descending = self.sort
+        for key, text in (("name", "Run"), ("saved", "Saved")):
+            self.tree.heading(key, text=text + (("  ▼" if descending else "  ▲") if key == column else ""))
+
+    def sort_by(self, column):
+        """A click on a heading: sort by it (and the other way round if it already is)."""
+        self.sort = (column, not self.sort[1]) if column == self.sort[0] else (column, column == "saved")      # (dates start with the newest)
+        self.mark_sort()
+        self.fill()
+
+    def fill(self):
+        """The runs that match the filter, in the sorted order; the run highlighted before stays so, else the most recent one is."""
+        if not self.scanned:
+            return
+        keep = None
+        if self.tree.selection() and self.shown:
+            keep = self.shown[int(self.tree.selection()[0])][1]
+        text = self.var_filter.get().strip().casefold()
+        column, descending = self.sort
+        self.shown = sorted([r for r in self.runs if text in r[0].casefold()],
+                            key=(lambda r: r[0].casefold()) if column == "name" else (lambda r: r[2]), reverse=descending)
+        self.tree.delete(*self.tree.get_children())
+        import time
+        for i, (name, _path, saved) in enumerate(self.shown):
+            self.tree.insert("", tk.END, iid=str(i), values=(name, time.strftime("%Y-%m-%d %H:%M", time.localtime(saved))))
+        if self.shown:
+            paths = [r[1] for r in self.shown]
+            at = paths.index(keep) if keep in paths else max(range(len(self.shown)), key=lambda i: self.shown[i][2])
+            self.tree.selection_set(str(at))
+            self.tree.focus(str(at))
+            self.tree.see(str(at))
+        self.btn_ok.config(state="normal" if self.shown else "disabled")
+        if not self.runs:
+            self.var_status.set("No saved runs in this folder. Use Browse… to pick a run folder from somewhere else.")
+        else:
+            self.var_status.set(f"{len(self.shown)} of {len(self.runs)} runs" if text else f"{len(self.runs)} runs, the most recent first.")
+
+    def ok(self):
+        picked = self.tree.selection()
+        if picked and self.shown:
+            self.result = self.shown[int(picked[0])][1]
+            self.top.destroy()
+
+    def cancel(self):
+        self.result = None
+        self.top.destroy()
+
+    def browse(self):
+        chosen = filedialog.askdirectory(parent=self.top, title="Select an existing run folder to load", initialdir=str(self.folder))
+        if chosen:
+            self.result = Path(chosen)
+            self.top.destroy()
+
+    def show(self):
+        """Open it over its parent and wait for it to be closed; returns the chosen folder or None."""
+        self.top.update_idletasks()
+        parent = self.top.master
+        x = parent.winfo_rootx() + max((parent.winfo_width() - self.top.winfo_width()) // 2, 0)
+        y = parent.winfo_rooty() + 40
+        self.top.geometry(f"+{x}+{y}")
+        self.top.grab_set()
+        self.top.wait_window()
+        return self.result
+
+
 def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
     """`helpers`: load_recent_output_folders(), remember_recent_output_folder(folder), required_cached_run_files(folder) ->
     {label: Path}, open_3d_viewer(abc_cache), settings_dialog(abc_cache)."""
@@ -219,10 +382,9 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
         folder = committed_folder()
         if folder is None:
             return
-        chosen = filedialog.askdirectory(parent=root, title="Select an existing run folder to load", initialdir=str(folder))
-        if not chosen:
+        chosen_path = RunPicker(root, folder).show()
+        if chosen_path is None:
             return
-        chosen_path = Path(chosen)
         required = helpers["required_cached_run_files"](chosen_path)
         missing = [f"{label}: {path}" for label, path in required.items() if label not in RECOVERABLE and not path.exists()]
         if missing:

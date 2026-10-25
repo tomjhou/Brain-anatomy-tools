@@ -33,10 +33,14 @@ from abc_tk_umap_export import ExportsMixin, hexcolor
 
 LEIDEN_KEY = "leiden"
 GREY = np.array([205, 205, 205], np.uint8)
-MULTI_BG = (26, 26, 26)           # the plots' background in the multi-gene view (a zero-expression cell is black, so it must not melt into it)
+MULTI_BG = (26, 26, 26)           # the plots' background in the gene views (a zero-expression cell is black in the multi-gene view, so it must not melt into it)
 MAX_GENES = 6                      # the first three are red / green / blue circles; the next three the same colors as small dots on top
 CHANNEL_HEX = ("#e53935", "#43a047", "#4a6cff", "#e53935", "#43a047", "#4a6cff")
 CHANNEL_NAMES = ("red", "green", "blue", "red", "green", "blue")
+CHANNEL_HEX_LIGHT = ("#00a8cc", "#d81b9a", "#d99a00", "#00a8cc", "#d81b9a", "#d99a00")        # the light theme's inks: cyan, magenta, yellow (a deep one: pale on white)
+CHANNEL_NAMES_LIGHT = ("cyan", "magenta", "yellow", "cyan", "magenta", "yellow")
+INK_ABSORB = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.3, 1.0]])    # what each ink takes out of (red, green, blue): cyan the red, magenta the green, yellow the blue
+INK_PAPER = 230.0                 # the light theme's colour for no expression: a light grey, close to the white background
 LIGHT_GREY = np.array([222, 222, 222], np.uint8)
 RING = "#ff1493"
 MAX_COLORED_CATEGORIES = 400
@@ -76,6 +80,39 @@ def rank_color(rank):
     hue = ((rank % 10) * 0.6180339887498949) % 1.0
     s, v = (0.90, 0.95) if (rank // 10) % 2 == 0 else (0.45, 0.85)
     return np.array([int(round(c * 255)) for c in colorsys.hsv_to_rgb(hue, s, v)], np.uint8)
+
+
+def is_dark(bgcolor):
+    return sum(bgcolor) < 300
+
+
+def ink_for(color, bgcolor):
+    """The colour of a group's number on this background. The numbers are made in a darker shade of the group's colour (see color_all), which is
+    for a light background; on a dark one the shade is brightened back."""
+    if not is_dark(bgcolor):
+        return color
+    rgb = [int(color[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(min(int(round(v / 0.55)), 255) for v in rgb)
+
+
+def ink_rgb(norms):
+    """The colours of cells shown in the light theme with several genes: each gene is an ink (cyan, magenta, yellow, in the order of the genes)
+    that takes its colour out of a light grey paper in proportion to the gene's value (`norms`: one array in 0..1 for each of up to three genes),
+    so that two genes together give blue, red or green, and three give a dark grey, and no expression is the paper's grey."""
+    absorbed = sum(np.asarray(t, dtype=float)[:, None] * INK_ABSORB[i] for i, t in enumerate(norms))
+    return np.rint(INK_PAPER * (1.0 - np.clip(absorbed, 0.0, 1.0))).astype(np.uint8)
+
+
+LIGHT_STOPS = ((0.0, (230, 230, 230)), (0.25, (253, 212, 158)), (0.5, (252, 141, 89)), (0.75, (215, 48, 31)), (1.0, (127, 0, 0)))
+
+
+def light_rgb(t):
+    """The colours of the light theme's gene scale, for values t in 0..1: a light grey for none (close to a white background), then through
+    pale orange and orange to red and a dark red, so that the highest values stand out against the low ones."""
+    t = np.clip(np.asarray(t, dtype=float), 0.0, 1.0)
+    xs = [s[0] for s in LIGHT_STOPS]
+    out = np.stack([np.interp(t, xs, [s[1][c] for s in LIGHT_STOPS]) for c in range(3)], axis=-1)
+    return np.rint(out).astype(np.uint8)
 
 
 def viridis_rgb(t):
@@ -370,6 +407,7 @@ class PointCanvas:
         self.labels = []                            # [item, x, y]
         self.label_text = {}                        # item -> its text (the group's number)
         self.label_weight = {}                      # item -> its size factor, by the group's cell count
+        self.label_color = {}                       # item -> the colour it was given (for a light background: see ink_for)
         self.scale_labels = True                    # the labels' size follows their weight
         self.shape_kernels = {}                     # (marker code, diameter) -> the kernel that grows a point into that marker
         self.moving = False                         # the view is being zoomed or panned: layers with shapes are drawn as plain discs
@@ -685,9 +723,11 @@ class PointCanvas:
             self.bgcolor = tuple(rgb)
             self.canvas.config(bg="#%02x%02x%02x" % self.bgcolor)
             if self.scalebar:                                   # (white on a dark background)
-                ink = "white" if sum(self.bgcolor) < 300 else "black"
+                ink = "white" if is_dark(self.bgcolor) else "black"
                 self.canvas.itemconfig(self.scalebar[0], fill=ink)
                 self.canvas.itemconfig(self.scalebar[1], fill=ink)
+            for item, color in self.label_color.items():
+                self.canvas.itemconfig(item, fill=ink_for(color, self.bgcolor))
 
     def set_dim(self, on):
         if on != self.dim:
@@ -756,11 +796,13 @@ class PointCanvas:
         self.labels = []
         self.label_text = {}
         self.label_weight = {}
+        self.label_color = {}
         self.boosted = None
 
     def add_label(self, text, x, y, color="black", weight=1.0):
         """`weight`: times the font size when the labels are sized by their group's cell count (see set_label_scaling)."""
-        item = self.canvas.create_text(0, 0, text=text, font=("Segoe UI", self.label_size, "bold"), fill=color)
+        item = self.canvas.create_text(0, 0, text=text, font=("Segoe UI", self.label_size, "bold"), fill=ink_for(color, self.bgcolor) if color.startswith("#") else color)
+        self.label_color[item] = color if color.startswith("#") else "#000000"
         self.labels.append([item, x, y])
         self.label_text[item] = text
         self.label_weight[item] = weight
@@ -900,7 +942,13 @@ class UmapWindow(ExportsMixin):
         self.n = len(self.coords)
         self.has_counts = "counts" in a.layers
         sec_col = core.SECTION_COL
-        spatial = core.load_section_spatial_coords(a, self.abc_cache) if sec_col in a.obs.columns else None
+        bsp = None
+        if adata_backed is not None and sec_col in a.obs.columns:
+            bsp = core.load_section_spatial_coords(adata_backed, self.abc_cache)      # (the whole atlas: the run's cells are taken from it, so the table is read once)
+        if sec_col not in a.obs.columns:
+            spatial = None
+        else:
+            spatial = bsp.reindex(a.obs.index) if bsp is not None else core.load_section_spatial_coords(a, self.abc_cache)
         self.section_of = a.obs[sec_col].to_numpy() if sec_col in a.obs.columns else None
         ok = spatial is not None and "x" in spatial.columns and "y" in spatial.columns
         self.cx = pd.to_numeric(spatial["x"], errors="coerce").to_numpy() if ok else None
@@ -918,11 +966,10 @@ class UmapWindow(ExportsMixin):
         # the section panels' background: every cell of each section (from the unfiltered data), when given
         self.bg = None
         self.adata_backed = adata_backed
-        if ok and adata_backed is not None:
+        if ok and bsp is not None:
             try:
                 bsec = core.get_section_labels(adata_backed, self.abc_cache)
-                bsp = core.load_section_spatial_coords(adata_backed, self.abc_cache)
-                if bsp is not None and "x" in bsp.columns:
+                if "x" in bsp.columns:
                     codes, uniques = pd.factorize(bsec.to_numpy())
                     order = np.argsort(codes, kind="stable")
                     starts = np.searchsorted(codes[order], np.arange(len(uniques) + 1))
@@ -1116,6 +1163,17 @@ class UmapWindow(ExportsMixin):
         self.var_scale = tk.StringVar(f, "log")
         for value, text in (("linear", "Linear"), ("log", "Log")):
             ttk.Radiobutton(sc, text=text, value=value, variable=self.var_scale, command=self.on_scale).pack(side=tk.LEFT, padx=(8, 0))
+        th = ttk.Frame(self.gene_frame)
+        th.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(th, text="Theme:").pack(side=tk.LEFT)
+        self.var_theme = tk.StringVar(f, "light")
+        self.theme_buttons = []
+        for value, text in (("dark", "Dark"), ("light", "Light")):
+            b = ttk.Radiobutton(th, text=text, value=value, variable=self.var_theme, command=self.on_theme)
+            b.pack(side=tk.LEFT, padx=(8, 0))
+            self.theme_buttons.append(b)
+            HoverTip(b, lambda: "Dark: a black background, as for the screen. Light: a white background, for a paper. One gene: a scale from light grey "
+                                "(none) to dark red. Several genes: cyan, magenta and yellow inks on light grey, that mix to blue, red and green.")
         self.cbar = tk.Canvas(self.gene_frame, width=300, height=70, highlightthickness=0)
         self.cbar.pack(fill=tk.X, pady=(6, 0))
         self.cbar_photo = None
@@ -1354,6 +1412,10 @@ class UmapWindow(ExportsMixin):
         for scale, default in zip(self.umap_sliders, (DEFAULT_LABEL_INDEX,)):
             scale.set(default)
 
+    def view_background(self):
+        """The background of the UMAP and the section maps: white, dark in the dark theme of the gene views."""
+        return MULTI_BG if getattr(self, "tiles_dark", False) else (255, 255, 255)
+
     def reset_sliders(self):
         for scale, default in zip(self.sliders, (DEFAULT_TILE_INDEX, DEFAULT_DOT_INDEX, DEFAULT_MARKER_INDEX)):
             scale.set(default)
@@ -1444,6 +1506,19 @@ class UmapWindow(ExportsMixin):
         if self.mode in ("all", "single"):
             self.recolor()
 
+    def gene_rgb(self, t):
+        """The colour of a gene's value (t in 0..1) in the theme chosen."""
+        return light_rgb(t) if self.var_theme.get() == "light" else viridis_rgb(t)
+
+    def on_theme(self):
+        """Dark or Light: the gene shown is drawn again in the other theme (nothing is read again)."""
+        if self.busy:
+            self.var_theme.set("light" if self.var_theme.get() == "dark" else "dark")
+            return
+        if self.mode in ("gene", "imputed") and self.gene_cache is not None:
+            key = self.gene_cache[0]
+            self.show_genes(list(key[0]), key[1], key[2], self.gene_cache[1])
+
     def on_scale(self):
         if self.mode in ("gene", "imputed") and self.var_gene.get().strip():
             self.recolor()
@@ -1470,11 +1545,10 @@ class UmapWindow(ExportsMixin):
         `bg_rgb_fn(section label)` -> (x, y, rgb) of the section panel's background cells, or None."""
         self.rgb_run = rgb_run
         o = order_run
-        bgc = MULTI_BG if dark else (255, 255, 255)
         self.run_cell_rank = self.bg_cell_rank = None   # (the mode that has groups says them: see set_cell_ranks)
         self.tiles_dark = dark
         self.umap_order = o                           # (the order of the UMAP's cells in its first layer: see set_umap_marks)
-        self.umap.set_background(bgc)
+        self.umap.set_background(self.view_background())
         self.set_tile_background()
         self.umap.set_layers([{"x": self.coords[o, 0], "y": self.coords[o, 1], "rgb": rgb_run[o], "size": 4 * self.dot_scale()}] + list(extra_umap_layers))
         self.umap.clear_labels()
@@ -1515,8 +1589,8 @@ class UmapWindow(ExportsMixin):
         self.set_umap_marks(run_rank)
 
     def set_tile_background(self):
-        """The section panels' background: dark in the multi-gene view, white otherwise, and white in ROI only (whose gray cells are for it)."""
-        bgc = MULTI_BG if getattr(self, "tiles_dark", False) and not self.var_roi_only.get() else (255, 255, 255)
+        """The section panels' background: the UMAP's (see view_background), and white in ROI only (whose gray cells are for it)."""
+        bgc = (255, 255, 255) if self.var_roi_only.get() else self.view_background()
         for t in getattr(self, "tiles", []):
             t["pc"].set_background(bgc)
 
@@ -2020,7 +2094,7 @@ class UmapWindow(ExportsMixin):
             self.show_single(genes[0], dataset, scale, per_gene[0][0], per_gene[0][1])
         else:
             self.view_kind, self.multi_genes = "multi", list(genes)
-            self.view_title = " / ".join(f"{g} ({CHANNEL_NAMES[i]})" for i, g in enumerate(genes)) + (" [imputed]" if imputed else "")
+            self.view_title = " / ".join(f"{g} ({self.channel_names()[i]})" for i, g in enumerate(genes)) + (" [imputed]" if imputed else "")
             self.show_multi(genes, dataset, scale, per_gene)
 
     def show_single(self, gene, dataset, scale, vals, bg_vals):
@@ -2035,7 +2109,7 @@ class UmapWindow(ExportsMixin):
         if linear:
             self.cbar_slider.set(low, high)
         t = np.clip((vals - vmin) / (vmax - vmin), 0, 1) if vmax > vmin else np.zeros_like(vals)
-        rgb = viridis_rgb(np.where(fin, t, 0))
+        rgb = self.gene_rgb(np.where(fin, t, 0))
         rgb[~fin] = GREY
         order = np.argsort(np.where(fin, vals, -np.inf), kind="stable")
         self.rank_run = np.argsort(order, kind="stable").astype(np.int64)       # the rank of each cell: highest expression on top
@@ -2051,20 +2125,28 @@ class UmapWindow(ExportsMixin):
             v = bg_vals[w]
             ok = np.isfinite(v)
             tt = np.clip((v - vmin) / (vmax - vmin), 0, 1) if vmax > vmin else np.zeros_like(v)
-            col = viridis_rgb(np.where(ok, tt, 0))
+            col = self.gene_rgb(np.where(ok, tt, 0))
             col[~ok] = LIGHT_GREY
             o = np.argsort(np.where(ok, v, -np.inf), kind="stable")           # (highest on top)
             return self.bg["x"][w][o], self.bg["y"][w][o], col[o], w[o]
 
-        self.apply(rgb, order, bg_fn)
+        self.apply(rgb, order, bg_fn, dark=self.var_theme.get() == "dark")             # (the dark theme: a black background, as in the multi-gene view)
         self.draw_colorbar(vmin, vmax, scale, dataset, readout=(percent_below(vals, vmin), percent_below(vals, vmax)) if linear else None)
         self.var_status.set(f"Showing {gene}{' [imputed]' if dataset == 'imputed' else ''} (every cell of the sections, colored on the selection's scale)."
                             if bg_vals is not None else "(cells outside this run's selection are gray).")
 
-    # ---- several genes: red / green / blue circles for the first three, the same three colors as small dots on top for the next three
+    # ---- several genes: red / green / blue circles for the first three (cyan / magenta / yellow in the light theme), the same three colors as small dots on top for the next three
+
+    def channel_names(self):
+        return CHANNEL_NAMES_LIGHT if self.var_theme.get() == "light" else CHANNEL_NAMES
+
+    def channel_hex(self):
+        return CHANNEL_HEX_LIGHT if self.var_theme.get() == "light" else CHANNEL_HEX
 
     def show_multi(self, genes, dataset, scale, per_gene):
         self.show_levels_slider(False)
+        light = self.var_theme.get() == "light"
+        mix = (lambda chans: ink_rgb(chans)) if light else (lambda chans: (core.multi_gene_rgb(chans, (0.0, 0.0, 0.0)) * 255).astype(np.uint8))
         n = len(genes)
         norm = []
         for i, (vals, _bg) in enumerate(per_gene):
@@ -2079,7 +2161,7 @@ class UmapWindow(ExportsMixin):
         runn = [zero if i in hidden else norm[i][0] for i in range(n)]
         intensity = lambda arrs: np.maximum.reduce([np.nan_to_num(a, nan=0.0) for a in arrs])
         circ = runn[:3]
-        rgb = (core.multi_gene_rgb(circ, (0.0, 0.0, 0.0)) * 255).astype(np.uint8)
+        rgb = mix(circ)
         order = np.argsort(intensity(circ), kind="stable")                      # (the most expressing on top)
         self.rank_run = np.argsort(order, kind="stable").astype(np.int64)
         extra = []
@@ -2088,7 +2170,7 @@ class UmapWindow(ExportsMixin):
             inten = intensity(dots)
             vis = np.flatnonzero(inten > 0)
             vis = vis[np.argsort(inten[vis], kind="stable")]
-            drgb = (core.multi_gene_rgb([d[vis] for d in dots], (0.0, 0.0, 0.0)) * 255).astype(np.uint8)
+            drgb = mix([d[vis] for d in dots])
             half = self.viewer_settings.get("gene456_shape") == "half circle"       # (the Settings choice: a half circle as big as the base one, or a small circle)
             extra = [{"x": self.coords[vis, 0], "y": self.coords[vis, 1], "rgb": drgb, "size": (4 if half else 2) * self.dot_scale(),
                       "shape": "half" if half else "circle"}]
@@ -2108,14 +2190,14 @@ class UmapWindow(ExportsMixin):
                 lo, hi = norm[i][1], norm[i][2]
                 v = bgv[w]
                 chans.append(np.clip((np.nan_to_num(v, nan=lo) - lo) / (hi - lo), 0, 1) if hi > lo else np.zeros(len(w)))
-            col = (core.multi_gene_rgb(chans, (0.0, 0.0, 0.0)) * 255).astype(np.uint8)
+            col = mix(chans)
             o = np.argsort(intensity(chans), kind="stable")
             return self.bg["x"][w][o], self.bg["y"][w][o], col[o], w[o]
 
-        self.apply(rgb, order, bg_fn, extra_umap_layers=extra, dark=True)
+        self.apply(rgb, order, bg_fn, extra_umap_layers=extra, dark=not light)
         readouts = [(percent_below(per_gene[i][0], norm[i][1]), percent_below(per_gene[i][0], norm[i][2])) for i in range(n)] if scale == "linear" else None
         self.draw_multi_legend(genes, [(v[1], v[2]) for v in norm], scale, readouts)
-        parts = " and ".join(f"'{g}' ({CHANNEL_NAMES[i]})" for i, g in enumerate(genes))
+        parts = " and ".join(f"'{g}' ({self.channel_names()[i]})" for i, g in enumerate(genes))
         self.var_status.set(f"Showing {parts}{' [imputed]' if dataset == 'imputed' else ''}."
                             + (f" Hidden: {', '.join(genes[i] for i in sorted(hidden))}." if hidden else ""))
 
@@ -2136,7 +2218,7 @@ class UmapWindow(ExportsMixin):
         for i, (g, (lo, hi)) in enumerate(zip(genes, ranges)):
             y = 8 + row * i
             off = i in self.hidden
-            color = "#999999" if off else CHANNEL_HEX[i]
+            color = "#999999" if off else self.channel_hex()[i]
             half = i >= 3 and self.viewer_settings.get("gene456_shape") == "half circle"      # (genes 4-6: the Settings choice, a half circle or a small circle)
             r = 6 if i < 3 or half else 3                          # (genes 4-6 are the small dots)
             if half:                                               # (the right half of a disc, as the cells of that gene are drawn)
@@ -2303,7 +2385,7 @@ class UmapWindow(ExportsMixin):
         c.delete("all")
         c.config(height=70 if readout is None else 88)
         w = max(c.winfo_width(), 200)
-        ramp = viridis_rgb(np.linspace(0, 1, w - 20))[None, :, :]
+        ramp = self.gene_rgb(np.linspace(0, 1, w - 20))[None, :, :]
         img = np.repeat(ramp, 16, axis=0)
         self.cbar_photo = ImageTk.PhotoImage(Image.fromarray(img), master=c)
         c.create_image(10, 8, anchor="nw", image=self.cbar_photo)

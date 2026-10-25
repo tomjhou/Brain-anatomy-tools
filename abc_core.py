@@ -395,8 +395,10 @@ def load_section_spatial_coords(adata, abc_cache, progress_callback=None):
                 t0 = time.perf_counter()
                 cell_meta = pd.read_pickle(cache_path)
                 if ZOOM_DEBUG_DIAGNOSTICS:
+                    caller = sys._getframe(1)
                     print(f"[spatial-cache] loaded {len(cell_meta)} rows from disk cache in "
-                          f"{time.perf_counter() - t0:.3f}s ({cache_path.name})")
+                          f"{time.perf_counter() - t0:.3f}s ({cache_path.name}) for {caller.f_code.co_name} "
+                          f"({Path(caller.f_code.co_filename).name}:{caller.f_lineno})")
                 if progress_callback is not None:
                     progress_callback(len(cell_meta), len(cell_meta))
                 return cell_meta.reindex(adata.obs.index)

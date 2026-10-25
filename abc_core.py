@@ -1129,6 +1129,14 @@ def generate_section_grid_image(adata, abc_cache, section_series):
 _expr_column_cache = {}
 
 
+LOG2_E = float(np.log2(np.e))
+
+
+def log2p1(values):
+    """log2(1 + values): the 'Log' scale of the MERFISH (standard) genes, in the base the imputed genes are stored in."""
+    return np.log1p(values) * LOG2_E
+
+
 def _get_full_gene_column(expr_adata, gene_col, layer=None):
     """The full expression column for var-index `gene_col`, across every
     cell in `expr_adata`, read once and cached in memory (keyed by the
@@ -1255,8 +1263,8 @@ def render_gene_expression_array(adata, section_series, section_label, get_spati
     default `adata`/raw-count path), 'linear' colors cells by their raw
     expression value — not log-transformed here (log1p/normalize_total
     don't run until well after the picker session, on the filtered/
-    subsampled adata — see around Step 3); 'log' colors by log1p
-    (expression) instead, compressing the (often heavily right-skewed,
+    subsampled adata — see around Step 3); 'log' colors by log2(1 +
+    expression) instead, compressing the (often heavily right-skewed,
     zero-inflated) raw count range so both dim and bright cells stay
     visible — chosen over a LogNorm on the raw values specifically to
     sidestep LogNorm's requirement that every value be strictly positive,
@@ -1390,7 +1398,7 @@ def render_gene_expression_array(adata, section_series, section_label, get_spati
     color_values = expr[colored]
     if dataset == 'standard':
         if color_scale == 'log':
-            color_values = np.log1p(color_values)
+            color_values = log2p1(color_values)
         # else 'linear': raw counts as-is.
     else:
         # expr_adata's values (e.g. the imputed dataset) are already log2-
@@ -1525,7 +1533,7 @@ def render_multi_gene_expression_array(adata, section_series, section_label, get
         # Same dataset-dependent scale-toggle meaning as render_gene_
         # expression_array's own docstring explains for `color_scale`.
         if dataset == 'standard':
-            return np.log1p(values) if color_scale == 'log' else values
+            return log2p1(values) if color_scale == 'log' else values
         return (np.exp2(values) - 1.0) if color_scale == 'linear' else values
 
     def normalize(values):

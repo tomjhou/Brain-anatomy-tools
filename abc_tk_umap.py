@@ -46,8 +46,7 @@ TILE_PX = 230
 MIN_TILE_PX = 50
 TILE_COLUMNS = (6, 5, 4, 3, 2, 1)         # the Section map size slider's stops: how many panels fit across the pane (1/6 of its width ... all of it)
 DEFAULT_TILE_INDEX = 4                    # (two across)
-CELL_SIZES_UM = (20, 30, 40, 50, 60)       # the Cell size slider's stops: the width of a cell's dot in the section panels, in microns
-CELL_SIZE_NAMES = ("Small", "Medium-small", "Medium", "Medium-large", "Large")
+CELL_SIZES_UM = (20, 30, 40, 50, 60, 70, 80, 90, 100)       # the Cell size slider's stops: the width of a cell's dot in the section panels, in microns
 OTHER_CELLS_DOT_RATIO = 0.5       # the dots of the cells of the other kind (e.g. the non-neurons of a neuron run), relative to the others'
 DEFAULT_DOT_INDEX = 2                     # (40 microns, DOT_MM: the size the dots have always had)
 MARKER_SIZES = (0.5, 1.0, 2.0)            # the Marker size slider's stops: times the size of the hover ring and of the red + marks in the section panels
@@ -68,7 +67,7 @@ DOT_MM = 0.04                      # a cell's dot in the section panels: 40 um a
 BIG_DOT_PX = 40                    # dots wider than this are drawn one by one as circles (the maximum filter gets slow)
 SCALEBAR_UM = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000)
 HOVER_RADIUS_PX = 9
-SCALE_UNITS = {("standard", "log"): "log1p(expr)", ("standard", "linear"): "expr (raw counts)",
+SCALE_UNITS = {("standard", "log"): "log2(1 + expr)", ("standard", "linear"): "expr (raw counts)",
                ("imputed", "log"): "log2 (imputed)", ("imputed", "linear"): "linear (imputed)"}
 
 
@@ -998,7 +997,7 @@ class UmapWindow(ExportsMixin):
             self.add_slider(bars, 0, "Section map size:", self.var_tile, len(TILE_COLUMNS), self.layout_tiles,
                             lambda i: "full width" if TILE_COLUMNS[i] == 1 else f"1/{TILE_COLUMNS[i]} width", None),
             self.add_slider(bars, 1, "Cell size:", self.var_dot, len(CELL_SIZES_UM), self.apply_dot_size,
-                            lambda i: f"{CELL_SIZE_NAMES[i]} ({CELL_SIZES_UM[i]}\u00b5m)", None),
+                            lambda i: f"{CELL_SIZES_UM[i]} \u00b5m", None),
             self.add_slider(bars, 2, "Marker size:", self.var_marker, len(MARKER_SIZES), self.apply_marker_size, lambda i: marker_names[i], None)]
         ttk.Button(bars, text="Reset to default", command=self.reset_sliders).grid(row=0, column=0, rowspan=3, sticky="nsw")
         self.var_roi_only = tk.BooleanVar(bars, False)
@@ -1006,15 +1005,9 @@ class UmapWindow(ExportsMixin):
         roi_only_box.grid(row=0, column=4, sticky="w", padx=(12, 6))
         HoverTip(roi_only_box, lambda: "The cells outside the ROIs go gray, on a white background: only the ROIs are colored. Saved section maps "
                                        "have the same look (and, as an SVG, the gray cells are pictures, so the file stays small).")
-        self.var_shapes = tk.BooleanVar(bars, False)
-        shapes_box = ttk.Checkbutton(bars, text="Shapes", variable=self.var_shapes, command=self.apply_shapes)
-        shapes_box.grid(row=1, column=4, sticky="w", padx=(12, 6))
-        HoverTip(shapes_box, lambda: "The cells of the section maps get the shape of their group, as in the UMAP (a new shape every 20 groups, which "
-                                     "share their colors otherwise). While you zoom or pan, cells are drawn as discs until the view settles. Saved "
-                                     "section maps have the same shapes.")
         self.var_ccf = tk.BooleanVar(bars, False)
         ccf_box = ttk.Checkbutton(bars, text="CCF atlas", variable=self.var_ccf, command=self.apply_ccf)
-        ccf_box.grid(row=2, column=4, sticky="w", padx=(12, 6))
+        ccf_box.grid(row=1, column=4, sticky="w", padx=(12, 6))
         HoverTip(ccf_box, lambda: "Draw the outlines of the Allen CCF (2020) regions over the section maps, fitted to each section from the CCF "
                                   "position of its cells. The first time reads the CCF coordinates of the cells (a minute or so).")
         self.ccf_outlines = None
@@ -1196,11 +1189,12 @@ class UmapWindow(ExportsMixin):
                 (("Save section maps", self.save_section_maps, False), ("Save UMAP", self.save_umap, False)),
                 (("Export DEGs", self.export_degs, True), ("Export expression", self.export_expression, True)),
                 (("Export coordinates", self.export_coordinates, True), ("3D view", self.show_3d, True)),
-                (("3D in browser", self.show_3d_browser, True), ("Close", self.close, False)))
+                (("3D in browser", self.show_3d_browser, True), ("Analyze...", self.open_analyze, False)),
+                (("Close", self.close, False),))
         for r, pair in enumerate(rows):
             for c, (text, cmd, grouped) in enumerate(pair):
                 b = ttk.Button(bar, text=text, command=cmd, style="Side.TButton")
-                b.grid(row=r, column=c, sticky="ew", padx=2, pady=2)
+                b.grid(row=r, column=c, columnspan=2 if len(pair) == 1 else 1, sticky="ew", padx=2, pady=2)
                 if grouped:
                     self.group_buttons.append(b)
         self.update_group_buttons()
@@ -1516,23 +1510,15 @@ class UmapWindow(ExportsMixin):
 
     def set_cell_ranks(self, run_rank, bg_rank):
         """The group rank of each cell of the run (`run_rank`, -1 for none) and of each cell of the sections' backgrounds (`bg_rank`, or None): the
-        UMAP's cells take their group's shape now, and the section panels' too when the Shapes box is ticked."""
+        UMAP's cells take their group's shape now, and the section panels' when they are made (just after: see apply)."""
         self.run_cell_rank, self.bg_cell_rank = run_rank, bg_rank
         self.set_umap_marks(run_rank)
-        if self.var_shapes.get():
-            self.apply_shapes()
 
     def set_tile_background(self):
         """The section panels' background: dark in the multi-gene view, white otherwise, and white in ROI only (whose gray cells are for it)."""
         bgc = MULTI_BG if getattr(self, "tiles_dark", False) and not self.var_roi_only.get() else (255, 255, 255)
         for t in getattr(self, "tiles", []):
             t["pc"].set_background(bgc)
-
-    def apply_shapes(self):
-        """The Shapes box was ticked or cleared: the panels are made again (those in view now, the others as they come into view)."""
-        for t in getattr(self, "tiles", []):
-            t["dirty"] = True
-        self.refresh_visible()
 
     def apply_roi_only(self):
         """The ROI only box was ticked or cleared: the panels are made again (those in view now, the others as they come into view)."""
@@ -1573,7 +1559,7 @@ class UmapWindow(ExportsMixin):
         layers = []
         bgl = self.tile_fn(t["label"])
         roi_only = self.var_roi_only.get()
-        shapes = self.var_shapes.get()
+        shapes = True                    # (the cells of a section map have the shape of their group, as in the UMAP; plain discs while the view moves)
         sources = []                     # (x, y, rgb, marks) of the run's kind, the section's cells first (marks: a marker code for each cell, or None)
         if bgl is not None:
             x, y, rgb, w = bgl
@@ -1940,27 +1926,11 @@ class UmapWindow(ExportsMixin):
         if self.gene_cache is not None and self.gene_cache[0] == key:                   # (a legend click, or the same genes again)
             self.show_genes(resolved, imputed, scale, self.gene_cache[1])
             return
-        adata = self.adata
         backed = self.adata_backed if self.bg else None
         bg_ids = self.bg["ids"] if self.bg else None
 
         def read_values(gene):
-            col = core.find_gene_index(source, gene)
-            if imputed:
-                full = core._get_full_gene_column(source, col)
-                pos = source.obs_names.get_indexer(adata.obs_names)
-                vals = np.full(adata.n_obs, np.nan)
-                found = pos >= 0
-                vals[found] = full[pos[found]]
-                if scale == "linear":
-                    vals = np.exp2(vals) - 1.0
-            else:
-                expr = adata.layers["counts"][:, col]
-                expr = expr.toarray() if hasattr(expr, "toarray") else expr
-                vals = np.asarray(expr).ravel().astype(float)
-                if scale == "log":
-                    vals = np.log1p(vals)
-            return vals
+            return self.read_run_gene(gene, imputed, scale)
 
         def read_background(gene):
             """The gene's value in every cell of the sections (the whole unfiltered dataset), or None if it can't be had."""
@@ -1977,7 +1947,7 @@ class UmapWindow(ExportsMixin):
                 if bcol is None:
                     return None
                 out = core._get_full_gene_column(backed, bcol)
-                return np.log1p(out) if scale == "log" else out
+                return core.log2p1(out) if scale == "log" else out
             except Exception as e:
                 print(f"Could not read {gene} for the cells outside the selection: {e}", flush=True)
                 return None
@@ -1996,6 +1966,39 @@ class UmapWindow(ExportsMixin):
             self.show_genes(resolved, imputed, scale, res)
 
         self.job(f"Reading {', '.join(resolved)}...", work, done)
+
+    def read_run_gene(self, gene, imputed, scale):
+        """A gene's value in each cell of the run (imputed or standard, on the linear or the log scale). Blocking: on a worker thread."""
+        adata = self.adata
+        source = self.imputed_state["adata"] if imputed else adata
+        col = core.find_gene_index(source, gene)
+        if imputed:
+            full = core._get_full_gene_column(source, col)
+            pos = source.obs_names.get_indexer(adata.obs_names)
+            vals = np.full(adata.n_obs, np.nan)
+            found = pos >= 0
+            vals[found] = full[pos[found]]
+            if scale == "linear":
+                vals = np.exp2(vals) - 1.0
+        else:
+            expr = adata.layers["counts"][:, col]
+            expr = expr.toarray() if hasattr(expr, "toarray") else expr
+            vals = np.asarray(expr).ravel().astype(float)
+            if scale == "log":
+                vals = core.log2p1(vals)
+        return vals
+
+    def open_analyze(self):
+        """The Analyze button: a window to plot genes against each other, per cell or per group."""
+        win = getattr(self, "analyze_window", None)
+        try:
+            if win is not None and win.top.winfo_exists():
+                win.top.lift()
+                return
+        except tk.TclError:
+            pass
+        from abc_tk_analyze import AnalyzeWindow
+        self.analyze_window = AnalyzeWindow(self)
 
     def color_all_quiet(self):
         mode = self.mode
@@ -2110,9 +2113,8 @@ class UmapWindow(ExportsMixin):
             return self.bg["x"][w][o], self.bg["y"][w][o], col[o], w[o]
 
         self.apply(rgb, order, bg_fn, extra_umap_layers=extra, dark=True)
-        to_log2 = 1.0 if dataset == "imputed" or scale == "linear" else float(np.log2(np.e))
         readouts = [(percent_below(per_gene[i][0], norm[i][1]), percent_below(per_gene[i][0], norm[i][2])) for i in range(n)] if scale == "linear" else None
-        self.draw_multi_legend(genes, [(v[1] * to_log2, v[2] * to_log2) for v in norm], scale, readouts)
+        self.draw_multi_legend(genes, [(v[1], v[2]) for v in norm], scale, readouts)
         parts = " and ".join(f"'{g}' ({CHANNEL_NAMES[i]})" for i, g in enumerate(genes))
         self.var_status.set(f"Showing {parts}{' [imputed]' if dataset == 'imputed' else ''}."
                             + (f" Hidden: {', '.join(genes[i] for i in sorted(hidden))}." if hidden else ""))

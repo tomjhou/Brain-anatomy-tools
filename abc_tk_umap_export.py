@@ -345,9 +345,10 @@ class ExportsMixin:
                 pts_per_mm = 72.0 * (pw_px / ppi) / (xl[1] - xl[0])
                 from abc_tk_umap import DOT_MM, GREY, LIGHT_GREY, SHAPE_MARKERS
                 for lay in pc.layers:
+                    dot_mm = lay.get("size_mm", DOT_MM) * pc.dot_factor          # (a dot's width on the tissue, as on the screen: the Cell size slider)
                     m = (lay["x"] >= xl[0]) & (lay["x"] <= xl[1]) & (lay["y"] >= yl[0]) & (lay["y"] <= yl[1])
                     x, y, rgb = lay["x"][m], lay["y"][m], lay["rgb"][m]
-                    marks = lay["marks"][m] if lay.get("marks") is not None else None         # (a marker code for each cell, when the Shapes box is ticked)
+                    marks = lay["marks"][m] if lay.get("marks") is not None else None         # (a marker code for each cell: the shape of its group)
                     # (in an SVG the gray cells, many thousands of them, are pictures: a vector dot apiece would make the file huge. They are told by
                     # their color, so that the gray ones of a layer that is mostly colored, or the other way round, are found too.)
                     if fmt == "svg" and not lay.get("gray"):
@@ -362,10 +363,10 @@ class ExportsMixin:
                             sub = sel & (marks == code) if marks is not None else sel
                             marker, is_open = SHAPE_MARKERS[int(code) % 10], int(code) >= 10
                             if is_open:
-                                ax.scatter(x[sub], y[sub], facecolors="none", edgecolors=rgb[sub] / 255.0, marker=marker, s=(DOT_MM * pts_per_mm) ** 2,
+                                ax.scatter(x[sub], y[sub], facecolors="none", edgecolors=rgb[sub] / 255.0, marker=marker, s=(dot_mm * pts_per_mm) ** 2,
                                            linewidths=0.5, rasterized=raster)
                             else:
-                                ax.scatter(x[sub], y[sub], c=rgb[sub] / 255.0, marker=marker, s=(DOT_MM * pts_per_mm) ** 2, linewidths=0,
+                                ax.scatter(x[sub], y[sub], c=rgb[sub] / 255.0, marker=marker, s=(dot_mm * pts_per_mm) ** 2, linewidths=0,
                                            rasterized=raster)
                 if pc.outlines:                                      # (the CCF atlas box: the regions' outlines, as on the screen)
                     from matplotlib.collections import LineCollection

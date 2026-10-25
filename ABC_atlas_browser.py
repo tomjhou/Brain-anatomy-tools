@@ -412,7 +412,7 @@ from abc_core import (
     SECTION_COORDS_CACHE_VERSION, SETTINGS_FILE, SPATIAL_CSV_CACHE_VERSION, SPATIAL_CSV_CHUNK_SIZE, ZOOM_DEBUG_DIAGNOSTICS,
     Z_MODE_OPTIONS, _expr_column_cache, _get_full_gene_column, _read_section_coordinates, _spatial_csv_cache_path,
     build_neuron_class_colors, ccf_files_missing, class_id_to_color, ensure_spatial_load_started, extract_leading_numeric_id,
-    find_gene_index, gene_expression_cache_paths, gene_symbol_list, generate_and_cache_section_image, generate_section_grid_image,
+    find_gene_index, gene_expression_cache_paths, gene_symbol_list, log2p1, generate_and_cache_section_image, generate_section_grid_image,
     get_section_labels, load_annotations_aligned, load_coordinate_settings, load_imputed_adata, load_rois_csv, load_section_spatial_coords,
     load_valid_section_roi_cache, map_data_to_pixel, map_pixel_to_data, metadata_file_status, multi_gene_rgb, parse_gene_names,
     rank_gene_suggestions, render_gene_expression_array, render_group_highlight_array, render_multi_gene_expression_array,
@@ -7958,7 +7958,7 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
     def hover_expression_text(idx):
         """The hovered cell's expression of the gene(s) the Gene / Imputed Gene view is showing, as text for the status bar (None in
         the Groups view, or if it can't be read). In the units of the Linear / Log radio buttons, as in render_gene_expression_array:
-        MERFISH genes are raw counts (Linear) or log1p of them (Log); imputed genes are stored as log2 values (Log) and shown as
+        MERFISH genes are raw counts (Linear) or log2(1 + counts) (Log); imputed genes are stored as log2 values (Log) and shown as
         2**x - 1 (Linear)."""
         mode = current_view.get('mode')
         if mode not in ('gene', 'imputed_gene') or hover_cells.get('rows') is None:
@@ -7990,7 +7990,7 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
                         cell = cell.toarray()
                     value = float(np.asarray(cell).ravel()[0])
                     if log_scale:
-                        value = float(np.log1p(value))
+                        value = float(log2p1(value))
             except Exception as e:
                 print(f"Could not read the expression of {gene} for the hovered cell: {e}")
                 continue
@@ -8000,7 +8000,7 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
         if use_imputed:
             unit = 'log2' if log_scale else 'linear'
         else:
-            unit = 'log1p' if log_scale else 'raw'
+            unit = 'log2' if log_scale else 'raw'
         return ', '.join(parts) + f' ({unit})'
 
     # cached_layout's pixel_bbox/data_xlim/data_ylim give the (near-uniform)
@@ -9303,7 +9303,7 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
         colorbar_max_text.set_text(f'{color_vmax:.2f}')
         colorbar_mid_text.set_text(f'{(color_vmin + color_vmax) / 2:.2f}')
         colorbar_min_text.set_text(f'{color_vmin:.2f}')
-        scale_label = 'log1p(expr)' if color_scale_state['mode'] == 'log' else 'expr (raw)'
+        scale_label = 'log2(1 + expr)' if color_scale_state['mode'] == 'log' else 'expr (raw)'
         colorbar_title_text.set_text(f'{resolved_gene_name}\n{scale_label}')
         colorbar_ax.set_visible(True)
         clear_multi_gene_legend()
@@ -14397,7 +14397,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
 
     # Linear/Log switch for the Gene and Imputed Gene views (the UMAP and every section panel are coloured from the same
     # values), like the one over the ROI picker's section view. Log is the default, as there: counts are heavy-tailed.
-    # MERFISH genes: Log = log1p(raw counts), Linear = raw counts. Imputed genes (stored as log2 values): Log = as
+    # MERFISH genes: Log = log2(1 + raw counts), Linear = raw counts. Imputed genes (stored as log2 values): Log = as
     # stored, Linear = 2**v - 1. Hand-rolled like the mode radio above, but not animated: a click is always followed
     # by a full redraw of the view anyway.
     GENE_SCALE_OPTIONS = ('Linear', 'Log')
@@ -14431,13 +14431,13 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
                 unlog = lambda values: np.exp2(values) - 1.0
                 return unlog, unlog
             return None, None
-        return (None, None) if linear else (np.log1p, np.log1p)
+        return (None, None) if linear else (log2p1, log2p1)
 
     def gene_scale_text(imputed):
         linear = gene_scale_state['mode'] == 'linear'
         if imputed:
             return ' [imputed, linear]' if linear else ' [imputed]'
-        return ' (raw counts)' if linear else ' (raw counts, log1p)'
+        return ' (raw counts)' if linear else ' (raw counts, log2)'
 
     # Level-of-granularity selector (class/subclass/supertype/cluster) —
     # same hand-rolled click-to-open/select dropdown pattern as the gene
@@ -16413,18 +16413,8 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             full_layers=bg_layers[:3], full_transforms=bg_transforms[:3],
         )
         update_umap_dot_size()
-        # vmins/vmaxes are each in whatever base resolve_gene_expression
-        # happened to log-transform that gene with — natural-log log1p for
-        # MERFISH, already-log2 for imputed (see that function's own
-        # comment) — converted to log2 units here purely for display, same
-        # convention mean_log2_expression already established for export_
-        # expression's own reported ranges, so the legend's numbers mean
-        # what they say regardless of which source each gene came from.
-        # Purely a display-side conversion: normalize_expression's own
-        # min-max scaling is invariant to this positive linear factor, so
-        # the actual on-screen colors are unaffected either way.
-        to_log2 = 1.0 if imputed or gene_scale_state['mode'] == 'linear' else np.log2(np.e)
-        draw_multi_gene_legend(resolved, [v * to_log2 for v in vmins], [v * to_log2 for v in vmaxes], hidden)
+        # vmins/vmaxes are in log2 units for both sources (MERFISH: log2(1 + counts), see log2p1; imputed: stored as log2): no conversion is needed.
+        draw_multi_gene_legend(resolved, list(vmins), list(vmaxes), hidden)
         # Set *after* clear_colorbar (already run above) reset it to
         # inactive — this is what tells render_export_figure (Save UMAP)
         # to rebuild its own copy from this scatter's actual facecolors

@@ -488,7 +488,7 @@ class SectionWindow:
 
     MARK_DELAY_MS = 500
     MARK_COLOR = (255, 0, 0)
-    SCALE_UNITS = {("standard", "log"): "log1p(expr)", ("standard", "linear"): "expr (raw counts)",
+    SCALE_UNITS = {("standard", "log"): "log2(1 + expr)", ("standard", "linear"): "expr (raw counts)",
                    ("imputed", "log"): "log2 (imputed)", ("imputed", "linear"): "linear (imputed)"}
     CHANNEL_COLORS = ("#e53935", "#43a047", "#4a6cff")        # the red, green and blue of a multi-gene overlay
 
@@ -991,7 +991,7 @@ class SectionWindow:
                 if self.shown_dataset == "imputed":
                     v = v if log else 2.0 ** v - 1.0
                 else:
-                    v = float(np.log1p(v)) if log else v
+                    v = float(core.log2p1(v)) if log else v
                 parts.append(f"{gene} = {v:.3g}" if np.isfinite(v) else f"{gene} = n/a")
         if not parts:
             return None

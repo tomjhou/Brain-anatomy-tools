@@ -21,9 +21,11 @@ EXPORT_FONTSIZE = 14
 EXPORT_AXES_PX = 6400                         # the UMAP's plotting square in a saved file, at the save DPI
 EXPORT_MARGIN_IN = 2.5
 EXPORT_LEGEND_MAX_ROWS = 35
-SECTION_MAPS_LONG_SIDE_IN = 20.0              # a saved section map figure is about this long (inches) on its longer side, when it has enough panels to need it
+SECTION_MAPS_FULL_WIDTH_PX = 4000            # a panel at the largest Section map size (one across) is this many pixels wide in a saved PNG; smaller sizes in proportion
 PANEL_PAD_IN, PANEL_TITLE_IN = 0.08, 0.25     # the space round a panel in a saved section map figure, and above it for its title
 PANELS_ACROSS_CHOICES = ("Auto (near-square)", "As on screen", "1", "2", "3", "4", "5", "6", "8", "10", "12")
+JPG_ARGS = {"quality": 85, "subsampling": 2, "optimize": True}      # a saved JPG: quality 85, colors at half resolution: on a section map, 2 to 4 times smaller than the PNG
+JPG_MAX_SIDE_PX = 65500                       # the JPEG format cannot hold a picture more than 65,535 pixels on a side
 SVG_PICTURE_DPI = 200                         # the pictures inside a saved SVG (the blank and gray cells): a picture costs the same however many cells it holds, so a big one loses to vector dots below about 70,000 cells
 UMAP_POINT_SIZE = 10                          # matplotlib's s (an area) of a dot in a saved UMAP
 POINT_ALPHA = 0.75
@@ -41,36 +43,26 @@ def parse_panels_across(text):
     return "screen" if text.startswith("as on") else "auto"
 
 
-def section_map_layout(n, panel_aspect, choice, screen_cols, screen_panel_in, band_height=None):
-    """How a saved section map figure is arranged: (the panels across, the width of a panel in inches). `panel_aspect`: a panel's width over its
-    height. 'screen': as the pane has them. Otherwise the figure is made about SECTION_MAPS_LONG_SIDE_IN long on its longer side, never with a panel
-    bigger than on the screen; with 'auto' the columns are the number that make it closest to a square, and if it cannot be square, taller than wide
-    is preferred to wider than tall (a small extra cost for wider: it decides between layouts about as far from a square, but never picks a
-    tall thin strip over a wide one that is much closer to a square), and a layout that leaves few empty places to one that leaves many.
-    `band_height(width in inches)`, if given, is the height of the legend band under the panels, which counts in the shape."""
+def section_map_columns(n, panel_w_in, panel_h_in, choice, screen_cols):
+    """The number of panels across in a saved section map figure. 'screen': as the pane has them. A whole number: that many. 'auto': the number
+    that makes the figure closest to a square, and if it cannot be square, taller than wide is preferred to wider than tall (a small extra cost
+    for wider: it decides between layouts about as far from a square, but never picks a tall thin strip over a wide one that is much closer to a
+    square); a layout that leaves few empty places is preferred to one that leaves many. Only the panels count in the shape: the legend band under
+    them goes as far past the square as it needs to. The panels' size is set by the Section map size slider, so the figure is as big as that makes it."""
     pad, title = PANEL_PAD_IN, PANEL_TITLE_IN
-
-    def panel_for(cols):
-        rows = -(-n // cols)
-        by_width = SECTION_MAPS_LONG_SIDE_IN / cols - pad
-        by_height = (SECTION_MAPS_LONG_SIDE_IN / rows - pad - title) * panel_aspect
-        return max(min(by_width, by_height, screen_panel_in), 0.5)
-
     if choice == "screen":
-        return max(1, screen_cols), screen_panel_in
+        return max(1, screen_cols)
     if isinstance(choice, int):
-        cols = min(max(choice, 1), n)
-        return cols, panel_for(cols)
+        return min(max(choice, 1), n)
     best = None
     for cols in range(1, n + 1):
         rows = -(-n // cols)
-        w = panel_for(cols)
-        width = cols * (w + pad)
-        aspect = width / (rows * (w / panel_aspect + pad + title) + (band_height(width) if band_height else 0.0))
+        width = cols * (panel_w_in + pad)
+        aspect = width / (rows * (panel_h_in + pad + title))
         cost = abs(math.log(aspect)) + (0.12 if aspect > 1.0 else 0.0) + 0.15 * (cols * rows - n) / (cols * rows)
         if best is None or cost < best[0] - 1e-9:
-            best = (cost, cols, w)
-    return best[1], best[2]
+            best = (cost, cols)
+    return best[1]
 
 
 def sibling(path, tail, ext):
@@ -109,8 +101,8 @@ class ExportsMixin:
         self.export_dir = path.parent
         return path
 
-    def ask_image_format(self, title, svg_note, panels_across=False):
-        """"png", "svg" or "both", chosen in a small dialog (None if it was cancelled or closed). The last choice made in this window is offered first.
+    def ask_image_format(self, title, svg_note, panels_across=False, summary=None):
+        """"png", "jpg", "svg" or "both", chosen in a small dialog (None if it was cancelled or closed). The last choice made in this window is offered first.
         `svg_note` is added under the SVG choice."""
         import tkinter as tk
         from tkinter import ttk
@@ -123,9 +115,16 @@ class ExportsMixin:
         box.pack()
         ttk.Label(box, text="Save as:").pack(anchor="w")
         ttk.Radiobutton(box, text="PNG: a picture", value="png", variable=var).pack(anchor="w", pady=(6, 0))
+        png_info = tk.StringVar(dlg, "")                 # (what the picture will be, under its choice; the SVG's goes at the end of its description)
+        if summary is not None:
+            ttk.Label(box, textvariable=png_info, foreground="gray30", wraplength=340, justify=tk.LEFT).pack(anchor="w", padx=(22, 0))
+        ttk.Radiobutton(box, text="JPG: a picture in a much smaller file", value="jpg", variable=var).pack(anchor="w", pady=(4, 0))
+        jpg_info = tk.StringVar(dlg, "The same picture as the PNG, compressed: typically 2 to 4 times smaller, with slight blurring and color fringes at the edges of dots and text.")
+        ttk.Label(box, textvariable=jpg_info, foreground="gray30", wraplength=340, justify=tk.LEFT).pack(anchor="w", padx=(22, 0))
         ttk.Radiobutton(box, text="SVG: vector graphics, for editing in a drawing program", value="svg", variable=var).pack(anchor="w", pady=(4, 0))
-        if svg_note:
-            ttk.Label(box, text=svg_note, foreground="gray30", wraplength=320, justify=tk.LEFT).pack(anchor="w", padx=(22, 0))
+        svg_info = tk.StringVar(dlg, svg_note or "")
+        if svg_note or summary is not None:
+            ttk.Label(box, textvariable=svg_info, foreground="gray30", wraplength=340, justify=tk.LEFT).pack(anchor="w", padx=(22, 0))
         ttk.Radiobutton(box, text="Both: a PNG and an SVG (you name both files now)", value="both", variable=var).pack(anchor="w", pady=(8, 0))
         across = tk.StringVar(dlg, getattr(self, "export_panels_across", PANELS_ACROSS_CHOICES[0]))
         if panels_across:                          # (section maps: how the panels are arranged in the saved picture)
@@ -133,8 +132,19 @@ class ExportsMixin:
             line.pack(anchor="w", pady=(12, 0))
             ttk.Label(line, text="Panels across:").pack(side=tk.LEFT)
             ttk.Combobox(line, textvariable=across, values=PANELS_ACROSS_CHOICES, width=18).pack(side=tk.LEFT, padx=(8, 0))
-            ttk.Label(box, text="Auto makes the picture close to a square (taller rather than wider), whatever the window looks like.",
-                      foreground="gray30", wraplength=320, justify=tk.LEFT).pack(anchor="w")
+            ttk.Label(box, text="Auto makes the panels close to a square (taller rather than wider); the legend is under them.", foreground="gray30",
+                      wraplength=340, justify=tk.LEFT).pack(anchor="w")
+            if summary is not None:                                       # (the layout and the size of each file the choice makes, updated as it is changed)
+                def refresh(*args):
+                    try:
+                        png_text, svg_text, jpg_text = summary(across.get())
+                    except Exception:
+                        png_text, svg_text, jpg_text = "", "", ""
+                    png_info.set(png_text)
+                    svg_info.set(((svg_note + " ") if svg_note else "") + svg_text)
+                    jpg_info.set("The same picture as the PNG, compressed: typically 2 to 4 times smaller, with slight blurring and color fringes at the edges of dots and text." + jpg_text)
+                across.trace_add("write", refresh)
+                refresh()
         result = []
 
         def finish(value):
@@ -308,6 +318,40 @@ class ExportsMixin:
                            handleheight=1.0, labelspacing=0.4, columnspacing=1.5)
         return fig
 
+    def section_map_plan(self, choice):
+        """What a saved section map will be for this choice of panels across ('auto', 'screen' or a number): the layout, and the size of the picture.
+        A panel's size in the picture follows the Section map size slider and nothing else (not the window or the screen): at full width it is
+        SECTION_MAPS_FULL_WIDTH_PX pixels wide, at one half of the width half of that, and so on; its shape is the shape of the panels on the screen."""
+        dpi = self.host["SECTION_MAPS_SAVE_DPI"]
+        n = len(self.tiles)
+        screen_w, screen_h = self.tiles[0]["pc"].size()
+        pw_px = round(SECTION_MAPS_FULL_WIDTH_PX / max(1, self.tile_cols))
+        ph_px = round(pw_px * screen_h / screen_w)
+        pw_in, ph_in = pw_px / dpi, ph_px / dpi
+        legend = self.section_legend()                                  # (what the view on the screen says its colors are: a band under the panels)
+        cols = section_map_columns(n, pw_in, ph_in, choice, max(1, self.tile_cols))
+        rows = -(-n // cols)
+        width = cols * (pw_in + PANEL_PAD_IN)
+        band_h = self.legend_band_height(legend, width)
+        height = rows * (ph_in + PANEL_PAD_IN + PANEL_TITLE_IN) + band_h
+        return {"cols": cols, "rows": rows, "pw_in": pw_in, "ph_in": ph_in, "width": width, "height": height, "band_h": band_h, "legend": legend,
+                "panel_px": (pw_px, ph_px), "px": (round(width * dpi), round(height * dpi))}
+
+    def section_map_summary(self, choice_text):
+        """(the PNG's line, the SVG's line) the save dialog shows for this choice of panels across: the layout and the size of each file."""
+        plan = self.section_map_plan(parse_panels_across(choice_text))
+        w_px, h_px = plan["px"]
+        mp = w_px * h_px / 1e6
+        png = (f"{plan['cols']} panel{'s' if plan['cols'] > 1 else ''} across and {plan['rows']} down" + (", the legend under them" if plan["band_h"] else "") + ". "
+               f"Each panel is {plan['panel_px'][0]:,} x {plan['panel_px'][1]:,} pixels (set by the Section map size slider, not by the window). "
+               f"The picture is {w_px:,} x {h_px:,} pixels ({mp:.0f} megapixels, about {w_px * h_px * 4 / 1e6:,.0f} MB of memory to make).")
+        if mp > 250:
+            png += " That is very large: use more panels across, or a smaller Section map size."
+        svg = f"The page is {plan['width']:.1f} x {plan['height']:.1f} inches."
+        jpg = (f" This one is too big for a JPG, which can be at most {JPG_MAX_SIDE_PX:,} pixels on a side: use more panels across, or a smaller Section map size."
+               if max(w_px, h_px) > JPG_MAX_SIDE_PX else "")
+        return png, svg, jpg
+
     def gene_cmap(self):
         """The colormap of a single gene in the theme on the screen."""
         from matplotlib import colormaps
@@ -422,7 +466,7 @@ class ExportsMixin:
             for f, path in paths.items():
                 self.var_status.set(f"Saving {f}...")
                 self.root.update()
-                fig.savefig(path, bbox_inches="tight", dpi=dpi if f == "png" else SVG_PICTURE_DPI)          # (for an SVG the dpi is that of the pictures in it)
+                fig.savefig(path, bbox_inches="tight", dpi=SVG_PICTURE_DPI if f == "svg" else dpi, **({"pil_kwargs": JPG_ARGS} if f == "jpg" else {}))          # (for an SVG the dpi is that of the pictures in it)
                 written.append(path)
                 if has_legend:
                     from matplotlib.figure import Figure
@@ -433,7 +477,7 @@ class ExportsMixin:
                     lf.legend(handles=handles, title=cat["title"], loc="center", fontsize=EXPORT_FONTSIZE * 0.85, title_fontsize=EXPORT_FONTSIZE,
                               ncol=max(1, math.ceil(len(handles) / EXPORT_LEGEND_MAX_ROWS)), frameon=True, handlelength=1.0, handleheight=1.0,
                               labelspacing=0.4, columnspacing=1.5)
-                    lf.savefig(legend_paths[f], bbox_inches="tight", dpi=dpi if f == "png" else None)
+                    lf.savefig(legend_paths[f], bbox_inches="tight", dpi=None if f == "svg" else dpi, **({"pil_kwargs": JPG_ARGS} if f == "jpg" else {}))
                     written.append(legend_paths[f])
             folders = list(dict.fromkeys(str(p.parent) for p in written))
             self.var_status.set(f"Saved {', '.join(p.name for p in written)} to {' and '.join(folders)}.")
@@ -454,10 +498,16 @@ class ExportsMixin:
         from matplotlib.patches import Rectangle
         h = self.host
         fmt = self.ask_image_format("Save the section maps", "The gray cells, and in a gene view the cells with no expression, are pictures inside it, to keep the file small; the colored cells and the "
-                                                              "outlines stay vector graphics.", panels_across=True)
+                                                              "outlines stay vector graphics.", panels_across=True, summary=self.section_map_summary)
         if fmt is None:
             self.var_status.set("Save section maps cancelled.")
             return
+        if fmt == "jpg":
+            big = max(self.section_map_plan(parse_panels_across(getattr(self, "export_panels_across", "")))["px"])
+            if big > JPG_MAX_SIDE_PX:
+                self.var_status.set(f"A JPG can be at most {JPG_MAX_SIDE_PX:,} pixels on a side and this picture would be {big:,}: use more panels across, "
+                                    "a smaller Section map size, or a PNG.")
+                return
         roi_only = "_ROI_only" if self.var_roi_only.get() else ""        # (the ROI only box above the panels: the name says what the maps show)
         ccf = "_CCF-overlay" if any(t["pc"].outlines for t in self.tiles) else ""        # (and the CCF atlas box)
         paths = self.ask_export_paths(fmt, f"{self.view_token_safe()}_section_maps{roi_only}{ccf}", "Save the section maps")
@@ -471,13 +521,9 @@ class ExportsMixin:
             written = []
             n = len(self.tiles)
             pw_px, ph_px = self.tiles[0]["pc"].size()
-            legend = self.section_legend()                                  # (what the view on the screen says its colors are: a band under the panels)
-            cols, pw_in = section_map_layout(n, pw_px / ph_px, parse_panels_across(getattr(self, "export_panels_across", "")), max(1, self.tile_cols), pw_px / 100.0,
-                                             band_height=lambda width: self.legend_band_height(legend, width))
-            rows = -(-n // cols)
-            ph_in = pw_in * ph_px / pw_px
+            plan = self.section_map_plan(parse_panels_across(getattr(self, "export_panels_across", "")))
+            legend, cols, rows, pw_in, ph_in, band_h = plan["legend"], plan["cols"], plan["rows"], plan["pw_in"], plan["ph_in"], plan["band_h"]
             pad, row_extra = PANEL_PAD_IN, PANEL_TITLE_IN
-            band_h = self.legend_band_height(legend, cols * (pw_in + pad))
             for fmt, chosen in paths.items():             # (each format is made on its own: the SVG holds its gray cells as pictures)
                 fig = Figure(figsize=(cols * (pw_in + pad), rows * (ph_in + pad + row_extra) + band_h))
                 FigureCanvasAgg(fig)
@@ -552,7 +598,7 @@ class ExportsMixin:
                     self.draw_legend_band(fig, legend, fw, fh, band_h)
                 self.var_status.set(f"Saving {fmt}...")
                 self.root.update()
-                fig.savefig(chosen, dpi=h["SECTION_MAPS_SAVE_DPI"])         # (for an SVG the dpi is that of the pictures in it)
+                fig.savefig(chosen, dpi=h["SECTION_MAPS_SAVE_DPI"], **({"pil_kwargs": JPG_ARGS} if fmt == "jpg" else {}))         # (for an SVG the dpi is that of the pictures in it)
                 written.append(chosen)
             folders = list(dict.fromkeys(str(p.parent) for p in written))
             self.var_status.set(f"Saved {', '.join(p.name for p in written)} to {' and '.join(folders)} "

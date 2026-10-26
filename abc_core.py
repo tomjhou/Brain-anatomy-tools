@@ -71,7 +71,7 @@ DEFAULT_BREGMA_CCF_AP_MM = 5.40
 
 # (these settings are always kept in viewer_settings.json, whether or not the viewer's own settings persist; 'tk_section_window':
 # open the single-section window as the Tk version, abc_tk_picker.py, instead of the matplotlib one)
-COORD_SETTINGS = {'z_mode': 'section', 'bregma_ap_mm': DEFAULT_BREGMA_CCF_AP_MM, 'tk_section_window': True}
+COORD_SETTINGS = {'z_mode': 'section', 'bregma_ap_mm': DEFAULT_BREGMA_CCF_AP_MM, 'tk_section_window': True, 'reconstructed_coords': True}
 
 
 def load_coordinate_settings():
@@ -84,6 +84,7 @@ def load_coordinate_settings():
         if on_disk.get('z_mode') in dict(Z_MODE_OPTIONS):
             COORD_SETTINGS['z_mode'] = on_disk['z_mode']
         COORD_SETTINGS['tk_section_window'] = bool(on_disk.get('tk_section_window', True))
+        COORD_SETTINGS['reconstructed_coords'] = bool(on_disk.get('reconstructed_coords', True))
         bregma = float(on_disk.get('bregma_ap_mm'))
         if 0.0 < bregma < 13.5:
             COORD_SETTINGS['bregma_ap_mm'] = bregma
@@ -104,6 +105,7 @@ def save_coordinate_settings():
     on_disk['z_mode'] = COORD_SETTINGS['z_mode']
     on_disk['bregma_ap_mm'] = COORD_SETTINGS['bregma_ap_mm']
     on_disk['tk_section_window'] = bool(COORD_SETTINGS['tk_section_window'])
+    on_disk['reconstructed_coords'] = bool(COORD_SETTINGS['reconstructed_coords'])
     try:
         SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
@@ -238,13 +240,36 @@ ZOOM_DEBUG_DIAGNOSTICS = True  # TODO: set back to False once the section-cache 
 DATASET_NAME = 'merfish_c57bl6j_638850'
 
 
+# Which coordinates the cells are placed by. 'raw': the x, y of the cell metadata table. 'reconstructed': Allen's reconstructed x, y, in which the
+# sections have been registered to the Common Coordinate Framework (a non-rigid warp of each section, which corrects tissue distortion) and the
+# atlas's own regions (resampled_annotation) line up with the cells exactly. Chosen by the 'reconstructed_coords' setting, but only used once its
+# files are in the cache (`ready`), and an existing run that was made with ROIs in the other frame is opened in its own (`override`). Everything
+# cached from the cells' positions (pictures, run folders' ROI names) carries the frame in its name.
+FRAME_STATE = {'ready': False, 'override': None}
+
+
+def reconstructed_in_use():
+    want = (FRAME_STATE['override'] == 'reconstructed') if FRAME_STATE['override'] is not None else bool(COORD_SETTINGS['reconstructed_coords'])
+    return bool(want and FRAME_STATE['ready'])
+
+
+def dataset_prefix():
+    return DATASET_NAME + ('_rc' if reconstructed_in_use() else '')
+
+
+def coordinate_frame_name():
+    return 'reconstructed' if reconstructed_in_use() else 'raw'
+
+
 # The section-picker grid always shows every section, neuron-only, regardless
 # of which cell type / section subset is chosen for the actual UMAP run — so
 # there's exactly one canonical cached image, reused across every run.
-GRID_CACHE_PNG = CACHE_DIR / f'{DATASET_NAME}_section_picker_grid.png'
+def grid_cache_png():
+    return CACHE_DIR / f'{dataset_prefix()}_section_picker_grid.png'
 
 
-GRID_CACHE_LAYOUT = CACHE_DIR / f'{DATASET_NAME}_section_picker_grid_layout.json'
+def grid_cache_layout():
+    return CACHE_DIR / f'{dataset_prefix()}_section_picker_grid_layout.json'
 
 
 GRID_CACHE_DPI = 375  # 300 * 1.25
@@ -414,6 +439,130 @@ def _spatial_csv_cache_path(cell_metadata_path):
 
 
 def load_section_spatial_coords(adata, abc_cache, progress_callback=None):
+    """The table of _load_raw_section_spatial_coords, with its x and y replaced by Allen's reconstructed coordinates when the app is using those
+    (see FRAME_STATE): the original ones are kept in 'x_raw' / 'y_raw', and 'coord_src' says where each cell's position came from (0: its own
+    reconstructed position, 1: estimated from its neighbours' in the same section, 2: the raw position, for a section Allen did not register)."""
+    table = _load_raw_section_spatial_coords(adata, abc_cache, progress_callback)
+    if table is None or not reconstructed_in_use():
+        return table
+    try:
+        x, y, src = reconstructed_positions(adata, abc_cache, table)
+        table['x_raw'], table['y_raw'] = table['x'].to_numpy(), table['y'].to_numpy()
+        table['x'], table['y'], table['coord_src'] = x, y, src
+    except Exception as e:
+        print(f"Warning: could not use the reconstructed coordinates ({e}); using the raw ones.")
+    return table
+
+
+RECON_CACHE_VERSION = 1
+RECON_FIT_CELLS = 4000              # the thin-plate fit that places a cell Allen left out uses this many of its section's registered cells
+RECON_MIN_REGISTERED = 500          # a section with fewer registered cells is left in its raw coordinates
+
+
+def release_tk_variables(window):
+    """Drops the Tk variables a window object keeps as attributes, now, on this thread, while its Tk is still up. A Tk variable that is freed
+    later by the garbage collector, on whatever thread happens to run it (a loader's, say), prints "main thread is not in main loop" once for
+    each of them. Call it just before the window's root is destroyed."""
+    import tkinter as tk
+    for name, value in list(vars(window).items()):
+        if isinstance(value, tk.Variable):
+            setattr(window, name, None)
+
+
+def _file_stamp(path):
+    st = os.stat(path)
+    return f"{path}|{st.st_mtime_ns}|{st.st_size}"
+
+
+def _fill_unregistered(x, y, z, rx, ry):
+    """(X, Y, src): the reconstructed position of every cell. `rx`, `ry` are NaN for a cell Allen did not register. In a section that has
+    registered cells, one that is missing is placed by a thin-plate spline from raw (x, y) to reconstructed (x, y), fitted on that section's
+    registered cells: the two frames differ by a smooth warp of about 0.1 mm, which the spline follows to about 8 um. A section with hardly any
+    registered cells keeps its raw positions."""
+    from scipy.interpolate import RBFInterpolator
+    X, Y = rx.astype(np.float32), ry.astype(np.float32)
+    src = np.zeros(len(x), np.int8)
+    have = np.isfinite(rx) & np.isfinite(ry)
+    zr = np.round(z, 3)
+    rng = np.random.default_rng(0)
+    for value in np.unique(zr[np.isfinite(zr)]):
+        rows = np.flatnonzero(zr == value)
+        ok = rows[have[rows]]
+        lost = rows[~have[rows]]
+        if len(ok) < RECON_MIN_REGISTERED:
+            X[rows], Y[rows], src[rows] = x[rows], y[rows], 2
+            continue
+        if len(lost) == 0:
+            continue
+        centers = rng.choice(ok, min(RECON_FIT_CELLS, len(ok)), replace=False)
+        spline = RBFInterpolator(np.column_stack([x[centers], y[centers]]), np.column_stack([rx[centers], ry[centers]]),
+                                 kernel='thin_plate_spline', smoothing=1e-3, neighbors=80)
+        guess = spline(np.column_stack([x[lost], y[lost]]))
+        X[lost], Y[lost], src[lost] = guess[:, 0], guess[:, 1], 1
+    return X, Y, src
+
+
+def _full_reconstructed(abc_cache):
+    """(labels, x, y, src) for every cell of the atlas's metadata table, in its order. Made once from the two tables (a minute) and kept."""
+    meta_path = abc_cache.get_metadata_path(directory='MERFISH-C57BL6J-638850', file_name='cell_metadata_with_cluster_annotation')
+    recon_path = abc_cache.get_metadata_path(directory=CCF_DIRECTORY, file_name=RECON_COORDS_FILE_NAME)
+    key = f"{_file_stamp(meta_path)}|{_file_stamp(recon_path)}|v{RECON_CACHE_VERSION}"
+    full_path = CACHE_DIR / f"recon_full_v{RECON_CACHE_VERSION}_{hashlib.md5(key.encode('utf-8')).hexdigest()[:16]}.npz"
+    pickle_path = _spatial_csv_cache_path(meta_path)
+    if pickle_path.exists():
+        meta = pd.read_pickle(pickle_path)
+    else:
+        meta = pd.read_csv(meta_path, index_col=0, converters={0: str}, usecols=[0, 'x', 'y', 'z'])
+    if full_path.exists():
+        try:
+            saved = np.load(full_path)
+            if len(saved['x']) == len(meta):
+                return meta.index, saved['x'], saved['y'], saved['src']
+        except Exception:
+            pass
+    print("Placing the cells by Allen's reconstructed coordinates (done once, about a minute)...", flush=True)
+    t0 = time.perf_counter()
+    recon = pd.read_csv(recon_path, index_col=0, dtype={'cell_label': str}, usecols=['cell_label', 'x', 'y'])
+    aligned = recon.reindex(meta.index)
+    X, Y, src = _fill_unregistered(meta['x'].to_numpy(float), meta['y'].to_numpy(float), meta['z'].to_numpy(float),
+                                   aligned['x'].to_numpy(float), aligned['y'].to_numpy(float))
+    try:
+        np.savez(full_path, x=X, y=Y, src=src)
+    except Exception as e:
+        print(f"Could not keep the reconstructed positions ({e}).")
+    print(f"Reconstructed positions ready in {time.perf_counter() - t0:.0f} s: {int((src == 0).sum()):,} cells registered by Allen, "
+          f"{int((src == 1).sum()):,} placed from their neighbours, {int((src == 2).sum()):,} in sections Allen did not register (raw positions).", flush=True)
+    return meta.index, X, Y, src
+
+
+def reconstructed_positions(adata, abc_cache, raw_table):
+    """(x, y, src) arrays lined up with adata's cells (see load_section_spatial_coords). The same cell has the same position whatever the
+    AnnData: they come from one table of the whole atlas. Kept per set of cells, so the next time is one small file."""
+    meta_path = abc_cache.get_metadata_path(directory='MERFISH-C57BL6J-638850', file_name='cell_metadata_with_cluster_annotation')
+    recon_path = abc_cache.get_metadata_path(directory=CCF_DIRECTORY, file_name=RECON_COORDS_FILE_NAME)
+    key = f"{_file_stamp(meta_path)}|{_file_stamp(recon_path)}|v{RECON_CACHE_VERSION}|{_index_fingerprint(adata.obs.index)}"
+    path = CACHE_DIR / f"recon_aligned_v{RECON_CACHE_VERSION}_{hashlib.md5(key.encode('utf-8')).hexdigest()[:16]}.npz"
+    if path.exists():
+        try:
+            saved = np.load(path)
+            if len(saved['x']) == len(adata.obs.index):
+                return saved['x'], saved['y'], saved['src']
+        except Exception:
+            pass
+    labels, X, Y, src = _full_reconstructed(abc_cache)
+    positions = atlas_positions(adata.obs.index, labels)
+    found = positions >= 0
+    x = np.where(found, X[np.maximum(positions, 0)], raw_table['x'].to_numpy(np.float32))
+    y = np.where(found, Y[np.maximum(positions, 0)], raw_table['y'].to_numpy(np.float32))
+    s = np.where(found, src[np.maximum(positions, 0)], 2).astype(np.int8)
+    try:
+        np.savez(path, x=x, y=y, src=s)
+    except Exception:
+        pass
+    return x, y, s
+
+
+def _load_raw_section_spatial_coords(adata, abc_cache, progress_callback=None):
     """Load per-cell 'x'/'y' spatial coordinates (and 'class'/'subclass'/
     'supertype'/'cluster', if available) from the ABC atlas cell_metadata table (these
     aren't normally joined into adata), aligned to adata.obs.index. Used for
@@ -584,6 +733,13 @@ CCF_PARCELLATION_FILE_NAME = 'parcellation_to_parcellation_term_membership_acron
 CCF_FILES = ((CCF_DIRECTORY, CCF_COORDS_FILE_NAME), (CCF_PARCELLATION_DIRECTORY, CCF_PARCELLATION_FILE_NAME))
 
 
+# For the reconstructed coordinates: each cell's x, y, z in Allen's reconstructed space (a table), and the CCF annotation resampled into that same
+# space (a volume: [x, y, section] voxels of 10, 10 and 200 um, the labels of the CCF's regions). Downloaded (with a confirmation) when first needed.
+RECON_COORDS_FILE_NAME = 'reconstructed_coordinates'
+RECON_ANNOTATION_FILE_NAME = 'resampled_annotation'
+RECON_FILES = ((CCF_DIRECTORY, RECON_COORDS_FILE_NAME, 'metadata'), (CCF_DIRECTORY, RECON_ANNOTATION_FILE_NAME, 'data'))
+
+
 def metadata_file_status(abc_cache, directory, file_name):
     """(local_path, expected_size_bytes, is_present) for an atlas metadata file, without downloading
     it; (None, None, None) if abc_atlas_access's internals no longer answer this (same private-API
@@ -595,10 +751,10 @@ def metadata_file_status(abc_cache, directory, file_name):
         return None, None, None
 
 
-def ccf_files_missing(abc_cache):
-    """[(directory, file_name, expected_bytes, local_path)] of the CCF files not yet in the local cache."""
+def ccf_files_missing(abc_cache, files=CCF_FILES):
+    """[(directory, file_name, expected_bytes, local_path)] of the CCF files (or of `files`) not yet in the local cache."""
     missing = []
-    for directory, file_name in CCF_FILES:
+    for directory, file_name, *_kind in files:
         local_path, size, present = metadata_file_status(abc_cache, directory, file_name)
         if present is not True:
             missing.append((directory, file_name, size, local_path))
@@ -707,7 +863,7 @@ def section_roi_cache_paths(section_label):
     reopening the ROI picker for the same section is fast the second time
     (skips reloading spatial data and re-scattering every point)."""
     token = sanitize_section_token(section_label)
-    stem = f'{DATASET_NAME}_section_roi_{token}'
+    stem = f'{dataset_prefix()}_section_roi_{token}'
     return CACHE_DIR / f'{stem}.png', CACHE_DIR / f'{stem}.json'
 
 
@@ -733,7 +889,7 @@ def gene_expression_cache_paths(section_label, resolved_gene, cell_type_selectio
     gene_token = re.sub(r'[^A-Za-z0-9]+', '', str(resolved_gene))
     dataset_token = '' if dataset == 'standard' else f'_{dataset}'
     stem = (
-        f'{DATASET_NAME}_gene_expr_{section_token}_{gene_token}_'
+        f'{dataset_prefix()}_gene_expr_{section_token}_{gene_token}_'
         f'{cell_type_selection.lower()}_{color_scale}{dataset_token}'
     )
     return CACHE_DIR / f'{stem}.png', CACHE_DIR / f'{stem}.json'
@@ -1170,11 +1326,11 @@ def generate_section_grid_image(adata, abc_cache, section_series):
         axes_flat[j].axis('off')
 
     fig.subplots_adjust(top=0.98, bottom=0.02, hspace=0.05, wspace=0.05)
-    fig.savefig(GRID_CACHE_PNG, dpi=GRID_CACHE_DPI)
+    fig.savefig(grid_cache_png(), dpi=GRID_CACHE_DPI)
 
     # Read the actual saved image back to get its exact pixel dimensions, so
     # the bounding boxes we store line up exactly with what gets displayed.
-    img = imread(GRID_CACHE_PNG)
+    img = imread(grid_cache_png())
     img_h, img_w = img.shape[0], img.shape[1]
 
     # Store both the pixel bounding box (for click-hit-testing and drawing
@@ -1191,10 +1347,10 @@ def generate_section_grid_image(adata, abc_cache, section_series):
             'data_xlim': list(ax.get_xlim()),
             'data_ylim': list(ax.get_ylim()),
         }
-    with open(GRID_CACHE_LAYOUT, 'w') as f:
+    with open(grid_cache_layout(), 'w') as f:
         json.dump(layout, f)
 
-    print(f"Cached section grid image to {GRID_CACHE_PNG} ({img_w}x{img_h}px, {n} sections).")
+    print(f"Cached section grid image to {grid_cache_png()} ({img_w}x{img_h}px, {n} sections).")
     return img, layout
 
 

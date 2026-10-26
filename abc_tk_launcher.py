@@ -282,7 +282,7 @@ class RunPicker:
         self.tree.configure(yscrollcommand=scroll.set)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.tree.bind("<Double-Button-1>", lambda e: self.ok() if self.tree.identify_row(e.y) else None)
+        self.tree.bind("<Double-Button-1>", self.double_clicked)
         self.var_status = tk.StringVar(top, "Looking for runs...")
         ttk.Label(body, textvariable=self.var_status, foreground="gray30").pack(anchor="w", pady=(6, 0))
         buttons = ttk.Frame(body)
@@ -352,6 +352,12 @@ class RunPicker:
             self.var_status.set("No saved runs in this folder. Use Browse… to pick a run folder from somewhere else.")
         else:
             self.var_status.set(f"{len(self.shown)} of {len(self.runs)} runs" if text else f"{len(self.runs)} runs, the most recent first.")
+
+    def double_clicked(self, event):
+        if not self.tree.identify_row(event.y):
+            return None
+        self.ok()
+        return "break"                  # (the window is gone: the tree's own double-click handler, which runs after this one, would fail on it)
 
     def ok(self):
         picked = self.tree.selection()

@@ -35,6 +35,7 @@ from abc_tk_umap_export import ExportsMixin, hexcolor
 LEIDEN_KEY = "leiden"
 GREY = np.array([205, 205, 205], np.uint8)
 MULTI_BG = (26, 26, 26)           # the plots' background in the gene views (a zero-expression cell is black in the multi-gene view, so it must not melt into it)
+CCF_FIT_CELLS_PER_SECTION = 30000   # the CCF atlas fit of a section map uses at most this many of its cells (the lookup of millions is seconds)
 MAX_GENES = 6                      # the first three are red / green / blue circles; the next three the same colors as small dots on top
 CHANNEL_HEX = ("#e53935", "#43a047", "#4a6cff", "#e53935", "#43a047", "#4a6cff")
 CHANNEL_NAMES = ("red", "green", "blue", "red", "green", "blue")
@@ -1392,6 +1393,8 @@ class UmapWindow(ExportsMixin):
         h = self.host
         if not self.tiles:
             return False
+        if core.reconstructed_in_use() and self.bg is not None and self.bg.get("z") is not None:
+            return self.load_ccf_from_slices()
         if not h["ensure_ccf_downloaded"](self.abc_cache, parent=self.root):
             self.var_status.set("The CCF coordinates were not downloaded, so there is no atlas to draw.")
             return False
@@ -1400,12 +1403,16 @@ class UmapWindow(ExportsMixin):
             s = t["label"]
             if self.bg is not None and s in self.bg["where"]:          # (every cell of the section: a better fit than the run's own)
                 w = self.bg["where"][s]
-                ids, x, y = np.asarray(self.bg["ids"])[w], self.bg["x"][w], self.bg["y"][w]
+                ids, x, y = self.bg["ids"][w], self.bg["x"][w], self.bg["y"][w]          # (indexed first, then made an array: converting every id of the atlas for each section is slow)
             else:
                 idx = self.run_idx[s]
-                ids, x, y = np.asarray(self.adata.obs_names)[idx], self.cx[idx], self.cy[idx]
-            cells[s] = (ids, x, y)
+                ids, x, y = self.adata.obs_names[idx], self.cx[idx], self.cy[idx]
+            if len(ids) > CCF_FIT_CELLS_PER_SECTION:                    # (a section's fit needs tens of thousands of cells, not millions)
+                keep = np.sort(np.random.default_rng(0).choice(len(ids), CCF_FIT_CELLS_PER_SECTION, replace=False))
+                ids, x, y = ids[keep], x[keep], y[keep]
+            cells[s] = (np.asarray(ids, dtype=object), x, y)
             homes[s] = t["pc"].home
+
 
         def work():
             path = self.abc_cache.get_data_path(directory=h["CCF_VOLUME_DIRECTORY"], file_name=h["CCF_VOLUME_FILE_NAME"])
@@ -1420,13 +1427,37 @@ class UmapWindow(ExportsMixin):
             return abc_tk_ccf.section_outlines(volume, fitted, homes)
 
         try:
-            self.ccf_outlines = h["run_with_loading_window"]("Drawing the CCF atlas on the section maps (the first read of the CCF coordinates takes about a minute).", work)
+            self.ccf_outlines = h["run_with_loading_window"]("Drawing the CCF atlas on the section maps (the first read of the CCF coordinates takes about a minute).", work, show_after_s=0)
         except Exception as e:
             self.var_status.set(f"Could not draw the CCF atlas: {e}")
             return False
         empty = [core.sanitize_section_token(s) for s, p in self.ccf_outlines.items() if not p]
         if empty:
             self.var_status.set(f"No CCF position for section {', '.join(empty)}: no outlines there.")
+        return True
+
+    def load_ccf_from_slices(self):
+        """The outlines when the cells are placed by Allen's reconstructed coordinates: the CCF annotation resampled into that same space, one slice per
+        section, is read off as it is (the cells' own region labels are exactly its values at their positions), so nothing is fitted. True if done."""
+        h = self.host
+        homes = {t["label"]: t["pc"].home for t in self.tiles}
+        section_z = {}
+        for t in self.tiles:
+            w = self.bg["where"].get(t["label"])
+            section_z[t["label"]] = float(np.nanmedian(self.bg["z"][w])) if w is not None and len(w) else float("nan")
+
+        def work():
+            path = self.abc_cache.get_data_path(directory=core.CCF_DIRECTORY, file_name=core.RECON_ANNOTATION_FILE_NAME)
+            return abc_tk_ccf.slice_outlines(h["read_nifti_volume"](path), section_z, homes)
+
+        try:
+            self.ccf_outlines = h["run_with_loading_window"]("Drawing the CCF atlas on the section maps.", work, show_after_s=0)
+        except Exception as e:
+            self.var_status.set(f"Could not draw the CCF atlas: {e}")
+            return False
+        empty = [core.sanitize_section_token(s) for s, p in self.ccf_outlines.items() if not p]
+        if empty:
+            self.var_status.set(f"No CCF atlas for section {', '.join(empty)} (Allen did not register it): no outlines there.")
         return True
 
     def add_slider(self, parent, row, text, var, n, command, value_text, tip_text):
@@ -2941,6 +2972,7 @@ class UmapWindow(ExportsMixin):
                 self.root.quit()
             except tk.TclError:
                 pass
+        core.release_tk_variables(self)
         self.root.destroy()
 
     def run(self):

@@ -489,6 +489,7 @@ class GridWindow:
                 self.root.quit()
             except tk.TclError:
                 pass
+        core.release_tk_variables(self)
         self.root.destroy()
 
     def run(self):
@@ -504,8 +505,8 @@ class GridWindow:
 def load_grid(adata, abc_cache, section_series):
     """(RGB uint8 picture, layout) of the section grid: the cached ones, made first if there are none."""
     layout = None
-    if core.GRID_CACHE_PNG.exists() and core.GRID_CACHE_LAYOUT.exists():
-        with open(core.GRID_CACHE_LAYOUT) as f:
+    if core.grid_cache_png().exists() and core.grid_cache_layout().exists():
+        with open(core.grid_cache_layout()) as f:
             layout = json.load(f)
         if layout and not isinstance(next(iter(layout.values())), dict):
             layout = None                                  # (an older format: made again)
@@ -514,7 +515,7 @@ def load_grid(adata, abc_cache, section_series):
             raise RuntimeError("no section metadata available")
         print("No cached section grid image found; generating one (this happens once)...", flush=True)
         _img, layout = core.generate_section_grid_image(adata, abc_cache, section_series)
-    img = np.asarray(Image.open(core.GRID_CACHE_PNG).convert("RGB"))
+    img = np.asarray(Image.open(core.grid_cache_png()).convert("RGB"))
     return img, layout
 
 

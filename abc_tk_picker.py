@@ -1246,6 +1246,7 @@ class SectionWindow:
                 self.root.quit()        # (the loop ends even while other windows, matplotlib's, are alive in the same process)
             except tk.TclError:
                 pass
+        core.release_tk_variables(self)
         self.root.destroy()
         if self.on_close:
             self.on_close()

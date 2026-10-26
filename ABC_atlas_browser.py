@@ -407,7 +407,8 @@ from abc_atlas_access.abc_atlas_cache.cloud_cache import OutdatedManifestWarning
 # under its own name, so the rest of this file is unchanged. Must come after the library check and the matplotlib setup above.
 from abc_core import (
     CACHE_DIR, CCF_COORDS_FILE_NAME, CCF_DIRECTORY, CCF_FILES, CCF_PARCELLATION_DIRECTORY, CCF_PARCELLATION_FILE_NAME,
-    COORD_SETTINGS, DATASET_NAME, DEFAULT_BREGMA_CCF_AP_MM, DEFAULT_GREY_RGBA, GRID_CACHE_DPI, GRID_CACHE_LAYOUT, GRID_CACHE_PNG,
+    COORD_SETTINGS, DATASET_NAME, DEFAULT_BREGMA_CCF_AP_MM, DEFAULT_GREY_RGBA, FRAME_STATE, GRID_CACHE_DPI, RECON_FILES,
+    coordinate_frame_name, dataset_prefix, grid_cache_layout, grid_cache_png, reconstructed_in_use,
     IMPUTED_DATASET_DIRECTORY, IMPUTED_DATASET_FILE_NAME, MULTI_GENE_BRIGHT_BLUE, NON_NEURON_CLASS_IDS, SCRIPT_DIR, SECTION_COL,
     SECTION_COORDS_CACHE_VERSION, SETTINGS_FILE, SPATIAL_CSV_CACHE_VERSION, SPATIAL_CSV_CHUNK_SIZE, ZOOM_DEBUG_DIAGNOSTICS,
     Z_MODE_OPTIONS, _expr_column_cache, _get_full_gene_column, _read_section_coordinates, _spatial_csv_cache_path,
@@ -530,7 +531,8 @@ def save_viewer_settings(settings):
     worth interrupting the session over."""
     to_write = {'persist_settings': bool(settings.get('persist_settings', False)),
                 'z_mode': COORD_SETTINGS['z_mode'], 'bregma_ap_mm': COORD_SETTINGS['bregma_ap_mm'],
-                'tk_section_window': bool(COORD_SETTINGS['tk_section_window'])}   # (always kept: see COORD_SETTINGS)
+                'tk_section_window': bool(COORD_SETTINGS['tk_section_window']),
+                'reconstructed_coords': bool(COORD_SETTINGS['reconstructed_coords'])}   # (always kept: see COORD_SETTINGS)
     if to_write['persist_settings']:
         to_write['hover_enabled'] = bool(settings.get('hover_enabled', True))
         to_write['gene456_shape'] = settings.get('gene456_shape', GENE456_SHAPE_DEFAULT)
@@ -617,6 +619,12 @@ def show_coordinate_settings_dialog(abc_cache):
         "(a one-time download).")).pack(
         anchor="w", pady=(6, 0))
     ttk.Separator(frame).pack(fill=tk.X, pady=(14, 8))
+    recon_var = tk.BooleanVar(dlg, bool(COORD_SETTINGS['reconstructed_coords']))
+    ttk.Checkbutton(frame, text="Place cells by Allen's reconstructed coordinates", variable=recon_var).pack(anchor="w")
+    ttk.Label(frame, foreground="gray35", justify=tk.LEFT, wraplength=460, text=(
+        "May be more biologically accurate: it corrects possible tissue distortions in the raw coordinates, and the CCF atlas then lines "
+        "up with the cells. One-time download (about 260 MB); applies to the next run you open.")).pack(anchor="w", pady=(2, 0))
+    ttk.Separator(frame).pack(fill=tk.X, pady=(14, 8))
     tk_var = tk.BooleanVar(dlg, bool(COORD_SETTINGS['tk_section_window']))
     ttk.Checkbutton(frame, text="Use the new Tk windows (the section picker, the section windows and the UMAP viewer)", variable=tk_var).pack(anchor="w")
     ttk.Label(frame, foreground="gray35", justify=tk.LEFT, wraplength=460, text=(
@@ -654,9 +662,15 @@ def show_coordinate_settings_dialog(abc_cache):
             COORD_SETTINGS['z_mode'] = mode
             COORD_SETTINGS['bregma_ap_mm'] = result['bregma']
             COORD_SETTINGS['tk_section_window'] = bool(tk_var.get())
+            COORD_SETTINGS['reconstructed_coords'] = bool(recon_var.get())
             save_coordinate_settings()
             start_section_coordinate_load(abc_cache)
     finally:
+        # The window's Tk variables are freed here, on this thread, while Tk is still up: left to the garbage collector they can be freed later
+        # on a background thread, which prints "main thread is not in main loop" once for each of them.
+        mode_var = bregma_var = tk_var = recon_var = dlg = frame = buttons = row = None
+        import gc
+        gc.collect()
         root.destroy()
 
 
@@ -2318,20 +2332,52 @@ THREED_WEB_OPACITY_SCRIPT = """
 
 
 
-def ensure_ccf_downloaded(abc_cache, parent=None):
-    """True once every CCF file is in the local cache, downloading them first if need be: asks (naming
-    the size) before downloading, then shows a progress window fed by the bytes landing on disk.
-    False if the user declined or cancelled, or the download failed."""
-    missing = ccf_files_missing(abc_cache)
+def prepare_coordinate_frame(abc_cache, parent=None):
+    """Decides which coordinates this session places the cells by (see FRAME_STATE in abc_core.py): Allen's reconstructed ones when the setting
+    asks for them (or the run being opened was made with them), once their files are in the cache (asked about, and downloaded, if not); the
+    raw ones otherwise, including when the download is declined."""
+    want = (FRAME_STATE['override'] == 'reconstructed') if FRAME_STATE['override'] is not None else bool(COORD_SETTINGS['reconstructed_coords'])
+    FRAME_STATE['ready'] = False
+    if not want:
+        return
+    if ensure_ccf_downloaded(abc_cache, parent=parent, files=RECON_FILES, what="reconstructed coordinates and the matching atlas"):
+        FRAME_STATE['ready'] = True
+    else:
+        print("The reconstructed coordinates are not available, so the cells are placed by the raw coordinates this time.")
+
+
+def write_run_frame(run_folder):
+    """Records in a run's folder which coordinates its ROIs were drawn on (see read_run_frame)."""
+    try:
+        (Path(run_folder) / 'coordinate_frame.txt').write_text(coordinate_frame_name() + '\n', encoding='utf-8')
+    except Exception as e:
+        print(f"Could not record the coordinates of this run ({e}).")
+
+
+def read_run_frame(run_folder):
+    """'raw' or 'reconstructed': the coordinates a saved run's ROIs were drawn on. A run saved before this was recorded used the raw ones."""
+    try:
+        text = (Path(run_folder) / 'coordinate_frame.txt').read_text(encoding='utf-8').strip()
+        return 'reconstructed' if text == 'reconstructed' else 'raw'
+    except Exception:
+        return 'raw'
+
+
+def ensure_ccf_downloaded(abc_cache, parent=None, files=CCF_FILES, what="CCF coordinates"):
+    """True once every CCF file (or each of `files`, as in RECON_FILES) is in the local cache, downloading
+    them first if need be: asks (naming the size) before downloading, then shows a progress window fed
+    by the bytes landing on disk. False if the user declined or cancelled, or the download failed."""
+    missing = ccf_files_missing(abc_cache, files)
     if not missing:
         return True
+    kinds = {(entry[0], entry[1]): (entry[2] if len(entry) > 2 else 'metadata') for entry in files}
     total_bytes = sum(size or 0 for _d, _f, size, _p in missing)
     size_text = f"{total_bytes / 1e6:.0f} MB" if total_bytes else "a large file"
     try:
         from tkinter import messagebox
         if not messagebox.askyesno(
                 "Download CCF coordinates?",
-                f"The 3D coordinates need the Allen CCF registration of every cell, a one-time download of "
+                f"This needs the Allen {what}, a one-time download of "
                 f"{size_text} into your atlas cache folder. Download it now?", parent=parent):
             return False
     except Exception as e:
@@ -2343,7 +2389,10 @@ def ensure_ccf_downloaded(abc_cache, parent=None):
     def worker():
         try:
             for directory, file_name, _size, _path in missing:
-                abc_cache.get_metadata_path(directory=directory, file_name=file_name)
+                if kinds.get((directory, file_name)) == 'data':
+                    abc_cache.get_data_path(directory=directory, file_name=file_name)
+                else:
+                    abc_cache.get_metadata_path(directory=directory, file_name=file_name)
         except Exception as e:
             outcome['error'] = e
         finally:
@@ -2352,7 +2401,7 @@ def ensure_ccf_downloaded(abc_cache, parent=None):
     threading.Thread(target=worker, daemon=True).start()
     restore_cursors = set_wait_cursor_on_open_figures()
     proc_fig, cancel_flag, set_progress = show_processing_dialog(
-        f"Downloading the CCF coordinates ({size_text}); a one-time download.")
+        f"Downloading the {what} ({size_text}); a one-time download.")
     started = time.perf_counter()
     try:
         set_progress(0.0)
@@ -2373,10 +2422,10 @@ def ensure_ccf_downloaded(abc_cache, parent=None):
         plt.close(proc_fig)
         restore_cursors()
     if cancel_flag['cancelled']:
-        print("CCF download cancelled; it continues in the background and will be there next time.")
+        print(f"The {what} download was cancelled; it continues in the background and will be there next time.")
         return False
     if outcome['error'] is not None:
-        print(f"CCF download failed: {outcome['error']}")
+        print(f"The {what} download failed: {outcome['error']}")
         return False
     return not ccf_files_missing(abc_cache)
 
@@ -4518,7 +4567,9 @@ def run_with_loading_window(message, work, show_after_s=0.4):
     nothing else is on screen — so the app looks hung when it isn't.
 
     The window is only created after `show_after_s`, so a fast (already
-    cached) step doesn't flash a window open and shut. It shows `message`, an
+    cached) step doesn't flash a window open and shut. With 0 it is made
+    and painted before `work` starts, so a worker that holds the GIL for
+    seconds (big pandas lookups) cannot keep it from appearing. It shows `message`, an
     indeterminate bar, and elapsed seconds, repainted by this thread's own
     polling loop (Tk stays on the main thread; only `work` runs elsewhere —
     work must not touch any GUI object). No Cancel button: a blocking file
@@ -4535,10 +4586,14 @@ def run_with_loading_window(message, work, show_after_s=0.4):
     print(message)
     thread = threading.Thread(target=runner, daemon=True)
     started = time.perf_counter()
-    thread.start()
-
     ui = None
-    while thread.is_alive():
+    if show_after_s <= 0:
+        thread_started = False
+    else:
+        thread.start()
+        thread_started = True
+
+    while not thread_started or thread.is_alive():
         elapsed = time.perf_counter() - started
         if ui is None and elapsed >= show_after_s:
             try:
@@ -4566,6 +4621,9 @@ def run_with_loading_window(message, work, show_after_s=0.4):
                 ui[0].update()
             except Exception:
                 ui = False
+        if not thread_started:
+            thread.start()                       # (after the first paint of the window)
+            thread_started = True
         time.sleep(0.03)
     thread.join()
     if ui:
@@ -4777,7 +4835,7 @@ def section_home_cache_path(run_folder, section_label, level):
     property of the raw dataset (like raw expression) can."""
     section_token = sanitize_section_token(section_label)
     return (Path(run_folder) / 'section_home_cache' /
-            f'{DATASET_NAME}_v{SECTION_HOME_CACHE_VERSION}_{section_token}_{level}.png')
+            f'{dataset_prefix()}_v{SECTION_HOME_CACHE_VERSION}_{section_token}_{level}.png')
 
 
 def render_section_home_view_png(xs, ys, colors, is_gray, home_xlim, home_ylim, long_edge_in, dot_size_scale=1.0):
@@ -6211,8 +6269,8 @@ def prompt_section_selection_gui(adata, abc_cache, section_series, out_folder=No
         raise RuntimeError(f"non-interactive matplotlib backend '{backend}'")
 
     img, layout = None, None
-    if GRID_CACHE_PNG.exists() and GRID_CACHE_LAYOUT.exists():
-        with open(GRID_CACHE_LAYOUT) as f:
+    if grid_cache_png().exists() and grid_cache_layout().exists():
+        with open(grid_cache_layout()) as f:
             layout = json.load(f)
         # Older cache format stored a flat [x0,x1,y0,y1] list per section
         # (pixel bbox only, no data x/y limits, needed for mapping ROI
@@ -6221,8 +6279,8 @@ def prompt_section_selection_gui(adata, abc_cache, section_series, out_folder=No
             print("Cached section grid uses an older format; regenerating...")
             layout = None
         else:
-            print(f"Loading cached section grid image from {GRID_CACHE_PNG}...")
-            img = plt.imread(GRID_CACHE_PNG)
+            print(f"Loading cached section grid image from {grid_cache_png()}...")
+            img = plt.imread(grid_cache_png())
 
     if layout is None:
         if section_series is None:
@@ -10056,6 +10114,8 @@ def region_naming(sections_suffix, rois):
             key=lambda r: (r['section'], r['x_min'], r['y_min']),
         )
     )
+    if reconstructed_in_use():
+        roi_key = 'reconstructed|' + roi_key                    # (the same bounds, drawn on Allen's reconstructed coordinates, select other cells)
     roi_hash = hashlib.md5(roi_key.encode()).hexdigest()[:8]
     return 'sections-' + '-'.join(sanitize_section_token(s) for s in roi_sections), f'_rois{len(rois)}-{roi_hash}', roi_sections
 
@@ -18400,6 +18460,8 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
             log_status("UMAP viewer closed.")
         return
 
+    FRAME_STATE['override'] = None
+    prepare_coordinate_frame(abc_cache)
     if startup_action == 'load_existing':
         # Skips section/ROI selection and UMAP computation (Steps 1-8) entirely
         # — the chosen folder's own cached files (verified by prompt_startup_
@@ -18440,6 +18502,11 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         if roi_csv_path.exists():
             rois, _whole_sections = load_rois_csv(roi_csv_path)
             print(f"Loaded {len(rois)} ROI(s) from {roi_csv_path}.")
+            run_frame = read_run_frame(load_existing_folder)
+            if rois and run_frame != coordinate_frame_name():
+                print(f"This run's ROIs were drawn on the {run_frame} coordinates, so its cells are placed by those (the setting is for new runs).")
+                FRAME_STATE['override'] = run_frame
+                prepare_coordinate_frame(abc_cache)
         else:
             # Not written at all for a whole-brain run (no ROIs, no explicit
             # whole-section picks) — see the main script's own roi_csv_path-
@@ -18755,6 +18822,8 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
     whole_only_sections = [s for s in (whole_sections_selected or []) if s not in roi_section_set] if rois else []
 
     roi_csv_path = run_folder / 'roi_coords.csv'
+    if rois:
+        write_run_frame(run_folder)
     # Skip the confirm-overwrite prompt (and the write itself) entirely when
     # roi_coords.csv already records exactly this session's ROI/whole-section
     # selection — most relevantly when reusing a cached run's selection

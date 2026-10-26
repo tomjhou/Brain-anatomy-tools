@@ -17,7 +17,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 
 import abc_core as core
-from abc_tk_umap import LEVEL_NAMES, rank_color
+from abc_tk_umap import rank_color, plural_name
 from abc_tk_umap_export import hexcolor
 
 MAX_LABELED_GROUPS = 400         # a per-group plot names its points up to this many groups
@@ -65,9 +65,8 @@ def match_groups(entries, uniques):
     return chosen, bad
 
 
-def plural(level):
-    name = LEVEL_NAMES[level].lower()
-    return name + ("es" if name.endswith("s") else "s")
+def plural(name):
+    return plural_name(name)
 
 
 def darker(color, factor=LABEL_DARKEN):
@@ -96,9 +95,11 @@ def local_density(x, y, bins=DENSITY_BINS):
     return h[ix, iy]
 
 
-def units(imputed, scale):
+def units(imputed, scale, own=None):
     if imputed:
         return "imputed, log2" if scale == "log" else "imputed, linear"
+    if own is not None and not (own.kind == "counts" and own.normalization == "none"):
+        return "log2(1 + normalized)" if scale == "log" else "normalized expression"
     return "log2(1 + counts)" if scale == "log" else "counts"
 
 
@@ -232,9 +233,9 @@ class AnalyzeWindow:
         # what both tabs use: the group type, the kind of plot, and where the genes come from
         box = ttk.LabelFrame(side, text="Group type", padding=6)
         box.pack(fill=tk.X)
-        self.level_keys = [k for k in LEVEL_NAMES if k in viewer.levels]
-        self.var_level = tk.StringVar(top, LEVEL_NAMES[viewer.level] if viewer.level in self.level_keys else LEVEL_NAMES[self.level_keys[0]])
-        combo = ttk.Combobox(box, textvariable=self.var_level, values=[LEVEL_NAMES[k] for k in self.level_keys], state="readonly")
+        self.level_keys = [k for k in viewer.level_names if k in viewer.levels]
+        self.var_level = tk.StringVar(top, self.v.level_names[viewer.level] if viewer.level in self.level_keys else self.v.level_names[self.level_keys[0]])
+        combo = ttk.Combobox(box, textvariable=self.var_level, values=[self.v.level_names[k] for k in self.level_keys], state="readonly")
         combo.pack(fill=tk.X)
         combo.bind("<<ComboboxSelected>>", lambda ev: self.level_changed())
 
@@ -249,12 +250,13 @@ class AnalyzeWindow:
                         command=self.redraw).pack(anchor="w", pady=(6, 0))
         ttk.Checkbutton(box, text="Shade per-cell dots by density", variable=self.var_density, command=self.redraw).pack(anchor="w")
 
-        box = ttk.LabelFrame(side, text="Genes from", padding=6)
-        box.pack(fill=tk.X, pady=(6, 0))
         self.var_source = tk.StringVar(top, "imputed" if viewer.mode == "imputed" else "panel")
         self.source_shown = self.var_source.get()
-        for value, text in (("panel", "Panel gene"), ("imputed", "Imputed gene")):
-            ttk.Radiobutton(box, text=text, value=value, variable=self.var_source, command=self.source_changed).pack(anchor="w")
+        if viewer.own is None:                                            # (a dataset of the user's own has no imputed genes to choose)
+            box = ttk.LabelFrame(side, text="Genes from", padding=6)
+            box.pack(fill=tk.X, pady=(6, 0))
+            for value, text in (("panel", "Panel gene"), ("imputed", "Imputed gene")):
+                ttk.Radiobutton(box, text=text, value=value, variable=self.var_source, command=self.source_changed).pack(anchor="w")
 
         # the two analyses, a tab each (the tab control is as tall as the taller of them, so nothing below it moves)
         self.tabs = ttk.Notebook(side)
@@ -387,7 +389,7 @@ class AnalyzeWindow:
     # ---- what the boxes ask for
 
     def level(self):
-        names = {LEVEL_NAMES[k]: k for k in self.level_keys}
+        names = {self.v.level_names[k]: k for k in self.level_keys}
         return names[self.var_level.get()]
 
     def groups(self, level):
@@ -401,7 +403,7 @@ class AnalyzeWindow:
         chosen, bad = match_groups(entries, uniques)
         if bad:
             self.groups_entry.configure(foreground="red")
-            self.var_status.set(f"No {LEVEL_NAMES[level].lower()} named {', '.join(bad)} in this run.")
+            self.var_status.set(f"No {self.v.level_names[level].lower()} named {', '.join(bad)} in this run.")
             return None
         return codes, chosen, uniques, True
 
@@ -481,15 +483,17 @@ class AnalyzeWindow:
         self.hover_group = None
         label_of = {g: (re.match(r"^\s*(\d+)", str(uniques[g])).group(1) if re.match(r"^\s*(\d+)", str(uniques[g])) else str(uniques[g])) for g in chosen}
         full_of = {g: str(uniques[g]).strip() for g in chosen}
-        unit = units(imputed, scale)
+        unit = units(imputed, scale, self.v.own)
+        own = self.v.own
+        continuous = imputed or (own is not None and not (own.kind == "counts" and own.normalization == "none"))      # (values that are not whole counts are not jittered)
         if per == "cell":
             cell_group = codes[in_group]
             px, py = vx[in_group], vy[in_group]
             note = ""
             if self.var_jitter.get():
                 rng = np.random.default_rng(0)
-                px, py = jittered(px, imputed, scale, rng), jittered(py, imputed, scale, rng)
-                note = " Imputed values are continuous: not jittered." if imputed else " Counts jittered within their step."
+                px, py = jittered(px, continuous, scale, rng), jittered(py, continuous, scale, rng)
+                note = " These values are continuous: not jittered." if continuous else " Counts jittered within their step."
             shade = self.var_density.get() and len(px) > 0
             if shade:
                 from matplotlib.colors import LogNorm
@@ -512,10 +516,10 @@ class AnalyzeWindow:
                 handles = [Line2D([], [], marker="o", linestyle="", color=color_of[g], label=f"{full_of[g]} ({int((cell_group == g).sum()):,})")
                            for g in chosen if (cell_group == g).any()]
                 if handles:
-                    ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8, frameon=True, title=LEVEL_NAMES[level])
+                    ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8, frameon=True, title=self.v.level_names[level])
             ax.set_xlabel(f"{gx} ({unit})")
             ax.set_ylabel(f"{gy} ({unit})")
-            ax.set_title(f"{int(in_group.sum()):,} cells in {len(set(cell_group.tolist()))} {plural(level)}")
+            ax.set_title(f"{int(in_group.sum()):,} cells in {len(set(cell_group.tolist()))} {plural(self.v.level_names[level])}")
             self.var_status.set(f"{int(in_group.sum()):,} cells plotted." + note)
         else:
             xs, ys, names, cols, counts = [], [], [], [], []
@@ -537,7 +541,7 @@ class AnalyzeWindow:
                                 ha="left", va="center", color=darker(c))
             ax.set_xlabel(f"mean {gx} ({unit})")
             ax.set_ylabel(f"mean {gy} ({unit})")
-            ax.set_title(f"{len(xs)} {plural(level)}")
+            ax.set_title(f"{len(xs)} {plural(self.v.level_names[level])}")
             self.var_status.set(f"{len(xs)} groups plotted (the mean of each, over {sum(counts):,} cells; the circle's area follows the cell count).")
         ax.grid(True, alpha=0.25)
         ax.margins(0.08)                                      # (room for the big dots and their numbers at the edges)
@@ -560,7 +564,7 @@ class AnalyzeWindow:
         chosen, bad = match_groups(entries[:1], uniques)
         if bad or not chosen:
             self.groups_entry.configure(foreground="red")
-            self.var_status.set(f"No {LEVEL_NAMES[level].lower()} named {entries[0]} in this run.")
+            self.var_status.set(f"No {self.v.level_names[level].lower()} named {entries[0]} in this run.")
             return
         imputed = self.imputed()
         if not imputed and not v.has_counts:
@@ -612,11 +616,12 @@ class AnalyzeWindow:
                 save_means(disk, data)
                 return data
         else:
-            matrix = v.adata.layers["counts"]
             names = v.adata.var["gene_symbol"].astype(str).to_numpy()
+            matrix = v.adata.layers["counts"] if v.own is None else None
+            means_of = (lambda c, n: group_means_panel(matrix, c, n)) if v.own is None else v.own.group_means      # (a dataset of the user's own: its normalized values)
 
             def work(progress, cancelled):
-                return {"names": names, "levels": {k: {"means": group_means_panel(matrix, c, len(u_)), "uniques": uniques_of[k], "counts": counts_of[k]}
+                return {"names": names, "levels": {k: {"means": means_of(c, len(u_)), "uniques": uniques_of[k], "counts": counts_of[k]}
                                                    for k, (c, u_) in by_level.items()}}
         self.start_means(work, key, meta)
         return None
@@ -705,9 +710,11 @@ class AnalyzeWindow:
             for i in np.argsort(-(x * y), kind="stable")[:LABELED_GENES]:               # (the ten with the highest x * y are named)
                 if i not in marked:
                     ax.annotate(names[i], (x[i], y[i]), xytext=(5, 3), textcoords="offset points", fontsize=LABEL_FONT_SIZE, color="#1d3b5c")
-        unit = "mean count per cell" if not imputed else "mean imputed expression (linear)"
+        own = self.v.own
+        unit = ("mean imputed expression (linear)" if imputed else "mean normalized expression" if own is not None and not (own.kind == "counts" and own.normalization == "none")
+                else "mean count per cell")
         ax.set_xlabel(f"{unit} in {label}")
-        ax.set_ylabel(textwrap.fill(f"ratio to the highest of the {used} largest other {plural(level)}", 42))
+        ax.set_ylabel(textwrap.fill(f"ratio to the highest of the {used} largest other {plural(self.v.level_names[level])}", 42))
         ax.set_title(f"{len(x):,} genes: {label}")
         ax.grid(True, alpha=0.25, which="both")
         self.hover = {"kind": "genes", "x": x, "y": y, "names": names}
@@ -727,7 +734,7 @@ class AnalyzeWindow:
         if not_shown:
             extra += f" None in {label}, so not on the graph: {', '.join(not_shown)}."
         self.var_status.set(f"{len(x):,} genes plotted" + (f" ({dropped:,} with none in {label} are left out)" if dropped else "")
-                            + f", each against the {used} largest other {plural(level)} (at least {smallest:,} cells each)." + s.get("note", "") + extra
+                            + f", each against the {used} largest other {plural(self.v.level_names[level])} (at least {smallest:,} cells each)." + s.get("note", "") + extra
                             + " Scroll to zoom, double-click to reset.")
 
     # ---- zoom: the wheel, about the pointer; a double-click goes back (the toolbar's zoom and pan tools work as well)

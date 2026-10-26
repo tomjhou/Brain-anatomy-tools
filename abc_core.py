@@ -352,6 +352,56 @@ SPATIAL_CSV_CHUNK_SIZE = 200_000  # see the chunked read in load_section_spatial
 SPATIAL_CSV_CACHE_VERSION = 3  # v2: adds the section 'z' column; v3: the neurotransmitter
 
 
+ALIGNED_CACHE_MIN_ROWS = 1_000_000     # only a table of the whole atlas is kept lined up (lining one up by cell ID takes seconds: see _spatial_aligned_cache_path)
+SPATIAL_ALIGNED_CACHE_VERSION = 1
+
+
+def _spatial_aligned_cache_path(cell_metadata_path, index):
+    """Where the table, already lined up with the cells of `index` (the atlas's own order, in practice), is kept: it is the same every time, and
+    lining it up by the 4 million cell ID strings (building a lookup of them, twice over) takes about four seconds. Keyed on the table's CSV and
+    on the index."""
+    st = os.stat(cell_metadata_path)
+    key = f"{cell_metadata_path}|{st.st_mtime_ns}|{st.st_size}|v{SPATIAL_CSV_CACHE_VERSION}|{_index_fingerprint(index)}"
+    return CACHE_DIR / f"spatial_aligned_v{SPATIAL_ALIGNED_CACHE_VERSION}_{hashlib.md5(key.encode('utf-8')).hexdigest()[:16]}.pkl"
+
+
+def _align_spatial(cell_meta, adata, aligned_path):
+    """`cell_meta` lined up with adata.obs.index; kept on disk for next time when it is a table of the whole atlas (without its index, which
+    is the one in hand and the slowest part to read back)."""
+    result = cell_meta.reindex(adata.obs.index)
+    if aligned_path is not None:
+        try:
+            t0 = time.perf_counter()
+            result.reset_index(drop=True).to_pickle(aligned_path)
+            if ZOOM_DEBUG_DIAGNOSTICS:
+                print(f"[spatial-cache] saved the table lined up with the atlas ({aligned_path.name}) in {time.perf_counter() - t0:.2f}s")
+        except Exception as e:
+            if ZOOM_DEBUG_DIAGNOSTICS:
+                print(f"[spatial-cache] could not save the lined-up table ({e})")
+    return result
+
+
+def atlas_positions(small_index, big_index):
+    """The row of each cell of `small_index` (a run's cells) in `big_index` (the atlas's), -1 for one that is not in it. The lookup builds a hash
+    table of the 4 million ID strings (a second or two), so the answer is kept on disk for the next time this run is opened."""
+    key = f"{_index_fingerprint(small_index)}|{_index_fingerprint(big_index)}"
+    path = CACHE_DIR / f"atlas_positions_{hashlib.md5(key.encode('utf-8')).hexdigest()[:16]}.npy"
+    check = np.linspace(0, max(len(small_index) - 1, 0), num=min(len(small_index), 50)).astype(int)
+    try:
+        saved = np.load(path)
+        if len(saved) == len(small_index) and all(saved[i] < 0 or big_index[saved[i]] == small_index[i] for i in check):
+            return saved
+    except Exception:
+        pass
+    positions = big_index.get_indexer(small_index).astype(np.int32)
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        np.save(path, positions)
+    except Exception:
+        pass
+    return positions
+
+
 def _spatial_csv_cache_path(cell_metadata_path):
     """Shared (not run-specific) disk-cache path for the full, un-reindexed
     cell_metadata table read by load_section_spatial_coords(). Keyed on the
@@ -388,6 +438,26 @@ def load_section_spatial_coords(adata, abc_cache, progress_callback=None):
         index_col_name = header_cols[0]
         wanted_cols = [c for c in ['x', 'y', 'z', 'class', 'subclass', 'supertype', 'cluster', 'neurotransmitter'] if c in header_cols]
 
+        aligned_path = None
+        if len(adata.obs.index) >= ALIGNED_CACHE_MIN_ROWS:
+            try:
+                aligned_path = _spatial_aligned_cache_path(cell_metadata_path, adata.obs.index)
+                if aligned_path.exists():                                   # (the table lined up with these cells, kept from an earlier time)
+                    t0 = time.perf_counter()
+                    table = pd.read_pickle(aligned_path)
+                    if len(table) == len(adata.obs.index):
+                        table.index = adata.obs.index
+                        if ZOOM_DEBUG_DIAGNOSTICS:
+                            caller = sys._getframe(1)
+                            print(f"[spatial-cache] loaded {len(table)} rows, already lined up with the cells, in {time.perf_counter() - t0:.3f}s "
+                                  f"for {caller.f_code.co_name} ({Path(caller.f_code.co_filename).name}:{caller.f_lineno})")
+                        if progress_callback is not None:
+                            progress_callback(len(table), len(table))
+                        return table
+            except Exception as e:
+                if ZOOM_DEBUG_DIAGNOSTICS:
+                    print(f"[spatial-cache] the lined-up table could not be read ({e}); making it again")
+
         cache_path = None
         try:
             cache_path = _spatial_csv_cache_path(cell_metadata_path)
@@ -401,7 +471,7 @@ def load_section_spatial_coords(adata, abc_cache, progress_callback=None):
                           f"({Path(caller.f_code.co_filename).name}:{caller.f_lineno})")
                 if progress_callback is not None:
                     progress_callback(len(cell_meta), len(cell_meta))
-                return cell_meta.reindex(adata.obs.index)
+                return _align_spatial(cell_meta, adata, aligned_path)
         except Exception as e:
             if ZOOM_DEBUG_DIAGNOSTICS:
                 print(f"[spatial-cache] cache read failed, falling back to CSV ({e})")
@@ -451,7 +521,7 @@ def load_section_spatial_coords(adata, abc_cache, progress_callback=None):
             except Exception as e:
                 if ZOOM_DEBUG_DIAGNOSTICS:
                     print(f"[spatial-cache] cache save failed ({e})")
-        return cell_meta.reindex(adata.obs.index)
+        return _align_spatial(cell_meta, adata, aligned_path)
     except Exception as e:
         print(f"Warning: could not load spatial coordinates for GUI section picker ({e}).")
         return None

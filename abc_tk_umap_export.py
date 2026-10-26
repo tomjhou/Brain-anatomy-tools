@@ -21,12 +21,56 @@ EXPORT_FONTSIZE = 14
 EXPORT_AXES_PX = 6400                         # the UMAP's plotting square in a saved file, at the save DPI
 EXPORT_MARGIN_IN = 2.5
 EXPORT_LEGEND_MAX_ROWS = 35
+SECTION_MAPS_LONG_SIDE_IN = 20.0              # a saved section map figure is about this long (inches) on its longer side, when it has enough panels to need it
+PANEL_PAD_IN, PANEL_TITLE_IN = 0.08, 0.25     # the space round a panel in a saved section map figure, and above it for its title
+PANELS_ACROSS_CHOICES = ("Auto (near-square)", "As on screen", "1", "2", "3", "4", "5", "6", "8", "10", "12")
+SVG_PICTURE_DPI = 200                         # the pictures inside a saved SVG (the blank and gray cells): a picture costs the same however many cells it holds, so a big one loses to vector dots below about 70,000 cells
 UMAP_POINT_SIZE = 10                          # matplotlib's s (an area) of a dot in a saved UMAP
 POINT_ALPHA = 0.75
 
 
 def hexcolor(rgb):
     return "#%02x%02x%02x" % tuple(int(v) for v in rgb)
+
+
+def parse_panels_across(text):
+    """The choice typed or picked in the "Panels across" box: 'auto', 'screen', or a whole number of columns."""
+    text = (text or "").strip().lower()
+    if text.isdigit() and int(text) >= 1:
+        return int(text)
+    return "screen" if text.startswith("as on") else "auto"
+
+
+def section_map_layout(n, panel_aspect, choice, screen_cols, screen_panel_in, band_height=None):
+    """How a saved section map figure is arranged: (the panels across, the width of a panel in inches). `panel_aspect`: a panel's width over its
+    height. 'screen': as the pane has them. Otherwise the figure is made about SECTION_MAPS_LONG_SIDE_IN long on its longer side, never with a panel
+    bigger than on the screen; with 'auto' the columns are the number that make it closest to a square, and if it cannot be square, taller than wide
+    is preferred to wider than tall (a small extra cost for wider: it decides between layouts about as far from a square, but never picks a
+    tall thin strip over a wide one that is much closer to a square), and a layout that leaves few empty places to one that leaves many.
+    `band_height(width in inches)`, if given, is the height of the legend band under the panels, which counts in the shape."""
+    pad, title = PANEL_PAD_IN, PANEL_TITLE_IN
+
+    def panel_for(cols):
+        rows = -(-n // cols)
+        by_width = SECTION_MAPS_LONG_SIDE_IN / cols - pad
+        by_height = (SECTION_MAPS_LONG_SIDE_IN / rows - pad - title) * panel_aspect
+        return max(min(by_width, by_height, screen_panel_in), 0.5)
+
+    if choice == "screen":
+        return max(1, screen_cols), screen_panel_in
+    if isinstance(choice, int):
+        cols = min(max(choice, 1), n)
+        return cols, panel_for(cols)
+    best = None
+    for cols in range(1, n + 1):
+        rows = -(-n // cols)
+        w = panel_for(cols)
+        width = cols * (w + pad)
+        aspect = width / (rows * (w / panel_aspect + pad + title) + (band_height(width) if band_height else 0.0))
+        cost = abs(math.log(aspect)) + (0.12 if aspect > 1.0 else 0.0) + 0.15 * (cols * rows - n) / (cols * rows)
+        if best is None or cost < best[0] - 1e-9:
+            best = (cost, cols, w)
+    return best[1], best[2]
 
 
 def sibling(path, tail, ext):
@@ -65,8 +109,8 @@ class ExportsMixin:
         self.export_dir = path.parent
         return path
 
-    def ask_image_format(self, title, svg_note):
-        """"png" or "svg", chosen in a small dialog (None if it was cancelled or closed). The last choice made in this window is offered first.
+    def ask_image_format(self, title, svg_note, panels_across=False):
+        """"png", "svg" or "both", chosen in a small dialog (None if it was cancelled or closed). The last choice made in this window is offered first.
         `svg_note` is added under the SVG choice."""
         import tkinter as tk
         from tkinter import ttk
@@ -82,6 +126,15 @@ class ExportsMixin:
         ttk.Radiobutton(box, text="SVG: vector graphics, for editing in a drawing program", value="svg", variable=var).pack(anchor="w", pady=(4, 0))
         if svg_note:
             ttk.Label(box, text=svg_note, foreground="gray30", wraplength=320, justify=tk.LEFT).pack(anchor="w", padx=(22, 0))
+        ttk.Radiobutton(box, text="Both: a PNG and an SVG (you name both files now)", value="both", variable=var).pack(anchor="w", pady=(8, 0))
+        across = tk.StringVar(dlg, getattr(self, "export_panels_across", PANELS_ACROSS_CHOICES[0]))
+        if panels_across:                          # (section maps: how the panels are arranged in the saved picture)
+            line = ttk.Frame(box)
+            line.pack(anchor="w", pady=(12, 0))
+            ttk.Label(line, text="Panels across:").pack(side=tk.LEFT)
+            ttk.Combobox(line, textvariable=across, values=PANELS_ACROSS_CHOICES, width=18).pack(side=tk.LEFT, padx=(8, 0))
+            ttk.Label(box, text="Auto makes the picture close to a square (taller rather than wider), whatever the window looks like.",
+                      foreground="gray30", wraplength=320, justify=tk.LEFT).pack(anchor="w")
         result = []
 
         def finish(value):
@@ -106,7 +159,25 @@ class ExportsMixin:
         choice = result[0] if result else None
         if choice:
             self.export_format = choice
+            if panels_across:
+                self.export_panels_across = across.get()
         return choice
+
+    def ask_export_paths(self, fmt, stem, title):
+        """The file to save for each format of `fmt` ("png", "svg" or "both"): {format: path}, or None if a Save dialog was cancelled. For both, the
+        two dialogs come one after the other, up front, so that both files can then be made without asking anything more; the second starts from
+        the name chosen for the first."""
+        formats = ["png", "svg"] if fmt == "both" else [fmt]
+        paths = {}
+        for k, f in enumerate(formats):
+            ext = "." + f
+            proposed = (f"{paths[formats[0]].stem}{ext}" if k else self.host["unique_export_paths"](self.target_dir(), stem, (ext,))[ext].name)
+            heading = f"{title} ({f.upper()}, file {k + 1} of 2)" if len(formats) > 1 else title
+            chosen = self.ask_save_path(heading, proposed, ext, f.upper() + " image")
+            if chosen is None:
+                return None
+            paths[f] = chosen
+        return paths
 
     def confirm_replacing(self, paths):
         """True unless some of `paths` (files the Save dialog did not ask about, saved along with the one it did) exist and the user declines
@@ -182,22 +253,27 @@ class ExportsMixin:
         entries = None
         if kind == "gene":
             gene, dataset, scale, vals = self.shown_values
-            from matplotlib import colormaps
-            from matplotlib.colors import LinearSegmentedColormap
-            from abc_tk_umap import LIGHT_STOPS
             fin = np.isfinite(vals)
-            vmin, vmax = (float(np.nanmin(vals)), float(np.nanmax(vals))) if fin.any() else (0.0, 1.0)
+            vmin, vmax = getattr(self, "shown_range", None) or ((float(np.nanmin(vals)), float(np.nanmax(vals))) if fin.any() else (0.0, 1.0))      # (as shown: with the levels of the slider)
             order = np.argsort(np.where(fin, vals, -np.inf), kind="stable")
-            sc = ax.scatter(coords[order, 0], coords[order, 1], c=vals[order], cmap=(LinearSegmentedColormap.from_list("light_gene", [(s[0], tuple(v / 255 for v in s[1])) for s in LIGHT_STOPS])
-                                                                                    if self.var_theme.get() == "light" else colormaps["viridis"]), vmin=vmin, vmax=vmax, s=size,
-                            alpha=POINT_ALPHA, linewidths=0)
+            cmap = self.gene_cmap()
+            lowest = (fin & (vals <= vmin))[order]                              # (the cells with no expression: most of them, all alike)
+            sc = None
+            for part, raster in ((lowest, True), (~lowest, False)):
+                if part.any():
+                    sc = ax.scatter(coords[order[part], 0], coords[order[part], 1], c=vals[order[part]], cmap=cmap, vmin=vmin, vmax=vmax, s=size,
+                                    alpha=POINT_ALPHA, linewidths=0, rasterized=raster)
             cb = fig.colorbar(sc, ax=ax)
             cb.set_label(gene, fontsize=EXPORT_FONTSIZE)
             cb.ax.tick_params(labelsize=EXPORT_FONTSIZE)
         elif kind == "multi":
+            zero = np.array(self.zero_color() or (-1, -1, -1))
             for lay in self.umap.layers:
-                ax.scatter(lay["x"], lay["y"], c=lay["rgb"] / 255.0, s=size * (0.25 if lay.get("shape") != "half" and lay["size"] < 4 * self.dot_scale() else 1.0),
-                           linewidths=0, alpha=None)
+                blank = (lay["rgb"] == zero).all(axis=1)                          # (no expression of any gene: a picture in an SVG)
+                dot = size * (0.25 if lay.get("shape") != "half" and lay["size"] < 4 * self.dot_scale() else 1.0)
+                for part, raster in ((blank, True), (~blank, False)):
+                    if part.any():
+                        ax.scatter(lay["x"][part], lay["y"][part], c=lay["rgb"][part] / 255.0, s=dot, linewidths=0, alpha=None, rasterized=raster)
             handles = [Line2D([0], [0], marker="o", linestyle="", color=color, label=f"{g} ({name})")
                        for i, (g, color, name) in enumerate(zip(self.multi_genes, *self.export_channels()))
                        if i not in self.hidden]
@@ -205,10 +281,10 @@ class ExportsMixin:
         else:
             cat = getattr(self, "export_cat", None)
             if cat is None:
-                ax.scatter(coords[:, 0], coords[:, 1], c="lightgray", s=size, alpha=POINT_ALPHA, linewidths=0)
+                ax.scatter(coords[:, 0], coords[:, 1], c="lightgray", s=size, alpha=POINT_ALPHA, linewidths=0, rasterized=True)
             else:
                 rest = cat["rank"] < 0
-                ax.scatter(coords[rest, 0], coords[rest, 1], c="lightgray", s=size, alpha=POINT_ALPHA, linewidths=0)
+                ax.scatter(coords[rest, 0], coords[rest, 1], c="lightgray", s=size, alpha=POINT_ALPHA, linewidths=0, rasterized=True)
                 for r, (color, label, count) in enumerate(cat["entries"]):
                     m = cat["rank"] == r
                     if not m.any():
@@ -232,13 +308,83 @@ class ExportsMixin:
                            handleheight=1.0, labelspacing=0.4, columnspacing=1.5)
         return fig
 
+    def gene_cmap(self):
+        """The colormap of a single gene in the theme on the screen."""
+        from matplotlib import colormaps
+        from matplotlib.colors import LinearSegmentedColormap
+        from abc_tk_umap import LIGHT_STOPS
+        if self.var_theme.get() == "light":
+            return LinearSegmentedColormap.from_list("light_gene", [(s[0], tuple(v / 255 for v in s[1])) for s in LIGHT_STOPS])
+        return colormaps["viridis"]
+
+    def section_legend(self):
+        """What the legend band of a saved section map holds, as the view on the screen has it (None if there is nothing to say):
+        {"kind": "groups", "title", "handles", "labels"} | {"kind": "colorbar", ...} | {"kind": "genes", "rows"}."""
+        kind = getattr(self, "view_kind", "all")
+        cat = getattr(self, "export_cat", None)
+        if kind in ("all", "single") and cat is not None:
+            handles = self.legend_handles(cat, sort="screen" if kind == "all" else "given")
+            return {"kind": "groups", "title": cat["title"], "handles": handles, "labels": [h.get_label() for h in handles]}
+        if kind == "gene" and getattr(self, "shown_values", None) is not None:
+            gene, dataset, scale, vals = self.shown_values
+            vmin, vmax = getattr(self, "shown_range", None) or ((float(np.nanmin(vals)), float(np.nanmax(vals))) if np.isfinite(vals).any() else (0.0, 1.0))
+            return {"kind": "colorbar", "gene": gene, "units": self.scale_units()[(dataset, scale)], "vmin": vmin, "vmax": vmax, "cmap": self.gene_cmap()}
+        if kind == "multi" and getattr(self, "multi_ranges", None):
+            colors, names = self.export_channels()
+            linear = getattr(self, "multi_scale", "log") == "linear"
+            rows = [(g, colors[i], names[i], f"{'' if linear else 'log2: '}{lo:.1f}\u2013{hi:.1f}") for i, (g, (lo, hi)) in enumerate(zip(self.multi_genes, self.multi_ranges))
+                    if i not in self.hidden]
+            return {"kind": "genes", "rows": rows}
+        return None
+
+    def legend_grid(self, spec, width):
+        """(columns, rows) of the entries of a group legend in a band `width` inches wide."""
+        chars = max((len(s) for s in spec["labels"]), default=10)
+        ncol = max(1, int((width - 0.5) // (0.55 + 0.072 * chars)))
+        return ncol, -(-len(spec["labels"]) // ncol)
+
+    def legend_band_height(self, spec, width):
+        """The height in inches of the band under the panels for this legend (0: none)."""
+        if spec is None:
+            return 0.0
+        if spec["kind"] == "groups":
+            return 0.55 + 0.2 * self.legend_grid(spec, width)[1]
+        if spec["kind"] == "colorbar":
+            return 1.3
+        return 0.5 + 0.26 * len(spec["rows"])
+
+    def draw_legend_band(self, fig, spec, fw, fh, band_h):
+        """The legend in the band along the bottom of the figure (band_h inches high)."""
+        from matplotlib.lines import Line2D
+        ax = fig.add_axes([0, 0, 1, band_h / fh])
+        ax.axis("off")
+        if spec["kind"] == "groups":
+            ncol = self.legend_grid(spec, fw)[0]
+            ax.legend(handles=spec["handles"], loc="upper left", bbox_to_anchor=(0.01, 0.98), ncol=ncol, frameon=False, fontsize=10, title=spec["title"],
+                      title_fontsize=11, handlelength=1.0, handleheight=1.0, labelspacing=0.4, columnspacing=1.5, alignment="left")
+        elif spec["kind"] == "colorbar":
+            from matplotlib.cm import ScalarMappable
+            from matplotlib.colors import Normalize
+            cax = fig.add_axes([0.5 / fw, 0.45 / fh, min(0.4 * fw, 8.0) / fw, 0.2 / fh])
+            cb = fig.colorbar(ScalarMappable(norm=Normalize(spec["vmin"], spec["vmax"]), cmap=spec["cmap"]), cax=cax, orientation="horizontal")
+            cb.set_label(f"{spec['gene']}   ({spec['units']})", fontsize=11)
+            cb.ax.tick_params(labelsize=10)
+        else:
+            ax.legend(handles=[Line2D([0], [0], marker="o", linestyle="", color=color, label=f"{g} ({name})   {rng}") for g, color, name, rng in spec["rows"]],
+                      loc="upper left", bbox_to_anchor=(0.01, 0.98), frameon=False, fontsize=10, alignment="left")
+
     def legend_handles(self, cat, sort="id"):
         from matplotlib.lines import Line2D
         rows = []
         for r, (color, label, count) in enumerate(cat["entries"]):
             marker, is_open = self.host["category_rank_shape"](r)
             rows.append((color, label, count, marker, is_open))
-        if sort == "count":
+        if sort == "given":                                              # (as the entries are: the groups in the order they were typed)
+            pass
+        elif sort == "screen":                                           # (the order of the list on the screen)
+            place = {k: i for i, k in enumerate(getattr(self, "group_rows", []))}
+            rows.sort(key=lambda e: place.get(e[1], math.inf))
+        elif sort == "count":
             rows.sort(key=lambda e: e[2], reverse=True)
         else:
             def key(e):
@@ -251,22 +397,20 @@ class ExportsMixin:
     def save_umap(self):
         if self.busy:
             return
-        target, token, dpi = self.target_dir(), self.view_token_safe(), self.host["UMAP_SAVE_DPI"]
-        fmt = self.ask_image_format("Save the UMAP", "")
+        token, dpi = self.view_token_safe(), self.host["UMAP_SAVE_DPI"]
+        fmt = self.ask_image_format("Save the UMAP", "The gray cells, and in a gene view the cells with no expression, are pictures inside it, to keep the file small; "
+                                                     "the colored cells stay vector graphics.")
         if fmt is None:
             self.var_status.set("Save UMAP cancelled.")
             return
-        ext = "." + fmt
-        proposed = self.host["unique_export_paths"](target, f"umap_{token}", (ext,))[ext].name
         cat = getattr(self, "export_cat", None)
         has_legend = getattr(self, "view_kind", "all") in ("all", "single") and cat is not None
-        chosen = self.ask_save_path("Save the UMAP" + (f" (its legend is saved with it, as _legend{ext})" if has_legend else ""), proposed, ext,
-                                    fmt.upper() + " image")
-        if chosen is None:
+        paths = self.ask_export_paths(fmt, f"umap_{token}", "Save the UMAP" + (" (its legend is saved with it, as _legend)" if has_legend else ""))
+        if paths is None:
             self.var_status.set("Save UMAP cancelled.")
             return
-        legend_path = sibling(chosen, "_legend", ext)
-        if has_legend and not self.confirm_replacing([legend_path]):
+        legend_paths = {f: sibling(path, "_legend", "." + f) for f, path in paths.items()}
+        if has_legend and not self.confirm_replacing(list(legend_paths.values())):
             self.var_status.set("Save UMAP cancelled.")
             return
         self.root.config(cursor="watch")
@@ -275,23 +419,24 @@ class ExportsMixin:
         try:
             fig = self.build_umap_figure()
             written = []
-            path = chosen
-            self.var_status.set(f"Saving {fmt}...")
-            self.root.update()
-            fig.savefig(path, bbox_inches="tight", dpi=dpi if fmt == "png" else None)
-            written.append(path)
-            if has_legend:
-                from matplotlib.figure import Figure
-                from matplotlib.backends.backend_agg import FigureCanvasAgg
-                handles = self.legend_handles(cat, sort="count")
-                lf = Figure()
-                FigureCanvasAgg(lf)
-                lf.legend(handles=handles, title=cat["title"], loc="center", fontsize=EXPORT_FONTSIZE * 0.85, title_fontsize=EXPORT_FONTSIZE,
-                          ncol=max(1, math.ceil(len(handles) / EXPORT_LEGEND_MAX_ROWS)), frameon=True, handlelength=1.0, handleheight=1.0,
-                          labelspacing=0.4, columnspacing=1.5)
-                lf.savefig(legend_path, bbox_inches="tight", dpi=dpi if fmt == "png" else None)
-                written.append(legend_path)
-            self.var_status.set(f"Saved {', '.join(p.name for p in written)} to {chosen.parent}.")
+            for f, path in paths.items():
+                self.var_status.set(f"Saving {f}...")
+                self.root.update()
+                fig.savefig(path, bbox_inches="tight", dpi=dpi if f == "png" else SVG_PICTURE_DPI)          # (for an SVG the dpi is that of the pictures in it)
+                written.append(path)
+                if has_legend:
+                    from matplotlib.figure import Figure
+                    from matplotlib.backends.backend_agg import FigureCanvasAgg
+                    handles = self.legend_handles(cat, sort="count")
+                    lf = Figure()
+                    FigureCanvasAgg(lf)
+                    lf.legend(handles=handles, title=cat["title"], loc="center", fontsize=EXPORT_FONTSIZE * 0.85, title_fontsize=EXPORT_FONTSIZE,
+                              ncol=max(1, math.ceil(len(handles) / EXPORT_LEGEND_MAX_ROWS)), frameon=True, handlelength=1.0, handleheight=1.0,
+                              labelspacing=0.4, columnspacing=1.5)
+                    lf.savefig(legend_paths[f], bbox_inches="tight", dpi=dpi if f == "png" else None)
+                    written.append(legend_paths[f])
+            folders = list(dict.fromkeys(str(p.parent) for p in written))
+            self.var_status.set(f"Saved {', '.join(p.name for p in written)} to {' and '.join(folders)}.")
         except Exception as e:
             self.var_status.set(f"Could not save the UMAP: {e}")
             print(f"Could not save the UMAP: {e}", flush=True)
@@ -308,100 +453,110 @@ class ExportsMixin:
         from matplotlib.backends.backend_agg import FigureCanvasAgg
         from matplotlib.patches import Rectangle
         h = self.host
-        target = self.target_dir()
-        fmt = self.ask_image_format("Save the section maps", "The gray cells are pictures inside it, to keep the file small; the colored cells and the "
-                                                              "outlines stay vector graphics.")
+        fmt = self.ask_image_format("Save the section maps", "The gray cells, and in a gene view the cells with no expression, are pictures inside it, to keep the file small; the colored cells and the "
+                                                              "outlines stay vector graphics.", panels_across=True)
         if fmt is None:
             self.var_status.set("Save section maps cancelled.")
             return
-        ext = "." + fmt
         roi_only = "_ROI_only" if self.var_roi_only.get() else ""        # (the ROI only box above the panels: the name says what the maps show)
         ccf = "_CCF-overlay" if any(t["pc"].outlines for t in self.tiles) else ""        # (and the CCF atlas box)
-        proposed = h["unique_export_paths"](target, f"{self.view_token_safe()}_section_maps{roi_only}{ccf}", (ext,))[ext].name
-        chosen = self.ask_save_path("Save the section maps", proposed, ext, fmt.upper() + " image")
-        if chosen is None:
+        paths = self.ask_export_paths(fmt, f"{self.view_token_safe()}_section_maps{roi_only}{ccf}", "Save the section maps")
+        if paths is None:
             self.var_status.set("Save section maps cancelled.")
             return
         self.root.config(cursor="watch")
         self.var_status.set("Saving the section maps...")
         self.root.update()
         try:
-            n, cols = len(self.tiles), max(1, self.tile_cols)
-            rows = -(-n // cols)
+            written = []
+            n = len(self.tiles)
             pw_px, ph_px = self.tiles[0]["pc"].size()
-            ppi = 100.0
-            pad = 0.08
-            fig = Figure(figsize=(cols * (pw_px / ppi + pad), rows * (ph_px / ppi + pad + 0.25)))
-            FigureCanvasAgg(fig)
-            fw, fh = fig.get_size_inches()
-            for k, t in enumerate(self.tiles):
-                if t.get("dirty") or not t["pc"].layers:
-                    self.build_tile(t)
-                pc = t["pc"]
-                r, c = divmod(k, cols)
-                x0 = c * (pw_px / ppi + pad) / fw
-                y0 = 1 - (r + 1) * (ph_px / ppi + pad + 0.25) / fh
-                ax = fig.add_axes([x0, y0, (pw_px / ppi) / fw, (ph_px / ppi) / fh])
-                ax.set_aspect("equal", adjustable="box")
-                w, hh = pc.size()
-                xl = (pc.cx - w / (2 * pc.scale), pc.cx + w / (2 * pc.scale))
-                yl = (pc.cy - hh / (2 * pc.scale), pc.cy + hh / (2 * pc.scale))
-                ax.set_xlim(xl)
-                ax.set_ylim(yl[1], yl[0])                            # (a section's y grows downward)
-                ax.set_xticks([])
-                ax.set_yticks([])
-                ax.set_facecolor(tuple(v / 255 for v in pc.bgcolor))
-                ax.set_title(t["title"].get(), fontsize=9, loc="left", pad=3)
-                pts_per_mm = 72.0 * (pw_px / ppi) / (xl[1] - xl[0])
-                from abc_tk_umap import DOT_MM, GREY, LIGHT_GREY, SHAPE_MARKERS
-                for lay in pc.layers:
-                    dot_mm = lay.get("size_mm", DOT_MM) * pc.dot_factor          # (a dot's width on the tissue, as on the screen: the Cell size slider)
-                    m = (lay["x"] >= xl[0]) & (lay["x"] <= xl[1]) & (lay["y"] >= yl[0]) & (lay["y"] <= yl[1])
-                    x, y, rgb = lay["x"][m], lay["y"][m], lay["rgb"][m]
-                    marks = lay["marks"][m] if lay.get("marks") is not None else None         # (a marker code for each cell: the shape of its group)
-                    # (in an SVG the gray cells, many thousands of them, are pictures: a vector dot apiece would make the file huge. They are told by
-                    # their color, so that the gray ones of a layer that is mostly colored, or the other way round, are found too.)
-                    if fmt == "svg" and not lay.get("gray"):
-                        gray = (rgb == GREY).all(axis=1) | (rgb == LIGHT_GREY).all(axis=1)
-                        parts = ((gray, True), (~gray, False))
-                    else:
-                        parts = ((np.ones(len(x), bool), fmt == "svg" and bool(lay.get("gray"))),)
-                    for sel, raster in parts:
-                        if not sel.any():
-                            continue
-                        for code in (np.unique(marks[sel]) if marks is not None else [0]):
-                            sub = sel & (marks == code) if marks is not None else sel
-                            marker, is_open = SHAPE_MARKERS[int(code) % 10], int(code) >= 10
-                            if is_open:
-                                ax.scatter(x[sub], y[sub], facecolors="none", edgecolors=rgb[sub] / 255.0, marker=marker, s=(dot_mm * pts_per_mm) ** 2,
-                                           linewidths=0.5, rasterized=raster)
-                            else:
-                                ax.scatter(x[sub], y[sub], c=rgb[sub] / 255.0, marker=marker, s=(dot_mm * pts_per_mm) ** 2, linewidths=0,
-                                           rasterized=raster)
-                if pc.outlines:                                      # (the CCF atlas box: the regions' outlines, as on the screen)
-                    from matplotlib.collections import LineCollection
-                    seen = [np.vstack([p, p[:1]]) for p in pc.outlines
-                            if p[:, 0].max() >= xl[0] and p[:, 0].min() <= xl[1] and p[:, 1].max() >= yl[0] and p[:, 1].min() <= yl[1]]
-                    ink = "#d7d7d7" if sum(pc.bgcolor) < 300 else "#5a5a5a"
-                    ax.add_collection(LineCollection(seen, colors=ink, linewidths=0.4))
-                for _it, a, b, c2, d in pc.rects:
-                    ax.add_patch(Rectangle((a, b), c2 - a, d - b, fill=False, edgecolor="#ff8c00", linestyle=(0, (4, 2)), linewidth=1.2))
-                if pc.scalebar:
-                    from abc_tk_umap import SCALEBAR_UM
-                    view_mm = xl[1] - xl[0]
-                    cands = [u for u in SCALEBAR_UM if u <= view_mm * 1000 * 0.22]
-                    um = cands[-1] if cands else SCALEBAR_UM[0]
-                    ink = "white" if sum(pc.bgcolor) < 300 else "black"
-                    bx0 = xl[0] + 0.06 * view_mm
-                    by = yl[1] - 0.06 * (yl[1] - yl[0])
-                    ax.plot([bx0, bx0 + um / 1000], [by, by], color=ink, linewidth=2.5, solid_capstyle="butt")
-                    ax.text(bx0 + um / 2000, by - 0.01 * view_mm, f"{um:g} µm" if um < 1000 else f"{um / 1000:g} mm", color=ink, fontsize=8,
-                            ha="center", va="bottom")
-            path = chosen
-            self.var_status.set(f"Saving {fmt}...")
-            self.root.update()
-            fig.savefig(path, dpi=h["SECTION_MAPS_SAVE_DPI"])         # (for an SVG the dpi is that of the pictures in it)
-            self.var_status.set(f"Saved {path.name} to {chosen.parent}.")
+            legend = self.section_legend()                                  # (what the view on the screen says its colors are: a band under the panels)
+            cols, pw_in = section_map_layout(n, pw_px / ph_px, parse_panels_across(getattr(self, "export_panels_across", "")), max(1, self.tile_cols), pw_px / 100.0,
+                                             band_height=lambda width: self.legend_band_height(legend, width))
+            rows = -(-n // cols)
+            ph_in = pw_in * ph_px / pw_px
+            pad, row_extra = PANEL_PAD_IN, PANEL_TITLE_IN
+            band_h = self.legend_band_height(legend, cols * (pw_in + pad))
+            for fmt, chosen in paths.items():             # (each format is made on its own: the SVG holds its gray cells as pictures)
+                fig = Figure(figsize=(cols * (pw_in + pad), rows * (ph_in + pad + row_extra) + band_h))
+                FigureCanvasAgg(fig)
+                fw, fh = fig.get_size_inches()
+                for k, t in enumerate(self.tiles):
+                    if t.get("dirty") or not t["pc"].layers:
+                        self.build_tile(t)
+                    pc = t["pc"]
+                    r, c = divmod(k, cols)
+                    x0 = c * (pw_in + pad) / fw
+                    y0 = 1 - (r + 1) * (ph_in + pad + row_extra) / fh
+                    ax = fig.add_axes([x0, y0, pw_in / fw, ph_in / fh])
+                    ax.set_aspect("equal", adjustable="box")
+                    w, hh = pc.size()
+                    xl = (pc.cx - w / (2 * pc.scale), pc.cx + w / (2 * pc.scale))
+                    yl = (pc.cy - hh / (2 * pc.scale), pc.cy + hh / (2 * pc.scale))
+                    ax.set_xlim(xl)
+                    ax.set_ylim(yl[1], yl[0])                            # (a section's y grows downward)
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                    ax.set_facecolor(tuple(v / 255 for v in pc.bgcolor))
+                    ax.set_title(t["title"].get(), fontsize=9, loc="left", pad=3)
+                    pts_per_mm = 72.0 * pw_in / (xl[1] - xl[0])
+                    from abc_tk_umap import DOT_MM, GREY, LIGHT_GREY, SHAPE_MARKERS
+                    zero_rgb = np.array(self.zero_color()) if self.zero_color() is not None else None
+                    for lay in pc.layers:
+                        dot_mm = lay.get("size_mm", DOT_MM) * pc.dot_factor          # (a dot's width on the tissue, as on the screen: the Cell size slider)
+                        m = (lay["x"] >= xl[0]) & (lay["x"] <= xl[1]) & (lay["y"] >= yl[0]) & (lay["y"] <= yl[1])
+                        x, y, rgb = lay["x"][m], lay["y"][m], lay["rgb"][m]
+                        marks = lay["marks"][m] if lay.get("marks") is not None else None         # (a marker code for each cell: the shape of its group)
+                        # (in an SVG the gray cells, many thousands of them, are pictures: a vector dot apiece would make the file huge. They are told by
+                        # their color, so that the gray ones of a layer that is mostly colored, or the other way round, are found too.)
+                        if fmt == "svg" and not lay.get("gray"):
+                            gray = (rgb == GREY).all(axis=1) | (rgb == LIGHT_GREY).all(axis=1)
+                            if zero_rgb is not None:
+                                gray |= (rgb == zero_rgb).all(axis=1)                  # (and the cells with no expression, in a gene view)
+                            parts = ((gray, True), (~gray, False))
+                        else:
+                            parts = ((np.ones(len(x), bool), fmt == "svg" and bool(lay.get("gray"))),)
+                        for sel, raster in parts:
+                            if not sel.any():
+                                continue
+                            for code in (np.unique(marks[sel]) if marks is not None else [0]):
+                                sub = sel & (marks == code) if marks is not None else sel
+                                marker, is_open = SHAPE_MARKERS[int(code) % 10], int(code) >= 10
+                                if is_open:
+                                    ax.scatter(x[sub], y[sub], facecolors="none", edgecolors=rgb[sub] / 255.0, marker=marker, s=(dot_mm * pts_per_mm) ** 2,
+                                               linewidths=0.5, rasterized=raster)
+                                else:
+                                    ax.scatter(x[sub], y[sub], c=rgb[sub] / 255.0, marker=marker, s=(dot_mm * pts_per_mm) ** 2, linewidths=0,
+                                               rasterized=raster)
+                    if pc.outlines:                                      # (the CCF atlas box: the regions' outlines, as on the screen)
+                        from matplotlib.collections import LineCollection
+                        seen = [np.vstack([p, p[:1]]) for p in pc.outlines
+                                if p[:, 0].max() >= xl[0] and p[:, 0].min() <= xl[1] and p[:, 1].max() >= yl[0] and p[:, 1].min() <= yl[1]]
+                        ink = "#d7d7d7" if sum(pc.bgcolor) < 300 else "#5a5a5a"
+                        ax.add_collection(LineCollection(seen, colors=ink, linewidths=0.4))
+                    for _it, a, b, c2, d in pc.rects:
+                        ax.add_patch(Rectangle((a, b), c2 - a, d - b, fill=False, edgecolor="#ff8c00", linestyle=(0, (4, 2)), linewidth=1.2))
+                    if pc.scalebar:
+                        from abc_tk_umap import SCALEBAR_UM
+                        view_mm = xl[1] - xl[0]
+                        cands = [u for u in SCALEBAR_UM if u <= view_mm * 1000 * 0.22]
+                        um = cands[-1] if cands else SCALEBAR_UM[0]
+                        ink = "white" if sum(pc.bgcolor) < 300 else "black"
+                        bx0 = xl[0] + 0.06 * view_mm
+                        by = yl[1] - 0.06 * (yl[1] - yl[0])
+                        ax.plot([bx0, bx0 + um / 1000], [by, by], color=ink, linewidth=2.5, solid_capstyle="butt")
+                        ax.text(bx0 + um / 2000, by - 0.01 * view_mm, f"{um:g} µm" if um < 1000 else f"{um / 1000:g} mm", color=ink, fontsize=8,
+                                ha="center", va="bottom")
+                if legend is not None:
+                    self.draw_legend_band(fig, legend, fw, fh, band_h)
+                self.var_status.set(f"Saving {fmt}...")
+                self.root.update()
+                fig.savefig(chosen, dpi=h["SECTION_MAPS_SAVE_DPI"])         # (for an SVG the dpi is that of the pictures in it)
+                written.append(chosen)
+            folders = list(dict.fromkeys(str(p.parent) for p in written))
+            self.var_status.set(f"Saved {', '.join(p.name for p in written)} to {' and '.join(folders)} "
+                                f"({cols} panels across, {rows} down; {fw:.0f} x {fh:.0f} in).")
         except Exception as e:
             self.var_status.set(f"Could not save section maps: {e}")
             print(f"Could not save section maps: {e}", flush=True)

@@ -13,6 +13,7 @@ the group (family) highlight on hover, and the exports.
 import colorsys
 import gc
 import queue
+import math
 import re
 from pathlib import Path
 import threading
@@ -80,6 +81,16 @@ def rank_color(rank):
     hue = ((rank % 10) * 0.6180339887498949) % 1.0
     s, v = (0.90, 0.95) if (rank // 10) % 2 == 0 else (0.45, 0.85)
     return np.array([int(round(c * 255)) for c in colorsys.hsv_to_rgb(hue, s, v)], np.uint8)
+
+
+def plural_name(name):
+    """'subclass' -> 'subclasses', 'cluster' -> 'clusters' (a level's name as the status line says it)."""
+    low = name if any(c.isupper() for c in name[1:]) else name.lower()            # ('MMC Class' keeps its capitals)
+    if any(c.isdigit() for c in low) or len(low) > 28:                              # (a long column name, 'DF classifications 0.25 0.15 3107')
+        return low + " groups"
+    if low.endswith("ss"):
+        return low + "es"                                                           # (classes)
+    return low if low.endswith("s") else low + "s"                                  # (clusters stay; subclass -> subclasses is the 'ss' above)
 
 
 def is_dark(bgcolor):
@@ -306,7 +317,9 @@ def percent_below(vals, point):
 class RangeSlider(tk.Canvas):
     """A track with two handles, for the lowest and the highest end of a range (0 to 1): the black level (left, a black dot) and the white level
     (right, a white dot) of a color scale. It is as wide as the color bar above it (the track runs between the same margins), calls
-    `command(low, high)` as a handle is dragged, and a double-click puts both back at the ends."""
+    `command(low, high)` as a handle is dragged, and a double-click puts both back at the ends. `low` and `high` are the fractions of the range
+    the levels are at; the track is drawn by their square root (a position is the square root of its value), so that the low end, where most of a
+    gene's expression is, has most of the track."""
     MIN_GAP = 0.02            # the handles keep at least this much of the track between them
 
     def __init__(self, parent, command, margin=10, height=26):
@@ -319,10 +332,11 @@ class RangeSlider(tk.Canvas):
         self.bind("<Double-Button-1>", lambda e: self.set(0.0, 1.0, notify=True))
 
     def x_of(self, fraction):
-        return self.margin + fraction * max(self.winfo_width() - 2 * self.margin, 1)
+        return self.margin + math.sqrt(min(max(fraction, 0.0), 1.0)) * max(self.winfo_width() - 2 * self.margin, 1)
 
     def fraction_of(self, x):
-        return min(max((x - self.margin) / max(self.winfo_width() - 2 * self.margin, 1), 0.0), 1.0)
+        position = min(max((x - self.margin) / max(self.winfo_width() - 2 * self.margin, 1), 0.0), 1.0)
+        return position * position
 
     def set(self, low, high, notify=False):
         self.low, self.high = low, high
@@ -381,6 +395,27 @@ class HoverTip:
         if self.tip is not None:
             self.tip.destroy()
             self.tip = self.label = None
+
+
+class LazyLevels(dict):
+    """The group labels (as text) of every cell of the atlas at each level, made the first time a level is asked for: making all of them takes
+    half a second, and a run is shown at one level at a time. Used like a dict of arrays: `levels.get(level)` (None if the table has no such level)."""
+
+    def __init__(self, table, names):
+        super().__init__()
+        self.table, self.names = table, list(names)
+
+    def get(self, key, default=None):
+        if key not in self:
+            dict.__setitem__(self, key, self.table[key].astype(str).to_numpy() if key in self.names and key in self.table.columns else None)
+        value = dict.__getitem__(self, key)
+        return default if value is None else value
+
+    def __getitem__(self, key):
+        value = self.get(key)
+        if value is None:
+            raise KeyError(key)
+        return value
 
 
 class PointCanvas:
@@ -806,6 +841,8 @@ class PointCanvas:
         self.labels.append([item, x, y])
         self.label_text[item] = text
         self.label_weight[item] = weight
+        # its own size now (the view's size has not changed, so update_label_size would not do it)
+        self.canvas.itemconfig(item, font=("Segoe UI", self.label_font_size(item, self.label_size or 8), "bold"))
 
     def boost_label(self, text):
         """Draw the label with this text bigger (the group being marked with '+' signs), and the others as they were; None puts it back."""
@@ -874,8 +911,12 @@ class PointCanvas:
 # ---------------------------------------------------------------------------------------------------------------------- the window
 
 class UmapWindow(ExportsMixin):
-    def __init__(self, adata, abc_cache, imputed_state, adata_backed, rois, run_folder, ensure_imputed, title, parent=None, host=None, params=None):
+    def __init__(self, adata, abc_cache, imputed_state, adata_backed, rois, run_folder, ensure_imputed, title, parent=None, host=None, params=None,
+                 own=None):
         self.adata, self.abc_cache = adata, abc_cache
+        self.own = own                      # a dataset of the user's own (abc_tk_own.OwnDataset): no atlas, no sections, no imputed genes
+        self.level_names = dict(own.level_names) if own is not None else dict(LEVEL_NAMES)          # the group types: column -> the words on the screen
+        self.level_has_ids = dict(own.level_has_ids) if own is not None else {"neurotransmitter": False}      # (whether a level's groups have numbers to type)
         self.host = host or {}             # the browser's own functions this window uses (settings dialog, UMAP variants, the exports)
         self.run_folder = run_folder
         self.params = dict(params) if params else None
@@ -895,7 +936,11 @@ class UmapWindow(ExportsMixin):
         self.gc_was_enabled = gc.isenabled()
         gc.disable()
         self.mode = "all"                  # "all" | "single" | "gene" | "imputed"
-        self.level = "subclass" if "subclass" in adata.obs.columns else "class"
+        if own is not None:
+            names = list(own.level_names)
+            self.level = next((k for k in names if k.lower().endswith("subclass")), next((k for k in names if k.lower().endswith("class")), names[0]))
+        else:
+            self.level = "subclass" if "subclass" in adata.obs.columns else "class"
         self.shown_gene = None
         self.shown_dataset = "standard"
         self.values = None                 # the shown gene's value for each cell (as coloured), or None
@@ -928,7 +973,7 @@ class UmapWindow(ExportsMixin):
     def preload_imputed(self):
         """Start loading the imputed gene dataset in the background, if it is already on this computer: the choice "Imputed Gene" is common."""
         start = self.host.get("preload_imputed")
-        if start is not None:
+        if start is not None and self.own is None:
             try:
                 start(self.imputed_state, self.abc_cache)
             except Exception as e:
@@ -940,29 +985,32 @@ class UmapWindow(ExportsMixin):
         a = self.adata
         self.coords = np.asarray(a.obsm["X_umap"], dtype=float)[:, :2]
         self.n = len(self.coords)
-        self.has_counts = "counts" in a.layers
+        self.has_counts = "counts" in a.layers or self.own is not None
         sec_col = core.SECTION_COL
         bsp = None
         if adata_backed is not None and sec_col in a.obs.columns:
             bsp = core.load_section_spatial_coords(adata_backed, self.abc_cache)      # (the whole atlas: the run's cells are taken from it, so the table is read once)
         if sec_col not in a.obs.columns:
             spatial = None
+        elif bsp is not None:
+            pos = core.atlas_positions(a.obs.index, adata_backed.obs.index)          # (the run's cells in the atlas's table: by position, no lookup of the cell IDs)
+            spatial = bsp.iloc[pos].set_axis(a.obs.index) if (pos >= 0).all() else bsp.reindex(a.obs.index)
         else:
-            spatial = bsp.reindex(a.obs.index) if bsp is not None else core.load_section_spatial_coords(a, self.abc_cache)
+            spatial = core.load_section_spatial_coords(a, self.abc_cache)
         self.section_of = a.obs[sec_col].to_numpy() if sec_col in a.obs.columns else None
         ok = spatial is not None and "x" in spatial.columns and "y" in spatial.columns
         self.cx = pd.to_numeric(spatial["x"], errors="coerce").to_numpy() if ok else None
         self.cy = pd.to_numeric(spatial["y"], errors="coerce").to_numpy() if ok else None
         self.sections = core.sorted_sections_descending(a.obs[sec_col].dropna().unique().tolist()) if ok else []
-        self.info = {k: (a.obs[k].astype(str).to_numpy() if k in a.obs.columns else None) for k in LEVEL_NAMES}
-        if self.info["neurotransmitter"] is None:           # (runs made before it was a column: read from the atlas's table, as the taxonomy was)
+        self.info = {k: (a.obs[k].astype(str).to_numpy() if k in a.obs.columns else None) for k in self.level_names}
+        if self.own is None and self.info.get("neurotransmitter") is None:           # (runs made before it was a column: read from the atlas's table, as the taxonomy was)
             try:
                 nt = core.load_annotations_aligned(a.obs_names, self.abc_cache)
                 if "neurotransmitter" in nt.columns:
                     self.info["neurotransmitter"] = nt["neurotransmitter"].astype(str).to_numpy()
             except Exception as e:
                 print(f"Could not read the neurotransmitter of the cells: {e}", flush=True)
-        self.levels = [k for k in LEVEL_NAMES if self.info[k] is not None]
+        self.levels = [k for k in self.level_names if self.info[k] is not None]
         # the section panels' background: every cell of each section (from the unfiltered data), when given
         self.bg = None
         self.adata_backed = adata_backed
@@ -976,7 +1024,7 @@ class UmapWindow(ExportsMixin):
                     where = {u: order[starts[i]:starts[i + 1]] for i, u in enumerate(uniques)}
                     self.bg = {"ids": adata_backed.obs_names, "sec_arr": bsec.to_numpy(), "z": (pd.to_numeric(bsp["z"], errors="coerce").to_numpy() if "z" in bsp.columns else None),
                                "x": pd.to_numeric(bsp["x"], errors="coerce").to_numpy(), "y": pd.to_numeric(bsp["y"], errors="coerce").to_numpy(),
-                               "where": where, "levels": {k: (bsp[k].astype(str).to_numpy() if k in bsp.columns else None) for k in LEVEL_NAMES}}
+                               "where": where, "levels": LazyLevels(bsp, self.level_names)}
             except Exception as e:
                 print(f"Could not load the all-cell background for the section panels: {e}", flush=True)
         self.run_idx = {}
@@ -1065,12 +1113,12 @@ class UmapWindow(ExportsMixin):
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         sb.bind("<MouseWheel>", lambda e: self.tile_scroll.yview_scroll(-1 if e.delta > 0 else 1, "units"))
         self.tile_scroll.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.tile_frame = tk.Frame(self.tile_scroll, bg="#f4f4f4")
-        self.tile_window = self.tile_scroll.create_window(0, 0, window=self.tile_frame, anchor="nw")
-        self.tile_frame.bind("<Configure>", lambda e: self.tile_scroll.configure(scrollregion=self.tile_scroll.bbox("all")))
+        # (Each section panel is its own item in the scrolled canvas, not a part of one big frame: a Tk window cannot be taller than about 32,000
+        # pixels, so with 60 panels as tall as the pane is wide one frame holding them all showed only the first 30 or so, the last cut off.)
         self.tile_scroll.bind("<Configure>", lambda e: self.layout_tiles())
         self.tile_scroll.bind("<MouseWheel>", lambda e: self.tile_scroll.yview_scroll(-1 if e.delta > 0 else 1, "units"))
-        pw.add(left, weight=2)
+        if self.own is None:                                        # (a dataset of the user's own has no sections)
+            pw.add(left, weight=2)
         # the UMAP
         mid = ttk.Frame(pw)
         umap_bar = ttk.Frame(mid, padding=(6, 4))
@@ -1105,7 +1153,7 @@ class UmapWindow(ExportsMixin):
 
     def fit_left_pane(self, again=True):
         """Once, at the start: the section pane gets about a third of the window (the panels fill whatever width it has)."""
-        if not self.root.winfo_viewable():
+        if not self.root.winfo_viewable() or self.own is not None:
             return
         total = self.pw.winfo_width()
         side_w = int(self.side_pane.cget("width")) or 420
@@ -1123,6 +1171,8 @@ class UmapWindow(ExportsMixin):
         self.color_label.pack(anchor="w")
         self.var_mode = tk.StringVar(f, "all")
         for value, text in (("all", "All groups"), ("single", "Specific group(s)"), ("gene", "Gene"), ("imputed", "Imputed Gene")):
+            if value == "imputed" and self.own is not None:
+                continue                                                  # (there is no imputed dataset behind a dataset of the user's own)
             ttk.Radiobutton(f, text=text, value=value, variable=self.var_mode, command=self.on_mode).pack(anchor="w")
         opacity_row = ttk.Frame(f)
         opacity_row.pack(fill=tk.X, pady=(8, 0))
@@ -1184,7 +1234,8 @@ class UmapWindow(ExportsMixin):
         self.multi_windows = []
         self.levels_job = None
         self.cbar_slider = RangeSlider(self.gene_frame, self.on_gene_levels)
-        HoverTip(self.cbar_slider, lambda: "Drag the black and white handles to set the lowest and the highest value of the color scale. Double-click to reset.")
+        HoverTip(self.cbar_slider, lambda: "Drag the black and white handles to set the lowest and the highest value of the color scale. The track is by the square root of the value: "
+                                        "most of it is for the low values. Double-click to reset.")
         # the legend for Single group(s)
         self.legend = tk.Canvas(f, width=300, height=10, highlightthickness=0)
         self.group_list = ttk.Frame(f)                      # the groups' numbers and colors (All groups), scrollable
@@ -1234,7 +1285,7 @@ class UmapWindow(ExportsMixin):
         for w in self.level_frame.winfo_children():
             w.destroy()
         for k, name in enumerate(self.levels):
-            ttk.Radiobutton(self.level_frame, text=LEVEL_NAMES[name], value=name, variable=self.var_level, command=self.on_level).grid(row=k // 2, column=k % 2, sticky="w", padx=(0, 14))
+            ttk.Radiobutton(self.level_frame, text=self.level_names[name], value=name, variable=self.var_level, command=self.on_level).grid(row=k // 2, column=k % 2, sticky="w", padx=(0, 14))
 
     def build_buttons(self, f):
         ttk.Style(self.root).configure("Side.TButton", font=("Segoe UI", 9))
@@ -1255,12 +1306,14 @@ class UmapWindow(ExportsMixin):
                 b.grid(row=r, column=c, columnspan=2 if len(pair) == 1 else 1, sticky="ew", padx=2, pady=2)
                 if grouped:
                     self.group_buttons.append(b)
+                if self.own is not None and text == "Save section maps":
+                    b.state(["disabled"])                                 # (no section maps)
         self.update_group_buttons()
 
     def update_group_buttons(self):
         """The group exports and 3D views are for the groups typed in Single group(s)."""
         for b in self.group_buttons:
-            b.state(["!disabled"] if self.mode == "single" else ["disabled"])
+            b.state(["!disabled"] if self.mode == "single" and self.own is None else ["disabled"])
 
     def update_frames(self):
         for w in (self.id_frame, self.gene_frame, self.legend, self.group_list):
@@ -1296,7 +1349,8 @@ class UmapWindow(ExportsMixin):
                 continue
             b = boxes[s]
             mx, my = (b[0] + b[1]) / 2, (b[2] + b[3]) / 2
-            fr = tk.Frame(self.tile_frame, bg="#f4f4f4")
+            fr = tk.Frame(self.tile_scroll, bg="#f4f4f4")
+            item = self.tile_scroll.create_window(0, 0, window=fr, anchor="nw")
             token = core.sanitize_section_token(s)
             title = tk.StringVar(fr, token)
             tk.Label(fr, textvariable=title, bg="#f4f4f4", font=("Segoe UI", 9, "bold")).pack(anchor="w")
@@ -1311,7 +1365,7 @@ class UmapWindow(ExportsMixin):
             pc.visible_fn = lambda fr=fr: self.frame_visible(fr)
             if not self.tiles:
                 pc.enable_scalebar()                       # (the first section's panel carries the scale bar)
-            tile = {"label": s, "frame": fr, "pc": pc, "title": title, "token": token, "tree": None}
+            tile = {"item": item, "label": s, "frame": fr, "pc": pc, "title": title, "token": token, "tree": None}
             pc.on_motion = lambda px, py, t=tile: self.tile_motion(t, px, py)
             pc.on_change = lambda zoom, dx, dy, t=tile: self.link_tiles(t, zoom, dx, dy)
             for r in self.rois:
@@ -1431,9 +1485,17 @@ class UmapWindow(ExportsMixin):
         if cols == self.tile_cols and px == self.tile_px:
             return
         self.tile_cols, self.tile_px = cols, px
-        for k, t in enumerate(self.tiles):
+        for t in self.tiles:
             t["pc"].canvas.config(width=px, height=int(px / self.tile_aspect))
-            t["frame"].grid(row=k // cols, column=k % cols, padx=4, pady=3, sticky="nw")
+        self.root.update_idletasks()                                  # (so that the panels know their size)
+        fw = max(t["frame"].winfo_reqwidth() for t in self.tiles)
+        fh = max(t["frame"].winfo_reqheight() for t in self.tiles)
+        for k, t in enumerate(self.tiles):                            # (8 across and 6 down between panels, as the grid had)
+            x, y = 4 + (k % cols) * (fw + 8), 3 + (k // cols) * (fh + 6)
+            t["frame"].tile_y = y                                     # (where it is in the scrolled canvas: see frame_visible)
+            self.tile_scroll.coords(t["item"], x, y)
+        rows = -(-len(self.tiles) // cols)
+        self.tile_scroll.configure(scrollregion=(0, 0, 4 + cols * (fw + 8), 3 + rows * (fh + 6)))
         self.root.after_idle(self.refresh_visible)
 
     def apply_dot_size(self):
@@ -1603,7 +1665,7 @@ class UmapWindow(ExportsMixin):
 
     def frame_visible(self, fr):
         """Whether a section panel is (at least partly) in the scrolled pane."""
-        top, h = fr.winfo_y(), fr.winfo_height()
+        top, h = getattr(fr, "tile_y", fr.winfo_y()), fr.winfo_reqheight()
         vt, vh = self.tile_scroll.canvasy(0), self.tile_scroll.winfo_height()
         return top + h > vt and top < vt + vh
 
@@ -1684,6 +1746,9 @@ class UmapWindow(ExportsMixin):
             self.var_status.set(f"No '{level}' column on this dataset.")
             return
         codes, uniques = self.category_codes(level)
+        if len(uniques) == 0:                                  # (no cell has a value at this level, such as the neurotransmitter of a run of non-neurons)
+            self.var_status.set(f"No cell of this dataset has a {self.level_names[level].lower()}.")
+            return
         counts = np.bincount(codes[codes >= 0], minlength=len(uniques))
         ranked = np.argsort(-counts, kind="stable")[:MAX_COLORED_CATEGORIES]
         lut = np.tile(GREY, (len(uniques), 1))
@@ -1715,15 +1780,15 @@ class UmapWindow(ExportsMixin):
             labels.append((m.group(1) if m else str(uniques[g]), row["x"], row["y"], "#%02x%02x%02x" % tuple(dark), float(weight)))
         self.apply(rgb, np.arange(self.n), bg_fn, labels)
         self.view_kind, self.view_token = "all", f"all_{level}"
-        self.view_title = f"All {LEVEL_NAMES[level].lower()}s"
+        self.view_title = f"All {plural_name(self.level_names[level])}"
         rank_of = np.full(len(uniques), -1)
         rank_of[ranked] = np.arange(len(ranked))
-        self.export_cat = {"rank": np.where(codes >= 0, rank_of[np.maximum(codes, 0)], -1), "title": LEVEL_NAMES[level],
+        self.export_cat = {"rank": np.where(codes >= 0, rank_of[np.maximum(codes, 0)], -1), "title": self.level_names[level],
                            "entries": [(hexcolor(GREY if str(uniques[u]) in self.off_groups else rank_color(r)), str(uniques[u]), int(counts[u])) for r, u in enumerate(ranked)]}
         self.set_cell_ranks(self.export_cat["rank"], np.where(bgc >= 0, rank_of[np.maximum(bgc, 0)], -1) if bgc is not None else None)
         self.shown_values = None
         n_cat = int((counts > 0).sum())
-        self.var_status.set(f"Showing all {n_cat} {LEVEL_NAMES[level].lower()}s" + (f"; the {len(ranked)} largest colored, the rest gray." if n_cat > len(ranked) else " (numbers at each center).") + " Click a group in the list to gray it or color it again.")
+        self.var_status.set(f"Showing all {n_cat} {plural_name(self.level_names[level])}" + (f"; the {len(ranked)} largest colored, the rest gray." if n_cat > len(ranked) else " (numbers at each center).") + " Click a group in the list to gray it or color it again.")
         self.values = None
         self.draw_group_list(ranked, uniques, counts)
 
@@ -1827,8 +1892,8 @@ class UmapWindow(ExportsMixin):
         if self.info.get(level) is None:
             self.var_status.set(f"No '{level}' column on this dataset.")
             return
-        if level == "neurotransmitter":
-            self.var_status.set("Neurotransmitters have names, not numbers: use All groups to see them (click a group in the list to gray it).")
+        if not self.level_has_ids.get(level, True):
+            self.var_status.set(f"{plural_name(self.level_names[level]).capitalize()} have names, not numbers: use All groups to see them (click a group in the list to gray it).")
             return
         ids, bad = self.parse_ids()
         codes, uniques = self.category_codes(level)
@@ -1859,12 +1924,12 @@ class UmapWindow(ExportsMixin):
 
         self.apply(rgb, order, bg_fn)
         counts = {t: int((uid[np.maximum(codes, 0)] == t)[codes >= 0].sum()) for t in ids}
-        full = {t: (str(uniques[np.flatnonzero(uid == t)[0]]) if (uid == t).any() else f"{LEVEL_NAMES[level]} {t}") for t in ids}
+        full = {t: (str(uniques[np.flatnonzero(uid == t)[0]]) if (uid == t).any() else f"{self.level_names[level]} {t}") for t in ids}
         self.last_ids = {"level": level, "targets": ids, "colors": colors, "counts": counts}
         self.view_kind, self.view_token = "single", f"{level}_{'-'.join(str(t) for t in ids)}"
-        self.view_title = f"{LEVEL_NAMES[level]} {', '.join(str(t) for t in ids)}"
+        self.view_title = f"{self.level_names[level]} {', '.join(str(t) for t in ids)}"
         order_of = {t: i for i, t in enumerate(ids)}
-        self.export_cat = {"rank": np.where((codes >= 0) & (hit[np.maximum(codes, 0)] > 0), hit[np.maximum(codes, 0)] - 1, -1), "title": LEVEL_NAMES[level],
+        self.export_cat = {"rank": np.where((codes >= 0) & (hit[np.maximum(codes, 0)] > 0), hit[np.maximum(codes, 0)] - 1, -1), "title": self.level_names[level],
                            "entries": [(hexcolor(colors[t]), full[t], counts[t]) for t in ids]}
         self.set_cell_ranks(self.export_cat["rank"], np.where((bgc >= 0) & (hit[np.maximum(bgc, 0)] > 0), hit[np.maximum(bgc, 0)] - 1, -1)
                             if bgc is not None else None)
@@ -1875,7 +1940,7 @@ class UmapWindow(ExportsMixin):
             if any(not counts[t] for t in ids):
                 parts.append("not found: " + ", ".join(str(t) for t in ids if not counts[t]))
         else:
-            parts.append(f"Enter one or more {LEVEL_NAMES[level].lower()} numbers.")
+            parts.append(f"Enter one or more {self.level_names[level].lower()} numbers.")
         if bad:
             parts.append("ignored: " + ", ".join(bad))
         self.var_status.set("; ".join(parts) + ".")
@@ -1921,7 +1986,7 @@ class UmapWindow(ExportsMixin):
         if elsewhere:
             lines.append(f"{', '.join(elsewhere)}: not in the {here} dataset, but it is in the {there} dataset: choose \u201c{there_choice}\u201d above.")
         if nowhere:
-            hint = " Check the spelling." if other is not None else \
+            hint = " Check the spelling." if other is not None or self.own is not None else \
                 " Check the spelling (the imputed genes can be checked once that dataset is loaded: choose \u201cImputed Gene\u201d)."
             lines.append(f"{', '.join(nowhere)}: not found in the {here} dataset.{hint}")
         return "\n".join(lines)
@@ -2033,16 +2098,50 @@ class UmapWindow(ExportsMixin):
             if isinstance(res, BaseException):
                 self.var_status.set(f"Could not read {', '.join(resolved)}: {res}")
                 return
+            self.keep_gene_settings(self.gene_cache[0] if self.gene_cache is not None else None, key)
             self.gene_cache = (key, res)
-            self.hidden = set()                    # (a different query: every gene shown again)
-            self.gene_levels = (0.0, 1.0)          # (and the full range of values)
-            self.multi_levels = {}
             self.show_genes(resolved, imputed, scale, res)
 
         self.job(f"Reading {', '.join(resolved)}...", work, done)
 
+    def zero_color(self):
+        """The colour of a cell with no expression (the lowest value) in the gene view on the screen, or None in the other views. Those cells are
+        most of a run and all look alike, so a saved SVG holds them as a picture, not as a dot apiece."""
+        if self.mode not in ("gene", "imputed"):
+            return None
+        if self.view_kind == "multi":
+            return (230, 230, 230) if self.var_theme.get() == "light" else (0, 0, 0)
+        if self.view_kind == "gene":
+            return tuple(int(v) for v in self.gene_rgb(np.array([0.0]))[0])
+        return None
+
+    def scale_units(self):
+        """What the color bar says the values are."""
+        if self.own is not None:
+            linear = "expr (normalized)" if self.own.normalization == "cp10k" or self.own.kind != "counts" else "expr (counts)"
+            return {("standard", "log"): "log2(1 + expr)", ("standard", "linear"): linear}
+        return SCALE_UNITS
+
+    def keep_gene_settings(self, old_key, new_key):
+        """A different set of genes is going to be shown: a gene that was shown before keeps what was set for it (the black and white levels of its
+        slider, and whether it was hidden); a new gene starts at the full range, shown. Nothing is kept when the dataset or the scale changed (the
+        levels are fractions of a range that is not the same any more)."""
+        names = list(new_key[0])
+        levels, hidden = {}, set()
+        if old_key is not None and old_key[1:] == new_key[1:]:
+            old_names = list(old_key[0])
+            old_levels = {old_names[0]: self.gene_levels} if len(old_names) == 1 else {g: self.multi_levels.get(i, (0.0, 1.0)) for i, g in enumerate(old_names)}
+            hidden_names = {old_names[i] for i in self.hidden if i < len(old_names)} if len(old_names) > 1 else set()
+            levels = {i: old_levels[g] for i, g in enumerate(names) if g in old_levels}
+            hidden = {i for i, g in enumerate(names) if g in hidden_names}
+        self.gene_levels = levels.get(0, (0.0, 1.0)) if len(names) == 1 else (0.0, 1.0)
+        self.multi_levels = levels if len(names) > 1 else {}
+        self.hidden = hidden if len(names) > 1 else set()
+
     def read_run_gene(self, gene, imputed, scale):
         """A gene's value in each cell of the run (imputed or standard, on the linear or the log scale). Blocking: on a worker thread."""
+        if self.own is not None:
+            return self.own.column(gene, scale)
         adata = self.adata
         source = self.imputed_state["adata"] if imputed else adata
         col = core.find_gene_index(source, gene)
@@ -2105,6 +2204,7 @@ class UmapWindow(ExportsMixin):
         self.clear_multi_sliders()
         low, high = self.gene_levels if linear else (0.0, 1.0)
         vmin, vmax = vmin + low * (vmax - vmin), vmin + high * (vmax - vmin)
+        self.shown_range = (vmin, vmax)                 # (the colors' range as shown, with the black and white levels: a saved picture's color bar has it too)
         self.show_levels_slider(linear)
         if linear:
             self.cbar_slider.set(low, high)
@@ -2133,7 +2233,7 @@ class UmapWindow(ExportsMixin):
         self.apply(rgb, order, bg_fn, dark=self.var_theme.get() == "dark")             # (the dark theme: a black background, as in the multi-gene view)
         self.draw_colorbar(vmin, vmax, scale, dataset, readout=(percent_below(vals, vmin), percent_below(vals, vmax)) if linear else None)
         self.var_status.set(f"Showing {gene}{' [imputed]' if dataset == 'imputed' else ''} (every cell of the sections, colored on the selection's scale)."
-                            if bg_vals is not None else "(cells outside this run's selection are gray).")
+                            if bg_vals is not None else f"Showing {gene}." if self.own is not None else "(cells outside this run's selection are gray).")
 
     # ---- several genes: red / green / blue circles for the first three (cyan / magenta / yellow in the light theme), the same three colors as small dots on top for the next three
 
@@ -2156,6 +2256,8 @@ class UmapWindow(ExportsMixin):
                 low, high = self.multi_levels.get(i, (0.0, 1.0))
                 lo, hi = lo + low * (hi - lo), lo + high * (hi - lo)
             norm.append((np.clip((vals - lo) / (hi - lo), 0, 1) if hi > lo else np.zeros_like(vals), lo, hi))
+        self.multi_ranges = [(v[1], v[2]) for v in norm]           # (each gene's range as shown: for the legend of a saved picture)
+        self.multi_scale = scale
         hidden = self.hidden
         zero = np.zeros(self.n)
         runn = [zero if i in hidden else norm[i][0] for i in range(n)]
@@ -2205,7 +2307,12 @@ class UmapWindow(ExportsMixin):
         c = self.cbar
         self.cbar_photo = None
         linear = scale == "linear"
-        row = 92 if linear else 44                                  # (in linear scale each gene has the slider of its black and white levels below its range, and what is below them)
+        h8, h10 = self.line_height(8), self.line_height(10, bold=True)
+        name_y = h10 // 2 + 3                                       # (the name and its circle; then the range; in linear scale what is below the two levels, and their slider)
+        range_y = h10 + 4
+        cells_y = range_y + h8 + 2
+        slider_y = cells_y + 2 * h8 + 4
+        row = slider_y + 26 + 10 if linear else range_y + h8 + 12
         if len(self.multi_sliders) != (len(genes) if linear else 0):
             c.delete("all")
             self.clear_multi_sliders()                              # (the sliders are kept while they are dragged: only made again for other genes)
@@ -2214,7 +2321,7 @@ class UmapWindow(ExportsMixin):
                 self.multi_windows = [c.create_window(0, 0, anchor="nw", window=sl, height=26) for sl in self.multi_sliders]
         else:
             c.delete("legend")                                      # (only the texts and circles: the sliders stay where they are, so that a drag in progress goes on)
-        c.config(height=8 + row * len(genes) + 22)
+        c.config(height=8 + row * len(genes) + 2 * h8 + 8)
         for i, (g, (lo, hi)) in enumerate(zip(genes, ranges)):
             y = 8 + row * i
             off = i in self.hidden
@@ -2222,26 +2329,28 @@ class UmapWindow(ExportsMixin):
             half = i >= 3 and self.viewer_settings.get("gene456_shape") == "half circle"      # (genes 4-6: the Settings choice, a half circle or a small circle)
             r = 6 if i < 3 or half else 3                          # (genes 4-6 are the small dots)
             if half:                                               # (the right half of a disc, as the cells of that gene are drawn)
-                c.create_arc(18 - r, y + 11 - r, 18 + r, y + 11 + r, start=-90, extent=180, style=tk.CHORD, tags="legend",
+                c.create_arc(18 - r, y + name_y - r, 18 + r, y + name_y + r, start=-90, extent=180, style=tk.CHORD, tags="legend",
                              **({"outline": "#999999"} if off else {"fill": color, "outline": ""}))
             elif off:
-                c.create_oval(18 - r, y + 11 - r, 18 + r, y + 11 + r, outline="#999999", tags="legend")
+                c.create_oval(18 - r, y + name_y - r, 18 + r, y + name_y + r, outline="#999999", tags="legend")
             else:
-                c.create_oval(18 - r, y + 11 - r, 18 + r, y + 11 + r, fill=color, outline="", tags="legend")
-            c.create_text(34, y + 11, anchor="w", text=g, fill=color, font=("Segoe UI", 10, "bold"), tags=("legend", f"row{i}"))      # (centered on the circle)
-            c.create_text(34, y + 22, anchor="nw", text="hidden" if off else f"{'' if scale == 'linear' else 'log2: '}{lo:.1f}\u2013{hi:.1f}",
+                c.create_oval(18 - r, y + name_y - r, 18 + r, y + name_y + r, fill=color, outline="", tags="legend")
+            c.create_text(34, y + name_y, anchor="w", text=g, fill=color, font=("Segoe UI", 10, "bold"), tags=("legend", f"row{i}"))      # (centered on the circle)
+            c.create_text(34, y + range_y, anchor="nw", text="hidden" if off else f"{'' if scale == 'linear' else 'log2: '}{lo:.1f}\u2013{hi:.1f}",
                           fill="#666666", font=("Segoe UI", 8), tags="legend")
             if linear:
                 if readouts is not None and not off:
                     for (a, e), x, anchor in ((readouts[i][0], 10, "nw"), (readouts[i][1], max(c.winfo_width(), 200) - 10, "ne")):
-                        c.create_text(x, y + 36, anchor=anchor, text=f"{a:.1f}% of cells below", font=("Segoe UI", 8), fill="gray30", tags="legend")
-                        c.create_text(x, y + 48, anchor=anchor, text=f"{e:.1f}% of expressing", font=("Segoe UI", 8), fill="gray30", tags="legend")
+                        c.create_text(x, y + cells_y, anchor=anchor, text=f"{a:.1f}% of cells below", font=("Segoe UI", 8), fill="gray30", tags="legend")
+                        c.create_text(x, y + cells_y + h8, anchor=anchor, text=f"{e:.1f}% of expressing", font=("Segoe UI", 8), fill="gray30", tags="legend")
                 self.multi_sliders[i].set(*self.multi_levels.get(i, (0.0, 1.0)))
-                c.coords(self.multi_windows[i], 0, y + 62)
+                c.coords(self.multi_windows[i], 0, y + slider_y)
                 c.itemconfig(self.multi_windows[i], width=max(c.winfo_width(), 200))
-        c.create_text(150, 8 + row * len(genes) + 2, anchor="n",
-                      text="click a gene to hide / show it" + ("; drag the handles for its black and white levels" if linear else ""),
-                      fill="#888888", font=("Segoe UI", 8, "italic"), tags="legend")
+        width = max(c.winfo_width(), 200)
+        hint = c.create_text(width / 2, 8 + row * len(genes) + 2, anchor="n", width=width - 20, justify=tk.CENTER,          # (wrapped: it is wider than a narrow panel)
+                             text="click a gene to hide / show it" + ("; drag the handles for its black and white levels" if linear else ""),
+                             fill="#888888", font=("Segoe UI", 8, "italic"), tags="legend")
+        c.config(height=c.bbox(hint)[3] + 6)                        # (as tall as the hint, however many lines it took)
         self.multi_rows = (8, row, len(genes))
 
     def clear_multi_sliders(self):
@@ -2299,15 +2408,15 @@ class UmapWindow(ExportsMixin):
         if not mask.any():
             return None
         i0 = int(np.flatnonzero(mask)[0])
-        levels = list(LEVEL_NAMES)
-        chain = [level] if level in NOT_IN_TAXONOMY else [k for k in levels[:levels.index(level) + 1] if k not in NOT_IN_TAXONOMY]
+        levels = list(self.level_names)
+        chain = [level] if level in NOT_IN_TAXONOMY or self.own is not None else [k for k in levels[:levels.index(level) + 1] if k not in NOT_IN_TAXONOMY]
         rows = []
         for k in chain:
             v = self.info[k][i0] if self.info.get(k) is not None else None
             if v is None or str(v) == "nan":
                 continue
             m = re.match(r"^\s*(\d+)\s*(.*)$", str(v))
-            rows.append((LEVEL_NAMES[k], m.group(1) if m else "", m.group(2) if m else str(v)))
+            rows.append((self.level_names[k], m.group(1) if m else "", m.group(2) if m else str(v)))
         rows.append(("Cells", f"{int(mask.sum())}", "in this run"))
         if self.section_of is not None:
             rows.append(("Sections", f"{len(np.unique(self.section_of[mask]))}", ""))
@@ -2379,11 +2488,19 @@ class UmapWindow(ExportsMixin):
         else:
             self.cbar_slider.pack_forget()
 
+    def line_height(self, size, bold=False):
+        """The height in pixels of a line of Segoe UI text of this size on this screen (the scaling of Windows makes it more than the points say)."""
+        fonts = self.__dict__.setdefault("line_fonts", {})
+        key = (size, bold)
+        if key not in fonts:
+            fonts[key] = tkfont.Font(root=self.root, family="Segoe UI", size=size, weight="bold" if bold else "normal")
+        return fonts[key].metrics("linespace")
+
     def draw_colorbar(self, vmin, vmax, scale, dataset, readout=None):
         """`readout` (linear scale): the percentages below the black and the white point, ((all, expressing), (all, expressing))."""
         c = self.cbar
         c.delete("all")
-        c.config(height=70 if readout is None else 88)
+        h8, h9 = self.line_height(8), self.line_height(9)
         w = max(c.winfo_width(), 200)
         ramp = self.gene_rgb(np.linspace(0, 1, w - 20))[None, :, :]
         img = np.repeat(ramp, 16, axis=0)
@@ -2391,11 +2508,14 @@ class UmapWindow(ExportsMixin):
         c.create_image(10, 8, anchor="nw", image=self.cbar_photo)
         c.create_text(10, 28, anchor="nw", text=f"{vmin:.2f}", font=("Segoe UI", 9))
         c.create_text(w - 10, 28, anchor="ne", text=f"{vmax:.2f}", font=("Segoe UI", 9))
+        y = 28 + h9 + 2
         if readout is not None:
             for (a, e), x, anchor in ((readout[0], 10, "nw"), (readout[1], w - 10, "ne")):
-                c.create_text(x, 42, anchor=anchor, text=f"{a:.1f}% of cells below", font=("Segoe UI", 8), fill="gray30")
-                c.create_text(x, 54, anchor=anchor, text=f"{e:.1f}% of expressing", font=("Segoe UI", 8), fill="gray30")
-        c.create_text(w / 2, 50 if readout is None else 76, text=SCALE_UNITS[(dataset, scale)], font=("Segoe UI", 9), fill="gray30")
+                c.create_text(x, y, anchor=anchor, text=f"{a:.1f}% of cells below", font=("Segoe UI", 8), fill="gray30")
+                c.create_text(x, y + h8, anchor=anchor, text=f"{e:.1f}% of expressing", font=("Segoe UI", 8), fill="gray30")
+            y += 2 * h8 + 4
+        c.create_text(w / 2, y + h9 / 2, text=self.scale_units()[(dataset, scale)], font=("Segoe UI", 9), fill="gray30")
+        c.config(height=int(y + h9 + 8))
 
     # ---- background work
 
@@ -2444,14 +2564,14 @@ class UmapWindow(ExportsMixin):
         if sec is not None:
             lines.append(f"Section {core.sanitize_section_token(sec)}")
         i = info["umap_idx"]
-        for k in LEVEL_NAMES:
+        for k in self.level_names:
             if i is not None:
                 v = self.info[k][i] if self.info.get(k) is not None else None
             else:
                 arr = self.bg["levels"].get(k) if self.bg else None
                 v = arr[info["bg_idx"]] if arr is not None else None
             if v is not None and str(v) != "nan":
-                lines.append(f"{LEVEL_NAMES[k]}: {v}")
+                lines.append(f"{self.level_names[k]}: {v}")
         z = core.section_z_text(sec, self.abc_cache, wait=False) if sec is not None else ""
         if z:
             lines.append(z)
@@ -2469,7 +2589,7 @@ class UmapWindow(ExportsMixin):
         if sec is not None:
             rows.append(("Section", core.sanitize_section_token(sec), ""))
         i = info["umap_idx"]
-        for k in LEVEL_NAMES:
+        for k in self.level_names:
             if i is not None:
                 v = self.info[k][i] if self.info.get(k) is not None else None
             else:
@@ -2478,7 +2598,7 @@ class UmapWindow(ExportsMixin):
             if v is None or str(v) == "nan":
                 continue
             m = re.match(r"^\s*(\d+)\s*(.*)$", str(v))
-            rows.append((LEVEL_NAMES[k], m.group(1) if m else "", m.group(2) if m else str(v)))
+            rows.append((self.level_names[k], m.group(1) if m else "", m.group(2) if m else str(v)))
         z = core.section_z_text(sec, self.abc_cache, wait=False) if sec is not None else ""
         if z:
             rows.append(("", "", z))
@@ -2776,7 +2896,7 @@ class UmapWindow(ExportsMixin):
             self.info["leiden"] = None
         for k in [k for k in self.cache if isinstance(k, tuple) and k[1] == "leiden"]:
             del self.cache[k]
-        self.levels = [k for k in LEVEL_NAMES if self.info[k] is not None]
+        self.levels = [k for k in self.level_names if self.info[k] is not None]
         if self.level not in self.levels:
             self.level = self.levels[0]
             self.var_level.set(self.level)
@@ -2837,12 +2957,12 @@ class UmapWindow(ExportsMixin):
 
 
 def show_umap_window_tk(adata, abc_cache, imputed_state=None, adata_backed=None, rois=None, run_folder=None, ensure_imputed=None, title=None,
-                        parent=None, host=None, params=None):
+                        parent=None, host=None, params=None, own=None):
     """Open the viewer and return when it is closed. `host`: the browser's own functions (see UmapWindow); `params`: the UMAP parameters
     the embedding in `adata` was made with."""
     if "X_umap" not in adata.obsm:
         print("No UMAP embedding available; skipping the interactive UMAP viewer.")
         return
     win = UmapWindow(adata, abc_cache, imputed_state, adata_backed, rois, run_folder, ensure_imputed, title or "Interactive UMAP viewer", parent,
-                     host=host, params=params)
+                     host=host, params=params, own=own)
     win.run()

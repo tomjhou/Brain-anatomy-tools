@@ -6200,8 +6200,7 @@ def prompt_section_selection_gui(adata, abc_cache, section_series, out_folder=No
             if outcome[0] != 'confirmed':
                 raise RuntimeError("section picker window was closed without confirming a selection")
             _status, chosen, chosen_rois, n_sections = outcome
-            if not chosen and not chosen_rois and not confirm_whole_brain():
-                raise UserCancelledSelection("Whole-brain run not confirmed.")
+            # (Nothing picked means the whole brain: the options window that follows says so, instead of a question here.)
             if not chosen or len(chosen) == n_sections:
                 return None, 'allsections', chosen_rois, imputed_state['adata']
             tokens = '-'.join(sanitize_section_token(s) for s in chosen)
@@ -7120,9 +7119,6 @@ def prompt_section_selection_gui(adata, abc_cache, section_series, out_folder=No
 
     chosen = result['selected']
     chosen_rois = result['rois']
-
-    if not chosen and not chosen_rois and not confirm_whole_brain():
-        raise UserCancelledSelection("Whole-brain run not confirmed.")
 
     if not chosen:
         return None, 'allsections', chosen_rois, imputed_state['adata']
@@ -10081,10 +10077,14 @@ def count_selected_cells(adata, abc_cache, section_series, selected_sections, ro
         keep = pd.Series(sections).isin(selected_sections).to_numpy()
     else:
         keep = np.ones(len(sections), dtype=bool)
-    class_ids = pd.to_numeric(annotations['class'].astype(str).str.strip().str.extract(r'^(\d+)')[0], errors='coerce')
-    valid = class_ids.notna().to_numpy()
-    is_non_neuron = valid & class_ids.isin(NON_NEURON_CLASS_IDS).to_numpy()
-    return {'All': int(keep.sum()), 'Neurons': int((keep & valid & ~is_non_neuron).sum()), 'NonNeurons': int((keep & is_non_neuron).sum())}
+    # The class number is read from each distinct class name once (about 34 of them), and only for the cells in the selection: matching the
+    # pattern against every one of the 4 million cells took three seconds.
+    codes, names = pd.factorize(annotations['class'].to_numpy()[keep])
+    name_ids = pd.to_numeric(pd.Series(names).astype(str).str.strip().str.extract(r'^(\d+)')[0], errors='coerce').to_numpy(dtype=float)
+    class_ids = np.where(codes >= 0, name_ids[np.maximum(codes, 0)], np.nan) if len(name_ids) else np.full(len(codes), np.nan)
+    valid = ~np.isnan(class_ids)
+    is_non_neuron = valid & np.isin(class_ids, list(NON_NEURON_CLASS_IDS))
+    return {'All': int(keep.sum()), 'Neurons': int((valid & ~is_non_neuron).sum()), 'NonNeurons': int(is_non_neuron.sum())}
 
 
 def filter_by_rois(adata, abc_cache, rois, section_col=SECTION_COL):
@@ -10866,6 +10866,24 @@ def compute_de_genes(work_adata, group_mask, log1p_base=None):
         & ((out['fold_change'] > DE_FOLD_CHANGE_MIN_UP) | (out['fold_change'] < DE_FOLD_CHANGE_MAX_DOWN))
     ]
     return out.sort_values('fold_change', ascending=False).reset_index(drop=True)
+
+
+def show_own_dataset_window(own, abc_cache, project_folder=None):
+    """The Tk UMAP viewer on a dataset of the user's own (see abc_tk_own.py); returns when it is closed."""
+    from abc_tk_umap import show_umap_window_tk
+    host_names = (
+        'CACHE_DIR', 'UMAP_SAVE_DPI', 'SECTION_MAPS_SAVE_DPI', 'THREED_SHELL_POINTS', 'load_viewer_settings', 'save_viewer_settings',
+        'prompt_viewer_settings_dialog', 'umap_params_key', 'umap_params_label', 'umap_params_are_default', 'umap_params_token',
+        'normalize_umap_params', 'write_last_umap_params', 'ensure_umap_variant_csv', 'load_umap_variant', 'open_with_default_viewer',
+        'unique_export_paths', 'prompt_deg_comparison_mode', 'materialize_subset', 'compute_de_genes', 'mean_log2_expression',
+        'ensure_ccf_downloaded', 'load_ccf_for_cells', 'load_parcellation_names', 'run_with_loading_window', 'brain_outline_segments',
+        'open_3d_group_view', 'build_3d_edges', 'write_3d_group_html', 'category_rank_shape', 'visible_points_only', 'sc',
+        'read_nifti_volume', 'CCF_VOLUME_DIRECTORY', 'CCF_VOLUME_FILE_NAME')
+    host = {name: globals()[name] for name in host_names}
+    host['settings_dialog'] = prompt_viewer_settings_dialog
+    host['umap_circle_sizes'] = UMAP_CIRCLE_SIZE_REGISTRY
+    title = f"{project_folder.name} \u2014 {own.title}" if project_folder is not None else own.title
+    show_umap_window_tk(own.viewer_adata(), abc_cache, run_folder=project_folder, title=title, host=host, own=own)
 
 
 def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_backed=None, rois=None,
@@ -18344,6 +18362,44 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         subset_suffix = CELL_TYPE_SUFFIXES[cell_type_selection]
         print(f"Selected cell type subset: {cell_type_selection}")
 
+    if startup_action == 'own_dataset':
+        # A dataset of the user's own (an .h5ad of single-cell or single-nucleus RNA-seq): the UMAP viewer without the atlas (abc_tk_own.py).
+        from abc_tk_own import prepare_own_dataset
+        try:
+            prepared = prepare_own_dataset(Path(load_existing_folder), run_with_loading_window, CACHE_DIR, out_folder)
+        except Exception as e:
+            show_error_dialog("Could not open the dataset", f"{type(e).__name__}: {e}")
+            return
+        if prepared is not None:
+            own, project_folder = prepared
+            selection_confirmed_at = time.perf_counter()                 # (log_status counts the time from here)
+            log_status(f"Opening {own.path.name} in the UMAP viewer (project folder {project_folder})...")
+            try:
+                show_own_dataset_window(own, abc_cache, project_folder)
+            except Exception as e:
+                log_status(f"Could not open the UMAP viewer: {e}")
+            log_status("UMAP viewer closed.")
+        return
+
+    from abc_tk_own import read_project, reopen_own_project
+    if startup_action == 'load_existing' and read_project(load_existing_folder) is not None:
+        # The saved run is the project folder of a dataset of the user's own: it opens from the dataset it names, with no questions.
+        try:
+            prepared = reopen_own_project(load_existing_folder, run_with_loading_window, CACHE_DIR)
+        except Exception as e:
+            show_error_dialog("Could not open the dataset", f"{type(e).__name__}: {e}")
+            return
+        if prepared is not None:
+            own, project_folder = prepared
+            selection_confirmed_at = time.perf_counter()                 # (log_status counts the time from here)
+            log_status(f"Opening {own.path.name} in the UMAP viewer (project folder {project_folder})...")
+            try:
+                show_own_dataset_window(own, abc_cache, project_folder)
+            except Exception as e:
+                log_status(f"Could not open the UMAP viewer: {e}")
+            log_status("UMAP viewer closed.")
+        return
+
     if startup_action == 'load_existing':
         # Skips section/ROI selection and UMAP computation (Steps 1-8) entirely
         # — the chosen folder's own cached files (verified by prompt_startup_
@@ -18463,13 +18519,21 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
     # label, the optional plots), so that it can then run unattended. Without a window (no display), the questions come one by one at the
     # console as they always did (run_options stays None).
     run_options = None
-    selection_counts = None
-    try:
-        print("Counting the cells in the selection...")
-        selection_counts = count_selected_cells(adata, abc_cache, section_series, selected_sections, rois)
-        print(f"Cells in the selection: {selection_counts}")
-    except Exception as e:
-        print(f"Could not count the cells in the selection ({e}); the large-project question will be asked regardless.")
+    whole_brain = selected_sections is None and not rois           # (no sections and no ROIs picked: every section is used)
+    # The cells of the selection are counted on a thread while the options window is open (it shows "counting..." until they are known).
+    count_state = {'done': False, 'counts': None, 'error': None}
+
+    def count_in_background():
+        try:
+            count_state['counts'] = count_selected_cells(adata, abc_cache, section_series, selected_sections, rois)
+            print(f"Cells in the selection: {count_state['counts']}")
+        except Exception as e:
+            count_state['error'] = e
+            print(f"Could not count the cells in the selection ({e}); the large-project question will be asked regardless.")
+        finally:
+            count_state['done'] = True
+
+    threading.Thread(target=count_in_background, daemon=True).start()
     try:
         from abc_tk_launcher import choose_run_options
         def folder_for(cell_type, project_name, cap):
@@ -18478,17 +18542,21 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
             name = f'umap_{CELL_TYPE_SUFFIXES[cell_type]}_{sections_part}{region_part}'
             if sanitize_run_label(project_name):
                 name += f'_{sanitize_run_label(project_name)}'
-            n = selection_counts.get(cell_type) if selection_counts else None
+            counted = count_state['counts']
+            n = counted.get(cell_type) if counted else None
             if cap is not None and n is not None and n > cap:
                 name += f'_sub{cap}'
             return Path(out_folder) / name
 
-        run_options = choose_run_options(cell_type_selection or 'Neurons', counts=selection_counts, folder_for=folder_for)
+        run_options = choose_run_options(cell_type_selection or 'Neurons', folder_for=folder_for, whole_brain=whole_brain, count_state=count_state)
         if run_options is None:
             print("Analysis options cancelled; returning to the startup panel.")
             return
     except Exception as e:
         print(f"Analysis options window unavailable ({e}); the questions will be asked here instead.")
+        if whole_brain and not confirm_whole_brain():
+            print("Whole-brain run not confirmed; returning to the startup panel.")
+            return
         if cell_type_selection is None:
             cell_type_selection = prompt_cell_type_selection()
     if run_options is not None:

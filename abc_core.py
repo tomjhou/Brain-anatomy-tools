@@ -443,7 +443,15 @@ def load_section_spatial_coords(adata, abc_cache, progress_callback=None):
     (see FRAME_STATE): the original ones are kept in 'x_raw' / 'y_raw', and 'coord_src' says where each cell's position came from (0: its own
     reconstructed position, 1: estimated from its neighbours' in the same section, 2: the raw position, for a section Allen did not register)."""
     table = _load_raw_section_spatial_coords(adata, abc_cache, progress_callback)
-    if table is None or not reconstructed_in_use():
+    if table is None:
+        return table
+    try:
+        region = region_indices(adata, abc_cache)
+        if region is not None:
+            table['parcellation_index'] = region
+    except Exception as e:
+        print(f"Could not read the regions of the cells ({e}).")
+    if not reconstructed_in_use():
         return table
     try:
         x, y, src = reconstructed_positions(adata, abc_cache, table)
@@ -454,9 +462,90 @@ def load_section_spatial_coords(adata, abc_cache, progress_callback=None):
     return table
 
 
+REGION_CACHE_VERSION = 1
+REGION_NAME_FILE = 'parcellation_to_parcellation_term_membership_name'
+
+
+def region_indices(adata, abc_cache):
+    """The CCF region of each cell of adata, as Allen gives it (the 'parcellation_index' of the reconstructed coordinates table, or of the CCF
+    coordinates table if that is the one in the cache): a float array, NaN for a cell without one; None if neither table has been downloaded.
+    Kept per set of cells, so the next time is one small file."""
+    for file_name in (RECON_COORDS_FILE_NAME, CCF_COORDS_FILE_NAME):
+        local_path, _size, present = metadata_file_status(abc_cache, CCF_DIRECTORY, file_name)
+        if present is True:
+            break
+    else:
+        return None
+    key = f"{_file_stamp(local_path)}|v{REGION_CACHE_VERSION}|{_index_fingerprint(adata.obs.index)}"
+    path = CACHE_DIR / f"region_aligned_v{REGION_CACHE_VERSION}_{hashlib.md5(key.encode('utf-8')).hexdigest()[:16]}.npy"
+    try:
+        saved = np.load(path)
+        if len(saved) == len(adata.obs.index):
+            return saved
+    except Exception:
+        pass
+    table = pd.read_csv(local_path, index_col=0, dtype={'cell_label': str}, usecols=['cell_label', 'parcellation_index'])
+    values = table['parcellation_index'].reindex(adata.obs.index).to_numpy(np.float32)
+    try:
+        np.save(path, values)
+    except Exception:
+        pass
+    return values
+
+
+def load_region_names(abc_cache):
+    """{parcellation_index: (substructure acronym, substructure name, structure name, division name)}: what the regions are called. None if the
+    lookup tables cannot be read. The names table is a few tens of kilobytes, fetched if it is not in the cache yet."""
+    try:
+        acronym_path = abc_cache.get_metadata_path(directory=CCF_PARCELLATION_DIRECTORY, file_name=CCF_PARCELLATION_FILE_NAME)
+        acronyms = pd.read_csv(acronym_path).set_index('parcellation_index')
+        names = None
+        try:
+            names = pd.read_csv(abc_cache.get_metadata_path(directory=CCF_PARCELLATION_DIRECTORY, file_name=REGION_NAME_FILE)).set_index('parcellation_index')
+        except Exception:
+            pass
+        out = {}
+        for index, row in acronyms.iterrows():
+            full = names.loc[index] if names is not None and index in names.index else row
+            out[int(index)] = (str(row['substructure']), str(full['substructure']), str(full['structure']), str(full['division']))
+        return out
+    except Exception as e:
+        print(f"Could not read the names of the CCF regions ({e}).")
+        return None
+
+
 RECON_CACHE_VERSION = 1
 RECON_FIT_CELLS = 4000              # the thin-plate fit that places a cell Allen left out uses this many of its section's registered cells
 RECON_MIN_REGISTERED = 500          # a section with fewer registered cells is left in its raw coordinates
+
+
+RUN_OPENED_FILE = CACHE_DIR / 'run_opened.json'
+
+
+def _run_key(folder):
+    return os.path.normcase(os.path.abspath(str(folder)))
+
+
+def run_opened_times():
+    """{run folder: the time it was last opened (seconds since the epoch)}, from the small file kept in the cache folder. Empty if there is none."""
+    try:
+        with open(RUN_OPENED_FILE, 'r', encoding='utf-8') as f:
+            loaded = json.load(f)
+        return {k: float(v) for k, v in loaded.items()} if isinstance(loaded, dict) else {}
+    except Exception:
+        return {}
+
+
+def record_run_opened(folder):
+    """Notes that the saved run in `folder` is being opened now (the Load Existing list starts on the run opened last). Best effort."""
+    try:
+        times = run_opened_times()
+        times[_run_key(folder)] = time.time()
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(RUN_OPENED_FILE, 'w', encoding='utf-8') as f:
+            json.dump(times, f, indent=1)
+    except Exception as e:
+        print(f"Could not note that this run was opened ({e}).")
 
 
 def release_tk_variables(window):

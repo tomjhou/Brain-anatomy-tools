@@ -64,6 +64,7 @@ DEFAULT_LABEL_INDEX = 1
 OPACITIES = (0.15, 0.25, 0.35, 0.5, 0.75, 1.0)      # the Opacity slider's stops, low to high: how opaque one cell's dot is (overlapping dots add up)
 DEFAULT_OPACITY_INDEX = 5                          # (fully opaque: the dots on top hide the ones below)
 LABEL_ZOOM_CAP = 5.0               # the group numbers grow with the zoom up to this, then stay the same size
+LAYOUT_SETTLE_MS = 150             # dragging the divider (or the window's edge) changes the section pane's width many times a second: the panels are laid out and drawn again this long after it stops
 SHAPE_SETTLE_MS = 250              # while the view is being zoomed or panned the cells are drawn as plain discs; their shapes come back this long after it stops
 LABEL_WEIGHT_RANGE = (0.6, 2.0)    # the size factor of the smallest and the largest group's number, when sized by cell count
 LABEL_HIGHLIGHT_FACTOR = 2.0       # the number of the group being marked with '+' signs is drawn this much bigger, for as long as it is marked
@@ -1002,6 +1003,13 @@ class UmapWindow(ExportsMixin):
         ok = spatial is not None and "x" in spatial.columns and "y" in spatial.columns
         self.cx = pd.to_numeric(spatial["x"], errors="coerce").to_numpy() if ok else None
         self.cy = pd.to_numeric(spatial["y"], errors="coerce").to_numpy() if ok else None
+        self.region_of_run = spatial["parcellation_index"].to_numpy() if ok and "parcellation_index" in spatial.columns else None      # (Allen's CCF region of each cell)
+        self.region_names = None
+        if self.region_of_run is not None:
+            try:
+                self.region_names = core.load_region_names(self.abc_cache)
+            except Exception as e:
+                print(f"Could not read the names of the CCF regions: {e}", flush=True)
         self.sections = core.sorted_sections_descending(a.obs[sec_col].dropna().unique().tolist()) if ok else []
         self.info = {k: (a.obs[k].astype(str).to_numpy() if k in a.obs.columns else None) for k in self.level_names}
         if self.own is None and self.info.get("neurotransmitter") is None:           # (runs made before it was a column: read from the atlas's table, as the taxonomy was)
@@ -1025,6 +1033,7 @@ class UmapWindow(ExportsMixin):
                     where = {u: order[starts[i]:starts[i + 1]] for i, u in enumerate(uniques)}
                     self.bg = {"ids": adata_backed.obs_names, "sec_arr": bsec.to_numpy(), "z": (pd.to_numeric(bsp["z"], errors="coerce").to_numpy() if "z" in bsp.columns else None),
                                "x": pd.to_numeric(bsp["x"], errors="coerce").to_numpy(), "y": pd.to_numeric(bsp["y"], errors="coerce").to_numpy(),
+                               "region": bsp["parcellation_index"].to_numpy() if "parcellation_index" in bsp.columns else None,
                                "where": where, "levels": LazyLevels(bsp, self.level_names)}
             except Exception as e:
                 print(f"Could not load the all-cell background for the section panels: {e}", flush=True)
@@ -1116,7 +1125,8 @@ class UmapWindow(ExportsMixin):
         self.tile_scroll.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         # (Each section panel is its own item in the scrolled canvas, not a part of one big frame: a Tk window cannot be taller than about 32,000
         # pixels, so with 60 panels as tall as the pane is wide one frame holding them all showed only the first 30 or so, the last cut off.)
-        self.tile_scroll.bind("<Configure>", lambda e: self.layout_tiles())
+        self.layout_job, self.layout_seen = None, False
+        self.tile_scroll.bind("<Configure>", lambda e: self.layout_tiles_when_settled())
         self.tile_scroll.bind("<MouseWheel>", lambda e: self.tile_scroll.yview_scroll(-1 if e.delta > 0 else 1, "units"))
         if self.own is None:                                        # (a dataset of the user's own has no sections)
             pw.add(left, weight=2)
@@ -1183,6 +1193,7 @@ class UmapWindow(ExportsMixin):
         opacity_row.columnconfigure(0, weight=0)
         self.level_frame = ttk.LabelFrame(f, text="Level", padding=6)
         self.level_frame.pack(fill=tk.X, pady=(8, 0))
+        HoverTip(self.level_frame, self.level_tip)
         self.var_level = tk.StringVar(f, self.level)
         self.build_level_radios()
         self.box = ttk.Frame(f)
@@ -1239,6 +1250,9 @@ class UmapWindow(ExportsMixin):
                                         "most of it is for the low values. Double-click to reset.")
         # the legend for Single group(s)
         self.legend = tk.Canvas(f, width=300, height=10, highlightthickness=0)
+        self.select_bar = ttk.Frame(f)                      # All / None, above the group list and the Single group(s) legend
+        ttk.Button(self.select_bar, text="All", width=6, style="Side.TButton", command=self.select_all_groups).pack(side=tk.LEFT)
+        ttk.Button(self.select_bar, text="None", width=6, style="Side.TButton", command=self.select_no_groups).pack(side=tk.LEFT, padx=(6, 0))
         self.group_list = ttk.Frame(f)                      # the groups' numbers and colors (All groups), scrollable
         self.group_header = tk.Canvas(self.group_list, height=20, highlightthickness=0, cursor="hand2")      # the column headings: click to sort
         self.group_header.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
@@ -1269,7 +1283,7 @@ class UmapWindow(ExportsMixin):
         self.cell_grid.columnconfigure(2, weight=1)
         self.cell_grid.bind("<Configure>", lambda e: self.fit_cell_names())
         self.cell_cells = []
-        for r in range(12):
+        for r in range(20):                          # (the section, the region (up to 3 lines), the levels, the + note, the z, and up to 6 genes)
             a = ttk.Label(self.cell_grid, foreground="gray35", font=("Segoe UI", 9, "bold"))
             b = ttk.Label(self.cell_grid, width=6, anchor="e", font=("Segoe UI", 10, "bold"))
             c = ttk.Label(self.cell_grid, wraplength=190, justify=tk.LEFT)
@@ -1286,7 +1300,15 @@ class UmapWindow(ExportsMixin):
         for w in self.level_frame.winfo_children():
             w.destroy()
         for k, name in enumerate(self.levels):
-            ttk.Radiobutton(self.level_frame, text=self.level_names[name], value=name, variable=self.var_level, command=self.on_level).grid(row=k // 2, column=k % 2, sticky="w", padx=(0, 14))
+            rb = ttk.Radiobutton(self.level_frame, text=self.level_names[name], value=name, variable=self.var_level, command=self.on_level)
+            rb.grid(row=k // 2, column=k % 2, sticky="w", padx=(0, 14))
+            HoverTip(rb, self.level_tip)
+
+    def level_tip(self):
+        if self.mode in ("gene", "imputed"):
+            return ("The group that is marked with red + signs when the pointer rests on a cell: every cell of that cell's group at this level.\n"
+                    "It does not change how the cells are colored in this mode.")
+        return "The level the cells are colored by, and the group that is marked with red + signs when the pointer rests on a cell."
 
     def build_buttons(self, f):
         ttk.Style(self.root).configure("Side.TButton", font=("Segoe UI", 9))
@@ -1317,7 +1339,8 @@ class UmapWindow(ExportsMixin):
             b.state(["!disabled"] if self.mode == "single" and self.own is None else ["disabled"])
 
     def update_frames(self):
-        for w in (self.id_frame, self.gene_frame, self.legend, self.group_list):
+        self.level_frame.config(text="Level" if self.mode in ("all", "single") else "Level (group marked with + on hover)")
+        for w in (self.id_frame, self.gene_frame, self.select_bar, self.legend, self.group_list):
             w.pack_forget()
         if self.mode == "single":
             self.id_frame.pack(fill=tk.X)
@@ -1505,6 +1528,21 @@ class UmapWindow(ExportsMixin):
         for scale, default in zip(self.sliders, (DEFAULT_TILE_INDEX, DEFAULT_DOT_INDEX, DEFAULT_MARKER_INDEX)):
             scale.set(default)
 
+    def layout_tiles_when_settled(self):
+        """The section pane changed size (the divider or the window is being dragged): lay the panels out once it has stopped changing, not at
+        every step, which redrew all of them each time."""
+        if not self.layout_seen:                                    # (the first time, when the window opens, at once)
+            self.layout_seen = True
+            self.layout_tiles()
+            return
+        if self.layout_job is not None:
+            self.root.after_cancel(self.layout_job)
+        self.layout_job = self.root.after(LAYOUT_SETTLE_MS, self.layout_after_settling)
+
+    def layout_after_settling(self):
+        self.layout_job = None
+        self.layout_tiles()
+
     def layout_tiles(self):
         """The panels are a third, a half or all of the pane's width (the Section map size buttons), as many to a row as that gives; the
         pane scrolls to the rest."""
@@ -1621,6 +1659,7 @@ class UmapWindow(ExportsMixin):
             self.last_group_click = None
             self.off_groups = set()                      # (a new level, mode or list of groups starts with every group colored)
         self.var_status.set("")
+        self.select_bar.pack_forget()
         self.legend.pack_forget()
         self.group_list.pack_forget()
         if self.mode == "all":
@@ -1629,6 +1668,7 @@ class UmapWindow(ExportsMixin):
             self.color_single()
         else:
             self.color_gene()
+        self.sync_select_bar()
 
     def dot_scale(self):
         return self.host.get("umap_circle_sizes", {}).get(self.viewer_settings.get("umap_circle_size", "Default"), 1.0)
@@ -1869,6 +1909,7 @@ class UmapWindow(ExportsMixin):
         c.configure(scrollregion=(0, 0, max(300, width), 8 + 22 * len(rows)))
         self.draw_group_header()
         self.group_list.pack(fill=tk.BOTH, expand=True, pady=(6, 0), after=self.box)
+        self.sync_select_bar()                              # (packed again, the list is above the buttons: they go back above it)
 
     def draw_group_header(self):
         """The headings of the group list's columns, over the columns, each with an arrow: dark on the column it is sorted by (pointing the way it
@@ -1983,6 +2024,7 @@ class UmapWindow(ExportsMixin):
         if len(ids) < 2:
             return
         self.legend.pack(fill=tk.X, pady=(6, 0), after=self.box)
+        self.sync_select_bar()
         self.legend.delete("all")
         self.legend.config(height=22 * len(ids) + 8)
         rows = [("#%02x%02x%02x" % tuple(int(v) for v in colors[t]), str(t), f"({counts[t]})",
@@ -2415,6 +2457,38 @@ class UmapWindow(ExportsMixin):
             self.last_group_click = (key, key in self.off_groups)
         self.recolor(keep_off=True)
 
+    def sync_select_bar(self):
+        """All / None, right under the box, so above the group list or the legend. Only where a click on the entries switches them (All groups and
+        Single group(s); with a gene the list is only what the cells were colored by before)."""
+        self.select_bar.pack_forget()
+        if self.mode in ("all", "single") and (self.group_list.winfo_manager() or self.legend.winfo_manager()):
+            self.select_bar.pack(fill=tk.X, pady=(6, 0), after=self.box)
+
+    def legend_keys(self):
+        """The entries of the legend on the screen, as toggle_group knows them: the group list's (All), or the numbers of Single group(s)."""
+        if self.mode == "all":
+            return list(getattr(self, "group_rows", []))
+        if self.mode == "single":
+            return list((self.last_ids or {}).get("targets", []))
+        return []
+
+    def select_all_groups(self):
+        """The All button: every entry of the legend is shown in its color."""
+        if self.busy or not self.legend_keys():
+            return
+        self.last_group_click = None
+        self.off_groups = set()
+        self.recolor(keep_off=True)
+
+    def select_no_groups(self):
+        """The None button: every entry of the legend is switched off (gray)."""
+        keys = self.legend_keys()
+        if self.busy or not keys:
+            return
+        self.last_group_click = None
+        self.off_groups = set(keys)
+        self.recolor(keep_off=True)
+
     def on_group_list_click(self, e):
         rows = getattr(self, "group_rows", [])
         i = int((self.group_canvas.canvasy(e.y) - 4) // 22)
@@ -2594,6 +2668,9 @@ class UmapWindow(ExportsMixin):
         sec = info["sec"]
         if sec is not None:
             lines.append(f"Section {core.sanitize_section_token(sec)}")
+        region = self.region_of(info)
+        if region is not None:
+            lines.append(f"Region: {region[0]} {region[1]}" if region[0] != "unassigned" else "Region: unassigned (outside the CCF atlas)")
         i = info["umap_idx"]
         for k in self.level_names:
             if i is not None:
@@ -2613,12 +2690,38 @@ class UmapWindow(ExportsMixin):
             lines.append("(not in the UMAP)")
         return "\n".join(lines)
 
+    def region_of(self, info):
+        """(acronym, name, structure, division) of the CCF region Allen gives the hovered cell (the registration's own answer, whatever the outlines
+        drawn show), or None if there is no table of regions or the cell has none."""
+        if self.region_names is None:
+            return None
+        i = info["umap_idx"]
+        if i is not None:
+            value = self.region_of_run[i] if self.region_of_run is not None else np.nan
+        else:
+            arr = self.bg.get("region") if self.bg else None
+            value = arr[info["bg_idx"]] if arr is not None else np.nan
+        if value is None or not np.isfinite(value):
+            return None
+        return self.region_names.get(int(value))
+
     def cell_rows(self, info):
         """The hovered cell as table rows: (what, number, name). A group's label '268 CS-PRNr-DR ...' is split into its number and its name."""
         rows = []
         sec = info["sec"]
         if sec is not None:
             rows.append(("Section", core.sanitize_section_token(sec), ""))
+        region = self.region_of(info)
+        if region is not None:
+            acronym, name, structure, division = region
+            if acronym == "unassigned":
+                rows.append(("Region", "", "unassigned (outside the CCF atlas)"))
+            else:
+                rows.append(("Region", acronym, name))
+                if structure and structure not in (name, "unassigned"):
+                    rows.append(("", "", f"in {structure}"))
+                if division and division not in (structure, name, "unassigned"):
+                    rows.append(("Division", "", division))
         i = info["umap_idx"]
         for k in self.level_names:
             if i is not None:
@@ -2630,6 +2733,9 @@ class UmapWindow(ExportsMixin):
                 continue
             m = re.match(r"^\s*(\d+)\s*(.*)$", str(v))
             rows.append((self.level_names[k], m.group(1) if m else "", m.group(2) if m else str(v)))
+        note = getattr(self, "group_note", None)
+        if note is not None and note[0] == info["key"]:
+            rows.append(("Red +", "", note[1]))
         z = core.section_z_text(sec, self.abc_cache, wait=False) if sec is not None else ""
         if z:
             rows.append(("", "", z))
@@ -2775,6 +2881,7 @@ class UmapWindow(ExportsMixin):
             t["pc"].set_dim(on)
 
     def clear_highlights(self, keep_dim=False):
+        self.group_note = None
         if not keep_dim:
             self.set_dim(False)
         self.umap.set_pluses(None)
@@ -2798,7 +2905,9 @@ class UmapWindow(ExportsMixin):
             label = arr[info["bg_idx"]]
         if label is None or str(label) == "nan":
             return
-        self.mark_group(label, skip=i)
+        if self.mark_group(label, skip=i):
+            self.group_note = (info["key"], f"every cell of this {self.level_names[self.level].lower()} (the Level box changes which)")
+            self.show_cell_rows(self.cell_rows(info))
 
     def mark_group(self, label, skip=None):
         """Red '+' signs on every cell of the group `label` (at the Group level), in the UMAP and in every section. `skip`: a UMAP cell that
@@ -2806,7 +2915,7 @@ class UmapWindow(ExportsMixin):
         level = self.level
         run_mask = self.info[level] == label
         if not run_mask.any():
-            return                                   # (a group none of the run's cells is in: nothing in the UMAP to relate to)
+            return False                             # (a group none of the run's cells is in: nothing in the UMAP to relate to)
         if skip is not None:
             run_mask[skip] = False                   # (the hovered cell keeps its own ring)
         self.umap.set_pluses((self.coords[run_mask, 0], self.coords[run_mask, 1]))
@@ -2826,6 +2935,7 @@ class UmapWindow(ExportsMixin):
                 m = self.info[level][idx] == label
                 xy = (self.cx[idx][m], self.cy[idx][m])
             t["pc"].set_pluses(xy if len(xy[0]) else None)
+        return True
 
     def umap_motion(self, px, py):
         if px is None or not self.viewer_settings.get("hover_enabled", True):
@@ -2971,6 +3081,11 @@ class UmapWindow(ExportsMixin):
             try:
                 self.root.quit()
             except tk.TclError:
+                pass
+        if self.layout_job is not None:
+            try:
+                self.root.after_cancel(self.layout_job)
+            except Exception:
                 pass
         core.release_tk_variables(self)
         self.root.destroy()

@@ -409,6 +409,7 @@ from abc_core import (
     CACHE_DIR, CCF_COORDS_FILE_NAME, CCF_DIRECTORY, CCF_FILES, CCF_PARCELLATION_DIRECTORY, CCF_PARCELLATION_FILE_NAME,
     COORD_SETTINGS, DATASET_NAME, DEFAULT_BREGMA_CCF_AP_MM, DEFAULT_GREY_RGBA, FRAME_STATE, GRID_CACHE_DPI, RECON_FILES,
     coordinate_frame_name, dataset_prefix, grid_cache_layout, grid_cache_png, reconstructed_in_use,
+    record_run_opened as core_record_run_opened,
     IMPUTED_DATASET_DIRECTORY, IMPUTED_DATASET_FILE_NAME, MULTI_GENE_BRIGHT_BLUE, NON_NEURON_CLASS_IDS, SCRIPT_DIR, SECTION_COL,
     SECTION_COORDS_CACHE_VERSION, SETTINGS_FILE, SPATIAL_CSV_CACHE_VERSION, SPATIAL_CSV_CHUNK_SIZE, ZOOM_DEBUG_DIAGNOSTICS,
     Z_MODE_OPTIONS, _expr_column_cache, _get_full_gene_column, _read_section_coordinates, _spatial_csv_cache_path,
@@ -18442,6 +18443,8 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         return
 
     from abc_tk_own import read_project, reopen_own_project
+    if startup_action == 'load_existing':
+        core_record_run_opened(load_existing_folder)                 # (the Load Existing list starts on the run opened last)
     if startup_action == 'load_existing' and read_project(load_existing_folder) is not None:
         # The saved run is the project folder of a dataset of the user's own: it opens from the dataset it names, with no questions.
         try:
@@ -18821,6 +18824,7 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
     roi_section_set = {roi['section'] for roi in rois}
     whole_only_sections = [s for s in (whole_sections_selected or []) if s not in roi_section_set] if rois else []
 
+    core_record_run_opened(run_folder)
     roi_csv_path = run_folder / 'roi_coords.csv'
     if rois:
         write_run_frame(run_folder)

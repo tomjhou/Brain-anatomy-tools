@@ -27,11 +27,14 @@ LABEL_DARKEN = 0.6               # the group numbers beside the dots: the circle
 LABEL_FONT_SIZE = 8              # the group numbers beside the dots: the same for every group
 DENSITY_BINS = 160               # the grid the density shading counts the cells on
 HOVER_PX = 9                     # a per-cell plot: how close (pixels) the pointer must be to a cell
+DEFAULT_OTHER_GROUPS = 5         # the slider starts on this many of the other groups (while it has not been moved)
 MIN_GROUP_CELLS = 20             # Selectivity ignores groups with fewer cells (their means are too noisy to be the highest of the others)
 SELECTIVITY_FLOOR = 0.01         # added to a gene's mean in the group and in the other groups before the ratio, so that "none anywhere else" is finite
 IMPUTED_BLOCK_GENES = 20         # the imputed file is read this many genes at a time
 MARK_COLOR = "#d62728"           # the genes typed in the Selectivity tab
-LABELED_GENES = 10               # a Selectivity plot names this many genes: the highest x * y
+LABEL_RATIO = 5.0                # a Selectivity plot names every gene whose ratio (y) is above this
+EXPRESSION_DOT_AREA = {False: 4.0, True: 1.5}      # the dots of a per-cell plot (marker area, points squared), for panel genes and for imputed ones
+SELECTIVITY_DOT_AREA = {False: 16.0, True: 5.0}    # ... and of a Selectivity plot (500 panel genes, but 8,000 imputed ones)
 MAX_LEGEND_GROUPS = 15           # a per-cell plot has a legend up to this many groups
 POINT_ALPHA = 0.5
 
@@ -87,6 +90,37 @@ def jittered(values, imputed, scale, rng):
     return low + (high - low) * rng.random(len(values))
 
 
+def clamp_limits(lim, home, scale):
+    """`lim` (low, high) held inside `home`: no wider than it, and moved back in if it has gone out. None if it already is. On a log axis the
+    comparison is of the logarithms."""
+    flip = lim[0] > lim[1]
+    a, b = (lim[1], lim[0]) if flip else (lim[0], lim[1])
+    ha, hb = (home[1], home[0]) if home[0] > home[1] else (home[0], home[1])
+    if scale == "log":
+        if min(a, ha) <= 0:
+            return None
+        a, b, ha, hb = np.log10(a), np.log10(b), np.log10(ha), np.log10(hb)
+    tolerance = 1e-9 * max(hb - ha, 1e-12)
+    span = min(b - a, hb - ha)
+    na = min(max(a, ha), hb - span)
+    nb = na + span
+    if abs(na - a) <= tolerance and abs(nb - b) <= tolerance:
+        return None
+    if scale == "log":
+        na, nb = 10 ** na, 10 ** nb
+    return (nb, na) if flip else (na, nb)
+
+
+def both_scales(value, scale):
+    """A plotted value in both units, as text: 'linear 3, log2(1 + x) 2'. `scale` is the one it is plotted in ('log' values are log2(1 + x))."""
+    if scale == "log":
+        log, linear = float(value), float(np.exp2(value) - 1.0)
+    else:
+        linear, log = float(value), float(np.log2(1.0 + value))
+    text = f"{round(linear):d}" if abs(linear - round(linear)) < 1e-6 and abs(linear) < 1e6 else f"{linear:.3g}"
+    return f"linear {text}, log2(1 + x) {log:.3g}"
+
+
 def local_density(x, y, bins=DENSITY_BINS):
     """For each point, how many points share its cell of a bins x bins grid over the points."""
     h, xe, ye = np.histogram2d(x, y, bins=bins)
@@ -112,6 +146,20 @@ def other_groups_used(slider, n_others):
     else:
         k = half + ((slider - 50.0) / 50.0) * (n_others - half)
     return int(min(max(int(round(k)), 1), n_others))
+
+
+def slider_for_groups(k, n_others):
+    """The slider position (0 to 100) at which other_groups_used gives `k` (or the most there are) of `n_others` groups."""
+    k = min(max(int(k), 1), max(n_others, 1))
+    half = max(int(round(n_others / 2)), 1)
+    if k <= half:
+        position = 0.0 if half <= 1 else (k - 1) / (half - 1) * 50.0
+    else:
+        position = 50.0 + (k - half) / max(n_others - half, 1) * 50.0
+    for nudge in (0.0, 0.01, -0.01, 0.1, -0.1, 0.5, -0.5):                     # (rounding: the nearest position that really gives k)
+        if other_groups_used(position + nudge, n_others) == k:
+            return min(max(position + nudge, 0.0), 100.0)
+    return min(max(position, 0.0), 100.0)
 
 
 def other_group_sizes(counts, target, min_cells=MIN_GROUP_CELLS):
@@ -242,47 +290,64 @@ class AnalyzeWindow:
         box = ttk.LabelFrame(side, text="Plot", padding=6)
         box.pack(fill=tk.X, pady=(6, 0))
         self.var_per = tk.StringVar(top, "cell")
-        ttk.Radiobutton(box, text="Per cell", value="cell", variable=self.var_per).pack(anchor="w")
-        ttk.Radiobutton(box, text="Per group", value="group", variable=self.var_per).pack(anchor="w")
+        ttk.Radiobutton(box, text="Per cell", value="cell", variable=self.var_per, command=self.per_changed).pack(anchor="w")
+        ttk.Radiobutton(box, text="Per group", value="group", variable=self.var_per, command=self.per_changed).pack(anchor="w")
         self.var_jitter = tk.BooleanVar(top, True)
         self.var_density = tk.BooleanVar(top, False)
-        ttk.Checkbutton(box, text="Jitter counts (cells with the same count are spread out)", variable=self.var_jitter,
-                        command=self.redraw).pack(anchor="w", pady=(6, 0))
-        ttk.Checkbutton(box, text="Shade per-cell dots by density", variable=self.var_density, command=self.redraw).pack(anchor="w")
 
-        self.var_source = tk.StringVar(top, "imputed" if viewer.mode == "imputed" else "panel")
-        self.source_shown = self.var_source.get()
-        if viewer.own is None:                                            # (a dataset of the user's own has no imputed genes to choose)
-            box = ttk.LabelFrame(side, text="Genes from", padding=6)
-            box.pack(fill=tk.X, pady=(6, 0))
-            for value, text in (("panel", "Panel gene"), ("imputed", "Imputed gene")):
-                ttk.Radiobutton(box, text=text, value=value, variable=self.var_source, command=self.source_changed).pack(anchor="w")
+        # where each tab's genes come from: Expression starts as the viewer's colouring is, Selectivity on the imputed genes (a dataset of the user's own
+        # has none)
+        can_impute = viewer.own is None
+        self.var_source = {"expression": tk.StringVar(top, "imputed" if can_impute and viewer.mode == "imputed" else "panel"),
+                           "selectivity": tk.StringVar(top, "imputed" if can_impute else "panel")}
+        self.source_shown = {tab: var.get() for tab, var in self.var_source.items()}
+
+        self.var_scale = tk.StringVar(top, viewer.var_scale.get())         # (the viewer's choice to begin with; changing it here leaves the viewer's alone)
 
         # the two analyses, a tab each (the tab control is as tall as the taller of them, so nothing below it moves)
-        self.tabs = ttk.Notebook(side)
-        self.tabs.pack(fill=tk.X, pady=(8, 0))
+        outline = tk.Frame(side, highlightthickness=1, highlightbackground="#7f7f7f", highlightcolor="#7f7f7f", bd=0)      # (a line round the tab control, to see where it is)
+        outline.pack(fill=tk.X, pady=(8, 0))
+        self.tabs = ttk.Notebook(outline)
+        self.tabs.pack(fill=tk.X, padx=1, pady=1)
         page = ttk.Frame(self.tabs, padding=6)
         self.tabs.add(page, text="Expression")
+        self.source_radios(page, "expression")
         ttk.Label(page, text="Genes, separated by commas: the first is plotted along x, the second up y.", foreground="gray30", wraplength=250).pack(anchor="w")
         self.var_genes = tk.StringVar(top, viewer.var_gene.get())
         self.genes_entry = ttk.Entry(page, textvariable=self.var_genes)
         self.genes_entry.pack(fill=tk.X, pady=(2, 0))
+        self.var_genes_hint = tk.StringVar(top, "")
+        self.genes_hint = ttk.Label(page, textvariable=self.var_genes_hint, foreground="#b3261e", wraplength=250, justify=tk.LEFT)     # (under the box, where it is seen; the status is at the foot of the window)
         self.var_cells_of = tk.StringVar(top, "")
-        ttk.Label(page, textvariable=self.var_cells_of, foreground="gray30", wraplength=250, justify=tk.LEFT).pack(anchor="w", pady=(8, 0))
+        self.cells_of_label = ttk.Label(page, textvariable=self.var_cells_of, foreground="gray30", wraplength=250, justify=tk.LEFT)
+        self.cells_of_label.pack(anchor="w", pady=(8, 0))
+        # (the scale, and the two boxes about the dots of the Expression plot: Selectivity has no use for them)
+        scale_row = ttk.Frame(page)
+        scale_row.pack(anchor="w", pady=(10, 0))
+        ttk.Label(scale_row, text="Scale:", foreground="gray30").pack(side=tk.LEFT, padx=(0, 8))
+        for value, text in (("linear", "Linear"), ("log", "Log")):
+            ttk.Radiobutton(scale_row, text=text, value=value, variable=self.var_scale, command=self.scale_changed).pack(side=tk.LEFT, padx=(0, 12))
+        self.chk_jitter = ttk.Checkbutton(page, text="Jitter counts", variable=self.var_jitter, command=self.redraw)
+        self.chk_jitter.pack(anchor="w", pady=(6, 0))
+        from abc_tk_umap import HoverTip                  # (the viewer's own tip; imported here, as that module imports this one)
+        HoverTip(self.chk_jitter, lambda: "Cells with the same count would sit on top of each other: each is spread over the stretch of the axis its count stands for.")
+        self.chk_density = ttk.Checkbutton(page, text="Shade per-cell dots by density", variable=self.var_density, command=self.redraw)
+        self.chk_density.pack(anchor="w")
 
         page = ttk.Frame(self.tabs, padding=6)
         self.tabs.add(page, text="Selectivity")
-        ttk.Label(page, text="Group number or name, or several separated by commas (Selectivity uses the first; Expression plots the cells of all of "
-                  "them, or of every group when empty).", foreground="gray30", wraplength=250).pack(anchor="w")
+        self.source_radios(page, "selectivity")
+        ttk.Label(page, text="Group number or name (only the first is used):", foreground="gray30", wraplength=250).pack(anchor="w")
         self.var_groups = tk.StringVar(top, viewer.var_ids.get())
         self.groups_entry = ttk.Entry(page, textvariable=self.var_groups)
         self.groups_entry.pack(fill=tk.X, pady=(2, 0))
-        ttk.Label(page, text="Genes to mark in red, separated by commas:", foreground="gray30").pack(anchor="w", pady=(8, 0))
+        ttk.Label(page, text="Genes to mark in red, separated by commas:", foreground="gray30", wraplength=250, justify=tk.LEFT).pack(anchor="w", pady=(8, 0))
         self.var_sel_genes = tk.StringVar(top, viewer.var_gene.get())
         self.sel_genes_entry = ttk.Entry(page, textvariable=self.var_sel_genes)
         self.sel_genes_entry.pack(fill=tk.X, pady=(2, 0))
-        ttk.Label(page, text="Compared with the largest other groups:", foreground="gray30").pack(anchor="w", pady=(8, 0))
+        ttk.Label(page, text="Compared with the largest other groups:", foreground="gray30", wraplength=250, justify=tk.LEFT).pack(anchor="w", pady=(8, 0))
         self.var_slider = tk.DoubleVar(top, 50.0)
+        self.slider_touched = False             # (until it is moved, the slider keeps to DEFAULT_OTHER_GROUPS whatever the group type and group)
         slider = ttk.Scale(page, from_=0, to=100, variable=self.var_slider, orient=tk.HORIZONTAL, command=lambda v: self.slider_moved())
         slider.pack(fill=tk.X)
         self.var_others = tk.StringVar(top, "")
@@ -319,38 +384,81 @@ class AnalyzeWindow:
         self.canvas.mpl_connect("motion_notify_event", self.on_motion)
         self.canvas.mpl_connect("figure_leave_event", lambda ev: self.hide_hover())
         self.canvas.mpl_connect("scroll_event", self.on_scroll)
-        self.canvas.mpl_connect("button_press_event", lambda ev: self.reset_view() if ev.dblclick and ev.inaxes is self.ax else None)
+        self.canvas.mpl_connect("button_press_event", self.on_press)
+        self.canvas.mpl_connect("button_release_event", self.on_release)
+        self.pan_start = None                   # while the plot is being dragged: the pointer and the limits where it began
         self.home_view = None                   # the limits of the plot as first drawn (a double-click goes back to them)
+        self.clamping = False
         bar = ttk.Frame(right)
         bar.pack(side=tk.BOTTOM, fill=tk.X)
-        NavigationToolbar2Tk(self.canvas, bar).update()
+        self.toolbar = NavigationToolbar2Tk(self.canvas, bar)
+        self.toolbar.update()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.update_labels()
         self.canvas.draw()
 
     # ---- the boxes and the choices above the tabs
 
-    def imputed(self):
-        return self.var_source.get() == "imputed"
+    def source_radios(self, page, tab):
+        """Panel gene / Imputed gene, at the top of a tab's page (not for a dataset of the user's own: it has no imputed genes)."""
+        if self.v.own is not None:
+            return
+        ttk.Label(page, text="Genes from:", foreground="gray30").pack(anchor="w")          # (above the two, which would not fit beside it)
+        row = ttk.Frame(page)
+        row.pack(anchor="w", pady=(0, 6))
+        for value, text in (("panel", "Panel gene"), ("imputed", "Imputed gene")):
+            ttk.Radiobutton(row, text=text, value=value, variable=self.var_source[tab], command=lambda t=tab: self.source_changed(t)).pack(side=tk.LEFT, padx=(0, 10))
 
-    def source_changed(self):
-        """Panel gene / Imputed gene: the imputed dataset is loaded first if it is not (as when the viewer's own Imputed Gene is chosen)."""
+    def imputed(self, tab):
+        return self.var_source[tab].get() == "imputed"
+
+    def ensure_source(self, tab):
+        """True once the tab's genes can be read: for imputed genes the imputed dataset is loaded first, if it is not (as when the viewer's own
+        Imputed Gene is chosen). If that is declined or fails the tab goes back to the genes it had."""
         v = self.v
-        if self.imputed() and v.imputed_state["adata"] is None:
+        if self.imputed(tab) and v.imputed_state["adata"] is None:
             ok = bool(v.ensure_imputed(v.imputed_state, v.abc_cache)) if v.ensure_imputed else False
             if not ok:
-                self.var_source.set(self.source_shown)
-                return
-        self.source_shown = self.var_source.get()
-        self.sel = None
+                self.var_source[tab].set(self.source_shown[tab] if self.source_shown[tab] != "imputed" else "panel")
+                return False
+        self.source_shown[tab] = self.var_source[tab].get()
+        return True
+
+    def source_changed(self, tab):
+        """Panel gene / Imputed gene was clicked on a tab."""
+        if not self.ensure_source(tab):
+            return
+        if tab == "selectivity":
+            self.sel = None
         self.var_status.set("")
+
+    def per_changed(self):
+        """Per cell / Per group: the two boxes are about the dots of single cells, so they are greyed out for a plot of groups."""
+        state = "normal" if self.var_per.get() == "cell" else "disabled"
+        self.chk_jitter.configure(state=state)
+        self.chk_density.configure(state=state)
 
     def level_changed(self):
         self.sel = None                         # (the means are kept for every group type: the next Analyze plots the new one from them)
         self.update_labels()
 
+    def show_genes_hint(self, text):
+        """The note under the genes box (nothing hides it)."""
+        self.var_genes_hint.set(text)
+        if text:
+            self.genes_hint.pack(anchor="w", pady=(4, 0), before=self.cells_of_label)
+        else:
+            self.genes_hint.pack_forget()
+
+    def scale_changed(self):
+        """Log / Linear: the plot on the screen is read and drawn again on the new scale."""
+        if self.last_plot is not None:
+            self.expression()
+
     def update_labels(self):
         """The small texts that follow the boxes: which groups the Expression tab plots, and how many other groups the slider compares with."""
+        n_genes = len(core.parse_gene_names(self.var_genes.get()))
+        self.show_genes_hint("Two genes are needed: add a second after a comma." if n_genes == 1 else "")
         entries = split_entries(self.var_groups.get())
         self.var_cells_of.set("Cells of the groups on the Selectivity tab: " + (", ".join(entries) if entries else "every group") + ".")
         try:
@@ -361,11 +469,14 @@ class AnalyzeWindow:
         chosen = match_groups(entries[:1], uniques)[0] if entries else []
         sizes = other_group_sizes(counts, chosen[0] if chosen else None)
         n_others = max(len(sizes), 1)
+        if not self.slider_touched:
+            self.var_slider.set(slider_for_groups(DEFAULT_OTHER_GROUPS, n_others))
         k = other_groups_used(self.var_slider.get(), n_others)
         smallest = sizes[k - 1] if sizes else 0
         self.var_others.set(f"Largest {k} of {n_others} other groups used, each with at least {smallest:,} cells (groups under {MIN_GROUP_CELLS} cells are ignored).")
 
     def slider_moved(self):
+        self.slider_touched = True
         self.update_labels()
         if self.sel is not None and self.slider_job is None:
             self.slider_job = self.top.after(60, self.slider_redraw)
@@ -413,9 +524,12 @@ class AnalyzeWindow:
         names = core.parse_gene_names(self.var_genes.get())
         if len(names) < 2:
             self.genes_entry.configure(foreground="red")
+            self.show_genes_hint("Two genes are needed: enter them separated by a comma.")
             self.var_status.set("Enter two genes on the Expression tab, separated by a comma.")
             return None
-        imputed = self.imputed()
+        if not self.ensure_source("expression"):
+            self.var_status.set("The imputed genes are not available: Panel gene is used.")
+        imputed = self.imputed("expression")
         if not imputed and not v.has_counts:
             self.var_status.set("No raw counts on this dataset (layers['counts'] missing).")
             return None
@@ -442,7 +556,7 @@ class AnalyzeWindow:
         if genes is None:
             return
         codes, chosen, uniques, typed = picked
-        imputed, scale, per = self.imputed(), v.var_scale.get(), self.var_per.get()
+        imputed, scale, per = self.imputed("expression"), self.var_scale.get(), self.var_per.get()
         use = genes[:2]
         extra = f" (only the first two of {len(genes)} are plotted)" if len(genes) > 2 else ""
 
@@ -479,6 +593,7 @@ class AnalyzeWindow:
             self.cax = None
         ax.clear()
         ax.set_axis_on()
+        self.home_view = None                               # (the new plot's own limits are not held to the old plot's)
         self.hover = None
         self.hover_group = None
         label_of = {g: (re.match(r"^\s*(\d+)", str(uniques[g])).group(1) if re.match(r"^\s*(\d+)", str(uniques[g])) else str(uniques[g])) for g in chosen}
@@ -499,14 +614,15 @@ class AnalyzeWindow:
                 from matplotlib.colors import LogNorm
                 dens = local_density(px, py)
                 order = np.argsort(dens, kind="stable")                      # (the dense dots on top)
-                sc = ax.scatter(px[order], py[order], c=dens[order], cmap="viridis", norm=LogNorm(vmin=1, vmax=max(float(dens.max()), 2.0)), s=4,
+                sc = ax.scatter(px[order], py[order], c=dens[order], cmap="viridis", norm=LogNorm(vmin=1, vmax=max(float(dens.max()), 2.0)), s=EXPRESSION_DOT_AREA[imputed],
                                 linewidths=0, rasterized=True)
                 self.cax = ax.inset_axes([1.03, 0.0, 0.03, 1.0])
                 fig.colorbar(sc, cax=self.cax, label="cells in the same small square of the graph")
             else:
                 colors = np.array([color_of[g] for g in cell_group]) if len(cell_group) else []
-                ax.scatter(px, py, c=colors, s=4, alpha=POINT_ALPHA, linewidths=0, rasterized=True)
-            self.hover = {"x": px, "y": py, "group": cell_group, "full": full_of, "color": color_of}
+                ax.scatter(px, py, c=colors, s=EXPRESSION_DOT_AREA[imputed], alpha=POINT_ALPHA, linewidths=0, rasterized=True)
+            self.hover = {"x": px, "y": py, "group": cell_group, "full": full_of, "color": color_of,
+                          "ox": vx[in_group], "oy": vy[in_group], "genes": (gx, gy), "scale": scale}          # (the cell's own values: the dots may be jittered)
             self.pluses = ax.scatter([], [], marker="+", c="black", s=40, linewidths=0.9, animated=True, zorder=5)
             self.tip = ax.annotate("", xy=(0, 0), xytext=(14, 14), textcoords="offset points", fontsize=9, animated=True, zorder=6,
                                    bbox={"boxstyle": "round,pad=0.3", "fc": "#ffffe0", "ec": "#888888"}, annotation_clip=False)
@@ -545,7 +661,7 @@ class AnalyzeWindow:
             self.var_status.set(f"{len(xs)} groups plotted (the mean of each, over {sum(counts):,} cells; the circle's area follows the cell count).")
         ax.grid(True, alpha=0.25)
         ax.margins(0.08)                                      # (room for the big dots and their numbers at the edges)
-        self.legend_room = per == "cell" and (len(chosen) <= MAX_LEGEND_GROUPS or self.var_density.get())
+        self.legend_room = per == "cell" and len(chosen) <= MAX_LEGEND_GROUPS and not self.var_density.get()      # (a legend, not the colour bar: its room is measured)
         self.place_axes()
         self.canvas.draw()
         self.remember_view()
@@ -566,7 +682,10 @@ class AnalyzeWindow:
             self.groups_entry.configure(foreground="red")
             self.var_status.set(f"No {self.v.level_names[level].lower()} named {entries[0]} in this run.")
             return
-        imputed = self.imputed()
+        note_source = ""
+        if not self.ensure_source("selectivity"):
+            note_source = " The imputed genes are not available: Panel gene is used."
+        imputed = self.imputed("selectivity")
         if not imputed and not v.has_counts:
             self.var_status.set("No raw counts on this dataset (layers['counts'] missing).")
             return
@@ -577,7 +696,7 @@ class AnalyzeWindow:
             self.var_status.set(f"{str(uniques[target]).strip()} has only {int(counts[target])} cells in this run: a group needs at least {MIN_GROUP_CELLS}.")
             return
         meta = dict(level=level, target=target, uniques=uniques, imputed=imputed,
-                    note=f" (only the first, {entries[0]}, is used)" if len(entries) > 1 else "")
+                    note=(f" (only the first, {entries[0]}, is used)" if len(entries) > 1 else "") + note_source)
         data = self.ensure_means(imputed, meta)
         if data is not None:
             self.finish_means(data, meta)
@@ -682,10 +801,11 @@ class AnalyzeWindow:
             self.cax = None
         ax.clear()
         ax.set_axis_on()
+        self.home_view = None
         self.hover = None
         self.hover_group = None
         label = str(uniques[target]).strip()
-        ax.scatter(x, y, s=16, c="#3b6ea8", alpha=0.7, linewidths=0, rasterized=True)
+        ax.scatter(x, y, s=SELECTIVITY_DOT_AREA[bool(imputed)], c="#3b6ea8", alpha=0.7, linewidths=0, rasterized=True)
         ax.axhline(1.0, color="gray", linestyle="--", linewidth=0.8)
         ax.set_xscale("log")
         ax.set_yscale("log")
@@ -706,10 +826,10 @@ class AnalyzeWindow:
             for i in marked:
                 ax.annotate(names[i], (x[i], y[i]), xytext=(6, 4), textcoords="offset points", fontsize=LABEL_FONT_SIZE + 1, fontweight="bold",
                             color=MARK_COLOR, zorder=5)
-        if len(x):
-            for i in np.argsort(-(x * y), kind="stable")[:LABELED_GENES]:               # (the ten with the highest x * y are named)
-                if i not in marked:
-                    ax.annotate(names[i], (x[i], y[i]), xytext=(5, 3), textcoords="offset points", fontsize=LABEL_FONT_SIZE, color="#1d3b5c")
+        named = np.flatnonzero(y > LABEL_RATIO)                                            # (every gene whose ratio is above LABEL_RATIO is named)
+        for i in named:
+            if i not in marked:
+                ax.annotate(names[i], (x[i], y[i]), xytext=(5, 3), textcoords="offset points", fontsize=LABEL_FONT_SIZE, color="#1d3b5c")
         own = self.v.own
         unit = ("mean imputed expression (linear)" if imputed else "mean normalized expression" if own is not None and not (own.kind == "counts" and own.normalization == "none")
                 else "mean count per cell")
@@ -734,13 +854,31 @@ class AnalyzeWindow:
         if not_shown:
             extra += f" None in {label}, so not on the graph: {', '.join(not_shown)}."
         self.var_status.set(f"{len(x):,} genes plotted" + (f" ({dropped:,} with none in {label} are left out)" if dropped else "")
-                            + f", each against the {used} largest other {plural(self.v.level_names[level])} (at least {smallest:,} cells each)." + s.get("note", "") + extra
+                            + f", each against the {used} largest other {plural(self.v.level_names[level])} (at least {smallest:,} cells each). "
+                            f"{len(named):,} with a ratio above {LABEL_RATIO:g} are named." + s.get("note", "") + extra
                             + " Scroll to zoom, double-click to reset.")
 
     # ---- zoom: the wheel, about the pointer; a double-click goes back (the toolbar's zoom and pan tools work as well)
 
     def remember_view(self):
         self.home_view = (self.ax.get_xlim(), self.ax.get_ylim())
+        # (clearing the axes drops their callbacks, so this is done after each plot: zooming out stops at this view, and panning stays inside it)
+        self.ax.callbacks.connect("xlim_changed", self.keep_in_view)
+        self.ax.callbacks.connect("ylim_changed", self.keep_in_view)
+
+    def keep_in_view(self, _ax):
+        """The limits changed (the wheel, the toolbar's zoom or pan): the view may not be bigger than the first one drawn, nor leave it."""
+        if self.home_view is None or self.clamping:
+            return
+        self.clamping = True
+        try:
+            for lim, home, scale, setter in ((self.ax.get_xlim(), self.home_view[0], self.ax.get_xscale(), self.ax.set_xlim),
+                                             (self.ax.get_ylim(), self.home_view[1], self.ax.get_yscale(), self.ax.set_ylim)):
+                clamped = clamp_limits(lim, home, scale)
+                if clamped is not None:
+                    setter(*clamped)
+        finally:
+            self.clamping = False
 
     def reset_view(self):
         if self.home_view is not None:
@@ -748,6 +886,37 @@ class AnalyzeWindow:
             self.ax.set_ylim(self.home_view[1])
             self.place_axes()
             self.canvas.draw_idle()
+
+    def on_press(self, ev):
+        """A double-click goes back to the first view; a drag with the left button pans (unless one of the toolbar's own tools is on)."""
+        if ev.inaxes is not self.ax or self.home_view is None:
+            return
+        if ev.dblclick:
+            self.reset_view()
+        elif ev.button == 1 and not self.toolbar.mode:
+            self.pan_start = (ev.x, ev.y, self.ax.get_xlim(), self.ax.get_ylim())
+            self.hide_hover()
+            self.canvas.get_tk_widget().config(cursor="fleur")
+
+    def on_release(self, ev):
+        if self.pan_start is None:
+            return
+        self.pan_start = None
+        self.canvas.get_tk_widget().config(cursor="")
+        self.place_axes()                                         # (the tick labels may have changed width)
+        self.canvas.draw_idle()
+
+    def pan_to(self, ev):
+        """The plot follows the pointer from where it was pressed (whatever the axes' scales; the view cannot leave the first one: keep_in_view)."""
+        x0, y0, xlim, ylim = self.pan_start
+        box = self.ax.bbox
+        for lim, delta, size, scale, setter in ((xlim, ev.x - x0, box.width, self.ax.get_xscale(), self.ax.set_xlim),
+                                                (ylim, ev.y - y0, box.height, self.ax.get_yscale(), self.ax.set_ylim)):
+            a, b = (np.log10(lim[0]), np.log10(lim[1])) if scale == "log" else lim
+            shift = -delta / max(size, 1.0) * (b - a)
+            a, b = a + shift, b + shift
+            setter(*((10 ** a, 10 ** b) if scale == "log" else (a, b)))
+        self.canvas.draw_idle()
 
     def on_scroll(self, ev):
         if ev.inaxes is not self.ax or ev.xdata is None or self.home_view is None:
@@ -801,6 +970,9 @@ class AnalyzeWindow:
         self.canvas.blit(self.fig.bbox)
 
     def on_motion(self, ev):
+        if self.pan_start is not None:
+            self.pan_to(ev)
+            return
         h = self.hover
         if h is None or self.background is None:
             return
@@ -840,8 +1012,12 @@ class AnalyzeWindow:
         if g != self.hover_group:
             self.hover_group = g
             same = h["group"] == g
+            self.hover_count = int(same.sum())
             self.pluses.set_offsets(np.column_stack([h["x"][same], h["y"][same]]))
-            self.tip.set_text(f"{h['full'][g]}\n{int(same.sum()):,} cells")
+        lines = [f"{h['full'][g]}", f"{self.hover_count:,} cells"]
+        for gene, value in zip(h["genes"], (h["ox"][i], h["oy"][i])):
+            lines.append(f"{gene}: {both_scales(value, h['scale'])}")
+        self.tip.set_text("\n".join(lines))
         self.tip.xy = (h["x"][i], h["y"][i])
         self.tip.set_visible(True)
         self.ax.draw_artist(self.pluses)

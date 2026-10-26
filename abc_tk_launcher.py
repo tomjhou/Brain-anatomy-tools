@@ -222,8 +222,11 @@ RUN_FILE = "umap_coords.csv"        # the one file a run needs (see required_cac
 
 
 def scan_runs(folder):
-    """The saved runs in `folder`: [(name, path, saved: the time umap_coords.csv was written)], the most recent first. A subfolder without
-    umap_coords.csv is not a run (the folder of old outputs, say) and is left out. Slow on a network drive: call it from a thread."""
+    """The saved runs in `folder`: [(name, path, opened: when it was last opened, or else saved)], the most recent first. A run counts as opened
+    when it was made (the time umap_coords.csv was written) and each time it is opened after that (see abc_core.record_run_opened). A subfolder
+    without umap_coords.csv is not a run (the folder of old outputs, say) and is left out. Slow on a network drive: call it from a thread."""
+    import abc_core
+    opened = abc_core.run_opened_times()
     runs = []
     try:
         entries = [e for e in os.scandir(folder) if e.is_dir()]
@@ -231,7 +234,8 @@ def scan_runs(folder):
         return runs
     for e in entries:
         try:
-            runs.append((e.name, Path(e.path), os.stat(os.path.join(e.path, RUN_FILE)).st_mtime))
+            saved = os.stat(os.path.join(e.path, RUN_FILE)).st_mtime
+            runs.append((e.name, Path(e.path), max(saved, opened.get(abc_core._run_key(e.path), 0.0))))
         except OSError:
             continue
     runs.sort(key=lambda r: r[2], reverse=True)
@@ -240,7 +244,7 @@ def scan_runs(folder):
 
 class RunPicker:
     """A list of the saved runs in a folder, by name to start with (a click on the Run or the Saved heading sorts by that, and again the other way
-    round): click one to highlight it (the most recent starts highlighted), then OK (or Enter, or a double-click) to take it; Cancel (or Escape)
+    round): click one to highlight it (the one opened most recently starts highlighted), then OK (or Enter, or a double-click) to take it; Cancel (or Escape)
     to go back. Browse... picks a run folder from anywhere else with the system's dialog. A box above the list
     narrows it to the names that hold what is typed. `result` is the chosen folder (a Path), or None."""
 
@@ -277,7 +281,7 @@ class RunPicker:
         self.tree.heading("saved", command=lambda: self.sort_by("saved"))
         self.mark_sort()
         self.tree.column("name", width=720, stretch=True)
-        self.tree.column("saved", width=150, stretch=False)
+        self.tree.column("saved", width=170, stretch=False)
         scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -317,7 +321,7 @@ class RunPicker:
     def mark_sort(self):
         """The headings: an arrow on the one the list is sorted by."""
         column, descending = self.sort
-        for key, text in (("name", "Run"), ("saved", "Saved")):
+        for key, text in (("name", "Run"), ("saved", "Last opened")):
             self.tree.heading(key, text=text + (("  ▼" if descending else "  ▲") if key == column else ""))
 
     def sort_by(self, column):

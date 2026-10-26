@@ -18616,6 +18616,18 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         if match is not None and candidate.is_dir() and (candidate / 'umap_coords.csv').exists():
             early_cache_candidates.append((candidate, int(match.group(1)) if match.group(1) else None))
 
+    if run_options is not None:
+        # The options window has already settled the cap, so only a run made with that cap is a match: a single existing run with another cap (the
+        # 200,000 of an earlier time, say) must not be reloaded in place of the 800,000 just asked for. The cells in the selection are known (the
+        # window waited for the count), so whether this run would be capped at all is too: it is when there are more cells than the cap.
+        cap = run_options['cap']
+        counted = count_state['counts'].get(run_options['cell_type']) if count_state.get('counts') else None
+        if counted is not None:
+            expected = cap if (cap is not None and counted > cap) else None
+            early_cache_candidates = [(c, s) for c, s in early_cache_candidates if s == expected]
+        else:
+            early_cache_candidates = [(c, s) for c, s in early_cache_candidates if s == cap]
+
     early_cache_hit = len(early_cache_candidates) == 1
     subsample_target = None
     if early_cache_hit:

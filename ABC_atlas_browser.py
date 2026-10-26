@@ -4613,7 +4613,7 @@ def run_with_loading_window(message, work, show_after_s=0.4):
                 root.update_idletasks()
                 w, h = root.winfo_reqwidth(), root.winfo_reqheight()
                 root.geometry(f"+{(root.winfo_screenwidth() - w) // 2}+{(root.winfo_screenheight() - h) // 3}")
-                ui = (root, elapsed_label)
+                ui = (root, elapsed_label, bar)
             except Exception:
                 ui = False  # no usable Tk; just wait
         if ui:
@@ -4629,6 +4629,7 @@ def run_with_loading_window(message, work, show_after_s=0.4):
     thread.join()
     if ui:
         try:
+            ui[2].stop()                       # (its pending step would otherwise run on the destroyed window and print an error)
             ui[0].destroy()
         except Exception:
             pass
@@ -11054,7 +11055,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             'unique_export_paths', 'prompt_deg_comparison_mode', 'materialize_subset', 'compute_de_genes', 'mean_log2_expression',
             'ensure_ccf_downloaded', 'load_ccf_for_cells', 'load_parcellation_names', 'run_with_loading_window', 'brain_outline_segments',
             'open_3d_group_view', 'build_3d_edges', 'write_3d_group_html', 'category_rank_shape', 'visible_points_only', 'sc',
-            'read_nifti_volume', 'CCF_VOLUME_DIRECTORY', 'CCF_VOLUME_FILE_NAME')
+            'read_nifti_volume', 'CCF_VOLUME_DIRECTORY', 'CCF_VOLUME_FILE_NAME', 'UMAP_PARAM_DEFAULTS')
         host = {name: globals()[name] for name in host_names}
         host['settings_dialog'] = prompt_viewer_settings_dialog
         host['preload_imputed'] = preload_imputed_gene_dataset

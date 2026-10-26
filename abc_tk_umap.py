@@ -51,6 +51,7 @@ NOT_IN_TAXONOMY = ("leiden", "neurotransmitter")        # the levels that are no
 TILE_PX = 230
 MIN_TILE_PX = 50
 TILE_COLUMNS = (6, 5, 4, 3, 2, 1)         # the Section map size slider's stops: how many panels fit across the pane (1/6 of its width ... all of it)
+OUTLINE_PX_LARGEST = 2                    # the CCF outlines' width (pixels) at the largest section map size (one pixel at the others)
 DEFAULT_TILE_INDEX = 4                    # (two across)
 CELL_SIZES_UM = (20, 30, 40, 50, 60, 70, 80, 90, 100)       # the Cell size slider's stops: the width of a cell's dot in the section panels, in microns
 OTHER_CELLS_DOT_RATIO = 0.5       # the dots of the cells of the other kind (e.g. the non-neurons of a neuron run), relative to the others'
@@ -470,6 +471,8 @@ class PointCanvas:
         self.pluses = None                          # (x, y) of the red '+' marks of the highlighted group
         self.compose_pending = None
         self.outlines = None                        # closed outlines (arrays of (x, y) in data units) drawn over the points: the CCF's regions
+        self.outline_px = 1                         # how wide the outlines are (pixels): twice as wide at the largest section map size
+        self.cell_alpha = 1.0                       # how opaque the cells are: lowered by the CCF atlas slider, so the outlines (always opaque) stand out
         c = self.canvas
         c.bind("<Configure>", lambda e: self.on_resize())
         c.bind("<MouseWheel>", lambda e: self.zoom_at(e.x, e.y, 1.25 if e.delta > 0 else 0.8))
@@ -662,6 +665,8 @@ class PointCanvas:
             lab = lab[d:d + h, d:d + w]
             hit = lab > 0
             img[hit] = rgb[lab[hit].astype(np.int64) - 1]
+        if self.cell_alpha < 0.999:
+            img = (img.astype(np.float32) * self.cell_alpha + np.asarray(self.bgcolor, np.float32) * (1.0 - self.cell_alpha)).astype(np.uint8)
         if self.outlines:
             self.draw_outlines(img, w, h, hw, hh)
         self.base = img
@@ -688,7 +693,7 @@ class PointCanvas:
             shown.append(np.round(np.column_stack([px, py])).astype(np.int32))
         if shown:
             ink = (215, 215, 215) if sum(self.bgcolor) < 300 else (90, 90, 90)
-            cv2.polylines(img, shown, True, ink, 1, cv2.LINE_AA)
+            cv2.polylines(img, shown, True, ink, self.outline_px, cv2.LINE_AA)
 
     def marker_kernel(self, code, d):
         """The kernel with which a maximum filter makes a marker of this code and diameter d out of a point (cached)."""
@@ -921,6 +926,8 @@ class UmapWindow(ExportsMixin):
         self.level_has_ids = dict(own.level_has_ids) if own is not None else {"neurotransmitter": False}      # (whether a level's groups have numbers to type)
         self.host = host or {}             # the browser's own functions this window uses (settings dialog, UMAP variants, the exports)
         self.run_folder = run_folder
+        self.rois_input = list(rois or [])                   # (as given: a subset's window draws the same ROIs)
+        self.subset_windows = []                             # the windows Analyze subset opened
         self.params = dict(params) if params else None
         self.viewer_settings = self.host["load_viewer_settings"]() if "load_viewer_settings" in self.host else {"hover_enabled": True, "gene456_shape": "small circle", "umap_circle_size": "Default", "persist_settings": False}
         self.base_title = title
@@ -1111,10 +1118,21 @@ class UmapWindow(ExportsMixin):
         HoverTip(roi_only_box, lambda: "The cells outside the ROIs go gray, on a white background: only the ROIs are colored. Saved section maps "
                                        "have the same look (and, as an SVG, the gray cells are pictures, so the file stays small).")
         self.var_ccf = tk.BooleanVar(bars, False)
-        ccf_box = ttk.Checkbutton(bars, text="CCF atlas", variable=self.var_ccf, command=self.apply_ccf)
-        ccf_box.grid(row=1, column=4, sticky="w", padx=(12, 6))
-        HoverTip(ccf_box, lambda: "Draw the outlines of the Allen CCF (2020) regions over the section maps, fitted to each section from the CCF "
-                                  "position of its cells. The first time reads the CCF coordinates of the cells (a minute or so).")
+        ccf_row = ttk.Frame(bars)
+        ccf_row.grid(row=1, column=4, sticky="w", padx=(12, 6))
+        ccf_box = ttk.Checkbutton(ccf_row, text="CCF atlas", variable=self.var_ccf, command=self.apply_ccf)
+        ccf_box.pack(side=tk.LEFT)
+        HoverTip(ccf_box, lambda: "Draw the outlines of the Allen CCF (2020) regions over the section maps. Placed by the cells' reconstructed "
+                                  "coordinates, they are the atlas's own; otherwise fitted to each section from the CCF position of its cells "
+                                  "(the first time reads the CCF coordinates of the cells: a minute or so).")
+        self.var_ccf_opacity = tk.IntVar(bars, DEFAULT_OPACITY_INDEX)                          # (full: the cells as they are)
+        ccf_shown = ttk.Label(ccf_row, width=5)
+        self.ccf_scale = self.stop_slider(ccf_row, ccf_shown, self.var_ccf_opacity, len(OPACITIES), self.apply_ccf_opacity, lambda i: f"{OPACITIES[i] * 100:g}%")
+        self.ccf_scale.pack(side=tk.LEFT, padx=(12, 0))
+        ccf_shown.pack(side=tk.LEFT, padx=(6, 0))
+        self.ccf_scale.state(["disabled"])                                                      # (until the atlas is shown)
+        HoverTip(self.ccf_scale, lambda: "How opaque the cells are while the CCF atlas is shown: lower it to see the outlines better. "
+                                         "The outlines stay fully opaque.")
         self.ccf_outlines = None
         bars.columnconfigure(3, weight=1)
         self.tile_scroll = tk.Canvas(left, highlightthickness=0, bg="#f4f4f4")
@@ -1322,6 +1340,7 @@ class UmapWindow(ExportsMixin):
                 (("Export DEGs", self.export_degs, True), ("Export expression", self.export_expression, True)),
                 (("Export coordinates", self.export_coordinates, True), ("3D view", self.show_3d, True)),
                 (("3D in browser", self.show_3d_browser, True), ("Analyze...", self.open_analyze, False)),
+                (("Analyze subset", self.analyze_subset, False),),
                 (("Close", self.close, False),))
         for r, pair in enumerate(rows):
             for c, (text, cmd, grouped) in enumerate(pair):
@@ -1331,7 +1350,19 @@ class UmapWindow(ExportsMixin):
                     self.group_buttons.append(b)
                 if self.own is not None and text == "Save section maps":
                     b.state(["disabled"])                                 # (no section maps)
+                if text == "3D view":
+                    HoverTip(b, lambda: "Deprecated: 3D in browser does this much better.")
+                if text == "Analyze subset":
+                    if self.own is not None:
+                        b.state(["disabled"])                             # (no legend of atlas groups)
+                    HoverTip(b, lambda: "Analyze only the groups switched on in the legend: a project of its own, in a subfolder of this one, with its own "
+                                        "PCA and UMAP, opened in a second window.")
         self.update_group_buttons()
+
+    def analyze_subset(self):
+        """The Analyze subset button: the groups switched on in the legend, analyzed again on their own (abc_tk_subset.py)."""
+        import abc_tk_subset
+        abc_tk_subset.analyze_subset(self)
 
     def update_group_buttons(self):
         """The group exports and 3D views are for the groups typed in Single group(s)."""
@@ -1399,16 +1430,32 @@ class UmapWindow(ExportsMixin):
         self.tile_cols = self.tile_px = 0
         self.layout_tiles()
 
+    def apply_ccf_opacity(self):
+        """The CCF atlas slider: the cells of the section maps are drawn again, more or less see-through (the outlines are not)."""
+        if not self.var_ccf.get():
+            return
+        a = OPACITIES[self.var_ccf_opacity.get()]
+        for t in self.tiles:
+            t["pc"].cell_alpha = a
+            if self.frame_visible(t["frame"]):
+                t["pc"].request_draw()
+            else:
+                t["pc"].stale = True
+
     def apply_ccf(self):
         """The CCF atlas checkbox: show or hide the regions' outlines on the section maps (made the first time it is ticked)."""
+        self.ccf_scale.state(["!disabled"] if self.var_ccf.get() else ["disabled"])
         if not self.var_ccf.get():
             for t in self.tiles:
+                t["pc"].cell_alpha = 1.0                                   # (the cells as they are again)
                 t["pc"].set_outlines(None)
             return
         if self.ccf_outlines is None and not self.load_ccf():
             self.var_ccf.set(False)
             return
+        a = OPACITIES[self.var_ccf_opacity.get()]
         for t in self.tiles:
+            t["pc"].cell_alpha = a
             t["pc"].set_outlines(self.ccf_outlines.get(t["label"]))
 
     def load_ccf(self):
@@ -1483,14 +1530,10 @@ class UmapWindow(ExportsMixin):
             self.var_status.set(f"No CCF atlas for section {', '.join(empty)} (Allen did not register it): no outlines there.")
         return True
 
-    def add_slider(self, parent, row, text, var, n, command, value_text, tip_text):
-        """A slider with `n` stops (0 .. n-1): it jumps from stop to stop, shows `value_text(stop)` beside it, and calls `command()` when the
-        stop changes. `tip_text(stop)`, if given, is shown in a tip while the pointer is over the slider. Returns the slider."""
-        ttk.Label(parent, text=text).grid(row=row, column=1, sticky="w", padx=(12, 6))
-        shown = ttk.Label(parent, width=19)
-        shown.grid(row=row, column=3, sticky="w", padx=(6, 0))
+    def stop_slider(self, parent, shown, var, n, command, value_text):
+        """A slider of `parent` with `n` stops (0 .. n-1), not yet placed: it jumps from stop to stop, shows `value_text(stop)` in the label `shown`, and
+        calls `command()` when the stop changes. The same width wherever it is."""
         scale = ttk.Scale(parent, from_=0, to=n - 1, orient=tk.HORIZONTAL, length=130)
-        scale.grid(row=row, column=2, sticky="w")
 
         def moved(v):
             i = int(round(float(v)))
@@ -1505,6 +1548,16 @@ class UmapWindow(ExportsMixin):
         scale.config(command=moved)
         scale.set(var.get())
         shown.config(text=value_text(var.get()))
+        return scale
+
+    def add_slider(self, parent, row, text, var, n, command, value_text, tip_text):
+        """A slider with `n` stops (0 .. n-1): it jumps from stop to stop, shows `value_text(stop)` beside it, and calls `command()` when the
+        stop changes. `tip_text(stop)`, if given, is shown in a tip while the pointer is over the slider. Returns the slider."""
+        ttk.Label(parent, text=text).grid(row=row, column=1, sticky="w", padx=(12, 6))
+        shown = ttk.Label(parent, width=19)
+        shown.grid(row=row, column=3, sticky="w", padx=(6, 0))
+        scale = self.stop_slider(parent, shown, var, n, command, value_text)
+        scale.grid(row=row, column=2, sticky="w")
         if tip_text is not None:
             HoverTip(scale, lambda: tip_text(var.get()))
         return scale
@@ -1555,6 +1608,7 @@ class UmapWindow(ExportsMixin):
             return
         self.tile_cols, self.tile_px = cols, px
         for t in self.tiles:
+            t["pc"].outline_px = OUTLINE_PX_LARGEST if cols == min(TILE_COLUMNS) else 1            # (the CCF outlines: wider at the largest size)
             t["pc"].canvas.config(width=px, height=int(px / self.tile_aspect))
         self.root.update_idletasks()                                  # (so that the panels know their size)
         fw = max(t["frame"].winfo_reqwidth() for t in self.tiles)
@@ -3081,6 +3135,11 @@ class UmapWindow(ExportsMixin):
             try:
                 self.root.quit()
             except tk.TclError:
+                pass
+        for win in list(self.subset_windows):
+            try:
+                win.close()
+            except Exception:
                 pass
         if self.layout_job is not None:
             try:

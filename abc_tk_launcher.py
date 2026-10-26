@@ -218,6 +218,8 @@ def choose_run_options(current="Neurons", counts=None, folder_for=None, whole_br
     return answer["value"]
 
 
+SUBSET_PREFIX = "subset_"          # the subfolders Analyze subset makes in a run (abc_tk_subset.py), each a run of its own
+MAX_SUBSET_DEPTH = 8               # how many levels of subsets inside subsets the list follows
 RUN_FILE = "umap_coords.csv"        # the one file a run needs (see required_cached_run_files in ABC_atlas_browser.py): a folder with it is a run
 
 
@@ -235,11 +237,30 @@ def scan_runs(folder):
     for e in entries:
         try:
             saved = os.stat(os.path.join(e.path, RUN_FILE)).st_mtime
-            runs.append((e.name, Path(e.path), max(saved, opened.get(abc_core._run_key(e.path), 0.0))))
         except OSError:
             continue
+        runs.append((e.name, Path(e.path), max(saved, opened.get(abc_core._run_key(e.path), 0.0)), 0, None))
+        _add_subsets(e.path, 1, runs, opened, abc_core)
     runs.sort(key=lambda r: r[2], reverse=True)
     return runs
+
+
+def _add_subsets(path, depth, runs, opened, abc_core):
+    """The subsets (Analyze subset in the viewer) kept in subfolders of the run at `path`, and theirs in turn: [(name, folder, opened, depth, the folder
+    of the project it was made from)] added to `runs`."""
+    if depth > MAX_SUBSET_DEPTH:
+        return
+    try:
+        entries = [e for e in os.scandir(path) if e.is_dir() and e.name.startswith(SUBSET_PREFIX)]
+    except OSError:
+        return
+    for e in entries:
+        try:
+            saved = os.stat(os.path.join(e.path, RUN_FILE)).st_mtime
+        except OSError:
+            continue
+        runs.append((e.name, Path(e.path), max(saved, opened.get(abc_core._run_key(e.path), 0.0)), depth, Path(path)))
+        _add_subsets(e.path, depth + 1, runs, opened, abc_core)
 
 
 class RunPicker:
@@ -339,12 +360,38 @@ class RunPicker:
             keep = self.shown[int(self.tree.selection()[0])][1]
         text = self.var_filter.get().strip().casefold()
         column, descending = self.sort
-        self.shown = sorted([r for r in self.runs if text in r[0].casefold()],
-                            key=(lambda r: r[0].casefold()) if column == "name" else (lambda r: r[2]), reverse=descending)
+        # (the projects in the sorted order, each followed by its subsets, sorted the same way: a project that matches the filter brings its subsets,
+        # and a subset that matches brings the projects it is under)
+        children, parent_of = {}, {}
+        for r in self.runs:
+            children.setdefault(r[4], []).append(r)
+            parent_of[r[1]] = r[4]
+        show = set()
+        for r in self.runs:
+            if text in r[0].casefold():
+                stack = [r]
+                while stack:
+                    item = stack.pop()
+                    show.add(item[1])
+                    stack.extend(children.get(item[1], []))
+                up = parent_of.get(r[1])
+                while up is not None:
+                    show.add(up)
+                    up = parent_of.get(up)
+        key = (lambda r: r[0].casefold()) if column == "name" else (lambda r: r[2])
+        self.shown = []
+
+        def emit(parent):
+            for r in sorted(children.get(parent, []), key=key, reverse=descending):
+                if r[1] in show:
+                    self.shown.append(r)
+                    emit(r[1])
+        emit(None)
         self.tree.delete(*self.tree.get_children())
         import time
-        for i, (name, _path, saved) in enumerate(self.shown):
-            self.tree.insert("", tk.END, iid=str(i), values=(name, time.strftime("%Y-%m-%d %H:%M", time.localtime(saved))))
+        for i, (name, _path, saved, depth, _parent) in enumerate(self.shown):
+            shown_name = "      " * depth + "\u21b3 " + name if depth else name           # (a subset: under its project, indented)
+            self.tree.insert("", tk.END, iid=str(i), values=(shown_name, time.strftime("%Y-%m-%d %H:%M", time.localtime(saved))))
         if self.shown:
             paths = [r[1] for r in self.shown]
             at = paths.index(keep) if keep in paths else max(range(len(self.shown)), key=lambda i: self.shown[i][2])
@@ -355,7 +402,7 @@ class RunPicker:
         if not self.runs:
             self.var_status.set("No saved runs in this folder. Use Browse… to pick a run folder from somewhere else.")
         else:
-            self.var_status.set(f"{len(self.shown)} of {len(self.runs)} runs" if text else f"{len(self.runs)} runs, the most recent first.")
+            self.var_status.set(f"{len(self.shown)} of {len(self.runs)} projects" if text else f"{len(self.runs)} projects, subsets under the project they were made from.")
 
     def double_clicked(self, event):
         if not self.tree.identify_row(event.y):

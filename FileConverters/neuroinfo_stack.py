@@ -427,6 +427,8 @@ class Stack:
     case_file_path: str = ""         # ...and where it is (the full path)
     z_spacing_um: float = 0.0        # distance between adjacent sections (um): NeuroInfo's xmp:SizeZ in the JPX; 0 if not known
     unsaved: bool = False            # made in memory from slide scans (no JPX behind it yet): everything is still to be exported
+    bit_depth: int = 16              # bits per pixel value of the JPX's pictures (from its first codestream: 8 or 16 mostly); the brightness range is 0 .. 2**bits - 1
+    read_only: bool = False          # a JPX with no alignment data (no reconstruction file, no alignment of this tool's): to look at, not to edit or export
 
     def apply_pixel_size(self, new_um):
         """Relabel the stack with pixel size `new_um` (the source images' true pixel size). Every length in um follows: the
@@ -593,6 +595,77 @@ def _h5_matches(h5_path, guids):
         return None
 
 
+class NoAlignmentData(FileNotFoundError):
+    """A JPX whose alignment cannot be recovered because a NeuroInfo file it needs was not found or not chosen: it can still be opened read-only
+    (open_stack with read_only=True)."""
+
+
+def has_reconstruction_file(jpx_path):
+    """Whether the folder of the JPX holds any NeuroInfo reconstruction .xml (the JPX's own <name>.xml, or another that reads as one): without
+    one there is nothing to recover the alignment from, and the JPX is opened read-only."""
+    folder = os.path.dirname(os.path.abspath(jpx_path))
+    for name in os.listdir(folder):
+        if name.lower().endswith(".xml"):
+            try:
+                read_reconstruction_xml(os.path.join(folder, name))
+                return True
+            except (OSError, ValueError):
+                continue
+    return False
+
+
+def _xmp_number(jpx_path, attribute):
+    """A number from the JPX's XMP (an attribute such as xmp:PixelWidth), or 0 if there is none."""
+    with open(jpx_path, "rb") as f:
+        for b in read_boxes(jpx_path):
+            if b.kind == b"uuid":
+                data = read_payload(f, b)
+                if data[:16] == XMP_UUID:
+                    m = re.search(attribute + r'="([0-9.eE+-]+)"', data[16:].decode("utf-8", "replace"))
+                    return max(float(m.group(1)), 0.0) if m else 0.0
+    return 0.0
+
+
+def jpx_bit_depth(jpx_path):
+    """Bits per pixel value of the JPX's pictures, from the SIZ marker of its first codestream (the decoder's own word: each component's
+    Ssiz byte is its depth minus one, the top bit meaning signed); the largest of the components. None if it cannot be read."""
+    try:
+        frames = [b for b in read_boxes(jpx_path) if b.kind == b"jp2c"]
+        with open(jpx_path, "rb") as f:
+            head = read_payload(f, frames[0], 48 + 3 * 16)
+        n = struct.unpack(">H", head[40:42])[0]
+        depths = [(head[42 + 3 * i] & 0x7F) + 1 for i in range(min(n, 16))]
+        return max(depths) if depths else None
+    except Exception:
+        return None
+
+
+def jpx_enumerated_colorspace(jpx_path):
+    """The enumerated colour space of the JPX's header (16 = sRGB, 17 = greyscale), or None if it names none."""
+    with open(jpx_path, "rb") as f:
+        for b in read_boxes(jpx_path):
+            if b.kind == b"jp2h":
+                data = read_payload(f, b, 4096)
+                i = data.find(b"colr")
+                if i >= 0 and data[i + 4] == 1:
+                    return struct.unpack(">I", data[i + 7:i + 11])[0]
+    return None
+
+
+def _load_read_only(jpx_path):
+    """A JPX with no alignment data, to look at: one section per frame, no outlines, nothing to edit. The pixel size and the spacing of the
+    sections are those in its XMP when it has them."""
+    frames = [b for b in read_boxes(jpx_path) if b.kind == b"jp2c"]
+    if not frames:
+        raise ValueError("This JPX has no images in it.")
+    with open(jpx_path, "rb") as f:
+        w, h, nc = codestream_size(f, frames[0])
+    stack = Stack(jpx_path, w, h, nc, _xmp_number(jpx_path, "xmp:PixelWidth") or 1.0, origin=os.path.abspath(jpx_path), read_only=True)
+    for i in range(len(frames)):
+        stack.sections.append(Section(i, f"Section {i + 1}", "", np.zeros((0, 2)), np.eye(2), np.zeros(2), pivot_src=np.zeros(2)))
+    return stack
+
+
 def _find_neuroinfo_files(jpx_path, locate=None):
     """(xml path, h5 path) of the NeuroInfo files that go with the JPX.
 
@@ -623,8 +696,8 @@ def _find_neuroinfo_files(jpx_path, locate=None):
         if not chosen and not locate and default:
             chosen = os.path.join(folder, default)
         if not chosen:
-            raise FileNotFoundError(f"This JPX has no alignment data of its own, and {jpx_stem}.xml (needed to recover it) "
-                                    f"wasn't found in\n{folder}")
+            raise NoAlignmentData(f"This JPX has no alignment data of its own, and {jpx_stem}.xml (needed to recover it) "
+                                  f"wasn't found in\n{folder}")
         xml_path = chosen
 
     return xml_path, find_case_file(folder, _xml_guids(xml_path), locate)
@@ -655,8 +728,8 @@ def find_case_file(folder, guids, locate=None):
         if not chosen and not locate and default:
             chosen = os.path.join(folder, default)
         if not chosen:
-            raise FileNotFoundError("This JPX has no alignment data of its own, and its NeuroInfo case file (.h5) "
-                                    f"{'was not chosen' if candidates else 'wasn' + chr(39) + 't found'} in\n{folder}")
+            raise NoAlignmentData("This JPX has no alignment data of its own, and its NeuroInfo case file (.h5) "
+                                  f"{'was not chosen' if candidates else 'wasn' + chr(39) + 't found'} in\n{folder}")
         h5_path = chosen
     return h5_path
 
@@ -847,11 +920,12 @@ def _load_aligner(jpx_path, doc):
     return stack
 
 
-def open_stack(path, locate=None, alignment=None):
+def open_stack(path, locate=None, alignment=None, read_only=False):
     """Open a JPX written by this tool, or a NeuroInfo reconstruction (a .jpx
     with reconstruction.xml and CaseFile.H5 beside it, or that folder). `locate` is asked for NeuroInfo files that are not
     beside the JPX (see _find_neuroinfo_files). `alignment`, if given, is a project's saved alignment (see stack_json) of this JPX:
-    the stack is made from it (its sections name their frames), and no NeuroInfo file is needed."""
+    the stack is made from it (its sections name their frames), and no NeuroInfo file is needed. A JPX with no alignment data and no
+    reconstruction file in its folder, or any JPX with `read_only`, opens read-only (_load_read_only)."""
     if os.path.isdir(path):
         names = {n.lower(): n for n in os.listdir(path)}
         if "reconstruction.jpx" not in names:
@@ -864,10 +938,19 @@ def open_stack(path, locate=None, alignment=None):
             raise ValueError("The project's alignment is of another JPX (it names frames this one doesn't have).")
     else:
         doc = find_aligner_json(path)
-        stack = _load_aligner(path, doc) if doc else _load_neuroinfo(path, locate)
+        if doc:
+            stack = _load_aligner(path, doc)
+        elif read_only or not has_reconstruction_file(path):
+            stack = _load_read_only(path)
+        else:
+            stack = _load_neuroinfo(path, locate)
+    stack.bit_depth = jpx_bit_depth(path) or stack.bit_depth
     # The XMP repeats channel names once per image; the first `channels` apply
-    stack.z_spacing_um = read_xmp_spacing(path)
+    stack.z_spacing_um = read_xmp_spacing(path) or (_xmp_number(path, "xmp:SpacingZ") if stack.read_only else 0.0)
     info = read_xmp_channels(path)[:stack.channels]
+    if not info and stack.channels == 3 and jpx_enumerated_colorspace(path) == 16:
+        # (no channel names or colors of NeuroInfo's: a picture in color, whose three components are its red, green and blue)
+        info = [ChannelInfo("Red", (255, 0, 0)), ChannelInfo("Green", (0, 255, 0)), ChannelInfo("Blue", (0, 0, 255))]
     stack.channel_info = info + [ChannelInfo(f"channel {i}", (255, 255, 255))
                                  for i in range(len(info), stack.channels)]
     return stack

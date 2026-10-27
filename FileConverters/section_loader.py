@@ -457,6 +457,7 @@ class SectionLoader:
         self.row_menu = tk.Menu(self.root, tearoff=0)
         self.row_menu.add_command(label="Copy path", command=self.copy_paths)
         self.slide_tree.bind("<Button-3>", self.row_menu_open)
+        self.enable_file_drop(self.slide_tree)
         side = ttk.Frame(mid, padding=(12, 0))
         side.pack(side=tk.LEFT, fill=tk.Y)
         self.need_images = []              # the buttons that mean nothing until an image has been added (see refresh_slide_list)
@@ -619,16 +620,48 @@ class SectionLoader:
                 self.project.slides[i].pixel_um = float(value)
             self.refresh_slide_list()
 
-    def add_slides(self):
-        """Add images. A project's images all lie in the folder its file is in (so that it can be moved or opened on another machine with
-        paths mapped differently): the dialog starts there, and files from elsewhere are refused. For a new project the first image
-        chosen sets the folder."""
+    DROPPABLE = (".czi", ".jp2", ".j2k", ".j2c", ".jpx", ".xml")      # what the Add images dialog offers first
+
+    def enable_file_drop(self, widget):
+        """Let files be dragged from Windows Explorer onto `widget` (the list of images): they are added as if chosen in Add images. Needs
+        tkinterdnd2 (installed if it is missing); without it the list simply does not take drops and the button still works."""
+        try:
+            try:
+                from tkinterdnd2 import DND_FILES, TkinterDnD
+            except ImportError:
+                ns.ensure_packages({"tkinterdnd2": "tkinterdnd2"}, exit_on_failure=False)
+                from tkinterdnd2 import DND_FILES, TkinterDnD
+            TkinterDnD._require(self.root)
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", self.files_dropped)
+            self.can_drop = True
+        except Exception as e:
+            self.can_drop = False
+            print(f"Dragging files onto the list is not available ({e}); use Add images instead.", flush=True)
+
+    def files_dropped(self, event):
+        """Files dropped on the list: the supported ones are added, the folders and other kinds are named in a message."""
+        dropped = [os.path.normpath(p) for p in self.root.tk.splitlist(event.data)]
+        paths = [p for p in dropped if os.path.isfile(p) and p.lower().endswith(self.DROPPABLE)]
+        ignored = [p for p in dropped if p not in paths]
+        if ignored:
+            messagebox.showinfo("Not added", "These can't be added (only .czi, .jp2, .j2k, .j2c, .jpx and NeuroInfo .xml files):\n\n"
+                                + "\n".join(os.path.basename(p) or p for p in ignored[:10]) + ("\n..." if len(ignored) > 10 else ""), parent=self.root)
+        if paths:
+            self.add_slides(sorted(paths, key=lambda p: os.path.basename(p).lower()))
+        return event.action
+
+    def add_slides(self, paths=None):
+        """Add images (`paths`, if they were dropped on the list; otherwise chosen in a dialog). A project's images all lie in the folder its
+        file is in (so that it can be moved or opened on another machine with paths mapped differently): the dialog starts there, and files from
+        elsewhere are refused. For a new project the first image chosen sets the folder."""
         folder = self.project.folder()
-        paths = filedialog.askopenfilenames(
-            parent=self.root, title="Slide scans, section images, JPX stacks, or a NeuroInfo reconstruction (.xml)", initialdir=folder or None,
-            filetypes=[("Slide scans, section images, JPX stacks and NeuroInfo .xml", "*.czi *.jp2 *.j2k *.j2c *.jpx *.xml"),
-                       ("Zeiss .czi", "*.czi"), ("JPEG 2000 section images", "*.jp2 *.j2k *.j2c"), ("JPX stack of sections", "*.jpx"),
-                       ("NeuroInfo reconstruction .xml (its JPX and case file are found from it)", "*.xml"), ("All files", "*.*")])
+        if paths is None:
+            paths = filedialog.askopenfilenames(
+                parent=self.root, title="Slide scans, section images, JPX stacks, or a NeuroInfo reconstruction (.xml)", initialdir=folder or None,
+                filetypes=[("Slide scans, section images, JPX stacks and NeuroInfo .xml", "*.czi *.jp2 *.j2k *.j2c *.jpx *.xml"),
+                           ("Zeiss .czi", "*.czi"), ("JPEG 2000 section images", "*.jp2 *.j2k *.j2c"), ("JPX stack of sections", "*.jpx"),
+                           ("NeuroInfo reconstruction .xml (its JPX and case file are found from it)", "*.xml"), ("All files", "*.*")])
         if not paths:
             return
         if any(p.lower().endswith(".xml") for p in paths):

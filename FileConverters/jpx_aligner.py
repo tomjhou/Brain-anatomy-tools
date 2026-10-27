@@ -643,6 +643,7 @@ class Aligner:
         self.opening = False        # a stack is being opened
         self.loading_previews = False   # section images are still being loaded in the background
         self.levels = []            # per channel [lo, hi] (display only)
+        self.max_level = 65535.0    # the top of the brightness range (set from the stack's bit depth when it is shown)
         self.levels_set = False
         self.auto2_pending = False  # opened with the loader's Auto: Auto2 is applied once all the pictures have loaded
         self.level_cache = {}       # id(picture) -> (weak reference to it, its brightness histograms), see level_hist
@@ -704,6 +705,7 @@ class Aligner:
         fm.add_cascade(label="Open recent", menu=self.recent_menu)
         fm.config(postcommand=self.fill_recent_menu)   # (refreshed each time the File menu opens)
         fm.add_command(label="Export JPX...", command=self.export_dialog, accelerator="Ctrl+S")
+        self.file_menu = fm
         om = tk.Menu(fm, tearoff=0)
         om.add_checkbutton(label="Check section positions in the background", variable=self.var_verify,
                            command=lambda: save_settings(verify_positions=bool(self.var_verify.get())))
@@ -788,6 +790,7 @@ class Aligner:
         self.listbox.bind("<ButtonPress-1>", self.list_press, add="+")
         self.listbox.bind("<B1-Motion>", self.list_motion)          # (replaces the default, which would select what the pointer passes)
         self.listbox.bind("<ButtonRelease-1>", self.list_release, add="+")
+        self.enable_file_drop(self.listbox)
 
         self.canvas = tk.Canvas(self.paned, bg="black", highlightthickness=0, cursor="fleur")
         self.paned.add(left, minsize=180, stretch="never")
@@ -953,8 +956,8 @@ class Aligner:
                 ("Auto1", "current", "Set each channel's black point to the 1st percentile and its white point to the 99.7th percentile of "
                                      "the pixel values (ignoring empty pixels) in the current section only."),
                 ("Auto2", "all", "The same, but the percentiles are taken over all the sections whose pictures have loaded."),
-                ("Full", "full", "Full scale: set every channel's black point to 0 and its white point to 65535, the whole range of "
-                                 "16-bit pixel values. No analysis of the pictures."))):
+                ("Full", "full", "Full scale: set every channel's black point to 0 and its white point to the top of the file's range "
+                                 "(65535 for 16-bit pixel values, 255 for 8-bit). No analysis of the pictures."))):
             b = ttk.Button(bar, text=text, command=lambda how=how: self.set_levels(how))
             b.grid(row=0, column=c, sticky="ew", padx=(0 if c == 0 else 2, 0))
             Tooltip(b, tip)
@@ -1000,7 +1003,7 @@ class Aligner:
             for r, (text, var) in enumerate((("black", vlo), ("white", vhi))):
                 pad = (4 if i and r == 0 else 0, 0)
                 ttk.Label(row, text=text).grid(row=1 + 2 * i + r, column=1, sticky="w", padx=(0, 4), pady=pad)
-                ttk.Scale(row, from_=0, to=65535, variable=var,
+                ttk.Scale(row, from_=0, to=self.max_level, variable=var,
                           command=lambda v: self.redraw()).grid(row=1 + 2 * i + r, column=2, sticky="ew", pady=pad)
 
     # ---------------------------------------------------------------- busy cursor
@@ -1192,6 +1195,46 @@ class Aligner:
             return
         self.open_path(path)
 
+    def enable_file_drop(self, widget):
+        """Let a .jpx or a section project be dragged from Windows Explorer onto `widget` (the list of sections) to open it, as Open does. Needs
+        tkinterdnd2 (installed if it is missing); without it the list does not take drops and Open still works."""
+        try:
+            try:
+                from tkinterdnd2 import DND_FILES, TkinterDnD
+            except ImportError:
+                ns.ensure_packages({"tkinterdnd2": "tkinterdnd2"}, exit_on_failure=False)
+                from tkinterdnd2 import DND_FILES, TkinterDnD
+            TkinterDnD._require(self.root)
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", self.files_dropped)
+            self.can_drop = True
+        except Exception as e:
+            self.can_drop = False
+            print(f"Dragging files onto the list is not available ({e}); use Open instead.", flush=True)
+
+    def files_dropped(self, event):
+        """A file dropped on the list of sections: a JPX or a section project is opened (after the usual question about unsaved work); only one
+        can be, so with several the first is opened and the rest are named."""
+        dropped = [os.path.normpath(p) for p in self.root.tk.splitlist(event.data)]
+        usable = [p for p in dropped if os.path.isfile(p) and (sp.is_jpx(p) or sp.is_project_path(p))]
+        if not usable:
+            messagebox.showinfo("Can't open", "Only a .jpx stack or a section project (" + sp.PROJECT_SUFFIX + ") can be opened here:"
+                                + "\n\n" + "\n".join(os.path.basename(p) or p for p in dropped[:8]), parent=self.root)
+            return event.action
+        if self.busy or self.opening:
+            self.var_status.set("Busy: drop the file again when this is finished.")
+            return event.action
+        if len(usable) > 1:
+            messagebox.showinfo("One file at a time", "Only one file can be open at a time. Opening " + os.path.basename(usable[0]) + "; not opened:"
+                                + "\n\n" + "\n".join(os.path.basename(p) for p in usable[1:8]), parent=self.root)
+        self.root.after(10, lambda: self.open_dropped(usable[0]))        # (after the drop is over: the questions that may follow need the window free)
+        return event.action
+
+    def open_dropped(self, path):
+        if self.busy or self.opening or not self.confirm_discard():
+            return
+        self.open_path(path)
+
     def open_dialog(self):
         if self.busy or self.opening or not self.confirm_discard():
             return
@@ -1229,8 +1272,8 @@ class Aligner:
         self.open_seconds = 0.0
         self.show_stack(stack, path)
 
-    def open_path(self, path):
-        """Open a JPX (or a section project). A JPX's NeuroInfo files are read in a thread, so that the window stays alive and can say
+    def open_path(self, path, read_only=False):
+        """Open a JPX (or a section project; `read_only`: the JPX with no alignment data, to look at). A JPX's NeuroInfo files are read in a thread, so that the window stays alive and can say
         what is happening (a big stack takes some seconds to read); a dialog asking for one of those files is made by the window itself."""
         if sp.is_project_path(path):
             return self.open_project(path)
@@ -1259,7 +1302,7 @@ class Aligner:
 
         def work():
             try:
-                stack = ns.open_stack(path, locate=ask)
+                stack = ns.open_stack(path, locate=ask, read_only=read_only)
             except BaseException as e:
                 self.msgs.put(("opened", (path, None, e, t_open)))
             else:
@@ -1272,11 +1315,17 @@ class Aligner:
         self.open_seconds = time.time() - t_open   # (includes any dialog asking for the NeuroInfo files)
         self.opening = False
         self.update_cursor()
+        if isinstance(error, ns.NoAlignmentData):         # (a file it needs was not found or not chosen: it can still be looked at)
+            self.var_status.set("")
+            if messagebox.askyesno("Open read-only?", str(error) + "\n\nOpen the JPX read-only, with its pictures but no alignment? "
+                                   "Nothing in it can then be edited or exported.", parent=self.root):
+                self.open_path(path, read_only=True)
+            return
         if error is not None:
             self.var_status.set("")
             messagebox.showerror("Can't open", str(error) or type(error).__name__, parent=self.root)
             return
-        missing = [s.name for s in stack.sections if not s.source_path and not s.placeholder]
+        missing = [s.name for s in stack.sections if not s.source_path and not s.placeholder] if not stack.read_only else []
         if missing:
             if not messagebox.askokcancel(
                     "Source images not found",
@@ -1346,7 +1395,8 @@ class Aligner:
         self.sel_outline, self.sel_vertices, self.odrag = False, set(), None
         self.cur = 0
         self.view = None
-        self.levels = [[0.0, 65535.0] for _ in range(stack.channels)]
+        self.max_level = float((1 << min(max(stack.bit_depth, 1), 16)) - 1)      # the top of the brightness range: 255 for an 8-bit JPX, 65535 for 16
+        self.levels = [[0.0, self.max_level] for _ in range(stack.channels)]
         self.levels_set = False
         self.auto2_pending = False
         self.build_channel_controls()
@@ -1360,7 +1410,11 @@ class Aligner:
         self.project_obj = getattr(self, "pending_project", None) if self.project_path else None
         self.pending_project = None
         self.saved_sig = self.stack_signature() if (self.project_obj is not None and self.project_obj.alignment) else None
-        if stack.jpx_path:
+        for label in ("Export JPX...", "Save project now (also done automatically)"):
+            self.file_menu.entryconfig(label, state="disabled" if stack.read_only else "normal")
+        if stack.read_only:
+            self.root.title(f"JPX aligner - {os.path.basename(path or stack.jpx_path)} (read-only: no alignment data)")
+        elif stack.jpx_path:
             self.root.title(f"JPX aligner - {os.path.basename(path or stack.jpx_path)}")
         else:
             self.root.title(f"JPX aligner - unsaved project from {len(stack.sections)} sections"
@@ -1735,7 +1789,7 @@ class Aligner:
             if v.size:
                 # (the white point is raised by half, so that the brightest 0.3 % are at two thirds: the first section alone tends to show
                 # brighter than the stack as a whole, which the Auto2 button, once everything has loaded, gets right)
-                self.levels[c] = [float(np.percentile(v, 1)), min(float(np.percentile(v, 99.7)) * 1.5, 65535.0)]
+                self.levels[c] = [float(np.percentile(v, 1)), min(float(np.percentile(v, 99.7)) * 1.5, self.max_level)]
                 self.chan_vars[c][1].set(self.levels[c][0])
                 self.chan_vars[c][2].set(self.levels[c][1])
         self.levels_set = True
@@ -1758,7 +1812,7 @@ class Aligner:
             return
         for c in range(len(self.levels)):
             if how == "full":
-                lo, hi = 0.0, 65535.0
+                lo, hi = 0.0, self.max_level
             else:
                 hs = [self.level_hist(img)[c] for img, _, _ in pvs if c < img.shape[2]]
                 if not hs:
@@ -1957,6 +2011,7 @@ class Aligner:
                  f"Net: rotation {-s.rotation_deg:+.2f}° (clockwise), {'mirrored' if s.mirrored else 'not mirrored'}"
                  + ("" if s.renderable else
                     "\nPlaceholder: a blank frame that keeps the spacing even where a section is missing. Nothing to edit." if s.placeholder else
+                    "\nRead-only: this JPX has no alignment data." if self.stack.read_only else
                     "\nSource image not found: can't edit." if not s.source_path else
                     "\nStill loading: can't edit yet." if self.loading_previews else
                     ("\nCouldn't be located on the slide scan" if s.source_path.lower().endswith(".czi")
@@ -1965,8 +2020,15 @@ class Aligner:
 
     # ---------------------------------------------------------------- editing
 
+    def refuse_read_only(self, what):
+        """True (saying so) when the stack is read-only, so `what` cannot be done."""
+        if self.stack is not None and self.stack.read_only:
+            self.var_status.set(f"This JPX is open read-only (it has no alignment data): can't {what}.")
+            return True
+        return False
+
     def editable(self):
-        if not self.stack or self.busy:
+        if not self.stack or self.busy or self.stack.read_only:
             return None
         s = self.stack.sections[self.cur]
         if not s.renderable or not self.loaded(s):
@@ -2072,7 +2134,7 @@ class Aligner:
             self.changed(s)
 
     def reset_all(self):
-        if not self.stack or self.busy:
+        if not self.stack or self.busy or self.stack.read_only:
             return
         if not messagebox.askyesno("Reset all", "Remove the edits from every section?", parent=self.root):
             return
@@ -2103,7 +2165,7 @@ class Aligner:
 
     def move_section(self, delta):
         """Move the current section up (-1) or down (+1) in the stack."""
-        if not self.stack or self.busy:
+        if not self.stack or self.busy or self.refuse_read_only("change the order"):
             return
         i, j = self.cur, self.cur + delta
         if not 0 <= j < len(self.stack.sections):
@@ -2121,6 +2183,8 @@ class Aligner:
 
     def list_press(self, event):
         """The start of a possible drag of a row of the section list (a plain click selects it, as before)."""
+        if self.stack is not None and self.stack.read_only:
+            return
         i = self.listbox.nearest(event.y)
         if self.stack and not self.busy and 0 <= i < len(self.stack.sections):
             self.list_drag = {"from": i, "y0": event.y, "moved": False, "target": i}
@@ -2161,13 +2225,13 @@ class Aligner:
     def order_dialog(self):
         """A window with a picture of every section, to put them in order by dragging, delete sections from the order and insert placeholders
         (the same editor as step 3's ordering tab). Apply makes the new order; Cancel leaves things as they were."""
-        if not self.stack or self.busy or self.opening:
+        if not self.stack or self.busy or self.opening or self.refuse_read_only("change the order"):
             return
         OrderDialog(self)
 
     def delete_section(self):
         """Remove the current section from the stack (after asking); the exported JPX will not contain it."""
-        if not self.stack or self.busy:
+        if not self.stack or self.busy or self.refuse_read_only("delete sections"):
             return
         secs = self.stack.sections
         if len(secs) <= 1:
@@ -2849,7 +2913,7 @@ class Aligner:
         return spread
 
     def export_dialog(self):
-        if not self.stack or self.busy:
+        if not self.stack or self.busy or self.refuse_read_only("export"):
             return
         stop_check = False      # (the check of the positions is stopped for the export, once the file is chosen)
         unchecked = [s for s in self.stack.sections if s.czi_assumed]

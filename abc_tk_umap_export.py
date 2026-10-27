@@ -198,6 +198,38 @@ class ExportsMixin:
         return messagebox.askyesno("Replace files?", "These files exist and would be replaced:\n\n" + "\n".join(str(p) for p in existing)
                                    + "\n\nReplace them?", icon="warning", parent=self.root)
 
+    def begin_wait(self, message):
+        """The hourglass at once, wherever the pointer is: the widgets that have a cursor of their own (the legend's hand, ...) get it too, since a
+        window's cursor does not reach them. The pending events are handled first, so that the Save dialog that was just closed is gone from the screen
+        before the long work begins. `end_wait` puts the cursors back."""
+        self.wait_cursors = []
+        stack = [self.root]
+        while stack:
+            w = stack.pop()
+            for child in w.winfo_children():
+                if child.winfo_class() == "Toplevel":
+                    continue
+                stack.append(child)
+                try:
+                    own = str(child.cget("cursor"))
+                    if own:
+                        self.wait_cursors.append((child, own))
+                        child.config(cursor="watch")
+                except Exception:
+                    pass
+        self.root.config(cursor="watch")
+        self.var_status.set(message)
+        self.root.update()
+
+    def end_wait(self):
+        for w, own in getattr(self, "wait_cursors", []):
+            try:
+                w.config(cursor=own)
+            except Exception:
+                pass
+        self.wait_cursors = []
+        self.root.config(cursor="")
+
     def view_token_safe(self):
         token = safe_token(getattr(self, "view_token", "view"))
         params_token = self.host["umap_params_token"](self.params) if self.params is not None else ""
@@ -372,7 +404,7 @@ class ExportsMixin:
         if kind == "gene" and getattr(self, "shown_values", None) is not None:
             gene, dataset, scale, vals = self.shown_values
             vmin, vmax = getattr(self, "shown_range", None) or ((float(np.nanmin(vals)), float(np.nanmax(vals))) if np.isfinite(vals).any() else (0.0, 1.0))
-            return {"kind": "colorbar", "gene": gene, "units": self.scale_units()[(dataset, scale)], "vmin": vmin, "vmax": vmax, "cmap": self.gene_cmap()}
+            return {"kind": "colorbar", "gene": gene, "units": self.units_text(dataset, scale), "vmin": vmin, "vmax": vmax, "cmap": self.gene_cmap()}
         if kind == "multi" and getattr(self, "multi_ranges", None):
             colors, names = self.export_channels()
             linear = getattr(self, "multi_scale", "log") == "linear"
@@ -457,9 +489,7 @@ class ExportsMixin:
         if has_legend and not self.confirm_replacing(list(legend_paths.values())):
             self.var_status.set("Save UMAP cancelled.")
             return
-        self.root.config(cursor="watch")
-        self.var_status.set("Saving the UMAP...")
-        self.root.update()
+        self.begin_wait("Saving the UMAP...")
         try:
             fig = self.build_umap_figure()
             written = []
@@ -484,7 +514,7 @@ class ExportsMixin:
         except Exception as e:
             self.var_status.set(f"Could not save the UMAP: {e}")
             print(f"Could not save the UMAP: {e}", flush=True)
-        self.root.config(cursor="")
+        self.end_wait()
 
     # ---- Save section maps
 
@@ -514,9 +544,7 @@ class ExportsMixin:
         if paths is None:
             self.var_status.set("Save section maps cancelled.")
             return
-        self.root.config(cursor="watch")
-        self.var_status.set("Saving the section maps...")
-        self.root.update()
+        self.begin_wait("Saving the section maps...")
         try:
             written = []
             n = len(self.tiles)
@@ -607,7 +635,7 @@ class ExportsMixin:
         except Exception as e:
             self.var_status.set(f"Could not save section maps: {e}")
             print(f"Could not save section maps: {e}", flush=True)
-        self.root.config(cursor="")
+        self.end_wait()
 
     # ---- Export DEGs / expression
 

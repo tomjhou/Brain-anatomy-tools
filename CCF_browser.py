@@ -1123,6 +1123,32 @@ def save_settings(settings):
 
 
 # ---- the info window ----------------------------------------------------------------------------------------------
+class HoverTip:
+    """A small tip beside the pointer while it is over `widget`; `text_fn()` gives the text (asked again each time it is shown)."""
+
+    def __init__(self, widget, text_fn):
+        self.widget, self.text_fn, self.tip, self.label = widget, text_fn, None, None
+        widget.bind('<Enter>', self.show, add='+')
+        widget.bind('<Motion>', self.show, add='+')
+        widget.bind('<Leave>', self.hide, add='+')
+        widget.bind('<ButtonPress>', self.hide, add='+')
+
+    def show(self, e):
+        if self.tip is None:
+            self.tip = tk.Toplevel(self.widget)
+            self.tip.wm_overrideredirect(True)
+            self.label = tk.Label(self.tip, bg='#ffffe0', relief='solid', borderwidth=1, font=('Segoe UI', 9), padx=4, pady=2,
+                                  justify='left', wraplength=420)
+            self.label.pack()
+        self.label.config(text=self.text_fn())
+        self.tip.wm_geometry(f"+{e.x_root + 12}+{e.y_root + 18}")
+
+    def hide(self, e=None):
+        if self.tip is not None:
+            self.tip.destroy()
+            self.tip = self.label = None
+
+
 class InfoWindow:
     """The floating window beside the image: the slice, the cursor, the cell nearest it, and the legend."""
 
@@ -1373,12 +1399,20 @@ class CCFBrowser:
             ttk.Radiobutton(views, text=name, value=name, variable=self.view_var,
                             command=self.change_view).pack(side='left', padx=(6, 0))
         ttk.Button(views, text="\u2699 Settings", command=self.open_settings).pack(side='right')
-        ttk.Label(views, text="Atlas colour saturation").pack(side='left', padx=(24, 4))
+        ttk.Button(views, text="Export .nrrd", command=self.save_volume).pack(side='right', padx=(0, 6))
+        ttk.Label(views, text="Color saturation").pack(side='left', padx=(24, 4))
         self.sat_var = tk.IntVar(value=int(self.settings.get('saturation', 100)))
         self.sat_label = ttk.Label(views, text="", width=5)
-        ttk.Scale(views, from_=0, to=100, orient='horizontal', length=160, variable=self.sat_var,
+        ttk.Scale(views, from_=0, to=100, orient='horizontal', length=107, variable=self.sat_var,
                   command=lambda v: self.change_saturation()).pack(side='left')
         self.sat_label.pack(side='left', padx=(4, 0))
+        ttk.Label(views, text="Search ID").pack(side='left', padx=(16, 4))
+        self.find_var = tk.StringVar()
+        find_entry = ttk.Entry(views, textvariable=self.find_var, width=9)
+        find_entry.pack(side='left')
+        find_entry.bind('<Return>', lambda e: self.find_region())
+        self.find_marker = None        # (view, slice, u, v): the red ring around a searched region's centre
+        self.find_job = None
 
         controls = ttk.Frame(root, padding=(6, 4, 6, 2))
         controls.pack(fill='x')
@@ -1401,7 +1435,9 @@ class CCFBrowser:
                         command=self.request_render).pack(side='left', padx=(8, 0))
         ttk.Button(controls, text="Info window", command=lambda: self.info.show()).pack(side='left', padx=(10, 0))
         ttk.Button(controls, text="Paint panel", command=self.open_paint).pack(side='left', padx=(4, 0))
-        ttk.Button(controls, text="Copy section from", command=self.restore_section).pack(side='left', padx=(4, 0))
+        copy_button = ttk.Button(controls, text="Copy section from", command=self.restore_section)
+        copy_button.pack(side='left', padx=(4, 0))
+        HoverTip(copy_button, self.copy_section_tip)
         ttk.Button(controls, text="Generate meshes", command=self.open_mesh_dialog).pack(side='left', padx=(4, 0))
         for variable in (self.slab_var, self.dot_var):
             variable.trace_add('write', lambda *a: self.refresh_all())
@@ -1436,6 +1472,7 @@ class CCFBrowser:
         root.bind('<equal>', lambda e: self.zoom_at(1.25))
         root.bind('<minus>', lambda e: self.zoom_at(0.8))
         root.bind('0', lambda e: self.fit_to_window())
+        root.bind('<Control-c>', self.repeat_copy_key)
         if self.dnd is not None:
             for slot, widgets in zip(self.slots, self.slot_widgets):   # onto an entry box: that slot
                 widgets['entry'].drop_target_register(self.dnd_files)
@@ -1741,7 +1778,6 @@ class CCFBrowser:
         buttons.pack(fill='x', pady=(10, 0))
         ttk.Button(buttons, text="Close", command=self.close_paint).pack(side='right')
         ttk.Button(buttons, text="Apply", command=self.apply_paint).pack(side='right', padx=(0, 6))
-        ttk.Button(buttons, text="Save volume as…", command=self.save_volume).pack(side='left')
         info = self.info.window
         info.update_idletasks()
         below = info.winfo_y() + info.winfo_height() + 8
@@ -1868,7 +1904,36 @@ class CCFBrowser:
         if not chosen:
             return
         self.settings['restore_dir'] = str(Path(chosen).parent)
-        path, axis, index, view = Path(chosen), self.axis, self.slice, self.view_name
+        self.start_restore(Path(chosen))
+
+    def repeat_copy_key(self, event):
+        """Ctrl+C: copy the section on screen from the volume the last 'Copy section from' used (not while the keys are going to a text box, where
+        Ctrl+C copies its text)."""
+        if event.widget.winfo_class() in ('Entry', 'TEntry', 'TCombobox', 'TSpinbox', 'Spinbox', 'Text', 'Listbox', 'Treeview'):
+            return None
+        self.repeat_restore()
+        return 'break'
+
+    def repeat_restore(self):
+        """Copy the section on screen from the volume of the last copy (the shortcut Ctrl+C)."""
+        if self.volume is None:
+            return
+        if self.busy_label:
+            self.message.configure(text="Still busy; try again when it finishes.")
+            return
+        source = getattr(self, 'restore_source', None)
+        if source is None:
+            self.message.configure(text="Nothing to repeat yet: use Copy section from first.")
+            return
+        if not source.is_file():
+            self.message.configure(text=f"{source.name} is not there any more: use Copy section from to choose it again.")
+            return
+        self.start_restore(source)
+
+    def start_restore(self, path):
+        """Read the section on screen from `path` and copy it in (restore_section and repeat_restore)."""
+        self.restore_source = path
+        axis, index, view = self.axis, self.slice, self.view_name
 
         def done(result, error):
             if error is not None:
@@ -1876,6 +1941,21 @@ class CCFBrowser:
                 return
             self.apply_restored_section(result, axis, index, view, path)
         self.run_in_thread(f"Reading {path.name}…", lambda: read_section_values(path, axis, index), done)
+
+    def copy_section_tip(self):
+        """What 'Copy section from' would do right now, for its tip: which section of the atlas on screen is replaced, and where the new one comes from."""
+        axis_name = AXIS_NAMES[self.axis]
+        again = getattr(self, 'restore_source', None)
+        repeat = (f"\n\nCtrl+C does it again for the section on screen, from the same file ({again.name}), so after moving to another section "
+                  f"one key press copies that one too." if again is not None else
+                  "\n\nAfterwards, Ctrl+C does it again for whichever section is on screen, from the same file (not while a text box has the keyboard).")
+        return (f"Replaces the {self.view_name.lower()} section on screen (section {self.slice + 1} of {self.n_slices}: {axis_name} "
+                f"{self.slice_um / 1000:.3f} mm, {self.slice_bregma_text()}) with the same section of another annotation volume "
+                f"(.nrrd, .nii or .nii.gz) that you choose.\n\n"
+                f"The file must be on the same {N_AP} x {N_DV} x {N_ML} voxel grid as the atlas. Its plane {self.slice + 1} along {axis_name} is read, "
+                f"and its pixel values are taken as region numbers, like those typed in the Paint panel. Only the voxels of this one section that "
+                f"differ are changed; every other section and the red drawing are left alone.\n\n"
+                f"One undo step (in the Paint panel)." + repeat)
 
     def apply_restored_section(self, values, axis, index, view, path):
         unique, inverse = np.unique(values, return_inverse=True)
@@ -2056,7 +2136,7 @@ class CCFBrowser:
             if (self.loaded_atlas_path and Path(ann) == Path(self.loaded_atlas_path)
                     and self.edit_version != self.saved_version):
                 notes.append("NOTE: the atlas on screen has painted changes that haven't been saved; the meshes are "
-                             "made from the file on disk. Use Save volume as… in the Paint panel first to include them.\n")
+                             "made from the file on disk. Use Export .nrrd first to include them.\n")
             self.settings.update(mesh_annotation=ann, mesh_reference=ref, mesh_copy_existing=copy_existing.get())
             show("Reading the volumes…")
 
@@ -2709,6 +2789,76 @@ class CCFBrowser:
             self.rebuild_toggles(slot)
             self.refresh_all()
 
+    # ---- search by region ID
+    def find_region(self):
+        """Ring the centre of the region whose ID is typed in Search ID on the current slice for 5 seconds; if the region is
+        not on this slice, first go to the nearest slice that holds it."""
+        if self.volume is None:
+            return
+        try:
+            value = int(self.find_var.get().strip())
+        except ValueError:
+            self.message.configure(text="Search ID: type a region number")
+            return
+        label = self.stored_label(value)
+        mask = (self.volume == label) if label is not None else None
+        if mask is None or not mask.any():
+            self.message.configure(text=f"No region with ID {value} in this atlas")
+            messagebox.showinfo("Search ID", f"No voxels in the brain have the ID {value}.", parent=self.root)
+            return
+        other = tuple(a for a in range(3) if a != self.axis)
+        present = np.flatnonzero(mask.any(axis=other))
+        nearest = int(present[np.argmin(np.abs(present - self.slice))])
+        if nearest != self.slice:
+            self.slice = nearest
+            self.refresh_all()
+            self.message.configure(text=f"Region {value} is not on that slice: moved to slice {nearest + 1}")
+        else:
+            self.message.configure(text=f"Region {value}")
+        rows, cols = np.nonzero(view_slice(mask, self.view_name, self.slice))
+        centre = np.array([cols.mean(), rows.mean()])
+        pick = int(np.argmin((cols - centre[0]) ** 2 + (rows - centre[1]) ** 2))   # (the region itself, even if it curls round)
+        self.find_marker = (self.view_name, self.slice, int(cols[pick]), int(rows[pick]), view_slice(mask, self.view_name, self.slice))
+        if self.find_job is not None:
+            self.root.after_cancel(self.find_job)
+        self.find_job = self.root.after(5000, self.clear_find_marker)
+        self.request_render()
+
+    def clear_find_marker(self):
+        self.find_job = None
+        self.find_marker = None
+        self.canvas.delete('find')
+
+    def draw_find_marker(self):
+        self.canvas.delete('find')
+        if self.find_marker is None or self.volume is None:
+            return
+        view, index, u, v, region = self.find_marker
+        if view != self.view_name or index != self.slice:
+            return
+        scale, ox, oy = self.view
+        pane_w, height = (self.pane_width() if self.pane_count() == 2 else self.canvas.winfo_width()), self.canvas.winfo_height()
+        # The whole region filled in, with an outline two screen pixels wide, found on the picture as drawn
+        cols = np.floor((np.arange(pane_w) - ox) / scale).astype(np.int64)
+        rows = np.floor((np.arange(height) - oy) / scale).astype(np.int64)
+        inside = ((rows >= 0) & (rows < region.shape[0]))[:, None] & ((cols >= 0) & (cols < region.shape[1]))[None, :]
+        shown = region[np.clip(rows, 0, region.shape[0] - 1)][:, np.clip(cols, 0, region.shape[1] - 1)] & inside
+        edge = outline_edges(shown.astype(np.int8))
+        edge[:, :-1] |= edge[:, 1:]
+        edge[:-1, :] |= edge[1:, :]
+        rgba = np.zeros((height, pane_w, 4), dtype=np.uint8)
+        rgba[shown] = (255, 32, 32, 110)      # the region filled in, see-through
+        rgba[edge] = (255, 32, 32, 255)
+        self.find_photo = ImageTk.PhotoImage(Image.fromarray(rgba, 'RGBA'))
+        radius = max(12.0, 3 * scale)
+        origins = [0, self.pane_width() + PANE_GAP] if self.pane_count() == 2 else [0]
+        for origin in origins:
+            self.canvas.create_image(origin, 0, image=self.find_photo, anchor='nw', tags='find')
+            if shown.sum() >= 10:   # the ring is only for a region too small to see
+                continue
+            x, y = origin + ox + (u + 0.5) * scale, oy + (v + 0.5) * scale
+            self.canvas.create_oval(x - radius, y - radius, x + radius, y + radius, outline='#ff2020', width=3, tags='find')
+
     # ---- navigation
     def go_to(self, index):
         index = int(min(max(index, 0), self.n_slices - 1))
@@ -2922,6 +3072,7 @@ class CCFBrowser:
 
     def render(self):
         self.render_picture()
+        self.draw_find_marker()
         if self.tip_active:
             self.refresh_tip()
         if self.busy_overlay:
@@ -3227,7 +3378,7 @@ class CCFBrowser:
     def close(self):
         if self.edit_version != self.saved_version and not messagebox.askyesno(
                 "Unsaved changes", f"The volume has {self.edit_count:,} edited voxels that have not been saved "
-                "(Paint panel > Save volume as).{0}{0}Close without saving?".format(chr(10)), icon='warning', default='no',
+                "(Export .nrrd).{0}{0}Close without saving?".format(chr(10)), icon='warning', default='no',
                 parent=self.root):
             return
         self.settings['bregma_mm'] = list(self.bregma)

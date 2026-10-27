@@ -66,6 +66,10 @@ OPACITIES = (0.15, 0.25, 0.35, 0.5, 0.75, 1.0)      # the Opacity slider's stops
 DEFAULT_OPACITY_INDEX = 5                          # (fully opaque: the dots on top hide the ones below)
 LABEL_ZOOM_CAP = 5.0               # the group numbers grow with the zoom up to this, then stay the same size
 LAYOUT_SETTLE_MS = 150             # dragging the divider (or the window's edge) changes the section pane's width many times a second: the panels are laid out and drawn again this long after it stops
+HOVER_LABEL_PX = 110               # the hover table: its first column wraps here, and the names beside it never get less than HOVER_NAME_MIN_PX
+HOVER_NAME_MIN_PX = 140
+HOVER_GAP_PX = 8                   # the space between the hover table's columns
+HOVER_SETTLE_MS = 120              # the hover box is measured this long after its text is set (once the names have wrapped)
 SHAPE_SETTLE_MS = 250              # while the view is being zoomed or panned the cells are drawn as plain discs; their shapes come back this long after it stops
 LABEL_WEIGHT_RANGE = (0.6, 2.0)    # the size factor of the smallest and the largest group's number, when sized by cell count
 LABEL_HIGHLIGHT_FACTOR = 2.0       # the number of the group being marked with '+' signs is drawn this much bigger, for as long as it is marked
@@ -951,6 +955,7 @@ class UmapWindow(ExportsMixin):
         else:
             self.level = "subclass" if "subclass" in adata.obs.columns else "class"
         self.shown_gene = None
+        self.number_arrays = {}            # a dataset of your own: the numeric columns' values, made when first hovered
         self.shown_dataset = "standard"
         self.values = None                 # the shown gene's value for each cell (as coloured), or None
         self.tree = None
@@ -1294,19 +1299,25 @@ class UmapWindow(ExportsMixin):
         hov = ttk.LabelFrame(f, text="Under the pointer", padding=6)
         hov.pack(fill=tk.X, side=tk.BOTTOM, pady=(6, 0))
         self.var_cell = tk.StringVar(f, "Hover over a cell in the UMAP or a section.")
+        self.hover_floor = 0                         # the box grows to fit the longest description shown so far and does not shrink again: the controls
+        self.hover_spacer = tk.Frame(hov, width=1, height=1)         # below it (the legend) stay where they are while the pointer moves between cells
+        self.hover_spacer.pack(side=tk.LEFT)
         self.cell_hint = ttk.Label(hov, textvariable=self.var_cell, wraplength=320, justify=tk.LEFT)
         self.cell_hint.pack(anchor="w")
         # the hovered cell as a table: what it is / its number / its name, each in a column of its own
         self.cell_grid = ttk.Frame(hov)
         self.cell_grid.columnconfigure(2, weight=1)
         self.cell_grid.bind("<Configure>", lambda e: self.fit_cell_names())
+        self.hover_width = 0
+        self.hover_job = None
+        hov.bind("<Configure>", self.hover_resized)
         self.cell_cells = []
-        for r in range(20):                          # (the section, the region (up to 3 lines), the levels, the + note, the z, and up to 6 genes)
-            a = ttk.Label(self.cell_grid, foreground="gray35", font=("Segoe UI", 9, "bold"))
+        for r in range(20 + (len(self.own.numbers) if self.own is not None else 0)):          # (the section, the region (3 lines), the levels, the + note, the z, up to 6 genes, and the numeric columns)
+            a = ttk.Label(self.cell_grid, foreground="gray35", font=("Segoe UI", 9, "bold"), wraplength=HOVER_LABEL_PX, justify=tk.LEFT)
             b = ttk.Label(self.cell_grid, width=6, anchor="e", font=("Segoe UI", 10, "bold"))
             c = ttk.Label(self.cell_grid, wraplength=190, justify=tk.LEFT)
-            a.grid(row=r, column=0, sticky="nw", padx=(0, 8))
-            b.grid(row=r, column=1, sticky="ne", padx=(0, 8))
+            a.grid(row=r, column=0, sticky="nw", padx=(0, HOVER_GAP_PX))
+            b.grid(row=r, column=1, sticky="ne", padx=(0, HOVER_GAP_PX))
             c.grid(row=r, column=2, sticky="nw")
             self.cell_cells.append((a, b, c))
         self.var_status = tk.StringVar(f, "")
@@ -1353,8 +1364,6 @@ class UmapWindow(ExportsMixin):
                 if text == "3D view":
                     HoverTip(b, lambda: "Deprecated: 3D in browser does this much better.")
                 if text == "Analyze subset":
-                    if self.own is not None:
-                        b.state(["disabled"])                             # (no legend of atlas groups)
                     HoverTip(b, lambda: "Analyze only the groups switched on in the legend: a project of its own, in a subfolder of this one, with its own "
                                         "PCA and UMAP, opened in a second window.")
         self.update_group_buttons()
@@ -2089,6 +2098,8 @@ class UmapWindow(ExportsMixin):
     # ---- genes
 
     def symbols(self):
+        if self.own is not None:                                       # (its genes, and its numeric columns: either can color the cells)
+            return list(self.own.gene_names) + list(self.own.numbers)
         return core.gene_symbol_list(self.adata, self.imputed_state, self.mode == "imputed")
 
     def show_gene_warning(self, text):
@@ -2176,7 +2187,7 @@ class UmapWindow(ExportsMixin):
             self.var_status.set("No raw counts on this dataset (layers['counts'] missing).")
             return
         source = self.imputed_state["adata"] if imputed else self.adata
-        _cols, resolved, missing = core.resolve_gene_names(source, names)
+        _cols, resolved, missing = self.own.resolve(names) if self.own is not None else core.resolve_gene_names(source, names)
         if missing:
             self.gene_entry.mark_bad(missing)
             self.rejected_text = self.var_gene.get()
@@ -2241,6 +2252,13 @@ class UmapWindow(ExportsMixin):
         if self.view_kind == "gene":
             return tuple(int(v) for v in self.gene_rgb(np.array([0.0]))[0])
         return None
+
+    def units_text(self, dataset, scale):
+        """What the color bar says the values are: for a numeric column of a dataset of your own, just 'value'."""
+        shown = self.gene_cache[0][0] if self.gene_cache is not None else ()
+        if self.own is not None and len(shown) == 1 and self.own.is_number(shown[0]):
+            return "value"
+        return self.scale_units()[(dataset, scale)]
 
     def scale_units(self):
         """What the color bar says the values are."""
@@ -2673,7 +2691,7 @@ class UmapWindow(ExportsMixin):
                 c.create_text(x, y, anchor=anchor, text=f"{a:.1f}% of cells below", font=("Segoe UI", 8), fill="gray30")
                 c.create_text(x, y + h8, anchor=anchor, text=f"{e:.1f}% of expressing", font=("Segoe UI", 8), fill="gray30")
             y += 2 * h8 + 4
-        c.create_text(w / 2, y + h9 / 2, text=self.scale_units()[(dataset, scale)], font=("Segoe UI", 9), fill="gray30")
+        c.create_text(w / 2, y + h9 / 2, text=self.units_text(dataset, scale), font=("Segoe UI", 9), fill="gray30")
         c.config(height=int(y + h9 + 8))
 
     # ---- background work
@@ -2716,6 +2734,13 @@ class UmapWindow(ExportsMixin):
 
     # ---- hover and the link between the UMAP and the section panels
 
+    def number_text(self, name, i):
+        """A numeric column's value in run cell `i`, as text."""
+        values = self.number_arrays.get(name)
+        if values is None:
+            values = self.number_arrays[name] = self.own.number_values(name)
+        return f"{values[i]:.4g}" if np.isfinite(values[i]) else "n/a"
+
     def level_text(self, info):
         """The lines describing the cell under the pointer."""
         lines = []
@@ -2734,11 +2759,16 @@ class UmapWindow(ExportsMixin):
                 v = arr[info["bg_idx"]] if arr is not None else None
             if v is not None and str(v) != "nan":
                 lines.append(f"{self.level_names[k]}: {v}")
+        if self.own is not None and i is not None:
+            for name in self.own.numbers:
+                lines.append(f"{name}: {self.number_text(name, i)}")
         z = core.section_z_text(sec, self.abc_cache, wait=False) if sec is not None else ""
         if z:
             lines.append(z)
         if i is not None and self.values is not None:
             for gene, vals in self.values:
+                if self.own is not None and self.own.is_number(gene):
+                    continue
                 lines.append(f"{gene} = {vals[i]:.3g}" if np.isfinite(vals[i]) else f"{gene} = n/a")
         elif i is None:
             lines.append("(not in the UMAP)")
@@ -2787,29 +2817,37 @@ class UmapWindow(ExportsMixin):
                 continue
             m = re.match(r"^\s*(\d+)\s*(.*)$", str(v))
             rows.append((self.level_names[k], m.group(1) if m else "", m.group(2) if m else str(v)))
-        note = getattr(self, "group_note", None)
-        if note is not None and note[0] == info["key"]:
-            rows.append(("Red +", "", note[1]))
+        if self.own is not None and i is not None:                      # (the numeric columns of a dataset of your own, under the groups)
+            for name in self.own.numbers:
+                rows.append((name, self.number_text(name, i), ""))
         z = core.section_z_text(sec, self.abc_cache, wait=False) if sec is not None else ""
         if z:
             rows.append(("", "", z))
         if i is not None and self.values is not None:
             for gene, vals in self.values:
+                if self.own is not None and self.own.is_number(gene):          # (already listed with the numeric columns)
+                    continue
                 rows.append((gene, f"{vals[i]:.3g}" if np.isfinite(vals[i]) else "n/a", ""))
         elif i is None:
             rows.append(("", "", "(not in the UMAP)"))
         return rows
 
     def fit_cell_names(self):
-        """The names wrap at the table's right edge, whatever the screen's scaling."""
+        """The first and last columns wrap at the table's right edge, whatever the screen's scaling: each has its minimum, and a wider table
+        gives half of the extra width to each."""
         try:
-            x2 = self.cell_grid.grid_bbox(column=2, row=0)[0]
+            number = self.cell_cells[0][1].winfo_reqwidth()
+            room = self.cell_grid.winfo_width() - number - 2 * HOVER_GAP_PX - 4
         except tk.TclError:
             return
-        wl = max(self.cell_grid.winfo_width() - x2 - 4, 60)
-        for _a, _b, c in self.cell_cells:
-            if int(str(c.cget("wraplength"))) != wl:
-                c.config(wraplength=wl)
+        extra = max(room - HOVER_LABEL_PX - HOVER_NAME_MIN_PX, 0)
+        label_wl = HOVER_LABEL_PX + extra // 2
+        name_wl = HOVER_NAME_MIN_PX + extra - extra // 2
+        for a, _b, c in self.cell_cells:
+            if int(str(a.cget("wraplength"))) != label_wl:
+                a.config(wraplength=label_wl)
+            if int(str(c.cget("wraplength"))) != name_wl:
+                c.config(wraplength=name_wl)
 
     def show_cell_rows(self, rows):
         self.cell_hint.pack_forget()
@@ -2828,6 +2866,33 @@ class UmapWindow(ExportsMixin):
                 b.grid_remove()
                 c.grid_remove()
         self.root.after_idle(self.fit_cell_names)
+        self.schedule_hover_floor()
+
+    def schedule_hover_floor(self):
+        """Measure the box once the names have wrapped and the layout has settled (a measure that comes too soon would keep a half-wrapped height)."""
+        if self.hover_job is not None:
+            self.root.after_cancel(self.hover_job)
+        self.hover_job = self.root.after(HOVER_SETTLE_MS, self.grow_hover_floor)
+
+    def hover_resized(self, event):
+        """The box's height only fits its width: when the width changes (the divider, the window), the floor starts over."""
+        if event.width != self.hover_width:
+            self.hover_width = event.width
+            self.hover_floor = 0
+            self.hover_spacer.configure(height=1)
+            self.schedule_hover_floor()
+
+    def grow_hover_floor(self):
+        """Make the 'Under the pointer' box at least as tall as the longest description it has shown (at this width)."""
+        self.hover_job = None
+        try:
+            need = self.cell_grid.winfo_reqheight() if self.cell_grid.winfo_manager() else self.cell_hint.winfo_reqheight()
+            need = min(need, max(150, self.root.winfo_height() // 3))        # (not more than a third of the window: the controls below must keep their room)
+            if need > self.hover_floor:
+                self.hover_floor = need
+                self.hover_spacer.configure(height=need)
+        except tk.TclError:
+            pass
 
     def cell_info(self, i, source):
         return {"key": ("run", i), "umap_idx": i, "bg_idx": None, "sec": self.section_of[i] if self.section_of is not None else None,
@@ -2935,7 +3000,6 @@ class UmapWindow(ExportsMixin):
             t["pc"].set_dim(on)
 
     def clear_highlights(self, keep_dim=False):
-        self.group_note = None
         if not keep_dim:
             self.set_dim(False)
         self.umap.set_pluses(None)
@@ -2959,9 +3023,7 @@ class UmapWindow(ExportsMixin):
             label = arr[info["bg_idx"]]
         if label is None or str(label) == "nan":
             return
-        if self.mark_group(label, skip=i):
-            self.group_note = (info["key"], f"every cell of this {self.level_names[self.level].lower()} (the Level box changes which)")
-            self.show_cell_rows(self.cell_rows(info))
+        self.mark_group(label, skip=i)
 
     def mark_group(self, label, skip=None):
         """Red '+' signs on every cell of the group `label` (at the Group level), in the UMAP and in every section. `skip`: a UMAP cell that

@@ -101,6 +101,23 @@ def find_group_columns(obs):
     return sorted(cols, key=rank)
 
 
+def find_number_columns(obs, groups):
+    """The numeric columns of `obs` that are not group types (counts per cell, percentages, scores such as a classification's confidence): each can
+    color the cells like a gene, and is in the hover. A column whose values are all the same is left out."""
+    cols = []
+    for c in obs.columns:
+        if c in groups:
+            continue
+        s = obs[c]
+        if str(s.dtype) == "bool" or not pd.api.types.is_numeric_dtype(s):
+            continue
+        values = pd.to_numeric(s, errors="coerce").to_numpy(float)
+        values = values[np.isfinite(values)]
+        if len(values) and float(np.ptp(values)) > 0:
+            cols.append(str(c))
+    return cols
+
+
 def level_display_name(column):
     text = re.sub(r"_+|(?<!\d)\.|\.(?!\d)", " ", str(column)).strip()          # (underscores, and dots that are not decimal points, become spaces)
     return text[:1].upper() + text[1:]
@@ -112,8 +129,9 @@ def describe(path):
     a = anndata.read_h5ad(path, backed="r")
     where, matrix, names, kind = choose_source(a)
     key = find_umap_key(a)
+    groups = find_group_columns(a.obs)
     info = {"path": str(path), "n_cells": int(a.n_obs), "n_genes": len(names), "where": where, "kind": kind, "umap_key": key,
-            "groups": find_group_columns(a.obs)}
+            "groups": groups, "numbers": find_number_columns(a.obs, groups)}
     try:
         a.file.close()
     except Exception:
@@ -126,7 +144,7 @@ def describe(path):
 class OwnDataset:
     """The cells of the file (their group columns and UMAP) and its expression as one sparse cells x genes matrix of log2(1 + x) values."""
 
-    def __init__(self, path, obs, umap, gene_names, log2, kind, normalization, groups):
+    def __init__(self, path, obs, umap, gene_names, log2, kind, normalization, groups, numbers=()):
         self.path = Path(path)
         self.obs = obs
         self.umap = umap                              # (n, 2) or None while it has to be made
@@ -135,6 +153,8 @@ class OwnDataset:
         self.kind = kind
         self.normalization = normalization
         self.groups = list(groups)
+        self.numbers = [c for c in numbers if c in obs.columns]            # the numeric columns of the cells (see find_number_columns)
+        self._number_names = {c.casefold(): c for c in self.numbers}
         self.level_names = {c: level_display_name(c) for c in self.groups}
         self.level_has_ids = {c: bool(obs[c].astype(str).str.match(r"^\s*\d").all()) for c in self.groups}
         self._index = None
@@ -150,9 +170,38 @@ class OwnDataset:
                 self._index.setdefault(g.casefold(), i)
         return self._index.get(str(name).strip().casefold())
 
+    def number_name(self, name):
+        """The numeric column called `name` (any case), as the dataset spells it, or None."""
+        return self._number_names.get(str(name).strip().casefold())
+
+    def is_number(self, name):
+        """Whether `name` is a numeric column (and not a gene)."""
+        return self.gene_index(name) is None and self.number_name(name) is not None
+
+    def number_values(self, name):
+        """A numeric column's value in every cell."""
+        return pd.to_numeric(self.obs[self.number_name(name)], errors="coerce").to_numpy(float)
+
+    def resolve(self, names):
+        """Each of `names` as the dataset spells it, a gene or a numeric column: (cols, canonical names, the ones that are neither)."""
+        canonical, missing = [], []
+        for name in names:
+            j = self.gene_index(name)
+            if j is not None:
+                canonical.append(str(self.gene_names[j]))
+            elif self.number_name(name) is not None:
+                canonical.append(self.number_name(name))
+            else:
+                canonical.append(name)
+                missing.append(name)
+        return [None] * len(names), canonical, missing
+
     def column(self, gene, scale):
-        """A gene's value in every cell: log2(1 + x) for the Log scale, x for Linear (normalized expression, not logs)."""
+        """A gene's value in every cell: log2(1 + x) for the Log scale, x for Linear (normalized expression, not logs). A numeric column's own
+        values, on either scale."""
         j = self.gene_index(gene)
+        if j is None and self.number_name(gene) is not None:
+            return self.number_values(gene)
         if j is None:
             raise KeyError(gene)
         col = self.log2[:, j].toarray().ravel().astype(float)
@@ -168,6 +217,12 @@ class OwnDataset:
             block = np.exp2(self.log2[:, g0:g0 + step].toarray()) - 1.0
             out[g0:g0 + step] = ((indicator @ block) / n[:, None]).T
         return out
+
+    def subset(self, rows):
+        """The dataset of the cells at `rows` (their positions): the same genes, no UMAP yet. The groups that still tell cells apart are kept."""
+        obs = self.obs.iloc[rows].copy()
+        keep = [c for c in self.groups if obs[c].nunique() > 1] or list(self.groups)
+        return OwnDataset(self.path, obs, None, self.gene_names, self.log2.tocsr()[rows].tocsc(), self.kind, self.normalization, keep, self.numbers)
 
     def viewer_adata(self):
         """An AnnData for the viewer: the cells with their group columns and UMAP, and the genes' names (the expression is read through this object)."""
@@ -209,7 +264,7 @@ def load_own(path, info, normalization):
         a.file.close()
     except Exception:
         pass
-    return OwnDataset(path, obs, umap, gene_names, log2, kind, normalization, info["groups"])
+    return OwnDataset(path, obs, umap, gene_names, log2, kind, normalization, info["groups"], info.get("numbers", []))
 
 
 # ---- a UMAP for a file that has none
@@ -220,9 +275,9 @@ def umap_cache_path(own, cache_dir):
     return Path(cache_dir) / f"own_umap_{hashlib.md5(key.encode('utf-8')).hexdigest()[:16]}.npy"
 
 
-def make_umap(own):
-    """A UMAP of the cells (scanpy): the 2,000 most variable genes, scaled, 50 principal components, 15 neighbors. A few minutes for 25,000
-    cells (the first time scanpy compiles its UMAP code, which adds a minute)."""
+def make_umap(own, n_components=50):
+    """A UMAP of the cells (scanpy): the 2,000 most variable genes, scaled, `n_components` principal components (50 unless asked: no more than the
+    cells and genes allow), 15 neighbors. A few minutes for 25,000 cells (the first time scanpy compiles its UMAP code, which adds a minute)."""
     import anndata
     import scanpy as sc
     x = own.log2.tocsr().astype(np.float32)
@@ -231,8 +286,8 @@ def make_umap(own):
     sc.pp.highly_variable_genes(a, n_top_genes=min(2000, x.shape[1] - 1), flavor="seurat")
     a = a[:, a.var["highly_variable"].to_numpy()].copy()
     sc.pp.scale(a, max_value=10)
-    sc.tl.pca(a, n_comps=min(50, a.n_vars - 1, a.n_obs - 1))
-    sc.pp.neighbors(a, n_neighbors=15, n_pcs=min(50, a.obsm["X_pca"].shape[1]))
+    sc.tl.pca(a, n_comps=min(int(n_components), a.n_vars - 1, a.n_obs - 1))
+    sc.pp.neighbors(a, n_neighbors=15, n_pcs=a.obsm["X_pca"].shape[1])
     sc.tl.umap(a)
     return np.asarray(a.obsm["X_umap"], dtype=float)
 
@@ -349,10 +404,12 @@ def write_project(folder, own, info):
     with open(folder / PROJECT_FILE, "w", encoding="utf-8") as f:
         json.dump({"source": str(own.path), "normalization": own.normalization, "kind": own.kind, "expression_from": info["where"],
                    "n_cells": int(len(own.obs)), "n_genes": int(len(own.gene_names)), "umap_from": "the file" if info["umap_key"] else "made by the browser",
-                   "groups": own.groups, "written": time.strftime("%Y-%m-%d %H:%M")}, f, indent=2)
+                   "groups": own.groups, "numbers": own.numbers, "written": time.strftime("%Y-%m-%d %H:%M")}, f, indent=2)
     table = pd.DataFrame({"cell_label": own.obs.index.astype(str), "UMAP1": own.umap[:, 0], "UMAP2": own.umap[:, 1]})
     for c in own.groups:
         table[c] = own.obs[c].astype(str).to_numpy()
+    for c in own.numbers:
+        table[c] = own.number_values(c)
     table.to_csv(folder / "umap_coords.csv", index=False)
     norm = dict(NORMALIZATIONS).get(own.normalization, own.normalization) if own.kind == "counts" else "not applied: " + KIND_TEXT[own.kind]
     lines = ["Statistics of this project", "==========================", f"Project folder:  {folder.name}",
@@ -363,6 +420,55 @@ def write_project(folder, own, info):
     for c in own.groups:
         lines.append(f"{own.level_names[c]:<28} {own.obs[c].nunique():,} values")
     (folder / STATISTICS_FILE).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+SUBSET_EXPRESSION_FILE = "expression_log2.npz"      # in the folder of a subset: its cells' expression, so that it opens without the dataset's file
+SUBSET_GENES_FILE = "genes.txt"
+
+
+def write_subset_project(folder, sub, parent_folder, level, names, n_components=50):
+    """Make the project folder of a subset (Analyze subset in the viewer): the project file (it names the dataset's file as the parent's does, and says
+    which groups the subset is), the cells' UMAP and groups, their expression (log2 values, a sparse file) and the genes' names, and statistics."""
+    import json
+    import time
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    parent = read_project(parent_folder) or {}
+    sp.save_npz(folder / SUBSET_EXPRESSION_FILE, sub.log2.tocsc())
+    (folder / SUBSET_GENES_FILE).write_text("\n".join(sub.gene_names) + "\n", encoding="utf-8")
+    table = pd.DataFrame({"cell_label": sub.obs.index.astype(str), "UMAP1": sub.umap[:, 0], "UMAP2": sub.umap[:, 1]})
+    for c in sub.groups:
+        table[c] = sub.obs[c].astype(str).to_numpy()
+    for c in sub.numbers:
+        table[c] = sub.number_values(c)
+    table.to_csv(folder / "umap_coords.csv", index=False)
+    when = time.strftime("%Y-%m-%d %H:%M")
+    with open(folder / PROJECT_FILE, "w", encoding="utf-8") as f:
+        json.dump({"source": str(sub.path), "normalization": sub.normalization, "kind": sub.kind, "expression_from": parent.get("expression_from", ""),
+                   "n_cells": int(len(sub.obs)), "n_genes": int(len(sub.gene_names)), "umap_from": "made by the browser (this subset)",
+                   "groups": sub.groups, "numbers": sub.numbers, "written": when,
+                   "subset": {"parent": str(parent_folder), "level": level, "groups": list(names), "cells": int(len(sub.obs)),
+                              "pca_components": int(n_components)}}, f, indent=2)
+    lines = ["Statistics of this subset", "=========================", f"Project folder:  {folder.name}", f"Written:         {when}", "",
+             f"Made from:       {Path(parent_folder).name}", f"Groups ({level}): " + ", ".join(names), f"Cells:           {len(sub.obs):,}",
+             f"Genes:           {len(sub.gene_names):,}", f"File:            {sub.path}", f"UMAP:            the most variable genes, PCA ({n_components} components), neighbors, UMAP, on these cells alone"]
+    (folder / STATISTICS_FILE).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def load_own_subset(folder):
+    """The dataset of a subset folder (write_subset_project), from its own files."""
+    saved = read_project(folder)
+    folder = Path(folder)
+    table = pd.read_csv(folder / "umap_coords.csv", dtype={"cell_label": str})
+    groups = [c for c in saved.get("groups", []) if c in table.columns]
+    numbers = [c for c in saved.get("numbers", []) if c in table.columns]
+    obs = table.set_index("cell_label")[groups + numbers]
+    obs.index.name = None
+    genes = (folder / SUBSET_GENES_FILE).read_text(encoding="utf-8").split("\n")
+    genes = genes[:-1] if genes and genes[-1] == "" else genes
+    log2 = sp.load_npz(folder / SUBSET_EXPRESSION_FILE).tocsc().astype(np.float32)
+    return OwnDataset(saved["source"], obs, table[["UMAP1", "UMAP2"]].to_numpy(dtype=float), genes, log2, saved.get("kind", "counts"),
+                      saved.get("normalization", NORMALIZATIONS[0][0]), groups, numbers)
 
 
 def saved_umap(folder, own):
@@ -425,6 +531,8 @@ def reopen_own_project(folder, run_blocking, cache_dir):
     """Open a project folder made by prepare_own_dataset: no questions, but where the dataset is if it has moved. Returns (OwnDataset, folder) or None."""
     folder = Path(folder)
     saved = read_project(folder)
+    if saved.get("subset") and (folder / SUBSET_EXPRESSION_FILE).exists():
+        return run_blocking(f"Opening {folder.name}.", lambda: load_own_subset(folder)), folder          # (a subset keeps its own expression: no file to find)
     path = Path(saved["source"])
     if not path.exists():
         path = locate_dialog(path)

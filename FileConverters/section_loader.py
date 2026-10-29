@@ -29,6 +29,7 @@ from PIL import Image, ImageTk
 import neuroinfo_dialogs
 import neuroinfo_stack as ns
 import section_project as sp
+from open_file_dialog import ask_open_file
 from section_order import OrderGrid, THUMB_W, THUMB_H, CELL_PAD
 from order_editor import OrderEditor, placeholder_image
 from tooltip import Tooltip
@@ -462,8 +463,7 @@ class SectionLoader:
         side.pack(side=tk.LEFT, fill=tk.Y)
         self.need_images = []              # the buttons that mean nothing until an image has been added (see refresh_slide_list)
         # the project buttons first, then those for the images in the list
-        ttk.Button(side, text="Open a saved project...", command=self.open_project).pack(fill=tk.X)
-        ttk.Button(side, text="Open recent projects...", command=self.open_recent_project).pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(side, text="Open saved project...", command=self.open_saved_project).pack(fill=tk.X)
         close_button = ttk.Button(side, text="Close project", command=self.close_project)
         close_button.pack(fill=tk.X, pady=(6, 0))
         self.need_images.append(close_button)
@@ -874,107 +874,26 @@ class SectionLoader:
         self.drag_row, self.drag_active = None, False
         self.move_slide_to(i, t - 1 if t > i else t)
 
-    def open_recent_project(self):
-        """A list of the recently used projects to choose from."""
-        paths = sp.recent_projects()
-        if not paths:
-            messagebox.showinfo("Recent projects", "No projects have been saved or opened yet.", parent=self.root)
-            return
-        dlg = tk.Toplevel(self.root)
-        dlg.title("Recent projects")
-        dlg.transient(self.root)
-        dlg.geometry(f"+{self.root.winfo_rootx() + 120}+{self.root.winfo_rooty() + 100}")
-        ttk.Label(dlg, text="Choose a project (double-click opens it):", padding=(10, 10, 10, 4)).pack(anchor="w")
-        cols = ("name", "sections", "folder", "when")
-        tree = ttk.Treeview(dlg, columns=cols, show="headings", selectmode="browse", height=min(max(len(paths), 4), 12))
-        for c, t, w, a in (("name", "Project", 280, "w"), ("sections", "Sections", 110, "e"), ("folder", "Folder", 400, "w"), ("when", "Last saved", 190, "w")):
-            tree.heading(c, text=t)
-            tree.column(c, width=w, anchor=a, stretch=c in ("name", "folder"))   # (a wider window widens only Project and Folder)
-        # The window comes up at once, from the names alone: reading each project file for its date and section count can take a while (the files
-        # are often on a network drive, and a big project is a big file), so that is filled in, row by row, by a thread.
-        for i, p in enumerate(paths):
-            tree.insert("", tk.END, iid=str(i), values=(os.path.basename(p), "...", os.path.dirname(p), "..."))
-        found = queue.Queue()
-
-        def read_details():
-            for i, p in enumerate(paths):
-                try:
-                    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(p)))
-                    n = sp.sections_text(p)
-                except OSError:
-                    when, n = "(missing)", ""
-                found.put((i, n, when))
-
-        threading.Thread(target=read_details, daemon=True).start()
-
-        def show_details():
-            try:
-                while True:
-                    i, n, when = found.get_nowait()
-                    if tree.exists(str(i)):
-                        tree.set(str(i), "sections", n)
-                        tree.set(str(i), "when", when)
-            except queue.Empty:
-                pass
-            except tk.TclError:
-                return                                   # (the window was closed)
-            if dlg.winfo_exists():
-                dlg.after(100, show_details)
-
-        dlg.after(50, show_details)
-        tree.pack(fill=tk.BOTH, expand=True, padx=10)
-        if paths:
-            tree.selection_set("0")
-            tree.focus("0")
-        chosen = []
-
-        def choose(event=None):
-            sel = tree.selection()
-            if sel:
-                chosen.append(paths[int(sel[0])])
-                dlg.destroy()
-
-        def forget():
-            sel = tree.selection()
-            if sel:
-                sp.remove_recent_project(paths[int(sel[0])])
-                tree.delete(sel[0])
-
-        def delete():
-            sel = tree.selection()
-            if not sel:
+    def open_saved_project(self):
+        """Open a project: the one picked in the list of the recently used ones, or a project file browsed for, typed or dragged in (the dialog
+        itself is open_file_dialog's)."""
+        def details(path):
+            return {"sections": sp.sections_text(path), "when": time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(path)))}
+        result = ask_open_file(
+            self.root, sp.recent_projects(), title="Open saved project", noun="project",
+            filetypes=[("Section projects", "*" + sp.PROJECT_SUFFIX + " *" + sp.OLD_PROJECT_SUFFIX), ("All files", "*.*")],
+            columns=[("name", "Project", 280, "w", True), ("sections", "Sections", 110, "e", False), ("folder", "Folder", 400, "w", True),
+                     ("when", "Last saved", 190, "w", False)],
+            details=details, on_remove=sp.remove_recent_project, allow_delete=True, delete_note="raw files remain intact",
+            drop=getattr(self, "can_drop", False))
+        if result:
+            path, from_list = result
+            if not os.path.isfile(path):
+                messagebox.showerror("Can't open", f"This project file {'no longer exists' if from_list else 'was not found'}:\n{path}", parent=self.root)
+                if from_list:
+                    sp.remove_recent_project(path)
                 return
-            p = paths[int(sel[0])]
-            if not messagebox.askyesno("Delete project", f"Delete the project file\n\n{p}\n\nfrom the disk? Only this file goes: the "
-                                       "images are not touched. This can't be undone.", icon="warning", default="no", parent=dlg):
-                return
-            try:
-                if os.path.isfile(p):
-                    os.remove(p)
-            except OSError as e:
-                messagebox.showerror("Can't delete", str(e), parent=dlg)
-                return
-            sp.remove_recent_project(p)
-            tree.delete(sel[0])
-
-        tree.bind("<Double-1>", choose)
-        tree.bind("<Return>", choose)
-        bar = ttk.Frame(dlg, padding=10)
-        bar.pack(fill=tk.X)
-        ttk.Button(bar, text="Remove project from list", command=forget).pack(side=tk.LEFT)
-        ttk.Button(bar, text="Delete project file (raw files remain intact)", command=delete).pack(side=tk.LEFT, padx=8)
-        ttk.Button(bar, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT)       # (packed first: the rightmost)
-        ttk.Button(bar, text="Open", command=choose).pack(side=tk.RIGHT, padx=(0, 8))
-        dlg.bind("<Escape>", lambda e: dlg.destroy())
-        dlg.grab_set()
-        tree.focus_set()
-        self.root.wait_window(dlg)
-        if chosen:
-            if not os.path.isfile(chosen[0]):
-                messagebox.showerror("Can't open", f"This project file no longer exists:\n{chosen[0]}", parent=self.root)
-                sp.remove_recent_project(chosen[0])
-                return
-            self.open_project(chosen[0])
+            self.open_project(path)
 
     def open_project(self, path=None):
         if path is None:
@@ -1319,7 +1238,7 @@ class SectionLoader:
             "This project file will record the images you chose, the outlines found on them, the order of the sections and, "
             "later, their alignment. It is written next to the images and updated as you work, so you can close the program and "
             "come back to where you left off.\n\n"
-            "Open it again with \"Open a saved project\" or \"Open recent projects\" in step 1 (for a JPX, adding the same JPX again "
+            "Open it again with \"Open saved project\" in step 1 (for a JPX, adding the same JPX again "
             "offers its project too). The images themselves are not changed or copied.\n\n"
             "The project file must be placed in the images' folder. Its name will end in _project.json.",
             parent=self.root)

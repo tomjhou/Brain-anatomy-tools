@@ -83,7 +83,7 @@ class ExportsMixin:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def ask_save_path(self, title, proposed, extension, kind):
+    def ask_save_path(self, title, proposed, extension, kind, parent=None):
         """The file the user picks in a Save dialog, or None if the dialog was cancelled. The dialog offers `proposed` (a file name) in the run's
         folder, or in the folder of the last export of this window; a name typed without the extension gets it. The dialog itself asks before
         replacing a file."""
@@ -91,7 +91,7 @@ class ExportsMixin:
         if folder is None or not Path(folder).is_dir():
             folder = self.target_dir()
         chosen = filedialog.asksaveasfilename(
-            parent=self.root, title=title, initialdir=str(folder), initialfile=proposed, defaultextension=extension,
+            parent=parent or self.root, title=title, initialdir=str(folder), initialfile=proposed, defaultextension=extension,
             filetypes=[(kind, "*" + extension), ("All files", "*.*")])
         if not chosen:
             return None
@@ -101,16 +101,17 @@ class ExportsMixin:
         self.export_dir = path.parent
         return path
 
-    def ask_image_format(self, title, svg_note, panels_across=False, summary=None):
-        """"png", "jpg", "svg" or "both", chosen in a small dialog (None if it was cancelled or closed). The last choice made in this window is offered first.
-        `svg_note` is added under the SVG choice."""
+    def ask_image_format(self, title, svg_note, panels_across=False, summary=None, parent=None):
+        """"png", "jpg" or "svg", chosen in a small dialog over `parent` (the window by default; None is returned if it was cancelled or closed). The last
+        choice made in this window is offered first. `svg_note` is added under the SVG choice."""
         import tkinter as tk
         from tkinter import ttk
-        dlg = tk.Toplevel(self.root)
+        owner = parent or self.root
+        dlg = tk.Toplevel(owner)
         dlg.title(title)
-        dlg.transient(self.root)
+        dlg.transient(owner)
         dlg.resizable(False, False)
-        var = tk.StringVar(dlg, getattr(self, "export_format", "png"))
+        var = tk.StringVar(dlg, getattr(self, "export_format", "png") if getattr(self, "export_format", "png") in ("png", "jpg", "svg") else "png")
         box = ttk.Frame(dlg, padding=16)
         box.pack()
         ttk.Label(box, text="Save as:").pack(anchor="w")
@@ -125,7 +126,6 @@ class ExportsMixin:
         svg_info = tk.StringVar(dlg, svg_note or "")
         if svg_note or summary is not None:
             ttk.Label(box, textvariable=svg_info, foreground="gray30", wraplength=340, justify=tk.LEFT).pack(anchor="w", padx=(22, 0))
-        ttk.Radiobutton(box, text="Both: a PNG and an SVG (you name both files now)", value="both", variable=var).pack(anchor="w", pady=(8, 0))
         across = tk.StringVar(dlg, getattr(self, "export_panels_across", PANELS_ACROSS_CHOICES[0]))
         if panels_across:                          # (section maps: how the panels are arranged in the saved picture)
             line = ttk.Frame(box)
@@ -159,13 +159,13 @@ class ExportsMixin:
         dlg.protocol("WM_DELETE_WINDOW", lambda: finish(None))
         dlg.update_idletasks()
         try:                                        # (in the middle of the window, not in a corner of the screen)
-            x = self.root.winfo_rootx() + (self.root.winfo_width() - dlg.winfo_reqwidth()) // 2
-            y = self.root.winfo_rooty() + (self.root.winfo_height() - dlg.winfo_reqheight()) // 3
+            x = owner.winfo_rootx() + (owner.winfo_width() - dlg.winfo_reqwidth()) // 2
+            y = owner.winfo_rooty() + (owner.winfo_height() - dlg.winfo_reqheight()) // 3
             dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
             dlg.grab_set()
         except tk.TclError:
             pass
-        self.root.wait_window(dlg)
+        owner.wait_window(dlg)
         choice = result[0] if result else None
         if choice:
             self.export_format = choice
@@ -173,21 +173,12 @@ class ExportsMixin:
                 self.export_panels_across = across.get()
         return choice
 
-    def ask_export_paths(self, fmt, stem, title):
-        """The file to save for each format of `fmt` ("png", "svg" or "both"): {format: path}, or None if a Save dialog was cancelled. For both, the
-        two dialogs come one after the other, up front, so that both files can then be made without asking anything more; the second starts from
-        the name chosen for the first."""
-        formats = ["png", "svg"] if fmt == "both" else [fmt]
-        paths = {}
-        for k, f in enumerate(formats):
-            ext = "." + f
-            proposed = (f"{paths[formats[0]].stem}{ext}" if k else self.host["unique_export_paths"](self.target_dir(), stem, (ext,))[ext].name)
-            heading = f"{title} ({f.upper()}, file {k + 1} of 2)" if len(formats) > 1 else title
-            chosen = self.ask_save_path(heading, proposed, ext, f.upper() + " image")
-            if chosen is None:
-                return None
-            paths[f] = chosen
-        return paths
+    def ask_export_paths(self, fmt, stem, title, parent=None):
+        """The file to save for the format `fmt` ("png", "jpg" or "svg"): {format: path}, or None if the Save dialog was cancelled."""
+        ext = "." + fmt
+        proposed = self.host["unique_export_paths"](self.target_dir(), stem, (ext,))[ext].name
+        chosen = self.ask_save_path(title, proposed, ext, fmt.upper() + " image", parent=parent)
+        return None if chosen is None else {fmt: chosen}
 
     def confirm_replacing(self, paths):
         """True unless some of `paths` (files the Save dialog did not ask about, saved along with the one it did) exist and the user declines
@@ -946,7 +937,47 @@ class ExportsMixin:
             print(f"Could not export coordinates: {e}", flush=True)
         self.root.config(cursor="")
 
-    def prepare_3d(self, action):
+    def ask_3d_jitter(self):
+        """Ask whether to jitter the section-axis coordinate of the cells (they sit on the planes of the sections, which looks layered): the
+        spread in mm (0 = none), or None if cancelled. The last answer is the default."""
+        import tkinter as tk
+        from tkinter import ttk
+        top = tk.Toplevel(self.root)
+        top.title("3D in browser")
+        top.transient(self.root)
+        top.resizable(False, False)
+        on = tk.BooleanVar(top, getattr(self, "jitter_3d_on", True))
+        spread = tk.StringVar(top, getattr(self, "jitter_3d_mm", "0.15"))
+        body = ttk.Frame(top, padding=12)
+        body.pack()
+        ttk.Checkbutton(body, text="Randomly jitter the section-axis (z) position of the cells", variable=on).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(body, text="Spread, +/- mm:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(body, textvariable=spread, width=6).grid(row=1, column=1, sticky="w", padx=4, pady=(8, 0))
+        ttk.Label(body, foreground="#555555", wraplength=300, justify="left",
+                  text="The cells lie on the planes of the sections, which gives a layered look. Jitter spreads them out along that axis "
+                       "(by default +/- 0.15 mm). Only the picture changes.").grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        result = []
+
+        def ok():
+            try:
+                mm = max(0.0, float(spread.get())) if on.get() else 0.0
+            except ValueError:
+                spread.set("0.15")
+                return
+            self.jitter_3d_on, self.jitter_3d_mm = on.get(), spread.get()
+            result.append(mm)
+            top.destroy()
+        buttons = ttk.Frame(body)
+        buttons.grid(row=3, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="Cancel", command=top.destroy).pack(side="right")
+        ttk.Button(buttons, text="Open", command=ok).pack(side="right", padx=(0, 6))
+        top.bind("<Return>", lambda e: ok())
+        top.bind("<Escape>", lambda e: top.destroy())
+        top.grab_set()
+        self.root.wait_window(top)
+        return result[0] if result else None
+
+    def prepare_3d(self, action, jitter_mm=0.0):
         chosen = self.group_choice(action)
         if chosen is None:
             return None
@@ -975,8 +1006,11 @@ class ExportsMixin:
                 hover = (rows["ccf_structure"].fillna("?").astype(str) + " | section " + rows["brain_section_label"].astype(str).str.rsplit(".", n=1).str[-1]
                          + " | " + rows["cell_label"].astype(str)).to_numpy()
             color = self.last_ids["colors"].get(t)
+            xyz = rows[list(columns)].to_numpy(dtype=float)
+            if jitter_mm > 0:                    # (the middle column is the one across the sections)
+                xyz[:, 1] += np.random.default_rng().uniform(-jitter_mm, jitter_mm, len(xyz))
             groups.append({"label": f"{level_name} {t} ({len(rows):,})", "color": hexcolor(color) if color is not None else "red",
-                           "xyz": rows[list(columns)].to_numpy(dtype=float), "hover": hover})
+                           "xyz": xyz, "hover": hover})
         structures = table["ccf_structure"].to_numpy() if have_ccf and "ccf_structure" in table.columns else None
         return {"groups": groups, "shell_xyz": shell_xyz, "outline": outline, "axis_labels": axis_labels, "structures": structures,
                 "title": f"3D view: {level_name.lower()} {', '.join(str(t) for t in targets)} ({scope})", "have_ccf": have_ccf, "level": level,
@@ -1008,11 +1042,16 @@ class ExportsMixin:
         except ImportError:
             self.var_status.set("The browser 3D view needs plotly: run  python -m pip install plotly  and restart.")
             return
+        if self.group_choice("opening the 3D view") is None:
+            return
+        jitter = self.ask_3d_jitter()
+        if jitter is None:
+            return
         self.root.config(cursor="watch")
         self.var_status.set("Preparing the 3D view...")
         self.root.update()
         try:
-            p = self.prepare_3d("opening the 3D view")
+            p = self.prepare_3d("opening the 3D view", jitter)
             if p is not None:
                 h = self.host
                 target = self.target_dir()

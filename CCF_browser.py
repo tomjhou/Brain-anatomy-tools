@@ -991,6 +991,21 @@ def marker_offsets(shape, radius):
     return dx[mask], dy[mask]
 
 
+def svg_marker(shape, x, y, r):
+    """An SVG element for one cell's marker of the given shape, centred on (x, y) with radius r (pixels)."""
+    if shape == 'circle':
+        return f'<circle cx="{x:.2f}" cy="{y:.2f}" r="{r:.2f}" stroke="none"/>'
+    if shape == 'square':
+        return f'<rect x="{x - r:.2f}" y="{y - r:.2f}" width="{2 * r:.2f}" height="{2 * r:.2f}" stroke="none"/>'
+    if shape == 'plus':
+        return f'<path d="M{x - r:.2f} {y:.2f}H{x + r:.2f}M{x:.2f} {y - r:.2f}V{y + r:.2f}" fill="none"/>'
+    if shape == 'x':
+        return f'<path d="M{x - r:.2f} {y - r:.2f}L{x + r:.2f} {y + r:.2f}M{x - r:.2f} {y + r:.2f}L{x + r:.2f} {y - r:.2f}" fill="none"/>'
+    if shape == 'triangle':
+        return f'<polygon points="{x:.2f},{y - r:.2f} {x + r:.2f},{y + r:.2f} {x - r:.2f},{y + r:.2f}" stroke="none"/>'
+    return f'<polygon points="{x:.2f},{y - r:.2f} {x + r:.2f},{y:.2f} {x:.2f},{y + r:.2f} {x - r:.2f},{y:.2f}" stroke="none"/>'
+
+
 def plane_view(array, view, index):
     """A writable (rows, columns) view, not a copy, of one slice of a volume-shaped array."""
     if view == 'Coronal':
@@ -1400,6 +1415,10 @@ class CCFBrowser:
                             command=self.change_view).pack(side='left', padx=(6, 0))
         ttk.Button(views, text="\u2699 Settings", command=self.open_settings).pack(side='right')
         ttk.Button(views, text="Export .nrrd", command=self.save_volume).pack(side='right', padx=(0, 6))
+        ttk.Button(views, text="Export image", command=self.export_image).pack(side='right', padx=(0, 6))
+        self.last_scene = None         # (how to draw the picture with other cells, the cells, dot radius, view, pane origins) as last drawn
+        self.last_frame = None         # the picture as last drawn (without the labels and marks on top of it), for Export image
+        self.image_format = 'png'
         ttk.Label(views, text="Color saturation").pack(side='left', padx=(24, 4))
         self.sat_var = tk.IntVar(value=int(self.settings.get('saturation', 100)))
         self.sat_label = ttk.Label(views, text="", width=5)
@@ -1411,6 +1430,8 @@ class CCFBrowser:
         find_entry = ttk.Entry(views, textvariable=self.find_var, width=9)
         find_entry.pack(side='left')
         find_entry.bind('<Return>', lambda e: self.find_region())
+        self.grid_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(views, text="Grid (1 mm)", variable=self.grid_var, command=self.draw_grid).pack(side='left', padx=(10, 0))
         self.find_marker = None        # (view, slice, u, v): the red ring around a searched region's centre
         self.find_job = None
 
@@ -1532,11 +1553,11 @@ class CCFBrowser:
         self.request_render()
 
     def on_right_click(self, event):
-        """With the paint panel open: a menu to add the region under the cursor to the drawing, or remove it."""
-        if self.volume is None or self.paint_window is None or not self.paint_window.winfo_exists():
+        """A menu to switch to either of the other two views at the clicked place; with the paint panel open (and the click on the
+        map that is painted) also to add the region under the cursor to the drawing, or remove it."""
+        if self.volume is None:
             return
-        if not self.in_paint_pane(event.x):
-            return   # the standard atlas at the left is never edited
+        paint = self.paint_window is not None and self.paint_window.winfo_exists() and self.in_paint_pane(event.x)
         scale, ox, oy = self.view
         u_idx, v_idx = int(np.floor((self.pane_x(event.x) - ox) / scale)), int(np.floor((event.y - oy) / scale))
         image_w, image_h = VIEW_IMAGE_SIZE[self.view_name]
@@ -1545,18 +1566,34 @@ class CCFBrowser:
         across, down = VIEW_CELL_AXES[self.view_name]
         voxel = [0, 0, 0]
         voxel[self.axis], voxel[across], voxel[down] = self.slice, u_idx, v_idx
-        label = int(self.volume[voxel[0], voxel[1], voxel[2]])
-        value = int(self.label_ids[label]) if self.label_ids is not None else label
-        name = self.region_name(value)
-        shown = f"{name} ({value})" if name else str(value)
         menu = tk.Menu(self.canvas, tearoff=0)
-        menu.add_command(label=f"Add region {shown} to drawing", command=lambda: self.region_to_drawing(label, True))
-        menu.add_command(label=f"Remove region {shown} from drawing",
-                         command=lambda: self.region_to_drawing(label, False))
+        for name in VIEWS:
+            if name != self.view_name:
+                index = voxel[VIEW_AXIS[name]]
+                menu.add_command(label=f"Switch to {name.lower()} view at this location (plane {index + 1} of {VOLUME_SHAPE[VIEW_AXIS[name]]})",
+                                 command=lambda n=name, i=index: self.switch_view(n, i))
+        if paint:
+            label = int(self.volume[voxel[0], voxel[1], voxel[2]])
+            value = int(self.label_ids[label]) if self.label_ids is not None else label
+            name = self.region_name(value)
+            shown = f"{name} ({value})" if name else str(value)
+            menu.add_separator()
+            menu.add_command(label=f"Add region {shown} to drawing", command=lambda: self.region_to_drawing(label, True))
+            menu.add_command(label=f"Remove region {shown} from drawing",
+                             command=lambda: self.region_to_drawing(label, False))
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
+    def switch_view(self, name, index):
+        """Show view `name` at plane `index`."""
+        self.view_name = name
+        self.view_var.set(name)
+        self.slice = index
+        self.fit_to_window()
+        self.refresh_all()
+        self.on_leave()
 
     def region_to_drawing(self, label, add):
         """Add all of a region's voxels to the red drawing, or remove them from it (one undo step)."""
@@ -2789,6 +2826,115 @@ class CCFBrowser:
             self.rebuild_toggles(slot)
             self.refresh_all()
 
+    # ---- export image
+    def ask_image_format(self):
+        """'png', 'jpg' or 'svg', chosen in a small dialog (None if cancelled); the last choice is offered first."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Export image")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        var = tk.StringVar(dlg, self.image_format)
+        box = ttk.Frame(dlg, padding=16)
+        box.pack()
+        ttk.Label(box, text="Save as:").pack(anchor='w')
+        notes = (('png', "PNG: a picture", None),
+                 ('jpg', "JPG: a picture in a much smaller file", "The same picture, compressed: slight blurring and color fringes at the edges of dots."),
+                 ('svg', "SVG: for editing in a drawing program", "The atlas is embedded as an image; each cell is a vector shape, grouped by cell group."))
+        for value, text, note in notes:
+            ttk.Radiobutton(box, text=text, value=value, variable=var).pack(anchor='w', pady=(6, 0))
+            if note:
+                ttk.Label(box, text=note, foreground='gray30', wraplength=340, justify='left').pack(anchor='w', padx=(22, 0))
+        result = []
+
+        def finish(value):
+            result.append(value)
+            dlg.destroy()
+        row = ttk.Frame(box)
+        row.pack(anchor='e', pady=(14, 0))
+        ttk.Button(row, text="OK", command=lambda: finish(var.get())).pack(side='left')
+        ttk.Button(row, text="Cancel", command=lambda: finish(None)).pack(side='left', padx=(6, 0))
+        dlg.bind('<Return>', lambda e: finish(var.get()))
+        dlg.bind('<Escape>', lambda e: finish(None))
+        dlg.protocol('WM_DELETE_WINDOW', lambda: finish(None))
+        dlg.update_idletasks()
+        dlg.geometry(f"+{self.root.winfo_rootx() + (self.root.winfo_width() - dlg.winfo_reqwidth()) // 2}"
+                     f"+{self.root.winfo_rooty() + (self.root.winfo_height() - dlg.winfo_reqheight()) // 3}")
+        dlg.grab_set()
+        self.root.wait_window(dlg)
+        if result and result[0]:
+            self.image_format = result[0]
+        return result[0] if result else None
+
+    def export_image(self):
+        """Save the picture on the screen (the atlas, cells and drawing, as drawn, without the labels) as a PNG, JPG or SVG."""
+        if self.last_frame is None or self.volume is None:
+            self.message.configure(text="Nothing to export yet")
+            return
+        fmt = self.ask_image_format()
+        if fmt is None:
+            return
+        source = Path(self.atlas_path) if self.atlas_path else None
+        folder = getattr(self, 'image_dir', None) or (source.parent if source else SCRIPT_DIR.parent)
+        chosen = filedialog.asksaveasfilename(
+            title="Export image", parent=self.root, initialdir=str(folder), defaultextension='.' + fmt,
+            initialfile=f"{self.view_name.lower()}_{self.slice + 1}.{fmt}", filetypes=[(fmt.upper() + " image", '*.' + fmt)])
+        if not chosen:
+            return
+        path = Path(chosen)
+        if path.suffix.lower() != '.' + fmt:
+            path = path.with_name(path.name + '.' + fmt)
+        self.image_dir = path.parent
+        make, layers, radius, (scale, ox, oy), origins = self.last_scene
+        # Only the atlas, not the empty space round it: the part of each pane the image covers, the panes side by side
+        pane_w = self.pane_width() if len(origins) == 2 else self.last_frame.shape[1]
+        image_w, image_h = VIEW_IMAGE_SIZE[self.view_name]
+        x0, x1 = max(0, int(np.floor(ox))), min(pane_w, int(np.ceil(ox + image_w * scale)))
+        y0, y1 = max(0, int(np.floor(oy))), min(self.last_frame.shape[0], int(np.ceil(oy + image_h * scale)))
+        gap = 8
+        offsets = [k * (x1 - x0 + gap) for k in range(len(origins))]
+
+        def cropped(full):
+            pieces = []
+            for k, origin in enumerate(origins):
+                if k:
+                    pieces.append(np.full((y1 - y0, gap, 3), 255, dtype=np.uint8))
+                pieces.append(full[y0:y1, origin + x0:origin + x1])
+            return np.concatenate(pieces, axis=1)
+        frame = cropped(self.last_frame)
+        picture = Image.fromarray(frame)
+        try:
+            if fmt == 'svg':
+                import base64
+                import io
+                data = io.BytesIO()
+                Image.fromarray(cropped(make(()))).save(data, format='PNG')      # the atlas (and the red drawing) without the cells
+                height, width = frame.shape[:2]
+                href = base64.b64encode(data.getvalue()).decode('ascii')
+                parts = [f'<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" '
+                         f'width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+                         f'<image width="{width}" height="{height}" xlink:href="data:image/png;base64,{href}"/>']
+                r = max(1, int(radius)) + 0.5
+                for origin, offset in zip(origins, offsets):
+                    for u_um, v_um, codes, styles in layers:
+                        xs = offset + ox - x0 + (u_um / VOXEL_UM + 0.5) * scale
+                        ys = oy - y0 + (v_um / VOXEL_UM + 0.5) * scale
+                        for group in np.unique(codes):
+                            color, shape = styles[int(group) % len(styles)]
+                            fill = '#%02x%02x%02x' % tuple(int(c) for c in color[:3])
+                            parts.append(f'<g id="cells_{int(group)}" fill="{fill}" stroke="{fill}" stroke-width="1">')
+                            for x, y in zip(xs[codes == group], ys[codes == group]):
+                                parts.append(svg_marker(shape, x, y, r))
+                            parts.append('</g>')
+                parts.append('</svg>')
+                path.write_text(chr(10).join(parts), encoding='utf-8')
+            elif fmt == 'jpg':
+                picture.save(path, quality=92, subsampling=0)
+            else:
+                picture.save(path)
+            self.message.configure(text=f"Saved {path.name}")
+        except Exception as error:
+            messagebox.showerror("Export image", f"Could not save the image:{chr(10)}{error}", parent=self.root)
+
     # ---- search by region ID
     def find_region(self):
         """Ring the centre of the region whose ID is typed in Search ID on the current slice for 5 seconds; if the region is
@@ -2828,6 +2974,28 @@ class CCFBrowser:
         self.find_job = None
         self.find_marker = None
         self.canvas.delete('find')
+
+    def draw_grid(self):
+        """The grid overlay: lines every 1 mm across the atlas in the current view (from the atlas's own corner, so they stay put as the
+        slices change), in each pane."""
+        self.canvas.delete('grid')
+        if not self.grid_var.get() or self.volume is None:
+            return
+        rows, cols = view_slice(self.volume, self.view_name, self.slice).shape[:2]
+        step = 1000.0 / VOXEL_UM                           # voxels per mm
+        scale, ox, oy = self.view
+        if step * scale < 4:                                # too fine to be useful at this zoom
+            return
+        origins = [0, self.pane_width() + PANE_GAP] if self.pane_count() == 2 else [0]
+        for origin in origins:
+            left, top = origin + ox, oy
+            right, bottom = left + cols * scale, top + rows * scale
+            for n in range(int(cols / step) + 1):
+                x = left + n * step * scale
+                self.canvas.create_line(x, top, x, bottom, fill='#40e0ff', width=1, tags='grid')
+            for n in range(int(rows / step) + 1):
+                y = top + n * step * scale
+                self.canvas.create_line(left, y, right, y, fill='#40e0ff', width=1, tags='grid')
 
     def draw_find_marker(self):
         self.canvas.delete('find')
@@ -3072,6 +3240,7 @@ class CCFBrowser:
 
     def render(self):
         self.render_picture()
+        self.draw_grid()
         self.draw_find_marker()
         if self.tip_active:
             self.refresh_tip()
@@ -3102,14 +3271,19 @@ class CCFBrowser:
             pane_w = self.pane_width()
             ref_labels = view_slice(self.reference['volume'], self.view_name, self.slice)
             outlines = self.outline_style('Regions (dim)')
-            left = render_frame(ref_labels, self.ref_lut_view, 'Regions', self.view, (pane_w, height), layers, radius,
-                                None, compared[0], outlines)
-            right = render_frame(labels, self.lut_view, 'Regions', self.view, (pane_w, height), layers, radius,
-                                 overlay, compared[1], outlines)
-            frame = np.empty((height, width, 3), dtype=np.uint8)
-            frame[:] = (90, 90, 90)
-            frame[:, :pane_w] = left
-            frame[:, pane_w + PANE_GAP:pane_w + PANE_GAP + pane_w] = right
+            def make(layers):
+                left = render_frame(ref_labels, self.ref_lut_view, 'Regions', self.view, (pane_w, height), layers, radius,
+                                    None, compared[0], outlines)
+                right = render_frame(labels, self.lut_view, 'Regions', self.view, (pane_w, height), layers, radius,
+                                     overlay, compared[1], outlines)
+                frame = np.empty((height, width, 3), dtype=np.uint8)
+                frame[:] = (90, 90, 90)
+                frame[:, :pane_w] = left
+                frame[:, pane_w + PANE_GAP:pane_w + PANE_GAP + pane_w] = right
+                return frame
+            frame = make(layers)
+            self.last_scene = (make, layers, radius, self.view, [0, pane_w + PANE_GAP])
+            self.last_frame = frame
             self.photo = ImageTk.PhotoImage(Image.fromarray(frame))
             self.canvas.itemconfigure(self.image_item, image=self.photo)
             for origin, title in ((0, "CCF 2020"), (pane_w + PANE_GAP, Path(self.loaded_atlas_path).name)):
@@ -3119,8 +3293,12 @@ class CCFBrowser:
             return
         if mode in DIFF_MODES:   # the standard atlas is still loading: just the dimmed alternate
             mode = 'Regions (dim)'
-        frame = render_frame(labels, self.lut_view, mode, self.view, (width, height), layers, radius, overlay,
-                             None, self.outline_style(mode))
+        def make(layers):
+            return render_frame(labels, self.lut_view, mode, self.view, (width, height), layers, radius, overlay,
+                                None, self.outline_style(mode))
+        frame = make(layers)
+        self.last_scene = (make, layers, radius, self.view, [0])
+        self.last_frame = frame
         self.photo = ImageTk.PhotoImage(Image.fromarray(frame))
         self.canvas.itemconfigure(self.image_item, image=self.photo)
         self.draw_edge_labels(0, width, height)

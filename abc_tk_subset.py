@@ -78,7 +78,7 @@ def ask_pca_components(parent, n_cells, n_groups):
     import tkinter as tk
     from tkinter import ttk
     dlg = tk.Toplevel(parent)
-    dlg.title("Analyze subset")
+    dlg.title("Create subproject")
     dlg.transient(parent)
     dlg.resizable(False, False)
     var = tk.StringVar(dlg, str(PCA_COMPONENTS))
@@ -101,7 +101,7 @@ def ask_pca_components(parent, n_cells, n_groups):
             if not 2 <= n <= MAX_PCA_COMPONENTS:
                 raise ValueError
         except ValueError:
-            messagebox.showerror("Analyze subset", f"Enter a whole number from 2 to {MAX_PCA_COMPONENTS}.", parent=dlg)
+            messagebox.showerror("Create subproject", f"Enter a whole number from 2 to {MAX_PCA_COMPONENTS}.", parent=dlg)
             return
         result["value"] = n
         dlg.destroy()
@@ -187,14 +187,14 @@ def analyze_subset(v):
         return
     level, mask, names, message = legend_selection(v)
     if mask is None:
-        messagebox.showwarning("Analyze subset", message, parent=v.root)
+        messagebox.showwarning("Create subproject", message, parent=v.root)
         return
     if int(mask.sum()) < MIN_SUBSET_CELLS:
-        messagebox.showwarning("Analyze subset", f"The selected groups have only {int(mask.sum())} cells in this run: a subset needs at least "
+        messagebox.showwarning("Create subproject", f"The selected groups have only {int(mask.sum())} cells in this run: a subset needs at least "
                                                  f"{MIN_SUBSET_CELLS}. Switch on more groups and try again.", parent=v.root)
         return
     if v.run_folder is None:
-        messagebox.showwarning("Analyze subset", "This viewer has no project folder to keep the subset in.", parent=v.root)
+        messagebox.showwarning("Create subproject", "This viewer has no project folder to keep the subset in.", parent=v.root)
         return
     n_components = ask_pca_components(v.root, int(mask.sum()), len(names))
     if n_components is None:
@@ -232,7 +232,7 @@ def analyze_own_subset(v, level, mask, names, folder, n_components=PCA_COMPONENT
     the subset's most variable genes (abc_tk_own.make_umap), and the subset is saved in a project folder of its own (abc_tk_own.write_subset_project)."""
     import abc_tk_own as own_module
     if v.own.kind == "scaled":
-        messagebox.showwarning("Analyze subset", "The values of this dataset were scaled (some are negative), so a UMAP of a subset cannot be made from them.",
+        messagebox.showwarning("Create subproject", "The values of this dataset were scaled (some are negative), so a UMAP of a subset cannot be made from them.",
                                parent=v.root)
         return
     host = v.host

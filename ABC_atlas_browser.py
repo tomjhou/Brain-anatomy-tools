@@ -439,7 +439,7 @@ from abc_core import (
 matplotlib.rcParams['toolbar'] = 'None'
 
 
-def _has_internet_connection(host='s3.amazonaws.com', port=443, timeout=2.0):
+def _has_internet_connection(host='allen-brain-cell-atlas.s3.amazonaws.com', port=443, timeout=2.0):
     """Best-effort, fast (few-second) connectivity probe — a plain TCP
     connect attempt, not an HTTP/S3 request. AbcProjectCache.from_cache_dir
     (below) picks an S3-backed cache over a local-only one any time the
@@ -451,7 +451,10 @@ def _has_internet_connection(host='s3.amazonaws.com', port=443, timeout=2.0):
     own default connect/read timeouts (60s each) plus its default retry
     count meant the app sat there for minutes, apparently frozen, before
     any window ever appeared — this whole check exists to detect that
-    upfront, in seconds, and skip straight to the local-only path instead."""
+    upfront, in seconds, and skip straight to the local-only path instead.
+    The probe is of the atlas's own bucket, not of s3.amazonaws.com: the
+    general S3 address can be reachable while the bucket's own name does
+    not resolve (a flaky DNS or VPN), which is the case that failed."""
     try:
         socket.create_connection((host, port), timeout=timeout).close()
         return True
@@ -950,19 +953,26 @@ def offer_atlas_release_update(cache):
         print(f"Keeping ABC atlas release {current}.")
 
 
+import botocore.exceptions
 startup_note("Libraries loaded. Looking for the ABC atlas download...")
 download_base = choose_atlas_cache_location()
 startup_note(f"Atlas download: {download_base}. Checking the internet connection...")
+abc_cache = None
+offline_reason = "No internet connection was detected."
 if _has_internet_connection():
     startup_note("Online: reading the atlas manifest (this also checks for a newer release)...")
-    with warnings.catch_warnings():
-        # The library's own "a newer release exists" warning; offer_atlas_release_update asks instead.
-        warnings.simplefilter('ignore', OutdatedManifestWarning)
-        abc_cache = AbcProjectCache.from_cache_dir(download_base)
+    try:
+        with warnings.catch_warnings():
+            # The library's own "a newer release exists" warning; offer_atlas_release_update asks instead.
+            warnings.simplefilter('ignore', OutdatedManifestWarning)
+            abc_cache = AbcProjectCache.from_cache_dir(download_base)
+    except (OSError, botocore.exceptions.BotoCoreError) as e:      # (the connection failed after all: the local cache is used, as when offline)
+        offline_reason = f"The Allen atlas server could not be reached ({type(e).__name__})."
+if abc_cache is not None:
     offer_atlas_release_update(abc_cache)
 else:
-    print("No internet connection detected — using the local ABC atlas cache only "
-          f"(skipping the S3 manifest check that would otherwise stall startup for minutes).")
+    print(f"{offline_reason} Using the local ABC atlas cache only "
+          "(skipping the S3 manifest check that would otherwise stall startup for minutes).")
     # NotImplementedError (not a hang) if this session ends up needing a
     # file that was never downloaded — see LocalCache's own _download_
     # file/_download_manifest, both of which just raise instead of trying
@@ -970,6 +980,17 @@ else:
     # at all still fails fast here, just with a real Python traceback
     # instead of a silent freeze.
     abc_cache = AbcProjectCache.from_local_cache(download_base)
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        messagebox.showwarning("Offline", offline_reason + "\n\nThe browser is working offline, with the atlas data already downloaded to this "
+                               "computer. Anything not downloaded yet cannot be loaded, and newer atlas releases are not checked for.", parent=root)
+        root.destroy()
+    except Exception:
+        pass                                              # (no GUI: the console line above is the notice)
 startup_note("Atlas manifest ready.")
 
 CELL_TYPE_OPTIONS = {'1': 'Neurons', '2': 'NonNeurons', '3': 'All'}
@@ -1717,7 +1738,7 @@ THREED_WEB_EDGE_SCRIPT = """
   var modes = [['cloud', 'Cloud'], ['lines', 'Lines']];
   if (roles.surfaces.length) modes.push(['surfaces', 'Surfaces']);
   var box = document.createElement('div');
-  box.className = 'background-box';   // THREED_WEB_SPIN_SCRIPT adds its button to this box
+  box.className = 'background-box';   // THREED_WEB_SPIN_SCRIPT adds its axes checkbox to this box
   box.style.cssText = 'position:absolute;left:14px;top:46px;z-index:20;padding:6px 10px;' +
     'background:rgba(29,32,41,0.88);color:#e6e8ee;border:1px solid #3a3f4d;border-radius:6px;font:12px sans-serif;';
   box.appendChild(document.createTextNode('Background: '));
@@ -1837,6 +1858,7 @@ THREED_WEB_SLICE_SCRIPT = """
   var box = document.createElement('div');
   box.style.cssText = 'position:absolute;left:14px;top:86px;z-index:20;padding:6px 10px;' +
     'background:rgba(29,32,41,0.88);color:#e6e8ee;border:1px solid #3a3f4d;border-radius:6px;font:12px sans-serif;';
+  box.className = 'slice-box';   // THREED_WEB_SPIN_SCRIPT moves it down under the View box
   var checkboxLabel = document.createElement('label');
   checkboxLabel.style.cssText = 'cursor:pointer;';
   var checkbox = document.createElement('input');
@@ -1989,13 +2011,26 @@ THREED_WEB_SPIN_SCRIPT = """
   var SECONDS_PER_TURN = 24;
   var scene = gd._fullLayout.scene._scene;
   var box = gd.querySelector('.background-box');
-  if (!box) {   // a page without background shells has no radio box: make one for the button alone
+  if (!box) {   // a page without background shells has no radio box: make one for the axes checkbox alone
     box = document.createElement('div');
     box.style.cssText = 'position:absolute;left:14px;top:46px;z-index:20;padding:6px 10px;' +
       'background:rgba(29,32,41,0.88);color:#e6e8ee;border:1px solid #3a3f4d;border-radius:6px;font:12px sans-serif;';
     gd.style.position = 'relative';
+    box.appendChild(document.createTextNode('Background: '));
     gd.appendChild(box);
   }
+  // The axes checkbox, in the Background box: the grid, tick labels and axis titles of the scene on and off.
+  var axesLabel = document.createElement('label');
+  axesLabel.style.cssText = 'margin-left:4px;cursor:pointer;';
+  var axesBox = document.createElement('input');
+  axesBox.type = 'checkbox'; axesBox.checked = true;
+  axesBox.addEventListener('change', function () {
+    var visible = axesBox.checked;
+    Plotly.relayout(gd, {'scene.xaxis.visible': visible, 'scene.yaxis.visible': visible, 'scene.zaxis.visible': visible});
+  });
+  axesLabel.appendChild(axesBox);
+  axesLabel.appendChild(document.createTextNode(' Axes'));
+  box.appendChild(axesLabel);
   var button = document.createElement('button');
   button.type = 'button';
   button.textContent = 'Spin';
@@ -2003,7 +2038,6 @@ THREED_WEB_SPIN_SCRIPT = """
     'background:#2b2f3b;color:#e6e8ee;border:1px solid #5a6072;';
   var ACTIVE = IDLE.replace('background:#2b2f3b', 'background:#3b6fd4').replace('#5a6072', '#8fb0ff');
   button.style.cssText = IDLE;
-  box.appendChild(button);
 
   var spinning = false, last = 0, lastSync = 0;
   // Toggling an object (a legend click, a radio button) makes plotly re-plot the scene from the camera stored in the
@@ -2053,16 +2087,48 @@ THREED_WEB_SPIN_SCRIPT = """
     if (now - lastSync > 700 && needsCatchUp()) { lastSync = now; syncLayout(false); }
     requestAnimationFrame(frame);
   }
-  button.addEventListener('click', function () {
-    spinning = !spinning;
+  function setSpinning(on) {
+    spinning = on;
     button.style.cssText = spinning ? ACTIVE : IDLE;
+    button.textContent = spinning ? 'Stop spin' : 'Spin';
     if (spinning) {
       last = performance.now(); lastSync = last;
       requestAnimationFrame(frame);
     } else {
       syncLayout(true);
     }
+  }
+  button.addEventListener('click', function () { setSpinning(!spinning); });
+
+  // The "View" box, under the Background box: Spin, and Top, Sagittal, Anterior, Posterior and Diagonal put the camera on that side of the brain, at
+  // the distance it is now (so the zoom is kept), with anterior up in the top view and left in the sagittal one. The axes
+  // are x = left - right, y = anterior - posterior (growing backwards), z = dorsal - ventral (shown reversed, so up on the screen).
+  var views = document.createElement('div');
+  var viewsTop = 46 + box.offsetHeight + 6;   // (under the Background box)
+  views.style.cssText = 'position:absolute;left:14px;top:' + viewsTop + 'px;z-index:20;padding:6px 10px;' +
+    'background:rgba(29,32,41,0.88);color:#e6e8ee;border:1px solid #3a3f4d;border-radius:6px;font:12px sans-serif;';
+  views.appendChild(document.createTextNode('View: '));
+  [['Top', [0, 0, 1], [0, -1, 0]], ['Sagittal', [1, 0, 0], [0, 0, 1]], ['Anterior', [0, -1, 0], [0, 0, 1]], ['Posterior', [0, 1, 0], [0, 0, 1]],
+   ['Diagonal', [1, -1, 1], [0, 0, 1]]].forEach(function (view, n) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = view[0];
+    b.style.cssText = IDLE.replace('margin-left:6px', 'margin-left:' + (n ? 4 : 0) + 'px');
+    b.addEventListener('click', function () {
+      if (spinning) setSpinning(false);
+      var camera = scene.getCamera(), c = camera.center, e = camera.eye;
+      var d = Math.sqrt(Math.pow(e.x - c.x, 2) + Math.pow(e.y - c.y, 2) + Math.pow(e.z - c.z, 2)) || 2;
+      var v = view[1], norm = Math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+      Plotly.relayout(gd, {'scene.camera': {eye: {x: c.x + d * v[0] / norm, y: c.y + d * v[1] / norm, z: c.z + d * v[2] / norm},
+                                            center: c, up: {x: view[2][0], y: view[2][1], z: view[2][2]},
+                                            projection: camera.projection}});
+    });
+    views.appendChild(b);
   });
+  views.appendChild(button);   // Spin belongs with the views
+  gd.appendChild(views);
+  var sliceBox = gd.querySelector('.slice-box');   // the slice checkbox and its sliders sit under the View box, not beneath it
+  if (sliceBox) sliceBox.style.top = (viewsTop + (views.offsetHeight || 32) + 6) + 'px';
 })();
 """
 

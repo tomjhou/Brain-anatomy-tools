@@ -3,6 +3,8 @@ the gene source), and then goes its own way.
 
 Expression: plots the second gene against the first, for the cells of some groups, per cell or per group.
 Selectivity: one dot for each gene, at its mean in one group (x) and the ratio of that to the highest mean among the largest other groups (y)."""
+import functools
+from pathlib import Path
 import hashlib
 import re
 import textwrap
@@ -20,7 +22,7 @@ import abc_core as core
 from abc_tk_umap import rank_color, plural_name
 from abc_tk_umap_export import hexcolor
 
-MAX_LABELED_GROUPS = 400         # a per-group plot names its points up to this many groups
+MAX_LABELED_GROUPS = 2000        # a per-group plot names its points up to this many groups (a supertype plot has about 1,200; the 5,000+ clusters are left unnamed)
 LARGEST_GROUP_AREA = 1400.0      # a per-group plot: the marker area (points squared) of the group with the most cells; the others by their cell count
 SMALLEST_AREA = 3.0              # (so that a tiny group is still a dot)
 LABEL_DARKEN = 0.6               # the group numbers beside the dots: the circle's color times this
@@ -28,6 +30,7 @@ LABEL_FONT_SIZE = 8              # the group numbers beside the dots: the same f
 DENSITY_BINS = 160               # the grid the density shading counts the cells on
 HOVER_PX = 9                     # a per-cell plot: how close (pixels) the pointer must be to a cell
 DEFAULT_OTHER_GROUPS = 5         # the slider starts on this many of the other groups (while it has not been moved)
+MIN_PLOTTED_GROUP_CELLS = 10      # a Per group plot can leave out the groups with fewer cells than this
 MIN_GROUP_CELLS = 20             # Selectivity ignores groups with fewer cells (their means are too noisy to be the highest of the others)
 SELECTIVITY_FLOOR = 0.01         # added to a gene's mean in the group and in the other groups before the ratio, so that "none anywhere else" is finite
 IMPUTED_BLOCK_GENES = 20         # the imputed file is read this many genes at a time
@@ -162,6 +165,19 @@ def slider_for_groups(k, n_others):
     return min(max(position, 0.0), 100.0)
 
 
+def shows_working(method):
+    """For a method of the window that reads or draws a plot (Analyze, Log / Linear, a box ticked): the Working... note is on the graph from the
+    start until nothing is being read or drawn any more (check_working)."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        self.show_working()
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self.top.after(50, self.check_working)
+    return wrapper
+
+
 def other_group_sizes(counts, target, min_cells=MIN_GROUP_CELLS):
     """The cell counts of the groups other than `target` that have at least `min_cells` cells, largest first (the order Selectivity takes them in)."""
     return [int(counts[g]) for g in np.argsort(-counts, kind="stable") if g != target and counts[g] >= min_cells]
@@ -292,6 +308,8 @@ class AnalyzeWindow:
         self.var_per = tk.StringVar(top, "cell")
         ttk.Radiobutton(box, text="Per cell", value="cell", variable=self.var_per, command=self.per_changed).pack(anchor="w")
         ttk.Radiobutton(box, text="Per group", value="group", variable=self.var_per, command=self.per_changed).pack(anchor="w")
+        self.var_exclude_small = tk.BooleanVar(top, True)
+        self.chk_exclude = ttk.Checkbutton(box, text=f"Exclude groups with <{MIN_PLOTTED_GROUP_CELLS} cells", variable=self.var_exclude_small, command=self.redraw)
         self.var_jitter = tk.BooleanVar(top, True)
         self.var_density = tk.BooleanVar(top, False)
 
@@ -362,6 +380,8 @@ class AnalyzeWindow:
 
         self.btn_analyze = ttk.Button(side, text="Analyze", command=self.analyze)
         self.btn_analyze.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(side, text="Save graph", command=self.save_graph).pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(side, text="Export CSV", command=self.export_csv).pack(fill=tk.X, pady=(6, 0))
         self.var_status = tk.StringVar(top, "")
         ttk.Label(side, textvariable=self.var_status, foreground="gray30", wraplength=270, justify=tk.LEFT).pack(anchor="w", pady=(10, 0))
 
@@ -376,6 +396,7 @@ class AnalyzeWindow:
         self.last_motion = 0.0
         self.hover_group = None
         self.canvas = FigureCanvasTkAgg(self.fig, master=right)
+        self.table = None                       # the numbers of the graph on the screen (a DataFrame), for Export CSV
         self.last_plot = None                   # the arguments of the plot on the screen (a checkbox draws it again)
         self.cax = None
         self.legend_room = False                # the plot leaves room at the right for a legend
@@ -394,8 +415,56 @@ class AnalyzeWindow:
         self.toolbar = NavigationToolbar2Tk(self.canvas, bar)
         self.toolbar.update()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.working = tk.Label(right, text="Working...", font=("Segoe UI", 20), foreground="#555555", background="white")      # (covers the graph while an analysis is going)
         self.update_labels()
         self.canvas.draw()
+
+    def export_csv(self):
+        """Save the numbers of the graph on the screen as a CSV file: per cell, one row for each cell plotted (its group and the two values, and the
+        jittered positions it was drawn at); per group, one row for each group (the cells and the two means); Selectivity, one row for each gene."""
+        v = self.v
+        if self.table is None:
+            self.var_status.set("Click Analyze first: there is no graph to export.")
+            return
+        proposed = v.host["unique_export_paths"](v.target_dir(), "analysis_graph", (".csv",))[".csv"].name
+        path = v.ask_save_path("Export the graph's data", proposed, ".csv", "CSV file", parent=self.top)
+        if path is None:
+            self.var_status.set("Export CSV cancelled.")
+            return
+        try:
+            self.table.to_csv(path, index=False)
+            self.var_status.set(f"Saved {len(self.table):,} rows to {Path(path).name} in {Path(path).parent}.")
+        except Exception as e:
+            self.var_status.set(f"Could not export the data: {e}")
+            print(f"Could not export the data: {e}", flush=True)
+
+    def save_graph(self):
+        """Save the graph on the screen as a PNG, JPG or SVG (asked as for the viewer's other saves)."""
+        v = self.v
+        if self.table is None:
+            self.var_status.set("Click Analyze first: there is no graph to save.")
+            return
+        fmt = v.ask_image_format("Save the graph", "", parent=self.top)
+        if fmt is None:
+            self.var_status.set("Save graph cancelled.")
+            return
+        paths = v.ask_export_paths(fmt, "analysis_graph", "Save the graph", parent=self.top)
+        if paths is None:
+            self.var_status.set("Save graph cancelled.")
+            return
+        path = paths[fmt]
+        self.top.config(cursor="watch")
+        self.var_status.set("Saving the graph...")
+        self.top.update()
+        try:
+            from abc_tk_umap_export import JPG_ARGS
+            self.hide_hover()
+            self.fig.savefig(path, bbox_inches="tight", dpi=300 if fmt != "svg" else None, **({"pil_kwargs": JPG_ARGS} if fmt == "jpg" else {}))
+            self.var_status.set(f"Saved {path.name} to {path.parent}.")
+        except Exception as e:
+            self.var_status.set(f"Could not save the graph: {e}")
+            print(f"Could not save the graph: {e}", flush=True)
+        self.top.config(cursor="")
 
     # ---- the boxes and the choices above the tabs
 
@@ -437,6 +506,10 @@ class AnalyzeWindow:
         state = "normal" if self.var_per.get() == "cell" else "disabled"
         self.chk_jitter.configure(state=state)
         self.chk_density.configure(state=state)
+        if self.var_per.get() == "group":                  # (the box about small groups, just under the radio button, is for a plot of groups)
+            self.chk_exclude.pack(anchor="w", padx=(20, 0))
+        else:
+            self.chk_exclude.pack_forget()
 
     def level_changed(self):
         self.sel = None                         # (the means are kept for every group type: the next Analyze plots the new one from them)
@@ -497,6 +570,18 @@ class AnalyzeWindow:
         else:
             self.selectivity()
 
+    def show_working(self):
+        """Cover the graph with the Working... note (painted now: reading and drawing a big plot holds the window up)."""
+        self.working.place(in_=self.canvas.get_tk_widget(), relx=0, rely=0, relwidth=1, relheight=1)
+        self.top.update()
+
+    def check_working(self):
+        """Take the Working... note off the graph once nothing is being read or drawn any more (the reads run in the background and draw when done)."""
+        if self.v.busy or self.job is not None:
+            self.top.after(150, self.check_working)
+        else:
+            self.working.place_forget()
+
     # ---- what the boxes ask for
 
     def level(self):
@@ -543,6 +628,7 @@ class AnalyzeWindow:
 
     # ---- Expression
 
+    @shows_working
     def expression(self):
         v = self.v
         if v.busy:
@@ -575,6 +661,7 @@ class AnalyzeWindow:
         if not v.job(f"Reading {', '.join(use)}...", work, done):
             self.var_status.set("The viewer is busy reading something: try again in a moment.")
 
+    @shows_working
     def redraw(self):
         """A box was ticked or cleared: the same genes and groups drawn again (nothing is read again)."""
         if self.last_plot is not None:
@@ -609,6 +696,11 @@ class AnalyzeWindow:
                 rng = np.random.default_rng(0)
                 px, py = jittered(px, continuous, scale, rng), jittered(py, continuous, scale, rng)
                 note = " These values are continuous: not jittered." if continuous else " Counts jittered within their step."
+            columns = {"cell": np.asarray(self.v.adata.obs_names)[in_group], self.v.level_names[level]: [full_of[g] for g in cell_group],
+                       gx: vx[in_group], gy: vy[in_group]}
+            if self.var_jitter.get():
+                columns[f"{gx} (plotted, jittered)"], columns[f"{gy} (plotted, jittered)"] = px, py
+            self.table = pd.DataFrame(columns)
             shade = self.var_density.get() and len(px) > 0
             if shade:
                 from matplotlib.colors import LogNorm
@@ -638,17 +730,19 @@ class AnalyzeWindow:
             ax.set_title(f"{int(in_group.sum()):,} cells in {len(set(cell_group.tolist()))} {plural(self.v.level_names[level])}")
             self.var_status.set(f"{int(in_group.sum()):,} cells plotted." + note)
         else:
-            xs, ys, names, cols, counts = [], [], [], [], []
+            xs, ys, names, cols, counts, shown_groups = [], [], [], [], [], []
             self.hover = None
             for g in chosen:
                 m = in_group & (codes == g)
-                if not m.any():
+                if not m.any() or (self.var_exclude_small.get() and m.sum() < MIN_PLOTTED_GROUP_CELLS):
                     continue
                 xs.append(float(np.mean(vx[m])))
                 ys.append(float(np.mean(vy[m])))
                 names.append(label_of[g])
+                shown_groups.append(g)
                 cols.append(color_of[g])
                 counts.append(int(m.sum()))
+            self.table = pd.DataFrame({self.v.level_names[level]: [full_of[g] for g in shown_groups], "cells": counts, f"mean {gx}": xs, f"mean {gy}": ys})
             areas = np.maximum(np.array(counts, dtype=float) / max(counts) * LARGEST_GROUP_AREA, SMALLEST_AREA) if counts else []
             ax.scatter(xs, ys, c=cols, s=areas, alpha=0.85, linewidths=0.4, edgecolors="black")
             if len(xs) <= MAX_LABELED_GROUPS:
@@ -668,6 +762,7 @@ class AnalyzeWindow:
 
     # ---- Selectivity: every gene's mean in one group against how much higher it is than in the other groups
 
+    @shows_working
     def selectivity(self):
         v = self.v
         level = self.level()
@@ -838,6 +933,7 @@ class AnalyzeWindow:
         ax.set_title(f"{len(x):,} genes: {label}")
         ax.grid(True, alpha=0.25, which="both")
         self.hover = {"kind": "genes", "x": x, "y": y, "names": names}
+        self.table = pd.DataFrame({"gene": names, ax.get_xlabel().replace("\n", " "): x, ax.get_ylabel().replace("\n", " "): y})
         self.pluses = ax.scatter([], [], marker="+", c="black", s=40, linewidths=0.9, animated=True, zorder=5)
         self.tip = ax.annotate("", xy=(0, 0), xytext=(14, 14), textcoords="offset points", fontsize=9, animated=True, zorder=6,
                                bbox={"boxstyle": "round,pad=0.3", "fc": "#ffffe0", "ec": "#888888"}, annotation_clip=False)

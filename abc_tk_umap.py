@@ -960,6 +960,7 @@ class UmapWindow(ExportsMixin):
         self.values = None                 # the shown gene's value for each cell (as coloured), or None
         self.tree = None
         self.hover_job = self.group_job = None
+        self.floor_job = None              # (the job that measures the 'Under the pointer' box: apart from hover_job, which dims the plots)
         self.gene_cache = None             # ((genes, imputed, scale), values read) of the genes shown, so a legend click re-uses them
         self.hidden = set()                # the genes switched off by a legend click
         self.multi_rows = None
@@ -1351,7 +1352,7 @@ class UmapWindow(ExportsMixin):
                 (("Export DEGs", self.export_degs, True), ("Export expression", self.export_expression, True)),
                 (("Export coordinates", self.export_coordinates, True), ("3D view", self.show_3d, True)),
                 (("3D in browser", self.show_3d_browser, True), ("Analyze...", self.open_analyze, False)),
-                (("Analyze subset", self.analyze_subset, False),),
+                (("Create subproject", self.analyze_subset, False),),
                 (("Close", self.close, False),))
         for r, pair in enumerate(rows):
             for c, (text, cmd, grouped) in enumerate(pair):
@@ -1363,7 +1364,7 @@ class UmapWindow(ExportsMixin):
                     b.state(["disabled"])                                 # (no section maps)
                 if text == "3D view":
                     HoverTip(b, lambda: "Deprecated: 3D in browser does this much better.")
-                if text == "Analyze subset":
+                if text == "Create subproject":
                     HoverTip(b, lambda: "Analyze only the groups switched on in the legend: a project of its own, in a subfolder of this one, with its own "
                                         "PCA and UMAP, opened in a second window.")
         self.update_group_buttons()
@@ -2870,9 +2871,9 @@ class UmapWindow(ExportsMixin):
 
     def schedule_hover_floor(self):
         """Measure the box once the names have wrapped and the layout has settled (a measure that comes too soon would keep a half-wrapped height)."""
-        if self.hover_job is not None:
-            self.root.after_cancel(self.hover_job)
-        self.hover_job = self.root.after(HOVER_SETTLE_MS, self.grow_hover_floor)
+        if self.floor_job is not None:
+            self.root.after_cancel(self.floor_job)
+        self.floor_job = self.root.after(HOVER_SETTLE_MS, self.grow_hover_floor)
 
     def hover_resized(self, event):
         """The box's height only fits its width: when the width changes (the divider, the window), the floor starts over."""
@@ -2884,7 +2885,7 @@ class UmapWindow(ExportsMixin):
 
     def grow_hover_floor(self):
         """Make the 'Under the pointer' box at least as tall as the longest description it has shown (at this width)."""
-        self.hover_job = None
+        self.floor_job = None
         try:
             need = self.cell_grid.winfo_reqheight() if self.cell_grid.winfo_manager() else self.cell_hint.winfo_reqheight()
             need = min(need, max(150, self.root.winfo_height() // 3))        # (not more than a third of the window: the controls below must keep their room)

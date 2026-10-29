@@ -975,7 +975,7 @@ class Aligner:
             sq_col = ttk.Frame(row)
             sq_col.grid(row=1 + 2 * i, column=0, rowspan=2, sticky="nw", padx=(0, 4), pady=(4 if i else 0, 0))
             # The colored square is the show/hide checkbox: while the channel is shown, two thin lines join its opposite corners
-            # (black, or white on a very dark color so that they can be seen).
+            # (black, or white on a very dark color so that they can be seen); while it is hidden the square goes grey and has no lines.
             dark = 0.299 * ch.color[0] + 0.587 * ch.color[1] + 0.114 * ch.color[2] < 60
             size = round(22 * self.root.winfo_fpixels("1i") / 96)
             square = tk.Canvas(sq_col, width=size, height=size, bg=hexcol, cursor="hand2", highlightthickness=1,
@@ -986,8 +986,9 @@ class Aligner:
                 vis.set(not vis.get())
                 self.redraw()
 
-            def show_x(*_, vis=vis, square=square, size=size, line="white" if dark else "black"):
+            def show_x(*_, vis=vis, square=square, size=size, line="white" if dark else "black", hexcol=hexcol):
                 square.delete("x")
+                square.configure(bg=hexcol if vis.get() else "#8c8c8c")   # (a channel that is off goes grey)
                 if vis.get():
                     m = 1   # (the lines run from corner to corner of the square, inside its 1-pixel border)
                     square.create_line(m, m, size, size, fill=line, tags="x")

@@ -87,3 +87,15 @@ click RUN_CCF_BROWSER.bat (it uses the same `.venv`; if that lacks pandas or Pil
 `abc_atlas_access` library, which brings about 300 MB of dependencies, is installed the first time the atlas is needed; neither needs git). The
 25 um annotation volume (3.6 MB) comes from the ABC atlas cache, and is downloaded on first use, after asking, if it is not there yet. Making surface meshes of regions needs the `vtk` library, which the
 program offers to install the first time (a download of about 100 MB).
+
+## 4. XLEF viewer
+
+A quick viewer for Leica LAS X experiments (`.xlef`): on Windows, double click RUN_XLEF_VIEWER.bat, or drop an `.xlef` file on it
+(it uses the same `.venv`, and installs numpy, tifffile and Pillow into it if they are missing). The left panel lists the experiment's
+images; click one to see its channels overlaid in their LAS X colors, starting with LAS X's contrast settings. Mouse wheel zooms,
+dragging pans, Home (or double click) fits the image to the window, and keys 1-9 switch channels on and off. Each channel has
+black/white sliders and an Auto button.
+
+The viewer only reads what it needs: listing the images reads only the small `.xlif` metadata files, and an image's TIFFs are
+opened only when you select it (and then only the rows the current view needs). Images whose files are online-only in OneDrive
+are marked with a cloud, and the viewer asks before opening one, since that downloads its files in full.

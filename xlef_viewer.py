@@ -20,6 +20,7 @@ import collections
 import functools
 import shutil
 import hashlib
+import uuid
 import queue
 import threading
 import xml.etree.ElementTree as ET
@@ -35,13 +36,14 @@ from PIL import Image, ImageTk
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "FileConverters"))
 from open_file_dialog import ask_open_file
 import leica_luts           # (LAS X's colour maps, sampled: see lut_table)
-from tooltip import Tooltip
+from tooltip import Tooltip, place_on_monitor
 
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".xlef_viewer_settings.json")
 THUMB_CACHE = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "JhouLab", "xlef_viewer_thumbs")
 MAX_RECENT = 20
 MOVING_PAUSE = 0.25          # s without a wheel click or drag before the view counts as at rest (see XlefViewer._moving)
-KEPT_IMAGES_BYTES = 500e6     # recently viewed images' pictures kept in memory, so that switching back to one is instant
+KEPT_IMAGES_PERCENT = 10      # share of the computer's memory (%) for the pictures of recently viewed and preloaded images, which
+                              # make switching to one instant (a setting); 500 MB if the memory's size can't be read
 THUMB_SIZE = 128         # longest side of a thumbnail, screen pixels
 THUMB_MAX_READ = 64e6    # a TIFF that can't be memory-mapped (compressed) is read whole for its thumbnail only up to this size (bytes)
 
@@ -98,6 +100,7 @@ MAX_ZOOM = 16.0          # screen pixels per image pixel
 THEMES = {
     "light": {"bg": "SystemButtonFace", "fg": "SystemButtonText", "field": "SystemWindow", "field_fg": "SystemWindowText",
               "muted": "#555555", "link": "#2060b0", "warn": "#c03030", "bad": "#999999",
+              "dim": "#7a7a7a", "link_dim": "#7f9fcb",
               "idle": "#e8e8e8", "idle_hover": "#d8d8d8", "idle_fg": "black", "selected": "#2f6fd4",
               "grid": "#f4f4f4", "tile": "white", "tile_line": "#d0d0d0", "tile_sel": "#cfe0fa", "tile_text": "black",
               "placeholder": "#e6e6e6", "placeholder_fg": "#777777",
@@ -106,6 +109,7 @@ THEMES = {
               "off_white": "#e4e4e4", "off_line": "#999999"},
     "dark": {"bg": "#2b2b2b", "fg": "#e6e6e6", "field": "#1e1e1e", "field_fg": "#e6e6e6",
              "muted": "#a8a8a8", "link": "#6ea8ff", "warn": "#ff6b6b", "bad": "#7a7a7a",
+             "dim": "#9a9a9a", "link_dim": "#4d76b3",
              "idle": "#3c3c3c", "idle_hover": "#4a4a4a", "idle_fg": "#e6e6e6", "selected": "#2f6fd4",
              "grid": "#232323", "tile": "#363636", "tile_line": "#4a4a4a", "tile_sel": "#28466f", "tile_text": "#e6e6e6",
              "placeholder": "#444444", "placeholder_fg": "#9a9a9a",
@@ -211,6 +215,32 @@ def stored_bytes(path):
 AUTO_DOWNLOAD_MAX = 50e6     # an online-only file up to this size (bytes) is downloaded when needed without asking (pyramid levels are)
 
 
+def size_text(n_bytes):
+    """A file size for people: "640 MB", or from 1,000 MB on "1.4 GB"."""
+    mb = n_bytes / 1e6
+    return f"{mb:,.0f} MB" if mb < 999.5 else f"{mb / 1e3:,.1f} GB"
+
+
+@functools.lru_cache(maxsize=None)
+def total_memory():
+    """The computer's physical memory (bytes), or None if it can't be read (read once)."""
+    if sys.platform != "win32":
+        try:
+            return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        except (ValueError, OSError, AttributeError):
+            return None
+    import ctypes
+
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong), ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong), ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong), ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong), ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+    status = MemoryStatus()
+    status.dwLength = ctypes.sizeof(status)
+    return status.ullTotalPhys if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)) else None
+
+
 def needs_asking(path):
     """True for a file that may only be read after asking: online-only AND bigger than AUTO_DOWNLOAD_MAX (reading any of it makes
     OneDrive download all of it). os.stat only: no download."""
@@ -281,10 +311,11 @@ class FolderEntry:
         self.saved_name = name
         self.parent_file = None
         self.annotations_changed = False
+        self.order_changed = False   # what it lists, or their order, changed in the viewer (dragged, deleted) and not saved yet
 
     @property
     def unsaved(self):
-        return self.name != self.saved_name
+        return self.name != self.saved_name or self.order_changed
 
 
 def _resolve(ref, base_dir):
@@ -309,6 +340,7 @@ def _children(element, base_dir, container=None):
         entry = load_entry(path)
         if entry is not None:
             entry.parent_file = container
+            entry.ref_uuid = ref.get("UUID") or ""
             out.append(entry)
     return out
 
@@ -701,6 +733,8 @@ def _write_text(path, new_text, bom):
 
 
 ELEMENT_NAME = re.compile(r'(<Element\b[^>]*?\bName=")([^"]*)(")')
+PREVIEW_MEMORY_NOTE = ("For the pictures of the images viewed recently, and of the ones loaded in the background so that they\n"
+                       "open at once. Memory is only taken as images are loaded.")
 RENAME_NOTE = ("Off: a rename changes only the name LAS X shows (in its .xlif / .xlcf).\n"
                "On: the image's .xlif and channel TIFFs, or the folder, get the new name too.")
 BAD_NAME_CHARS = '\\/:*?"<>|'
@@ -826,8 +860,12 @@ def carry_out(plan):
                 old_bytes = open(a, "rb").read()
                 _write_text(a, b, old_bytes.startswith(b"\xef\xbb\xbf"))
                 done.append(("text", a, old_bytes))
+            elif kind == "mkdir":
+                if not os.path.isdir(a):
+                    os.makedirs(a)
+                    done.append(("mkdir", a, None))
             else:
-                os.rename(a, b)
+                shutil.move(a, b)             # (a rename on the same drive; between drives a copy, then the original deleted)
                 done.append(("move", a, b))
     except Exception:
         for kind, a, b in reversed(done):
@@ -835,11 +873,148 @@ def carry_out(plan):
                 if kind == "text":
                     with open(a, "wb") as f:
                         f.write(b)
+                elif kind == "mkdir":
+                    os.rmdir(a)
                 else:
-                    os.rename(b, a)
+                    shutil.move(b, a)
             except OSError:
                 pass
         raise
+
+
+def experiment_home(container):
+    """The folder a LAS X experiment or folder keeps its things in: the .xlef's own folder, or for a folder's .xlcf (<name>/Metadata/
+    <name>.xlcf) the <name> folder."""
+    d = os.path.dirname(container)
+    return os.path.dirname(d) if container.lower().endswith(".xlcf") and os.path.basename(d).lower() == "metadata" else d
+
+
+def owned_files(xlif_path):
+    """Every file an image's .xlif brings with it: itself, its channel TIFFs (or .lof), and what it refers to in turn (LAS X's reduced
+    copies, _pmd_N, each an .xlif with TIFFs of its own; histograms). Read from the references, not guessed from names."""
+    out, todo = [], [os.path.normpath(xlif_path)]
+    while todo:
+        path = todo.pop()
+        if any(os.path.normcase(path) == os.path.normcase(p) for p in out):
+            continue
+        out.append(path)
+        if not path.lower().endswith(".xlif"):
+            continue
+        text, _ = _read_text(path)
+        for ref in re.findall(r'\bFile="([^"]*)"', text):
+            target = _resolve(ref, os.path.dirname(path))
+            if not os.path.basename(target).lower().startswith("iomanagerconfigu"):
+                todo.append(target)
+    return out
+
+
+def _moved_text(text, old_dir, new_dir, moved):
+    """An .xlif's text for its new place: every File="..." reference (read from old_dir) written relative to new_dir, pointing at the
+    file's new path if it moves too (moved: normcase(old path) -> new path)."""
+    def fix(m):
+        old = _resolve(m.group(2), old_dir)
+        return m.group(1) + _leica_ref(moved.get(os.path.normcase(old), old), new_dir) + m.group(3)
+    return re.sub(r'(\bFile=")([^"]*)(")', fix, text)
+
+
+def plan_move_image(entry, src_root, dst_container, dst_root):
+    """Moving an image into another experiment (or folder), files and all, as a carry_out() plan: its .xlif goes to the destination's
+    Metadata folder, the files beside it (channel TIFFs) to the destination's folder, LAS X's reduced copies (in the experiment's Pyramid
+    folder) to the destination experiment's Pyramid folder; the references inside the moved .xlif files are rewritten for their new
+    places. src_root/dst_root: the two experiments' folders. Checked first: raises ValueError (nothing done) if a file is missing,
+    lies outside its experiment, or its new name is taken. Returns (plan, {normcase(old path): new path})."""
+    meta = os.path.dirname(entry.xlif_path)          # (an image's .xlif: <folder>/Metadata/<name>.xlif)
+    src_home = os.path.dirname(meta) if os.path.basename(meta).lower() == "metadata" else meta
+    dst_home = experiment_home(dst_container)
+    files = owned_files(entry.xlif_path)
+    moved = {}
+    for f in files:
+        f = _real_case(f)
+        if not os.path.exists(f):
+            raise ValueError(f"{os.path.basename(f)} is missing")
+        pyramid = os.path.join(src_root, "Pyramid")
+        if os.path.normcase(f).startswith(os.path.normcase(pyramid + os.sep)):
+            new = os.path.join(dst_root, "Pyramid", os.path.relpath(f, pyramid))
+        elif os.path.normcase(f).startswith(os.path.normcase(src_home + os.sep)):
+            new = os.path.join(dst_home, os.path.relpath(f, src_home))
+        elif os.path.normcase(f).startswith(os.path.normcase(src_root + os.sep)):
+            new = os.path.join(dst_root, os.path.relpath(f, src_root))
+        else:
+            raise ValueError(f"{os.path.basename(f)} lies outside its experiment's folder")
+        if os.path.exists(new):
+            raise ValueError(f"{new} already exists")
+        moved[os.path.normcase(f)] = new
+    plan = [("mkdir", d, None) for d in sorted({os.path.dirname(n) for n in moved.values()})]
+    for f in files:
+        if f.lower().endswith(".xlif"):
+            new = moved[os.path.normcase(_real_case(f))]
+            text, _ = _read_text(f)
+            plan.append(("text", _real_case(f), _moved_text(text, os.path.dirname(f), os.path.dirname(new), moved)))
+    plan += [("move", _real_case(f), moved[os.path.normcase(_real_case(f))]) for f in files]
+    return plan, moved
+
+
+def children_text(container, listed, children):
+    """The container's (.xlef/.xlcf) text with the images and folders it shows set to `children`, in that order: [(path, uuid)].
+    listed: the paths of those it showed when it was read. Its other references (LAS X's settings file, ...) keep their places; the
+    shown ones take the places of those shown before (all together, where the first was). Checked to read back."""
+    text, _ = _read_text(container)
+    base = os.path.dirname(container)
+    if len(re.findall(r"<Children\b", text)) != 1:
+        raise ValueError("its list of contents is not laid out as expected")
+    nl = "\r\n" if "\r\n" in text else "\n"
+    m = re.search(r"([ \t]*)<Children\s*/>", text)
+    if m:                                    # (an empty list: <Children />)
+        text = text[:m.start()] + f"{m.group(1)}<Children>{nl}{m.group(1)}</Children>" + text[m.end():]
+    head_indent = re.search(r"([ \t]*)<Children>", text).group(1)
+    m = re.search(r"<Children>(.*?)[ \t]*</Children>", text, re.S)
+    refs = re.findall(r"[ \t]*<Reference\b[^>]*/>", m.group(1))
+    indent = re.match(r"[ \t]*", refs[0]).group(0) if refs else head_indent + "  "
+    shown = {os.path.normcase(p) for p in listed} | {os.path.normcase(p) for p, _ in children}
+
+    def target(ref):
+        f = re.search(r'\bFile="([^"]*)"', ref)
+        return os.path.normcase(_resolve(f.group(1), base)) if f else ""
+    new_lines = [f'{indent}<Reference File="{_leica_ref(p, base)}" UUID="{_xml_attr(u)}" />' for p, u in children]
+    out, last = [], 0                # (the shown ones fill the places of those shown before, in the new order; any more go after)
+    for ref in refs:
+        if target(ref) in shown:
+            if new_lines:
+                out.append(new_lines.pop(0))
+                last = len(out)
+        else:
+            out.append(ref)
+    out[last:last] = new_lines
+    new_text = text[:m.start(1)] + nl + "".join(line + nl for line in out) + text[m.end(1):]
+    kids = ET.fromstring(new_text.encode("utf-8")).find("Element/Children")
+    back = [os.path.normcase(_resolve(r.get("File", ""), base)) for r in (kids if kids is not None else [])]
+    if [b for b in back if b in shown] != [os.path.normcase(p) for p, _ in children]:
+        raise ValueError("its new list of contents did not read back as written")
+    return new_text
+
+
+def send_to_recycle_bin(paths):
+    """Move files to the Windows Recycle Bin (they can be restored from there). Raises OSError if Windows refuses."""
+    import ctypes
+    from ctypes import wintypes
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [("hwnd", wintypes.HWND), ("wFunc", ctypes.c_uint), ("pFrom", wintypes.LPCWSTR), ("pTo", wintypes.LPCWSTR),
+                    ("fFlags", ctypes.c_ushort), ("fAnyOperationsAborted", wintypes.BOOL), ("hNameMappings", ctypes.c_void_p),
+                    ("lpszProgressTitle", wintypes.LPCWSTR)]
+    FO_DELETE, FOF_SILENT, FOF_NOCONFIRMATION, FOF_ALLOWUNDO, FOF_NOERRORUI = 3, 0x4, 0x10, 0x40, 0x400
+    op = SHFILEOPSTRUCTW(None, FO_DELETE, "\0".join(os.path.abspath(p) for p in paths) + "\0\0", None,
+                         FOF_SILENT | FOF_NOCONFIRMATION | FOF_ALLOWUNDO | FOF_NOERRORUI, False, None, None)
+    err = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    if err or op.fAnyOperationsAborted:
+        raise OSError(f"Windows could not move them to the Recycle Bin (error {err:#x})")
+
+
+def has_recycle_bin(path):
+    """Does the drive of `path` have a Recycle Bin? Local drives do; network drives don't (Windows would delete outright there)."""
+    import ctypes
+    drive = os.path.splitdrive(os.path.abspath(path))[0] + "\\"
+    return ctypes.windll.kernel32.GetDriveTypeW(drive) in (2, 3)        # (DRIVE_REMOVABLE, DRIVE_FIXED)
 
 
 def argb_of(hex_color):
@@ -959,7 +1134,7 @@ def load_experiment(path):
     """The .xlef as a FolderEntry (its images and sub-folders)."""
     entry = load_entry(path)
     if isinstance(entry, FolderEntry):
-        entry.name = os.path.splitext(os.path.basename(path))[0]
+        entry.name = entry.saved_name = os.path.splitext(os.path.basename(path))[0]     # (the project: not renamed in the viewer)
         return entry
     folder = FolderEntry(os.path.splitext(os.path.basename(path))[0])
     if entry is not None:
@@ -1022,7 +1197,8 @@ class OpenImage:
             self.planes[key] = a
         return self.planes[key]
 
-    def overview(self, z, c):
+    def overview(self, z, c, progress=None):
+        """Channel c's overview for plane z (read once). progress(fraction), if given, is called as it is read from the image itself."""
         key = (z, c)
         if key not in self.overviews:
             small = self._from_pyramid(c) if self.pyramid is not None else None
@@ -1031,7 +1207,11 @@ class OpenImage:
                 if p is None:
                     return None
                 s = self.ov_step
-                small = np.ascontiguousarray(p[::s, ::s])
+                small = np.empty((-(-p.shape[0] // s), -(-p.shape[1] // s)), p.dtype)
+                for i in range(0, small.shape[0], 64):          # (in chunks of rows, so that the progress can be shown)
+                    small[i:i + 64] = p[i * s:(i + 64) * s:s, ::s]
+                    if progress is not None:
+                        progress(min(1.0, (i + 64) / small.shape[0]))
             self.overviews[key] = small
         return self.overviews[key]
 
@@ -1305,6 +1485,7 @@ class RangeSlider(tk.Canvas):
 
     def _press(self, event):
         x = self._along(event)
+        self.before_press = (self.lo, self.hi)
         xl, xh = self._shown()          # (the handles where they are drawn, which is where they are clicked)
         reach = self.HANDLE_W
         if min(abs(x - xl), abs(x - xh)) <= reach:
@@ -1322,6 +1503,13 @@ class RangeSlider(tk.Canvas):
         which, x0, lo0, hi0 = self.drag
         dv = (self._along(event) - x0) / self._span() * self.max_value * (0.1 if event.state & 0x0001 else 1)
         self._apply(which, round(dv), lo0, hi0)
+
+    def undo_press(self):
+        """Put back the handles as they were before the last click (whose first press, of a double click, may have moved one)."""
+        lo, hi = getattr(self, "before_press", (self.lo, self.hi))
+        self.drag = None
+        self._apply("lo", lo - self.lo)
+        self._apply("hi", hi - self.hi)
 
     def _apply(self, which, dv, lo=None, hi=None):
         """Move handle(s) `which` by dv from (lo, hi) (default: where they are now)."""
@@ -1551,9 +1739,7 @@ class PointerTip:
         if text != self.text:
             self.label.configure(text=text)
             self.text = text
-        self.win.update_idletasks()
-        x = min(x_root + 14, self.win.winfo_screenwidth() - self.win.winfo_reqwidth() - 4)      # (kept on screen)
-        self.win.wm_geometry(f"+{int(max(x, 0))}+{int(y_root + 16)}")
+        place_on_monitor(self.win, x_root + 14, y_root + 16, avoid_y=y_root)        # (kept on the pointer's monitor)
 
     def hide(self):
         self.win.destroy()
@@ -1584,30 +1770,79 @@ class ThumbGrid(ttk.Frame):
 
     GAP, NAME_H = 8, 30
 
-    def __init__(self, parent, on_click, size=THUMB_SIZE, on_menu=None):
+    def __init__(self, parent, on_click, size=THUMB_SIZE, on_menu=None, on_drop=None, name_tip=None):
         super().__init__(parent)
-        self.on_click, self.size, self.on_menu = on_click, size, on_menu
+        self.on_click, self.size, self.on_menu, self.on_drop = on_click, size, on_menu, on_drop
+        self.name_tip, self.tip = name_tip, None     # (name_tip(item): the note to show while the pointer is on its name, or None)
+        self.press = None         # (a thumbnail pressed: (item, x, y, dragging yet); dropped on another: on_drop(item, target, after))
         self.canvas = tk.Canvas(self, highlightthickness=0, background=PAL["grid"], takefocus=True)
         sb = ttk.Scrollbar(self, orient=tk.VERTICAL, command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=sb.set)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.rows = []            # ("folder", name) or ("image", item, name, tag)
+        self.rows = []            # ("project", name, its list item), ("folder", name) or ("image", item, name, tag)
         self.thumbs = {}          # item -> (PhotoImage or None, state)
+        self.dimmed = set()       # items whose names are dimmed (nothing of the image in memory yet: see set_dimmed)
         self.selected = None
         self.cols = 1
         self.tile_y = {}          # item -> y of its tile
         self.canvas.bind("<Configure>", lambda e: self.layout())
         self.canvas.bind("<ButtonPress-1>", self._click)
+        self.canvas.bind("<B1-Motion>", self._drag)
+        self.canvas.bind("<ButtonRelease-1>", self._release)
         self.canvas.bind("<Button-3>", self._menu)
+        self.canvas.bind("<Motion>", self._motion)
+        self.canvas.bind("<Leave>", lambda e: self._hide_tip())
         self.canvas.bind("<MouseWheel>", lambda e: self.canvas.yview_scroll(int(-e.delta / 120), "units"))
         for key, d in (("Left", -1), ("Right", 1), ("Up", "-row"), ("Down", "row")):
             self.canvas.bind(f"<{key}>", lambda e, d=d: self._step(d))
 
-    def set_items(self, rows, message=""):
-        """The rows to show; `message` is shown instead when there are none (e.g. "Loading...")."""
-        self.rows, self.thumbs, self.selected, self.message, self.progress = rows, {}, None, message, {}
-        self.canvas.yview_moveto(0)
+    def _name_color(self, item, tag):
+        dim = item in self.dimmed
+        return (PAL["bad"] if tag == "bad" else PAL["link_dim" if dim else "link"] if tag == "cloud"
+                else PAL["dim"] if dim else PAL["tile_text"])
+
+    def set_dimmed(self, item, dim):
+        """Dim an image's name (as in the list, while nothing of it is in memory), or not."""
+        if (item in self.dimmed) == dim:
+            return
+        (self.dimmed.add if dim else self.dimmed.discard)(item)
+        tag = next((r[3] for r in self.rows if r[0] == "image" and r[1] == item), None)
+        if tag is not None:
+            self.canvas.itemconfigure(f"name:{item}", fill=self._name_color(item, tag))
+
+    def _motion(self, event):
+        """The pointer on an image's name: its note (see name_tip) beside the pointer, if it has one."""
+        c = self.canvas
+        x, y = c.canvasx(event.x), c.canvasy(event.y)
+        text = None
+        if self.name_tip is not None and self.press is None:
+            for obj in c.find_overlapping(x - 1, y - 1, x + 1, y + 1):
+                name = next((t[5:] for t in c.gettags(obj) if t.startswith("name:")), None)
+                if name is not None:
+                    text = self.name_tip(name)
+                    break
+        if text is None:
+            self._hide_tip()
+            return
+        if self.tip is None:
+            self.tip = PointerTip(c)
+        self.tip.show(text, event.x_root, event.y_root)
+
+    def _hide_tip(self):
+        if self.tip is not None:
+            self.tip.hide()
+            self.tip = None
+
+    def set_items(self, rows, message="", keep=False):
+        """The rows to show; `message` is shown instead when there are none (e.g. "Loading..."). keep: the thumbnails (and selection)
+        of images still among them stay."""
+        items = {r[1] for r in rows if r[0] == "image"}
+        thumbs = {i: t for i, t in self.thumbs.items() if i in items} if keep else {}
+        selected = self.selected if keep and self.selected in items else None
+        self.rows, self.thumbs, self.selected, self.message, self.progress = rows, thumbs, selected, message, {}
+        if not keep:
+            self.canvas.yview_moveto(0)
         self.layout()
 
     def set_progress(self, item, fraction):
@@ -1682,7 +1917,7 @@ class ThumbGrid(ttk.Frame):
                     y += 2 * self.GAP
                 c.create_line(self.GAP, y, width - self.GAP, y, fill=PAL["selected"], width=3)
                 t = c.create_text(self.GAP, y + 6, anchor=tk.NW, text=row[1], font=("Segoe UI", 12, "bold"), fill=PAL["tile_text"],
-                                  width=max(width - 2 * self.GAP, 40))
+                                  width=max(width - 2 * self.GAP, 40), tags=(f"proj:{row[2]}",))
                 y = c.bbox(t)[3] + 8
                 continue
             if row[0] == "folder":
@@ -1698,9 +1933,9 @@ class ThumbGrid(ttk.Frame):
             tags = ("tile", f"i:{item}")
             c.create_rectangle(x, y, x + tile_w, y + tile_h, fill=self._bg(item), outline=self._outline(item), width=2,
                                tags=tags + (f"bg:{item}",))
-            short = name if len(name) <= 34 else name[:32] + "…"
+            short = (name if len(name) <= 34 else name[:32] + "…") + ("  ☁" if tag == "cloud" else "")
             c.create_text(x + tile_w / 2, y + self.size + 4, anchor=tk.N, text=short, width=tile_w - 4, justify=tk.CENTER,
-                          fill=PAL["link"] if tag == "cloud" else PAL["bad"] if tag == "bad" else PAL["tile_text"], tags=tags)
+                          fill=self._name_color(item, tag), tags=tags + (f"name:{item}",))
             self._draw_picture(item, x, y)
             self._draw_progress(item)
             col += 1
@@ -1738,20 +1973,68 @@ class ThumbGrid(ttk.Frame):
         return None
 
     def _click(self, event):
+        self._hide_tip()
         self.canvas.focus_set()
         item = self._item_at(event)
+        self.press = (item, event.x, event.y, False) if item is not None else None
         if item is not None:
             self.on_click(item)
 
+    def _drop_at(self, event, dragged):
+        """The thumbnail under the pointer while dragging, and whether the pointer is on its right half: (target, after, its box)."""
+        target = self._item_at(event)
+        box = self.canvas.coords(f"bg:{target}") if target is not None and target != dragged else None
+        if not box:
+            return None
+        return target, self.canvas.canvasx(event.x) > (box[0] + box[2]) / 2, box
+
+    def _drag(self, event):
+        """Dragging a thumbnail (after a few pixels): a bar before or after the thumbnail it would be dropped next to."""
+        if self.press is None or self.on_drop is None:
+            return
+        item, x0, y0, started = self.press
+        if not started and abs(event.x - x0) + abs(event.y - y0) < 8:
+            return
+        self.press = (item, x0, y0, True)
+        self.canvas.configure(cursor="fleur")
+        self.canvas.delete("dropline")
+        if event.y < 16:
+            self.canvas.yview_scroll(-1, "units")
+        elif event.y > self.canvas.winfo_height() - 16:
+            self.canvas.yview_scroll(1, "units")
+        hit = self._drop_at(event, item)
+        if hit:
+            target, after, box = hit
+            x = box[2] + self.GAP / 2 if after else box[0] - self.GAP / 2
+            self.canvas.create_line(x, box[1], x, box[3], fill=PAL["selected"], width=3, tags="dropline")
+
+    def _release(self, event):
+        press, self.press = self.press, None
+        if press is None or not press[3]:
+            return
+        self.canvas.delete("dropline")
+        self.canvas.configure(cursor="")
+        hit = self._drop_at(event, press[0])
+        if hit:
+            self.on_drop(press[0], hit[0], hit[1])
+
     def _menu(self, event):
-        """Right-click on a thumbnail: on_menu(item, x_root, y_root) (the viewer's menu for that section)."""
+        """Right-click on a thumbnail, or on a project's name: on_menu(item, x_root, y_root) (the viewer's menu for that section or
+        project, as in the list)."""
+        self._hide_tip()
+        x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        for obj in self.canvas.find_overlapping(x - 1, y - 1, x + 1, y + 1):
+            pid = next((t[5:] for t in self.canvas.gettags(obj) if t.startswith("proj:")), None)
+            if pid is not None and self.on_menu is not None:
+                self.on_menu(pid, event.x_root, event.y_root)
+                return
         item = self._item_at(event)
         if item is not None and self.on_menu is not None:
-            box = self.canvas.coords(f"bg:{item}")            # (the menu's top at the middle of the thumbnail's name)
+            box = self.canvas.coords(f"bg:{item}")            # (the menu's top at the middle of the thumbnail's picture)
             y = event.y_root
             if box:
-                name_mid = box[1] + self.size + 4 + self.NAME_H / 3
-                y = int(self.canvas.winfo_rooty() + name_mid - self.canvas.canvasy(0))
+                picture_mid = box[1] + 4 + self.size / 2
+                y = int(self.canvas.winfo_rooty() + picture_mid - self.canvas.canvasy(0))
             self.on_menu(item, event.x_root, y)
 
     def _step(self, d):
@@ -1805,7 +2088,12 @@ class XlefViewer:
         self.kept_images = collections.OrderedDict()     # ImageEntry -> OpenImage, for images seen recently (see _keep_image)
         self.kept_bytes = 0          # (their size, kept up to date here, for the background loader's thread to read)
         self.full_res_ok = None      # (see show_entry)
-        self.history = []            # changes that Undo goes back through: ("ann", entry) or ("lut", [(entry, channel, old map)])
+        self.history = []            # changes that Undo goes back through: ("ann", entry), ("lut", [(entry, channel, old map)]),
+                                     # ("move", (item, old parent, old index)) or ("delete", (item, entry, old parent, old index))
+        self.home = {}               # list item -> the project it was read from (an image dragged to another moves there on Save)
+        self.deleted = {}            # list item -> ImageEntry, for images deleted and not saved yet (out of the list; Save recycles them)
+        self.drag_item = None        # (a name pressed in the list: (item, y, dragging yet); see _tree_drag)
+        self.drop_line = None
         self.enlarge_method = self.settings.get("enlarge_method", "mitchell")     # (zoomed-in pixels: see ENLARGE_METHODS)
         if self.enlarge_method not in ENLARGE_METHODS:
             self.enlarge_method = "mitchell"
@@ -1815,7 +2103,10 @@ class XlefViewer:
         self.item_cloud = set()      # list items of images with online-only files (a cloud after the name)
         self.rename_job = self.rename_box = None
         self.preload_progress = {}   # list item -> percent, while the background loader reads it
-        self.thumbs_busy = False     # (the thumbnail thread is running: the background loader waits for it)
+        self.open_progress = None    # (list item, percent) while the preview of the image opened is read
+        self.preload_full = []       # images the background loader left out because the memory for previews was full
+        self.thumbs_busy = False     # (the thumbnail thread is running: the background loader waits for it while they are shown)
+        self.thumbs_shown = False    # (the thumbnail grid is showing, not the list: the thumbnail thread pauses otherwise)
         self.detail_cache = None     # the sharp view's pixels for the view on screen: {"key", "arrays"} (see redraw)
         self.download_queue = []     # list items whose full resolution is to be downloaded from OneDrive (see download_full_res)
         self.download_progress = {}  # list item -> "waiting" or percent, while it is queued or downloading
@@ -1866,7 +2157,8 @@ class XlefViewer:
         ttk.Button(self.list_bar, text="Open...", command=self.ask_open).pack(side=tk.LEFT)
         self.save_button = ttk.Button(self.list_bar, text="Save", command=self.save_annotations, state=tk.DISABLED)
         self.save_button.pack(side=tk.LEFT, padx=(4, 0))
-        Tooltip(self.save_button, "Write all unsaved changes (edited annotations, renames: marked ✎ in the list) into LAS X's files, "
+        Tooltip(self.save_button, "Write all unsaved changes (annotations, color maps, renames, the list's order, deleted images: "
+                                  "marked ✎ in the list) into LAS X's files, "
                                   "keeping a copy of each file as it was. Nothing is saved until you click this.")
         # The List / Thumbnails toggle: real buttons, the one showing filled in (as the Open dialog's toggle), since ttk's flat Toolbutton
         # style looks like a label on Windows.
@@ -1890,12 +2182,16 @@ class XlefViewer:
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
         self.tree.bind("<ButtonPress-1>", self._tree_press, add="+")
+        self.tree.bind("<B1-Motion>", self._tree_drag)
+        self.tree.bind("<ButtonRelease-1>", self._tree_drop, add="+")
         self.tree.bind("<Motion>", self._tree_motion, add="+")
         self.tree.bind("<Leave>", lambda e: self._hide_tree_tip(), add="+")
         self.tree.bind("<Button-3>", self._tree_menu, add="+")
         self.tree_tip = None
         self.tree.bind("<Double-Button-1>", lambda e: self._cancel_rename_job(), add="+")
-        self.thumb_grid = ThumbGrid(tree_frame, on_click=self.select_item, on_menu=lambda item, x, y: self._item_menu(item, x, y))
+        self.thumb_grid = ThumbGrid(tree_frame, on_click=self.select_item, on_menu=lambda item, x, y: self._item_menu(item, x, y),
+                                    on_drop=self._grid_drop,
+                                    name_tip=lambda item: self._cloud_tip_text(self.entries[item]) if item in self.item_cloud else None)
         self.thumb_gen = 0           # bumped for each experiment opened: thumbnails made for an earlier one are dropped
         self.thumbs_started = False
         self._tree_tag_colors()
@@ -2000,7 +2296,8 @@ class XlefViewer:
     # --- settings window, color theme
 
     def open_settings(self):
-        """The Settings window: the color theme (applied at once), and whether renaming also renames files on disk. Remembered."""
+        """The Settings window: the color theme (applied at once), zoomed-in pixels, whether renaming also renames files on disk, and
+        the memory for previews. Remembered."""
         if getattr(self, "settings_window", None) is not None and self.settings_window.winfo_exists():
             self.settings_window.lift()
             return
@@ -2035,12 +2332,39 @@ class XlefViewer:
             self._save_settings()
         ttk.Checkbutton(box, text="Also rename the files and folders on disk", variable=on_disk, command=set_on_disk).pack(anchor=tk.W)
         ttk.Label(box, text=RENAME_NOTE, style="Muted.TLabel", justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
+        box = ttk.LabelFrame(body, text="Memory for previews", padding=(10, 6))
+        box.pack(fill=tk.X, pady=(10, 0))
+        row = ttk.Frame(box)
+        row.pack(anchor=tk.W)
+        percent = tk.IntVar(dlg, self.settings.get("preview_memory_percent", KEPT_IMAGES_PERCENT))
+        amount = ttk.Label(row)
+
+        def set_percent(*_):
+            try:
+                value = min(80, max(1, int(percent.get())))
+            except (tk.TclError, ValueError):
+                return                      # (while typing)
+            more = value > self.settings.get("preview_memory_percent", KEPT_IMAGES_PERCENT)
+            self.settings["preview_memory_percent"] = value
+            self._save_settings()
+            amount.config(text=f"% of this computer's memory ({size_text(self.kept_limit())})")
+            if more and self.preload_full:
+                self._projects_changed()    # (the background loader goes on with the sections it left out)
+            elif not more:
+                self._keep_within_limit()
+        ttk.Spinbox(row, from_=1, to=80, increment=5, width=4, textvariable=percent).pack(side=tk.LEFT)
+        amount.pack(side=tk.LEFT, padx=(4, 0))
+        percent.trace_add("write", set_percent)
+        set_percent()
+        ttk.Label(box, text=PREVIEW_MEMORY_NOTE, style="Muted.TLabel", justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
         ttk.Button(body, text="Close", command=dlg.destroy).pack(anchor=tk.E, pady=(10, 0))
         dlg.bind("<Escape>", lambda e: dlg.destroy())
 
     def _tree_tag_colors(self):
         self.tree.tag_configure("cloud", foreground=PAL["link"])
         self.tree.tag_configure("bad", foreground=PAL["bad"])
+        self.tree.tag_configure("dim", foreground=PAL["dim"])             # (an image with nothing of it in memory yet)
+        self.tree.tag_configure("cloud_dim", foreground=PAL["link_dim"])
         self.tree.tag_configure("project", font=("Segoe UI", 10, "bold"))
 
     def apply_theme(self, name):
@@ -2173,6 +2497,8 @@ class XlefViewer:
             return
         self.add_recent(path)
         self.tree.item(pid, text=self.projects[pid]["name"])
+        self.projects[pid]["root"] = experiment
+        experiment.path = path
         self._fill_tree(pid, experiment)
         mine = self._entries_of(pid)
         n_cloud = sum(1 for e in mine.values() if e.online_only_files())
@@ -2193,7 +2519,8 @@ class XlefViewer:
         start again over all open projects' images (what was done already comes from the cache or memory)."""
         self.thumb_gen += 1
         self.thumbs_started = False
-        self.thumb_grid.set_items(self._grid_rows_all(), message="No images" if self.projects else "Open an experiment")
+        self.preload_full = []
+        self.thumb_grid.set_items(self._grid_rows_all(), message="No images" if self.projects else "Open an experiment", keep=True)
         if self.view_mode.get() == "thumbs":
             self._start_thumbnails()
         self._start_preload()
@@ -2213,10 +2540,8 @@ class XlefViewer:
     def _entries_of(self, pid):
         return {i: e for i, e in self.entries.items() if self._project_of(i) == pid}
 
-    def close_project(self, pid, ask=True):
-        """Close one open project (asking first if any of its images or folders have unsaved changes)."""
-        if pid not in self.projects:
-            return
+    def _project_items(self, pid):
+        """Every item under project `pid` in the list, at any depth."""
         items = []
 
         def walk(node):
@@ -2224,8 +2549,29 @@ class XlefViewer:
                 items.append(child)
                 walk(child)
         walk(pid)
-        changed = [(self.entries.get(i) or self.folders.get(i)).name for i in items
-                   if (self.entries.get(i) or self.folders.get(i)) is not None and (self.entries.get(i) or self.folders.get(i)).unsaved]
+        return items
+
+    def _unsaved_names(self, pid):
+        """The names of project `pid`'s images and folders (and the project itself) with unsaved changes, and of its deleted images."""
+        root = self.projects[pid].get("root")
+        objects = [self.entries.get(i) or self.folders.get(i) for i in self._project_items(pid)]
+        changed = [o.name for o in objects if o is not None and o.unsaved]
+        changed += [self.projects[pid]["name"]] if root is not None and root.unsaved else []
+        changed += [e.name + " (deleted)" for i, e in self.deleted.items() if self.home.get(i) == pid]
+        return changed
+
+    def close_project(self, pid, ask=True):
+        """Close one open project (asking first if any of its images or folders have unsaved changes)."""
+        if pid not in self.projects:
+            return
+        items = self._project_items(pid)
+        crossing = [i for i in self.home if self.tree.exists(i) and (self.home[i] == pid) != (self._project_of(i) == pid)
+                    and i not in self.deleted]
+        if ask and crossing:
+            messagebox.showinfo("Close project", f"Images were dragged between {self.projects[pid]['name']} and another project. Save "
+                                                 "those moves, or undo them, before closing it.", parent=self.root)
+            return
+        changed = self._unsaved_names(pid)
         if ask and changed and not messagebox.askyesno(
                 "Unsaved changes", f"{', '.join(changed[:5])}{' and more' if len(changed) > 5 else ''} "
                                    f"{'has' if len(changed) == 1 else 'have'} unsaved changes.\n\nClosing "
@@ -2241,9 +2587,16 @@ class XlefViewer:
             if kept is not None:
                 kept.close()
         self._kept_changed()
+        gone = [i for i in self.deleted if self.home.get(i) == pid]
+        for i in gone:
+            if self.tree.exists(i):
+                self.tree.delete(i)                 # (deleted images are kept out of the list, detached, until Save)
+        items += gone
         for i in items:
             self.entries.pop(i, None)
             self.folders.pop(i, None)
+            self.deleted.pop(i, None)
+            self.home.pop(i, None)
             self.item_cloud.discard(i)
             self.preload_progress.pop(i, None)
             self.download_progress.pop(i, None)
@@ -2259,31 +2612,47 @@ class XlefViewer:
 
     def _label_item(self, item):
         """An image's or folder's name in the list: its name (a cloud after an image with online-only files), a pencil while it has
-        unsaved changes (a rename, or edited annotations), and how far its background loading has got ("45%") while that runs."""
+        unsaved changes (a rename, or edited annotations), and how far the reading of its preview has got ("45% preview": in the background, or as it is opened) while that runs. An
+        image with nothing of it in memory yet (not open, not kept or preloaded: see _loaded_entries) is dimmed."""
         obj = self.entries.get(item) or self.folders.get(item)
         if obj is None or not self.tree.exists(item):
             return
+        if item in self.entries:
+            cloud = item in self.item_cloud
+            if obj.problem:
+                tags = ("bad",)
+            elif obj in self._loaded_entries():
+                tags = ("cloud",) if cloud else ()
+            else:
+                tags = ("cloud_dim",) if cloud else ("dim",)
+            self.tree.item(item, tags=tags)
+            self.thumb_grid.set_dimmed(item, tags in (("cloud_dim",), ("dim",)))
         text = obj.name + ("  ☁" if item in self.item_cloud else "")
         if obj.unsaved:
             text += "  ✎"
         if item in self.preload_progress:
-            text += f"  {self.preload_progress[item]}%"
+            text += f"  {self.preload_progress[item]}% preview"
+        elif self.open_progress is not None and self.open_progress[0] == item:
+            text += f"  {self.open_progress[1]}% preview"
         if item in self.download_progress:
             p = self.download_progress[item]
             text += "  ⇣ waiting" if p == "waiting" else f"  ⇣ {p}%"
         self.tree.item(item, text=text)
 
     def _fill_tree(self, parent, folder):
-        for child in sorted(folder.children, key=lambda e: _natural_key(e.name)):
+        """The folder's images and sub-folders, in LAS X's order (the order its file lists them in, which dragging changes)."""
+        for child in folder.children:
             if isinstance(child, FolderEntry):
                 item = self.tree.insert(parent, tk.END, text=child.name, open=True)
                 self.folders[item] = child
+                self.home[item] = self._project_of(parent)
                 self._fill_tree(item, child)
                 continue
             cloud = bool(child.online_only_files())
             tags = ("bad",) if child.problem else (("cloud",) if cloud else ())
             item = self.tree.insert(parent, tk.END, text=child.name, tags=tags)
             self.entries[item] = child
+            self.home[item] = self._project_of(parent)
             if cloud:
                 self.item_cloud.add(item)
             self._label_item(item)
@@ -2291,7 +2660,7 @@ class XlefViewer:
     # --- list / thumbnail view
 
     def show_view_mode(self):
-        thumbs = self.view_mode.get() == "thumbs"
+        thumbs = self.thumbs_shown = self.view_mode.get() == "thumbs"
         for value, b in self.view_buttons.items():
             on = value == self.view_mode.get()
             style_toggle(b, on)
@@ -2312,7 +2681,7 @@ class XlefViewer:
         rows = []
         for pid in self.tree.get_children(""):
             if pid in self.projects:
-                rows.append(("project", self.projects[pid]["name"]))
+                rows.append(("project", self.projects[pid]["name"], pid))
                 rows.extend(self._grid_rows(pid))
         return rows
 
@@ -2322,8 +2691,8 @@ class XlefViewer:
         rows = []
         for item in self.tree.get_children(parent):
             if item in self.entries:
-                tags = self.tree.item(item, "tags")
-                rows.append(("image", item, self.entries[item].name, tags[0] if tags else ""))
+                tag = "bad" if self.entries[item].problem else "cloud" if item in self.item_cloud else ""
+                rows.append(("image", item, self.entries[item].name, tag))
             else:
                 folder = path + (self.tree.item(item, "text"),)
                 rows.append(("folder", " / ".join(folder)))
@@ -2336,7 +2705,8 @@ class XlefViewer:
         if self.thumbs_started or not self.entries:
             return
         self.thumbs_started = True
-        gen, todo = self.thumb_gen, list(self.entries.items())
+        done = self.thumb_grid.thumbs                # (thumbnails already made, kept when another project was opened or closed)
+        gen, todo = self.thumb_gen, [(i, e) for i, e in self.entries.items() if done.get(i, (None, None))[1] != "ok"]
         self.thumbs_busy = True
 
         def work():
@@ -2348,10 +2718,13 @@ class XlefViewer:
 
         def make_all():
             for item, entry in todo:
-                # An image being opened comes first: wait (reading nothing) until it is shown, sharp level included.
-                while not self.thumbs_go.wait(0.2):
+                # An image being opened comes first: wait (reading nothing) until it is shown, sharp level included. While the list
+                # is showing instead of the thumbnails, wait too: the background loader goes first then.
+                while not self.thumbs_go.wait(0.2) or not self.thumbs_shown:
                     if gen != self.thumb_gen:
                         return
+                    if not self.thumbs_shown:
+                        time.sleep(0.2)
                 if gen != self.thumb_gen:
                     return
                 try:
@@ -2364,17 +2737,17 @@ class XlefViewer:
 
     def _start_preload(self):
         """Load each image's first picture (the pyramid level that fills the window, as when it is opened) in the background, in list
-        order, after the thumbnails, and keep it with the recently viewed images: picking it then shows it at once, and only its sharper
-        level is still read. It only fills memory that is free (KEPT_IMAGES_BYTES), and stops when that is used up. An image being
-        opened comes first: the loader pauses, mid-file if need be, until that image is shown, then goes on where it stopped. Images
+        order, after the thumbnails (while they are showing; before them while the list is), and keep it with the recently viewed images: picking it then shows it at once, and only its sharper
+        level is still read. It only fills memory that is free (the share set in Settings: see kept_limit), and stops when that is
+        used up, saying so in the status bar. An image being opened comes first: the loader pauses, mid-file if need be, until that image is shown, then goes on where it stopped. Images
         whose files would need asking (large and online-only: see needs_asking) are skipped."""
         gen, todo = self.thumb_gen, list(self.entries.items())
         cw, ch = self.canvas_size()
 
         def wait(entry):
-            """Wait while thumbnails are made or an image is opened; "stop" (another experiment), "skip" (this image needs no
-            preloading any more: it is open, or kept) or "go"."""
-            while self.thumbs_busy or not self.thumbs_go.is_set():
+            """Wait while thumbnails are made (when they are showing) or an image is opened; "stop" (another experiment), "skip"
+            (this image needs no preloading any more: it is open, or kept) or "go"."""
+            while (self.thumbs_busy and self.thumbs_shown) or not self.thumbs_go.is_set():
                 if gen != self.thumb_gen:
                     return "stop"
                 time.sleep(0.05)
@@ -2403,7 +2776,8 @@ class XlefViewer:
                         size = -(-entry.width // step) * -(-entry.height // step) * 2 * n
                     if any(needs_asking(f) for f in files):
                         continue                        # (large online-only files: only after asking, when opened)
-                    if self.kept_bytes + size > KEPT_IMAGES_BYTES:
+                    if self.kept_bytes + size > self.kept_limit():
+                        self.results.put(("preload_full", gen, [e for i, e in todo[todo.index((item, entry)):] if e.nz == 1]))
                         return                          # (memory for kept images is full)
                     arrays, last = [], -1
                     for c, f in enumerate(files):
@@ -2439,7 +2813,7 @@ class XlefViewer:
             return
         img.overviews = {(0, c): a for c, a in enumerate(arrays)}
         img.ov_step = step
-        if self.kept_bytes + img.nbytes() > KEPT_IMAGES_BYTES:
+        if self.kept_bytes + img.nbytes() > self.kept_limit():
             return
         self.kept_images[entry] = img
         self.kept_images.move_to_end(entry, last=False)         # (dropped before any image that was actually looked at)
@@ -2447,6 +2821,20 @@ class XlefViewer:
 
     def _kept_changed(self):
         self.kept_bytes = sum(k.nbytes() for k in self.kept_images.values())
+        self._show_loaded()
+
+    def _loaded_entries(self):
+        """The images with a picture in memory: kept (recently viewed, or preloaded) or open."""
+        return set(self.kept_images) | ({self.img.entry} if self.img is not None else set())
+
+    def _show_loaded(self):
+        """Dim or undim the names of images whose picture came into memory or left it since the last call (see _label_item)."""
+        now = self._loaded_entries()
+        for entry in now ^ getattr(self, "shown_loaded", set()):
+            item = self._item_of(entry)
+            if item is not None:
+                self._label_item(item)
+        self.shown_loaded = now
 
     def _start_slide(self, pid):
         """Show the slide overview of project `pid` above the list (the project of the image selected), when it has one: outlines at
@@ -2482,14 +2870,24 @@ class XlefViewer:
             self.tree.see(item)
             self.thumb_grid.set_selected(item)
 
+    def _set_open_progress(self, progress):
+        """(item, percent) of the image opened, or None once it is read (or left): shown after its name in the list."""
+        old, self.open_progress = self.open_progress, progress
+        for item in {p[0] for p in (old, progress) if p is not None}:
+            self._label_item(item)
+            if item not in self.preload_progress:
+                self.thumb_grid.set_progress(item, progress[1] / 100 if progress is not None and progress[0] == item else None)
+
     def _close_image(self):
         self.generation += 1
+        self._set_open_progress(None)
         if self.img:
             if not self.loading and self.img.complete(self.z):
                 self._keep_image(self.img)
             else:
                 self.img.close()
         self.img = None
+        self._show_loaded()
         self.photo = None
         self.last_view_rgb = None
         self.shrunk.clear()
@@ -2503,11 +2901,15 @@ class XlefViewer:
 
     def _keep_image(self, img):
         """Keep an image that is being left, fully loaded, so that coming back to it needs no reading: its pictures (overviews) stay in
-        memory, newest last, up to KEPT_IMAGES_BYTES in all (the longest unseen go first); its full-resolution files are closed (they
+        memory, newest last, up to kept_limit in all (the longest unseen go first); its full-resolution files are closed (they
         are opened again if it is zoomed into)."""
         img.planes.clear()
         self.kept_images[img.entry] = img
-        while sum(k.nbytes() for k in self.kept_images.values()) > KEPT_IMAGES_BYTES and self.kept_images:
+        self._keep_within_limit()
+
+    def _keep_within_limit(self):
+        """Drop kept images, the longest unseen first, until they fit in the memory for previews."""
+        while sum(k.nbytes() for k in self.kept_images.values()) > self.kept_limit() and self.kept_images:
             self.kept_images.popitem(last=False)[1].close()
         self._kept_changed()
 
@@ -2534,9 +2936,9 @@ class XlefViewer:
             return
         ask = [] if entry in self.kept_images else self._files_to_ask(entry)
         if ask:
-            mb = sum(os.path.getsize(f) for f in ask) / 1e6
+            size = size_text(sum(os.path.getsize(f) for f in ask))
             if not messagebox.askyesno("Download from OneDrive?",
-                                       f"{len(ask)} of {entry.name}'s files ({mb:,.0f} MB) are online-only.\n\n"
+                                       f"{len(ask)} of {entry.name}'s files ({size}) are online-only.\n\n"
                                        "Viewing the image makes OneDrive download them in full. Continue?", parent=self.root):
                 self.status.config(text=f"{entry.name} not opened (online-only).")
                 return
@@ -2570,6 +2972,7 @@ class XlefViewer:
             self.show_message(f"Loading channel 1 of {n}..." if n > 1 else "Loading...")
             self.thumbs_go.clear()          # (the thumbnails wait until this image is shown: see _start_thumbnails)
             self.img = OpenImage(entry)
+        self._show_loaded()
         # Each image opens with its own LAS X contrast; which channels are switched on carries over to images of the same channels.
         self.ch_settings = [{"on": on, "lo": c.black, "hi": c.white} for c, on in zip(entry.channels, shown)]
         self._build_channel_controls()
@@ -2604,6 +3007,15 @@ class XlefViewer:
         # sharper level is read next and replaces it whole, once all its channels are in.
         quick = img.quick_level(max(img.entry.width, img.entry.height) * self.fit_scale)
         have_first = img.pyramid is not None and img.has_all(z)     # (first picture already loaded in the background: only sharpen)
+        item = self._item_of(img.entry)
+        last = [-1]
+
+        def report(fraction):
+            """How far the preview has got, after the name in the list ("45% preview"), as the background loader shows it."""
+            pct = int(100 * fraction)
+            if pct != last[0]:
+                last[0] = pct
+                self.results.put(("open_progress", gen, (item, pct)))
 
         def work():
             try:
@@ -2613,6 +3025,8 @@ class XlefViewer:
 
         def read(quick):
             if quick is not None or have_first:
+                files = (n if quick is not None and not have_first else 0) + n
+                report(0)
                 for c in range(n if quick is not None and not have_first else 0):
                     if gen != self.generation:
                         return
@@ -2621,12 +3035,14 @@ class XlefViewer:
                     if a is None:
                         break
                     self.results.put(("quick", gen, (z, c, a, quick[1])))
+                    report((c + 1) / files)
                 sharp = []
                 for c in range(n):
                     if gen != self.generation:
                         return
                     self.results.put(("progress", gen, f"Reading {img.entry.name}: sharper view, channel {c + 1} of {n} ..."))
                     sharp.append(img._from_pyramid(c))
+                    report((files - n + c + 1) / files)
                 if all(a is not None for a in sharp):
                     self.results.put(("sharp", gen, (z, sharp, img.pyramid[1])))
                 self.results.put(("loaded", gen, f"{mb:,.0f} MB on disk"))
@@ -2636,7 +3052,7 @@ class XlefViewer:
                     return
                 self.results.put(("progress", gen, f"Reading {img.entry.name}: channel {c + 1} of {n} ..."))
                 try:
-                    img.overview(z, c)
+                    img.overview(z, c, lambda f, c=c: report((c + f) / n))
                 except Exception as e:
                     self.results.put(("error", gen, f"Can't read channel {c + 1} of {img.entry.name}: {e}"))
                     return
@@ -2670,6 +3086,7 @@ class XlefViewer:
                                  vertical=True)
             slider.pack(fill=tk.Y, expand=True)
             slider.bind("<Button-3>", lambda e, i=i: self.pick_channel_color(i))
+            slider.bind("<Double-Button-1>", lambda e, i=i, s=slider: (s.undo_press(), self.pick_channel_color(i)))
             swatch.color = color
             swatch.keep_colors = True       # (styled by _show_channel_state)
             self.ch_widgets.append((on, slider, swatch))
@@ -3116,7 +3533,7 @@ class XlefViewer:
     def _update_annotations_check(self):
         n = sum(a.visible for a in self.img.entry.annotations) if self.img else 0
         self.annotations_check.configure(text=f"Show annotations ({n or 'none'})")
-        changed = any(o.unsaved for o in list(self.entries.values()) + list(self.folders.values()))
+        changed = any(o.unsaved for o in self._all_objects())
         self.save_button.configure(state=tk.NORMAL if changed else tk.DISABLED)
         self.unsaved_label.configure(text="unsaved changes" if changed else "")
 
@@ -3254,12 +3671,11 @@ class XlefViewer:
             return False
         self.asking_download = True
         try:
-            mb = sum(os.path.getsize(f) for f in ask) / 1e6
+            size = size_text(sum(os.path.getsize(f) for f in ask))
             cloud = [i for i in self._entries_of(self._project_of(item)) if i in self.item_cloud and i not in self.download_progress]
             choice = ask_download(self.root, "Download from OneDrive?",
-                                  f"Zooming in this far needs {e.name}'s full-resolution files: {len(ask)} of them ({mb:,.0f} MB) are "
-                                  f"online-only.\n\nCancel: the view stays at its present sharpness.",
-                                  all_label=f"Download all sections ({len(cloud)}, {self._cloud_bytes(cloud) / 1e9:,.1f} GB)")
+                                  f"Zooming further needs high-resolution files ({size} for this section) that are online-only.",
+                                  all_label=f"Download for all sections ({size_text(self._cloud_bytes(cloud))})")
         finally:
             self.asking_download = False
         if choice is None:
@@ -3454,6 +3870,28 @@ class XlefViewer:
                     self._update_annotations_check()
                 self.status.config(text=f"Undone: an annotation change on {e.name}")
                 return
+            if kind == "move":
+                item, parent, index = data
+                if not (self.tree.exists(item) and self.tree.exists(parent)) or item in self.deleted:
+                    continue
+                crossed = self._project_of(item) != self._project_of(parent)
+                self._place(item, parent, index)
+                self._structure_changed(members=crossed)
+                self.tree.see(item)
+                self.status.config(text=f"Undone: moving {(self.entries.get(item) or self.folders.get(item)).name}")
+                return
+            if kind == "delete":
+                item, e, parent, index = data
+                if item not in self.deleted or not self.tree.exists(parent):
+                    continue
+                del self.deleted[item]
+                self.entries[item] = e
+                self._place(item, parent, index)
+                self._structure_changed(members=True)
+                self.tree.selection_set(item)
+                self.tree.see(item)
+                self.status.config(text=f"Undone: deleting {e.name}")
+                return
             if kind == "lut":
                 for e, i, old in data:
                     e.channels[i].lut = old
@@ -3509,24 +3947,35 @@ class XlefViewer:
     def save_annotations(self):
         """The Save button: write every change not saved yet into LAS X's files (only ever when it is clicked): edited annotations (into
         each image's .xlif) and renames (the Name in the .xlif / .xlcf; with "Also rename the files and folders on disk" in Settings,
-        the files and folders too, see plan_disk_rename). Each changed file is backed up first (BACKUP_SUFFIX)."""
-        items = [(i, o) for i, o in list(self.entries.items()) + list(self.folders.items()) if o.unsaved]
-        if not items:
+        the files and folders too, see plan_disk_rename), the list's order (dragged, deleted: see _save_structure). Each changed file is
+        backed up first (BACKUP_SUFFIX)."""
+        items = [(i, o) for i, o in list(self.entries.items()) + list(self.folders.items())
+                 + [(pid, p.get("root")) for pid, p in self.projects.items()] if o is not None and o.unsaved]
+        if not items and not self.deleted:
             return
         notes = [(i, o) for i, o in items if o.annotations_changed]
         maps = [(i, o) for i, o in items if isinstance(o, ImageEntry) and o.luts_changed]
         renames = [(i, o) for i, o in items if o.name != o.saved_name]
         on_disk = bool(renames) and self.settings.get("rename_files", False)
-        if not self.save_warned:
+        away = [o for i, o in self.entries.items() if self.home.get(i) not in (None, self._project_of(i))]
+        reordered = any(getattr(o, "order_changed", False) for _, o in items)
+        structure = reordered or bool(self.deleted)
+        if not self.save_warned or self.deleted or away:
+            n_del, n_away = len(self.deleted), len(away)
             what = ([f"the annotations of {len(notes)} image{'s' * (len(notes) != 1)}"] if notes else []) + \
                    ([f"the color maps of {len(maps)} image{'s' * (len(maps) != 1)}"] if maps else []) + \
                    ([f"{len(renames)} rename{'s' * (len(renames) != 1)}" + (" (files and folders on disk too)" if on_disk else "")]
-                    if renames else [])
+                    if renames else []) + (["the new order of the list"] if reordered else [])
+            extra = ((f"\n\n{n_away} image{'s' * (n_away != 1)} dragged into another project move{'s' * (n_away == 1)} there, files "
+                      "and all." if away else "")
+                     + (f"\n\nDeleted: {', '.join(e.name for e in list(self.deleted.values())[:5])}"
+                        f"{' and more' if n_del > 5 else ''}. Their files go to the Recycle Bin (on a network drive, which has "
+                        f"none: into a \"Deleted by XLEF viewer\" folder in the experiment's folder)." if n_del else ""))
             if not messagebox.askokcancel(
                     "Save changes into LAS X's files",
                     f"This writes {' and '.join(what)} into LAS X's files. A copy of each file as it is now is kept next to it "
-                    f"(ending in {BACKUP_SUFFIX}).\n\nClose this experiment in LAS X first: LAS X may otherwise overwrite these changes "
-                    f"with its own copy.", parent=self.root):
+                    f"(ending in {BACKUP_SUFFIX}).{extra}\n\nClose this experiment in LAS X first: LAS X may otherwise overwrite "
+                    f"these changes with its own copy.", parent=self.root):
                 return
             self.save_warned = True
         failed = []
@@ -3543,13 +3992,17 @@ class XlefViewer:
                     c.saved_lut = c.lut
             except Exception as err:
                 failed.append(f"color maps of {e.name}: {err}")
-        if renames and on_disk:
-            # (nothing may hold the files open while they are renamed: the image on screen, kept images, background readers)
+        touched, binned, aside = set(), 0, 0
+        if structure or (renames and on_disk):
+            # (nothing may hold the files open while they are moved or renamed: the image on screen, kept images, background readers)
             self._close_image()
             self.forget_kept_images()
             self.thumb_gen += 1
             self.slide_gen += 1
             time.sleep(0.3)
+        if structure:
+            touched, binned, aside = self._save_structure(failed)
+        if renames and on_disk:
             ordered = ([r for r in renames if isinstance(r[1], ImageEntry)] +          # (images first, then folders, deepest first)
                        sorted([r for r in renames if isinstance(r[1], FolderEntry)], key=lambda r: -self._tree_depth(r[0])))
             for item, o in ordered:
@@ -3570,20 +4023,27 @@ class XlefViewer:
         for item, _ in items:
             self._label_item(item)
         self._update_annotations_check()
-        done = len(items) - len(failed)
-        self.status.config(text=f"Saved {done} change{'s' * (done != 1)} into LAS X's files" + (f"; {len(failed)} failed" if failed else ""))
+        done = max(len(items) + binned + aside - len(failed), 0)
+        self.status.config(text=f"Saved {done} change{'s' * (done != 1)} into LAS X's files" + (f"; {len(failed)} failed" if failed else "")
+                                + (f". {binned} deleted image{'s' * (binned != 1)} moved to the Recycle Bin" if binned else "")
+                                + (f". {aside} deleted image{'s' * (aside != 1)} moved to the \"Deleted by XLEF viewer\" folder "
+                                   "(this drive has no Recycle Bin)" if aside else ""))
         if failed:
             messagebox.showerror("Some changes not saved", "These could not be saved (their files were left as they were):\n\n"
                                  + "\n".join(failed), parent=self.root)
+        reread = set(touched)
         if renames and on_disk:
             for _, o in renames:          # (anything that failed is dropped: those projects are read again from the files)
                 o.name = o.saved_name
             for _, e in notes:
                 e.annotations_changed = False
-            for pid in {self._project_of(i) for i, _ in renames} - {None}:     # (paths changed: read those experiments again)
-                path = self.projects[pid]["path"]
-                self.close_project(pid, ask=False)
-                self.open_xlef(path)
+            reread |= {self._project_of(i) for i, _ in renames} - {None}
+        if reread:
+            self.history = [h for h in self.history if h[0] in ("ann", "lut")]
+        for pid in [p for p in self.projects if p in reread]:      # (paths or contents changed: read those experiments again)
+            path = self.projects[pid]["path"]
+            self.close_project(pid, ask=False)
+            self.open_xlef(path)
 
     # --- the cloud after a name: what it means, and downloading full resolution
 
@@ -3591,8 +4051,22 @@ class XlefViewer:
         return f"Full resolution image of {entry.name} is in cloud. Zoom in or right-click to download"
 
     def _tree_motion(self, event):
-        """The pointer on the name of an image with a cloud, or on the cloud: a note saying what the cloud means."""
+        """The pointer on the name of an image with a cloud, or on the cloud: a note saying what the cloud means. On a project's name:
+        its full path, and whether it has unsaved changes."""
         item = self.tree.identify_row(event.y)
+        if item in self.projects and self.tree.bbox(item):
+            x, y, w, h = self.tree.bbox(item)
+            start = x + 20                                       # (after the open mark)
+            if not start - 8 <= event.x <= start + tkfont.nametofont("TkDefaultFont").measure(self.tree.item(item, "text")) + 8:
+                self._hide_tree_tip()
+                return
+            changed = self._unsaved_names(item)
+            note = (f"Unsaved changes: {', '.join(changed[:5])}{' and more' if len(changed) > 5 else ''}" if changed
+                    else "No unsaved changes")
+            if self.tree_tip is None:
+                self.tree_tip = PointerTip(self.tree)
+            self.tree_tip.show(f"{os.path.normpath(self.projects[item]['path'])}\n{note}", event.x_root, event.y_root)
+            return
         if item not in self.item_cloud or not self.tree.bbox(item):
             self._hide_tree_tip()
             return
@@ -3690,7 +4164,8 @@ class XlefViewer:
         entry = self.entries.get(item)
         if entry is not None and not entry.online_only_files():
             self.item_cloud.discard(item)
-            self.tree.item(item, tags=[t for t in self.tree.item(item, "tags") if t != "cloud"])
+            self.thumb_grid.rows = self._grid_rows_all()          # (its thumbnail's name: no longer blue, no cloud)
+            self.thumb_grid.layout()
             if self.img is not None and self.img.entry is entry:
                 self.schedule_redraw(0)          # (zoomed in, waiting for it: the sharp view can be read now)
         self._label_item(item)
@@ -3716,8 +4191,7 @@ class XlefViewer:
         menu = tk.Menu(self.root, tearoff=0)
         if item in self.entries:
             if item in self.item_cloud and item not in self.download_progress:
-                gb = self._cloud_bytes([item]) / 1e9
-                menu.add_command(label=f"Download full resolution this section ({gb:,.1f} GB)",
+                menu.add_command(label=f"Download full resolution this section ({size_text(self._cloud_bytes([item]))})",
                                  command=lambda: self.download_full_res([item]))
             else:
                 menu.add_command(label="Download full resolution this section" + (" (downloading)" if item in self.download_progress
@@ -3729,7 +4203,7 @@ class XlefViewer:
         cloud = [i for i in self._entries_of(pid) if i in self.item_cloud and i not in self.download_progress]
         if cloud:
             menu.add_command(label=f"Download full resolution all sections ({len(cloud)} in the cloud, "
-                                   f"{self._cloud_bytes(cloud) / 1e9:,.1f} GB)", command=lambda: self.download_full_res(cloud))
+                                   f"{size_text(self._cloud_bytes(cloud))})", command=lambda: self.download_full_res(cloud))
         else:
             queued = any(i in self.download_progress for i in self.entries)
             menu.add_command(label="Download full resolution all sections (" + ("all already queued" if queued else "none in the cloud")
@@ -3741,6 +4215,8 @@ class XlefViewer:
             menu.add_separator()
             self._project_menu(menu, pid)
         menu.add_separator()
+        if item in self.entries:
+            menu.add_command(label="Delete section", command=lambda: self.delete_section(item))
         menu.add_command(label="Properties", command=lambda: self.show_properties(item))
         try:
             menu.tk_popup(int(x_root), int(y_root))
@@ -3825,6 +4301,7 @@ class XlefViewer:
         a double-click, which opens or closes a folder, doesn't)."""
         self._cancel_rename_job()
         item = self.tree.identify_row(event.y)
+        self.drag_item = (item, event.y, False) if item in self.entries or item in self.folders else None
         if (item and item in self.tree.selection() and (item in self.entries or item in self.folders)
                 and "text" in self.tree.identify_element(event.x, event.y)):
             self.rename_job = self.root.after(600, lambda: self.start_rename(item))
@@ -3882,16 +4359,256 @@ class XlefViewer:
             self._update_status()
         self.status.config(text=f"Renamed to {new}: not saved yet (Save writes it into LAS X's files)")
 
+    # --- the list's order: dragging names (or thumbnails), deleting images. Shown at once, written by Save (see _save_structure).
+
+    def _all_objects(self):
+        """Everything that can have unsaved changes: the images, the folders, and the projects (their order of contents)."""
+        return (list(self.entries.values()) + list(self.folders.values())
+                + [p["root"] for p in self.projects.values() if p.get("root") is not None])
+
+    def _container(self, item):
+        """The FolderEntry a list item that holds others (a project or a folder) stands for, or None."""
+        return self.projects[item].get("root") if item in self.projects else self.folders.get(item)
+
+    def _shown_children(self, item):
+        return [self.entries.get(k) or self.folders.get(k) for k in self.tree.get_children(item)]
+
+    def _place(self, item, parent, index):
+        """Put `item` in the list under `parent`, at position `index` among parent's other children."""
+        others = [k for k in self.tree.get_children(parent) if k != item]
+        self.tree.move(item, parent, self.tree.index(others[index]) if index < len(others) else tk.END)
+
+    def _structure_changed(self, members=False):
+        """After images were dragged or deleted (or that was undone): the folders and projects that now list something other than
+        their files do (a pencil after the name; Save), the thumbnails' order, and (members: images came or went) the slide."""
+        for item, obj in list(self.folders.items()) + [(pid, p.get("root")) for pid, p in self.projects.items()]:
+            if obj is None:
+                continue
+            obj.order_changed = self._shown_children(item) != obj.children
+            if item in self.projects:
+                self.tree.item(item, text=self.projects[item]["name"] + ("  ✎" if obj.order_changed else ""))
+            else:
+                self._label_item(item)
+        self._update_annotations_check()
+        self.thumb_grid.rows = self._grid_rows_all()
+        self.thumb_grid.layout()
+        if members and self.slide_project in self.projects:
+            self._start_slide(self.slide_project)
+
+    def delete_section(self, item):
+        """Right-click > Delete section: out of the list at once; Save takes it out of LAS X's files and moves its files (its .xlif,
+        channel TIFFs and reduced copies) to the Recycle Bin. Undo (Ctrl+Z) brings it back until then."""
+        entry = self.entries.get(item)
+        parent = self.tree.parent(item)
+        container = self._container(parent)
+        if entry is None or container is None or container.path is None:
+            messagebox.showerror("Can't delete", "The file that lists this image is unreadable, so it can't be deleted here.",
+                                 parent=self.root)
+            return
+        index = self.tree.index(item)
+        if self.img is not None and self.img.entry is entry:
+            self._close_image()
+            self.show_message("Select an image")
+        kept = self.kept_images.pop(entry, None)
+        if kept is not None:
+            kept.close()
+            self._kept_changed()
+        if item in self.download_queue:
+            self.download_queue.remove(item)
+        self.tree.detach(item)
+        self.entries.pop(item)
+        self.deleted[item] = entry
+        self.history = self.history[-199:] + [("delete", (item, entry, parent, index))]
+        self._structure_changed(members=True)
+        self.status.config(text=f"Deleted {entry.name}: not saved yet (Save moves its files to the Recycle Bin; Ctrl+Z undoes it)")
+
+    def _drop_ok(self, item, parent):
+        """Can `item` go under `parent`? Not a folder into itself (or into what it holds), nor into another project (only images move
+        between projects), nor anything to or from a folder whose own file is unreadable."""
+        p = parent
+        while p:
+            if p == item:
+                return False
+            p = self.tree.parent(p)
+        if item in self.folders and self._project_of(parent) != self._project_of(item):
+            return False
+        target, source = self._container(parent), self._container(self.tree.parent(item))
+        return not (target is None or target.path is None or source is None or source.path is None)
+
+    def _drop_target(self, item, y):
+        """Where dropping `item` at height y of the list puts it: (parent, index among the parent's other children), or None. On the
+        upper or lower half of a name: before or after it; on the middle of a folder's name, or on a project's: into it, at the end."""
+        row = self.tree.identify_row(y)
+        box = self.tree.bbox(row) if row and row != item else None
+        if not box:
+            return None
+        rel = (y - box[1]) / max(box[3], 1)
+        if row in self.projects or (row in self.folders and 0.25 <= rel <= 0.75):
+            parent, index = row, len([k for k in self.tree.get_children(row) if k != item])
+        else:
+            parent = self.tree.parent(row)
+            others = [k for k in self.tree.get_children(parent) if k != item]
+            index = others.index(row) + (rel >= 0.5)
+        return (parent, index) if parent and self._drop_ok(item, parent) else None
+
+    def _show_drop(self, target):
+        """A line in the list where a dragged name would go (None: no line)."""
+        if target is None:
+            if self.drop_line is not None:
+                self.drop_line.place_forget()
+            return
+        parent, index = target
+        others = [k for k in self.tree.get_children(parent) if k != self.drag_item[0]]
+        if index < len(others):
+            box, edge = self.tree.bbox(others[index]), 0
+        else:
+            last = others[-1] if others else parent
+            while others and self.tree.item(last, "open") and self.tree.get_children(last):
+                last = self.tree.get_children(last)[-1]
+            box, edge = self.tree.bbox(last), 1
+        if not box:
+            self._show_drop(None)
+            return
+        if self.drop_line is None:
+            self.drop_line = tk.Frame(self.tree, height=3, background=PAL["selected"])
+        x = 20 * (self._tree_depth(parent) + 1) if parent else 0
+        self.drop_line.place(x=x, y=box[1] + edge * box[3] - 1, width=max(self.tree.winfo_width() - x, 20))
+
+    def _tree_drag(self, event):
+        """Dragging a name in the list (after a few pixels: a short wobble is still a click): a line shows where it would go."""
+        if self.drag_item is None:
+            return
+        item, y0, started = self.drag_item
+        if not started:
+            if abs(event.y - y0) < 6:
+                return
+            self._cancel_rename_job()
+            self._hide_tree_tip()
+            self.drag_item = (item, y0, True)
+            self.tree.configure(cursor="fleur")
+        if event.y < 12:
+            self.tree.yview_scroll(-1, "units")
+        elif event.y > self.tree.winfo_height() - 12:
+            self.tree.yview_scroll(1, "units")
+        self._show_drop(self._drop_target(item, event.y))
+        return "break"
+
+    def _tree_drop(self, event):
+        drag, self.drag_item = self.drag_item, None
+        if drag is None or not drag[2]:
+            return
+        self._show_drop(None)
+        self.tree.configure(cursor="")
+        target = self._drop_target(drag[0], event.y)
+        if target is not None:
+            self.move_item(drag[0], *target)
+        return "break"
+
+    def _grid_drop(self, item, target, after):
+        """A thumbnail dropped before (or after) another: it goes there in the list too."""
+        parent = self.tree.parent(target)
+        others = [k for k in self.tree.get_children(parent) if k != item]
+        if target in others and self._drop_ok(item, parent):
+            self.move_item(item, parent, others.index(target) + after)
+
+    def move_item(self, item, parent, index):
+        """Move an image (or a folder, within its project) to `parent`, at `index` among the others there: shown at once, written by
+        Save (into another project: its files move there too). Undoable."""
+        old = (self.tree.parent(item), self.tree.index(item))
+        if old == (parent, index):
+            return
+        crossed = self._project_of(item) != self._project_of(parent)
+        self._place(item, parent, index)
+        self.history = self.history[-199:] + [("move", (item,) + old)]
+        self._structure_changed(members=crossed)
+        self.tree.see(item)
+        obj = self.entries.get(item) or self.folders.get(item)
+        away = self._project_of(item) != self.home.get(item)
+        self.status.config(text=f"Moved {obj.name}: not saved yet (Save writes the new order"
+                                + (", and moves its files into that project" if away else "") + "; Ctrl+Z undoes it)")
+
+    def _save_structure(self, failed):
+        """Save, for the list's order: images dragged into another project move there, files and all (see plan_move_image); each
+        folder and project whose contents or their order changed gets its list of references rewritten (see children_text); deleted
+        images go to the Recycle Bin (on a drive that has none, a network drive, into a "Deleted by XLEF viewer" folder of their
+        experiment instead). Returns the projects to read again, and how many images were deleted where (bin, folder)."""
+        touched, binned, kept_aside = set(), 0, 0
+        old_path = {}           # ImageEntry -> its .xlif's path before it moved (how the list it left still refers to it)
+        # 1. images into another project: their files first (a container then refers only to what is really there)
+        for item, entry in list(self.entries.items()):
+            pid, home = self._project_of(item), self.home.get(item)
+            if pid is None or home is None or pid == home:
+                continue
+            touched |= {pid, home}
+            try:
+                plan, moved = plan_move_image(entry, os.path.dirname(self.projects[home]["path"]), self._container(
+                    self.tree.parent(item)).path, os.path.dirname(self.projects[pid]["path"]))
+                carry_out(plan)
+            except Exception as err:
+                failed.append(f"moving {entry.name}: {err}")
+                folder = next((k for k, o in [(home, self._container(home))] + list(self.folders.items())
+                               if o is not None and entry in o.children), home)
+                self._place(item, folder, self._container(folder).children.index(entry)
+                            if entry in self._container(folder).children else 0)
+                continue
+            new = lambda p: moved.get(os.path.normcase(p), p)       # noqa: E731
+            old_path[entry] = entry.xlif_path
+            entry.xlif_path = new(entry.xlif_path)
+            entry.files = {k: new(f) for k, f in entry.files.items()}
+            entry.pyramid = new(entry.pyramid) if entry.pyramid else None
+        # 2. the lists of references
+        written = set()
+        for item, obj in list(self.folders.items()) + [(pid, p.get("root")) for pid, p in self.projects.items()]:
+            if obj is None:
+                continue
+            shown = self._shown_children(item)
+            if shown == obj.children:
+                continue
+            touched.add(self._project_of(item) if item not in self.projects else item)
+            try:
+                text = children_text(obj.path, [old_path.get(c, c.path) for c in obj.children],
+                                     [(c.path, getattr(c, "ref_uuid", "") or str(uuid.uuid1())) for c in shown])
+                _write_text(obj.path, text, _read_text(obj.path)[1])
+                written.add(item)
+                obj.children = shown
+                obj.order_changed = False
+                for c in shown:
+                    c.parent_file = obj.path
+            except Exception as err:
+                failed.append(f"the list of {obj.name}: {err}")
+        # 3. deleted images, once nothing refers to them
+        for item, entry in list(self.deleted.items()):
+            parent = next((k for k, o in [(p, self._container(p)) for p in self.projects] + list(self.folders.items())
+                           if o is not None and entry.xlif_path in (getattr(c, "xlif_path", None) for c in o.children)), None)
+            if parent is not None:          # (its list was not rewritten: it stays)
+                failed.append(f"deleting {entry.name}: the file that lists it was not changed")
+                continue
+            touched.add(self.home.get(item))
+            try:
+                files = [_real_case(f) for f in owned_files(entry.xlif_path) if os.path.exists(f)]
+                root = os.path.dirname(self.projects[self.home[item]]["path"])
+                if has_recycle_bin(entry.xlif_path):
+                    send_to_recycle_bin(files)
+                    binned += 1
+                else:
+                    aside = os.path.join(root, "Deleted by XLEF viewer")
+                    carry_out([("mkdir", os.path.dirname(os.path.join(aside, os.path.relpath(f, root))), None) for f in files]
+                              + [("move", f, os.path.join(aside, os.path.relpath(f, root))) for f in files])
+                    kept_aside += 1
+                del self.deleted[item]
+            except Exception as err:
+                failed.append(f"deleting {entry.name}: {err}")
+        return touched - {None}, binned, kept_aside
+
     def unsaved_ok(self, doing, question):
         """True if there are no unsaved changes (renames, annotations), or the user agrees to lose them (nothing is ever saved without
         Save)."""
-        changed = [o.name for o in list(self.entries.values()) + list(self.folders.values()) if o.unsaved]
+        changed = [o.name for o in self._all_objects() if o.unsaved] + [e.name + " (deleted)" for e in self.deleted.values()]
         if not changed:
             return True
         names = ", ".join(changed[:5]) + (f" and {len(changed) - 5} more" if len(changed) > 5 else "")
         return messagebox.askyesno("Unsaved changes",
-                                   f"{names} {'has' if len(changed) == 1 else 'have'} unsaved changes (renamed, or annotations "
-                                   f"edited).\n\n{doing} discards them. {question}", icon="warning", default="no", parent=self.root)
+                                   f"{names} {'has' if len(changed) == 1 else 'have'} unsaved changes.\n\n{doing} discards them. {question}", icon="warning", default="no", parent=self.root)
 
     def _draw_scale_bar(self):
         e = self.img.entry
@@ -3912,7 +4629,24 @@ class XlefViewer:
             size += f", {e.pixel_um:.3f} µm/px"
         z = f", z {self.z + 1}/{e.nz}" if e.nz > 1 else ""
         if not self.loading:
-            self.status.config(text=f"{e.name}   {size}{z}   zoom {self.scale * 100:.1f}%")
+            self.status.config(text=f"{e.name}   {size}{z}   zoom {self.scale * 100:.1f}%" + ("      " + self._preload_full_text()
+                                                                                          if self.preload_full else ""))
+
+    def _preload_full_text(self):
+        n = sum(1 for e in self.preload_full if e not in self.kept_images and not (self.img is not None and self.img.entry is e))
+        return (f"⚠ The memory for previews ({size_text(self.kept_limit())}) is full: {n} more section"
+                f"{'s were' if n != 1 else ' was'} not preloaded. It can be increased in ⚙ Settings.")
+
+    def _preload_full_note(self):
+        """The background loader stopped with the memory for previews full: say so (and again after each image's own line)."""
+        if self.img is None or not self.loading:
+            self.status.config(text=self._preload_full_text() if self.img is None else self.status.cget("text").split("      ⚠")[0]
+                               + "      " + self._preload_full_text())
+
+    def kept_limit(self):
+        """Memory (bytes) for the pictures of recently viewed and preloaded images: the share of the computer's memory set in Settings."""
+        total = total_memory()
+        return self.settings.get("preview_memory_percent", KEPT_IMAGES_PERCENT) / 100 * total if total else 500e6
 
     def _poll_results(self):
         try:
@@ -3921,6 +4655,11 @@ class XlefViewer:
                 if kind == "thumb":
                     if gen == self.thumb_gen:
                         self.thumb_grid.set_thumb(*data)
+                    continue
+                if kind == "preload_full":
+                    if gen == self.thumb_gen:
+                        self.preload_full = data
+                        self._preload_full_note()
                     continue
                 if kind in ("preload_progress", "preloaded"):
                     if gen == self.thumb_gen:
@@ -3978,7 +4717,10 @@ class XlefViewer:
                         self.img.ov_step = step
                     self.shrunk.clear()
                     self.redraw(preview_only=True)
+                elif kind == "open_progress" and gen == self.generation:
+                    self._set_open_progress(data)
                 elif kind == "loaded" and gen == self.generation:
+                    self._set_open_progress(None)
                     self.loading = False
                     self.redraw()
                     self._update_cursor()
@@ -3995,6 +4737,7 @@ class XlefViewer:
                     self.detail_pending = False
                     self._update_cursor()
                 elif kind == "error":
+                    self._set_open_progress(None)
                     self.loading = False
                     self.detail_pending = False
                     self._update_cursor()
@@ -4157,7 +4900,7 @@ class LutChooser:
         self.win.destroy()
 
 
-def ask_download(parent, title, message, all_label="Download all sections"):
+def ask_download(parent, title, message, all_label="Download for all sections"):
     """Ask about downloading full resolution: "this" (this section), "all" (all sections), or None (Cancel, Escape, closed)."""
     dlg = tk.Toplevel(parent)
     dlg.title(title)
@@ -4175,7 +4918,7 @@ def ask_download(parent, title, message, all_label="Download all sections"):
         dlg.destroy()
     ttk.Button(bar, text="Cancel", command=lambda: pick(None)).pack(side=tk.RIGHT)
     ttk.Button(bar, text=all_label, command=lambda: pick("all")).pack(side=tk.RIGHT, padx=(0, 6))
-    this = ttk.Button(bar, text="Download this section", command=lambda: pick("this"))
+    this = ttk.Button(bar, text="Download for this section", command=lambda: pick("this"))
     this.pack(side=tk.RIGHT, padx=(0, 6))
     this.focus_set()
     dlg.bind("<Return>", lambda e: pick("this"))
@@ -4211,11 +4954,6 @@ def ask_text(parent, title, initial):
     dlg.grab_set()
     parent.wait_window(dlg)
     return result[0] if result else None
-
-
-def _natural_key(s):
-    """Sort "Section2" before "Section10"."""
-    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
 
 
 if __name__ == "__main__":

@@ -93,28 +93,36 @@ program offers to install the first time (a download of about 100 MB).
 A quick viewer for Leica LAS X experiments (`.xlef`): on Windows, double click RUN_XLEF_VIEWER.bat, or drop an `.xlef` file on it
 (it uses the same `.venv`, and installs numpy, tifffile and Pillow into it if they are missing). File > Open (Ctrl+O) lists the
 experiments opened recently, or lets you browse for one or drag it in; an `.xlef` can also be dragged onto the window. The left panel lists the experiment's
-images; click one to see its channels overlaid in their LAS X colors, starting with LAS X's contrast settings. Mouse wheel zooms,
+images in LAS X's order; click one to see its channels overlaid in their LAS X colors, starting with LAS X's contrast settings. Mouse wheel zooms,
 dragging pans, Home (or double click) fits the image to the window, and keys 1-9 switch channels on and off. "Show annotations" draws the measuring lines (with their lengths), lines, arrows, rectangles,
 circles/ellipses and text added to an image in LAS X. The toolbar above the image edits them: Select (drag to move, corners to resize,
 the round handle to rotate, double-click a text to change it), drawing tools, color, Delete and Undo. Changes are written into the
 image's LAS X file (`.xlif`) only when you click Save; only the annotations in it are changed, and a copy of the file as it was is kept
 next to it (`.before_xlef_viewer.bak`). Close the experiment in LAS X before saving. "⚙ Settings" (top right) switches between
 the dark (default) and light color themes, and sets how pixels look when zoomed in past them (Mitchell-Netravali smoothing by
-default; also bicubic, Gaussian, bilinear, or hard-edged true pixels). To rename an image or folder, click its name in the list once it is selected (as in
+default; also bicubic, Gaussian, bilinear, or hard-edged true pixels). It also sets the memory for previews (10% of the computer's memory by default): the pictures of recently viewed images, and of the ones loaded in the background so that they open at once; when it fills up, the status bar says so. To rename an image or folder, click its name in the list once it is selected (as in
 Windows Explorer); Save writes the new name into its `.xlif`/`.xlcf`. With "Also rename the files and folders on disk" (Settings,
 off by default) the image's `.xlif` and channel TIFFs, or the folder, are renamed too, and the references to them updated. Each channel has
-a swatch (click to switch it on/off) and a black/white slider. Right-click a channel's swatch or slider to choose its color map, as in
+a swatch (click to switch it on/off) and a black/white slider. Right-click a channel's swatch or slider (or double-click the slider) to choose its color map, as in
 LAS X: its list of maps (Gray, Red, ..., Glow (O&U), Spectrum, Rainbow), or any color from the picker. The choice shows on the image at
 once; apply it to This section or to All sections (the same channel in every image of the experiment), or Cancel. Undo (Ctrl+Z) takes
 it back, and Save writes it into the images' `.xlif` files, where LAS X reads it.
 
+To change the order of the images, drag their names in the list (or their thumbnails): onto the middle of a folder's name to put
+them in it, or into another open experiment, which moves the image's files (its `.xlif`, channel TIFFs and reduced copies) into that
+experiment's folder when you Save. Folders can be dragged within their experiment. Right-click an image > Delete section takes it out
+of the list; Save removes it from LAS X's files and moves its files to the Windows Recycle Bin (a network drive has no Recycle Bin, so
+there they go into a "Deleted by XLEF viewer" folder in the experiment's folder instead). Both can be undone (Ctrl+Z) until Save, and
+Save asks first whenever it moves or deletes files.
+
 The viewer only reads what it needs: listing the images reads only the small `.xlif` metadata files, and an image's TIFFs are
 opened only when you select it (and then only the rows the current view needs). When the experiment has LAS X's reduced copies
 (a `Pyramid` folder), the zoomed-out picture comes from those, and full resolution is read only as you zoom in. Several experiments
-can be open at once: each one opened is added to the list as a branch of its own (right-click its name to close it), and the slide
+can be open at once: each one opened is added to the list as a branch of its own (right-click its name to close it); hovering over its name shows its path and any unsaved changes, and the slide
 overview shows the selected image's experiment. The List / Thumbnails buttons switch the left panel
 to a grid of thumbnails; these come from LAS X's small reduced copies (the `Pyramid` folder) when an experiment has them, and are
 kept in `%LOCALAPPDATA%\JhouLab\xlef_viewer_thumbs`. Images whose files are online-only in OneDrive are marked with a cloud. Reading
 any part of an online-only file makes OneDrive download all of it, so the viewer downloads online-only files of up to 50 MB (such as
 the reduced copies) as needed, but asks before any bigger one: when opening an image without reduced copies, or when zooming in far
-enough to need full resolution (answering No keeps the view at the reduced copies' sharpness).
+enough to need full resolution ("Download for this section", "Download for all sections", or Cancel, which keeps the view at
+the reduced copies' sharpness).

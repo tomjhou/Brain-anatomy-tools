@@ -2177,8 +2177,12 @@ class XlefViewer:
         self.list_frame = ttk.Frame(tree_frame)
         self.tree = ttk.Treeview(self.list_frame, show="tree", selectmode="browse")
         sb = ttk.Scrollbar(self.list_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.configure(yscrollcommand=lambda *a: (sb.set(*a), self._place_list_bars()))
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.list_bars = {}          # list item -> the thin progress bar laid over the bottom of its row (see _place_list_bar)
+        self.tree.bind("<Configure>", lambda e: self._place_list_bars(), add="+")
+        for ev in ("<<TreeviewOpen>>", "<<TreeviewClose>>"):
+            self.tree.bind(ev, lambda e: self.root.after_idle(self._place_list_bars), add="+")
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
         self.tree.bind("<ButtonPress-1>", self._tree_press, add="+")
@@ -2366,6 +2370,8 @@ class XlefViewer:
         self.tree.tag_configure("dim", foreground=PAL["dim"])             # (an image with nothing of it in memory yet)
         self.tree.tag_configure("cloud_dim", foreground=PAL["link_dim"])
         self.tree.tag_configure("project", font=("Segoe UI", 10, "bold"))
+        for bar in getattr(self, "list_bars", {}).values():
+            bar.configure(background=PAL["placeholder"])
 
     def apply_theme(self, name):
         """Switch the color theme, for everything already on screen too, and remember it."""
@@ -2638,6 +2644,49 @@ class XlefViewer:
             p = self.download_progress[item]
             text += "  ⇣ waiting" if p == "waiting" else f"  ⇣ {p}%"
         self.tree.item(item, text=text)
+        self._place_list_bar(item)
+
+    def _list_bar_fraction(self, item):
+        if item in self.preload_progress:
+            return self.preload_progress[item] / 100
+        if self.open_progress is not None and self.open_progress[0] == item:
+            return self.open_progress[1] / 100
+        return None
+
+    def _place_list_bar(self, item):
+        """The thin blue bar under an image's name in the list while its preview is read (as along a thumbnail's bottom): a small
+        canvas laid over the list, moved whenever the rows move (scrolling, folders opened or closed, resizing)."""
+        frac = self._list_bar_fraction(item) if item in self.entries else None
+        bar = self.list_bars.get(item)
+        box = self.tree.bbox(item) if frac is not None and self.tree.exists(item) else ""
+        if not box:
+            if bar is not None:
+                if frac is None or not self.tree.exists(item):
+                    bar.destroy()
+                    del self.list_bars[item]
+                else:
+                    bar.place_forget()           # (scrolled out of view, or in a closed folder: back when it shows again)
+            return
+        x, y, w, h = box
+        start = x + 20 * (self._tree_depth(item) + 1)            # (where the name starts, as in _tree_motion)
+        width = max(40, min(x + w, self.tree.winfo_width()) - start - 8)     # (to the right edge of the list, whatever the name's length)
+        if bar is None:
+            bar = self.list_bars[item] = tk.Canvas(self.tree, height=3, highlightthickness=0, borderwidth=0,
+                                                   background=PAL["placeholder"])
+            bar.create_rectangle(0, 0, 0, 3, fill="#3a8fff", outline="", tags=("fill",))
+            # The mouse on the bar acts on the list under it (selecting, dragging, the menu, the wheel, hover notes).
+            for ev in ("<ButtonPress-1>", "<B1-Motion>", "<ButtonRelease-1>", "<Double-Button-1>", "<Button-3>", "<Motion>"):
+                bar.bind(ev, lambda e, ev=ev, bar=bar: self.tree.event_generate(
+                    ev, x=e.x + bar.winfo_x(), y=e.y + bar.winfo_y(), rootx=e.x_root, rooty=e.y_root))
+            bar.bind("<MouseWheel>", lambda e, bar=bar: self.tree.event_generate(
+                "<MouseWheel>", x=e.x + bar.winfo_x(), y=e.y + bar.winfo_y(), rootx=e.x_root, rooty=e.y_root, delta=e.delta))
+        bar.coords("fill", 0, 0, width * frac, 3)
+        bar.configure(width=width)
+        bar.place(x=start, y=y + h - 4, width=width, height=3)
+
+    def _place_list_bars(self):
+        for item in list(self.list_bars):
+            self._place_list_bar(item)
 
     def _fill_tree(self, parent, folder):
         """The folder's images and sub-folders, in LAS X's order (the order its file lists them in, which dragging changes)."""
@@ -4392,6 +4441,7 @@ class XlefViewer:
         self._update_annotations_check()
         self.thumb_grid.rows = self._grid_rows_all()
         self.thumb_grid.layout()
+        self.root.after_idle(self._place_list_bars)         # (rows moved: their progress bars with them)
         if members and self.slide_project in self.projects:
             self._start_slide(self.slide_project)
 

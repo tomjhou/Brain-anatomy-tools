@@ -36,7 +36,7 @@ from PIL import Image, ImageTk
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "FileConverters"))
 from open_file_dialog import ask_open_file
 import leica_luts           # (LAS X's colour maps, sampled: see lut_table)
-from tooltip import Tooltip, place_on_monitor
+from tooltip import Tooltip, place_on_monitor, monitor_area
 
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".xlef_viewer_settings.json")
 THUMB_CACHE = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "JhouLab", "xlef_viewer_thumbs")
@@ -91,6 +91,7 @@ def lut_ui_color(name):
     return tuple(float(v) for v in table[int(0.85 * 255)])
 OVERVIEW_MAX = 2048      # longest side of the overview kept in memory per channel
 MAX_ZOOM = 16.0          # screen pixels per image pixel
+PIXEL_GRID_COLOR = "#484848"     # lines along the pixels' edges at MAX_ZOOM, once the wheel tries to zoom in further
 
 
 # ---------------------------------------------------------------------------------------------------------------------- color themes
@@ -103,7 +104,7 @@ THEMES = {
               "dim": "#7a7a7a", "link_dim": "#7f9fcb",
               "idle": "#e8e8e8", "idle_hover": "#d8d8d8", "idle_fg": "black", "selected": "#2f6fd4",
               "grid": "#f4f4f4", "tile": "white", "tile_line": "#d0d0d0", "tile_sel": "#cfe0fa", "tile_text": "black",
-              "placeholder": "#e6e6e6", "placeholder_fg": "#777777",
+              "placeholder": "#e6e6e6", "placeholder_fg": "#777777", "download_bar": "#707070",
               "track": "#bbbbbb", "slider_text": "#333333", "handle_line": "#333333",
               "off_bg": "#c8c8c8", "off_fg": "#808080", "off_track": "#d4d4d4", "off_bar": "#b8b8b8", "off_black": "#8a8a8a",
               "off_white": "#e4e4e4", "off_line": "#999999"},
@@ -112,7 +113,7 @@ THEMES = {
              "dim": "#9a9a9a", "link_dim": "#4d76b3",
              "idle": "#3c3c3c", "idle_hover": "#4a4a4a", "idle_fg": "#e6e6e6", "selected": "#2f6fd4",
              "grid": "#232323", "tile": "#363636", "tile_line": "#4a4a4a", "tile_sel": "#28466f", "tile_text": "#e6e6e6",
-             "placeholder": "#444444", "placeholder_fg": "#9a9a9a",
+             "placeholder": "#444444", "placeholder_fg": "#9a9a9a", "download_bar": "#ffffff",
              "track": "#5a5a5a", "slider_text": "#d0d0d0", "handle_line": "#9a9a9a",
              "off_bg": "#4a4a4a", "off_fg": "#8a8a8a", "off_track": "#404040", "off_bar": "#5a5a5a", "off_black": "#6a6a6a",
              "off_white": "#9a9a9a", "off_line": "#666666"},
@@ -222,6 +223,62 @@ def size_text(n_bytes):
 
 
 @functools.lru_cache(maxsize=None)
+def readable_color(rgb, background, min_contrast=3.0):
+    """A channel's color (rgb, 0-1) as text on `background` (rgb, 0-1): itself, or mixed toward white (dark background) or black (light
+    background) until its contrast with the background reaches min_contrast (WCAG's ratio; 3 is enough for a short label). "#rrggbb"."""
+    def luminance(c):
+        lin = [v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4 for v in c]
+        return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+    lb = luminance(background)
+    toward = (1.0, 1.0, 1.0) if lb < 0.5 else (0.0, 0.0, 0.0)
+    for k in range(21):
+        t = k / 20
+        c = tuple(v + (w - v) * t for v, w in zip(rgb, toward))
+        lc = luminance(c)
+        if (max(lc, lb) + 0.05) / (min(lc, lb) + 0.05) >= min_contrast:
+            break
+    return "#%02x%02x%02x" % tuple(round(255 * v) for v in c)
+
+
+REVEAL_LABEL = ("Open folder in Windows Explorer" if sys.platform == "win32" else "Show in Finder" if sys.platform == "darwin"
+                else "Open folder in file manager")
+
+
+def reveal_in_file_manager(path, select=True):
+    """Open the folder of `path` in the system's file manager (Windows Explorer, Finder, or what xdg-open opens), with `path` selected
+    where the system can do that (select: path is a file to point at; else a folder to open)."""
+    import subprocess
+    path = os.path.normpath(path)
+    if sys.platform == "win32":
+        if select:
+            subprocess.Popen(f'explorer /select,"{path}"')
+        else:
+            os.startfile(path)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", path] if select else ["open", path])
+    else:
+        subprocess.Popen(["xdg-open", os.path.dirname(path) if select else path])
+
+
+WINDOW_FRAME = (16, 40)      # (pixels the title bar and borders add to a window's size, beyond what Tk's geometry counts)
+
+
+def on_screen_geometry(widget, geometry):
+    """A saved window geometry ("WxH+X+Y") moved, and if need be shrunk, so that the whole window is on the monitor it is mostly on
+    (or the nearest one: a monitor since unplugged), inside its work area (not under the taskbar). Just "WxH": as it is."""
+    m = re.fullmatch(r"(\d+)x(\d+)([+-]-?\d+)([+-]-?\d+)", geometry.strip())
+    if not m:
+        return geometry
+    w, h = int(m.group(1)), int(m.group(2))
+    x, y = int(m.group(3).replace("+-", "-").replace("+", "")), int(m.group(4).replace("+-", "-").replace("+", ""))
+    left, top, right, bottom = monitor_area(widget, x + w // 2, y + h // 2)
+    w = max(200, min(w, right - left - WINDOW_FRAME[0]))
+    h = max(150, min(h, bottom - top - WINDOW_FRAME[1]))
+    x = max(left, min(x, right - w - WINDOW_FRAME[0]))
+    y = max(top, min(y, bottom - h - WINDOW_FRAME[1]))
+    return f"{w}x{h}+{x}+{y}"
+
+
 def total_memory():
     """The computer's physical memory (bytes), or None if it can't be read (read once)."""
     if sys.platform != "win32":
@@ -257,7 +314,8 @@ class Channel:
         self.name, self.max_value = name, max_value
         self.lut = self.saved_lut = lut      # LAS X's colour map (LUTName): may be changed in the viewer; saved_lut is the file's
         self.named = named       # the name is from LAS X (False: made up here, e.g. "Channel 1 (Blue)")
-        self.black, self.white = black, white        # LAS X's display range, in pixel values
+        self.black, self.white = black, white        # display range, in pixel values: LAS X's, or as changed in the viewer
+        self.saved_black, self.saved_white = black, white    # (as in the file)
 
     @property
     def color(self):
@@ -277,6 +335,8 @@ class ImageEntry:
         self.files = {}          # (z, c) -> TIFF path
         self.problem = None      # why it can't be shown, if it can't
         self.pyramid = None      # .xlif of LAS X's first reduced copy (_pmd_0), if it made a pyramid; each level names the next
+        self.full_bytes = None   # its channel TIFFs' size on disk (bytes), once measured (see XlefViewer._measure_sizes)
+        self.pages = {}          # (z, c) -> page of its file, when the channels are the pages of one OME-TIFF (see _ome_pages)
         self.annotations = []    # what was drawn on the image in LAS X (Annotation objects, hidden ones too, as in the file)
         self.annotations_changed = False     # edited in the viewer and not saved yet
         self.stage_um = None     # (x, y) of the image's CENTRE on the microscope stage, um (its <Tile PosX/PosY>), to place it on the slide
@@ -292,8 +352,12 @@ class ImageEntry:
         return any(c.lut != c.saved_lut for c in self.channels)
 
     @property
+    def contrast_changed(self):
+        return any((c.black, c.white) != (c.saved_black, c.saved_white) for c in self.channels)
+
+    @property
     def unsaved(self):
-        return self.annotations_changed or self.name != self.saved_name or self.luts_changed
+        return self.annotations_changed or self.name != self.saved_name or self.luts_changed or self.contrast_changed
 
     def all_files(self):
         return sorted(set(self.files.values()))
@@ -403,6 +467,39 @@ def load_entry(path):
     return folder
 
 
+def _ome_pages(entry, element, dims, descs, base_dir):
+    """The other way LAS X stores an image: all its channels (and z planes) as the pages of one OME-TIFF, named by <OMETiffBlock
+    File=... Offset=... Size=...> (or a few such blocks, each a part of the data). Which page holds which channel comes from the
+    metadata alone (each channel's BytesInc, and the z dimension's, over one page's bytes): the TIFF is not opened, so an online-only
+    one is not downloaded. Sets entry.files and entry.pages."""
+    blocks = []
+    for b in element.iter("OMETiffBlock"):
+        try:
+            blocks.append((int(b.get("Offset") or 0), int(b.get("Size") or 0), _resolve(b.get("File"), base_dir)))
+        except (TypeError, ValueError):
+            continue
+    if not blocks or not entry.width or not entry.height:
+        return
+    try:
+        page_bytes = int(dims["2"].get("BytesInc")) * entry.height          # (one row's bytes, times the rows)
+        z_inc = int(dims["3"].get("BytesInc")) if "3" in dims else 0
+    except (KeyError, TypeError, ValueError):
+        return
+    if page_bytes <= 0:
+        return
+    for c, cd in enumerate(descs):
+        for z in range(entry.nz):
+            try:
+                at = int(cd.get("BytesInc") or 0) + z * z_inc
+            except ValueError:
+                return
+            for offset, size, fpath in blocks:
+                if offset <= at < offset + max(size, page_bytes) and (at - offset) % page_bytes == 0:
+                    entry.files[(z, c)] = fpath
+                    entry.pages[(z, c)] = (at - offset) // page_bytes
+                    break
+
+
 def _image_entry(name, path, element, image, base_dir):
     entry = ImageEntry(name, path)
     desc = image.find("ImageDescription")
@@ -425,7 +522,8 @@ def _image_entry(name, path, element, image, base_dir):
     names = {}
     for info in element.iter("WideFieldChannelInfo"):
         names.setdefault(info.get("Channel"), info.get("UserDefName") or "")     # (FluoCubeName is the filter cube, e.g. "MICA_WF")
-    names = list(names.values())
+    # In the order of their numbers (2000, 2001, ...), not as listed: LAS X lists the active channel's info first, again.
+    names = [names[k] for k in sorted(names, key=lambda k: int(k) if (k or "").isdigit() else 1 << 30)]
     scaling = list(element.iter("ChannelScalingInfo"))
     descs = list(desc.iter("ChannelDescription")) if desc is not None else []
     for i, cd in enumerate(descs):
@@ -443,8 +541,10 @@ def _image_entry(name, path, element, image, base_dir):
         if i < len(scaling):
             try:
                 b, w = float(scaling[i].get("BlackValue")), float(scaling[i].get("WhiteValue"))
-                if 0 <= b < w <= 1:
-                    black, white = round(b * top), max(round(w * top), round(b * top) + 1)
+                if 0 <= b <= w <= 1:
+                    black, white = round(b * top), round(w * top)
+                    if white == black and b < w:
+                        white = black + 1
             except (TypeError, ValueError):
                 pass
         entry.channels.append(Channel(nm, lut, top, black, white, named))
@@ -459,6 +559,8 @@ def _image_entry(name, path, element, image, base_dir):
         c = int(mc.group(1)) if mc else k % nch
         z = int(mz.group(1)) if mz else (k // nch if len(frames) > nch else 0)
         entry.files[(z, c)] = fpath
+    if not frames:
+        _ome_pages(entry, element, dims, descs, base_dir)
     kids = element.find("Children")
     for ref in (kids if kids is not None else []):
         if "_pmd_" in unquote(ref.get("File", "")).lower():
@@ -770,6 +872,31 @@ def write_luts(path, luts):
     back = [cd.get("LUTName") for cd in ET.fromstring(new_text.encode("utf-8")).iter("ChannelDescription")]
     if back != list(luts):
         raise ValueError("the colour maps did not read back as written")
+    return _write_text(path, new_text, bom)
+
+
+def write_contrast(path, ranges, tops):
+    """Write the channels' display ranges (black, white in pixel values; tops: each channel's largest value) into an image's .xlif, as
+    LAS X keeps them: BlackValue/WhiteValue (0-1) of each <ChannelScalingInfo> (in order, one per channel), Automatic="0". Nothing
+    else changes. Checked to read back; backed up (see _write_text)."""
+    text, bom = _read_text(path)
+    tags = list(re.finditer(r"<ChannelScalingInfo\b[^>]*>", text))
+    if len(tags) != len(ranges):
+        raise ValueError(f"the file has contrast for {len(tags)} channels, not {len(ranges)}")
+    out, last = [], 0
+    for m, (lo, hi), top in zip(tags, ranges, tops):
+        tag = m.group(0)
+        for key, v in (("BlackValue", f"{lo / top:.12f}"), ("WhiteValue", f"{hi / top:.12f}"), ("Automatic", "0")):
+            tag, n = re.subn(rf'\b{key}="[^"]*"', f'{key}="{v}"', tag)
+            if n == 0:
+                tag = tag[:-1].rstrip("/").rstrip() + f' {key}="{v}"' + (" />" if tag.endswith("/>") else ">")
+        out += [text[last:m.start()], tag]
+        last = m.end()
+    new_text = "".join(out) + text[last:]
+    back = [(round(float(e.get("BlackValue")) * top), round(float(e.get("WhiteValue")) * top))
+            for e, top in zip(ET.fromstring(new_text.encode("utf-8")).iter("ChannelScalingInfo"), tops)]
+    if back != [tuple(r) for r in ranges]:
+        raise ValueError("the contrast did not read back as written")
     return _write_text(path, new_text, bom)
 
 
@@ -1188,10 +1315,11 @@ class OpenImage:
             path = self.entry.files.get(key)
             if path is None:
                 return None
+            page = self.entry.pages.get(key)
             try:
-                a = tifffile.memmap(path, mode="r")
+                a = tifffile.memmap(path, mode="r", page=page)
             except (ValueError, OSError):
-                a = tifffile.imread(path)
+                a = tifffile.imread(path, key=page if page is not None else 0) if page is not None else tifffile.imread(path)
             while a.ndim > 2:        # a z stack in one file: pick the plane; extra sample axes: take the first
                 a = a[z if a.shape[0] == self.entry.nz else 0]
             self.planes[key] = a
@@ -1247,17 +1375,17 @@ class OpenImage:
         self.overviews.clear()
 
 
-def read_rows(path, step, wait, progress, chunk=64):
+def read_rows(path, step, wait, progress, chunk=64, page=None):
     """Every step-th row and column of a TIFF (step 1: all of it), read in chunks of rows so that a background read can pause between
     them: wait() is called before each chunk and blocks while it should pause; anything but "go" from it ends the read and is returned.
     progress(fraction) is called after each chunk. Returns the array, or wait()'s answer, or "skip" for a compressed image that is too
     big to read whole in the background."""
     try:
-        src = tifffile.memmap(path, mode="r")
+        src = tifffile.memmap(path, mode="r", page=page)          # (page: one of an OME-TIFF's channels; None: the file's image)
     except (ValueError, OSError):
         if step != 1:
             return "skip"
-        a = tifffile.imread(path)            # (a small compressed pyramid level: read whole)
+        a = tifffile.imread(path, key=page or 0)            # (a small compressed pyramid level: read whole)
         while a.ndim > 2:
             a = a[0]
         progress(1.0)
@@ -1486,6 +1614,7 @@ class RangeSlider(tk.Canvas):
     def _press(self, event):
         x = self._along(event)
         self.before_press = (self.lo, self.hi)
+        self.presses = getattr(self, "presses", 0) + 1         # (the viewer makes each press one step of Undo)
         xl, xh = self._shown()          # (the handles where they are drawn, which is where they are clicked)
         reach = self.HANDLE_W
         if min(abs(x - xl), abs(x - xh)) <= reach:
@@ -1530,7 +1659,7 @@ class RangeSlider(tk.Canvas):
 
 def _thumb_cache_path(entry, size):
     """Where the thumbnail of `entry` is cached: named by its files' paths, sizes and dates (os.stat only: no download)."""
-    h = hashlib.sha1(f"{size}|lasx-contrast|{'|'.join(c.lut for c in entry.channels)}".encode())     # (the second part changes whenever thumbnails are drawn differently)
+    h = hashlib.sha1(f"{size}|lasx-contrast|{'|'.join(f'{c.lut}:{c.black}-{c.white}' for c in entry.channels)}".encode())     # (the second part changes whenever thumbnails are drawn differently)
     for f in entry.all_files():
         st = os.stat(f)
         h.update(f"{os.path.normcase(f)}|{st.st_size}|{st.st_mtime_ns}".encode())
@@ -1578,7 +1707,7 @@ def _thumb_source(entry, size):
 def make_thumbnail(entry, size=THUMB_SIZE):
     """(PIL image, "ok"), or (None, "cloud") when the files are online-only (they are NOT read), or (None, "none").
     Made from the smallest fitting level of LAS X's pyramid if there is one (a few KB per channel), else from every n-th row and column
-    of the image itself, and shown with the image's LAS X contrast, as the main view first shows it."""
+    of the image itself, and shown with the image's contrast (LAS X's, or as changed in the viewer), as the main view first shows it."""
     if entry.problem or not entry.files or not entry.width:
         return None, "none"
     try:
@@ -1592,16 +1721,17 @@ def make_thumbnail(entry, size=THUMB_SIZE):
         return None, files
     step = max(1, max(source.width, source.height) // size)       # (rounded down: the resize below makes it exactly `size`)
     arrays = []
-    for f in files:
+    for c, f in enumerate(files):
         if f is None:
             arrays.append(None)
             continue
+        page = source.pages.get((0, c))                         # (one of an OME-TIFF's pages, or None)
         try:
-            a = tifffile.memmap(f, mode="r")
+            a = tifffile.memmap(f, mode="r", page=page)
         except (ValueError, OSError):
             if os.path.getsize(f) > THUMB_MAX_READ:
                 return None, "none"
-            a = tifffile.imread(f)
+            a = tifffile.imread(f, key=page or 0)
         while a.ndim > 2:
             a = a[0]
         small = np.ascontiguousarray(a[::step, ::step])
@@ -2066,7 +2196,9 @@ class XlefViewer:
             self.theme = "dark"
         style_theme(self.root, self.theme, self.native_theme)
         self.root.configure(background=PAL["bg"])
-        self.root.geometry(self.settings.get("geometry", "1400x900"))
+        self.root.geometry(on_screen_geometry(self.root, self.settings.get("geometry", "1400x900")))
+        self.normal_geometry = None  # (the window's size and position when last neither maximized nor minimized: what is saved)
+        self.root.bind("<Configure>", self._window_moved, add="+")
         self.entries = {}            # tree item -> ImageEntry
         self.img = None              # OpenImage
         self.z = 0
@@ -2088,7 +2220,9 @@ class XlefViewer:
         self.kept_images = collections.OrderedDict()     # ImageEntry -> OpenImage, for images seen recently (see _keep_image)
         self.kept_bytes = 0          # (their size, kept up to date here, for the background loader's thread to read)
         self.full_res_ok = None      # (see show_entry)
+        self.contrast_step, self.contrast_job = None, None     # (the slider drag being made: one Undo step; see _set_lo_hi)
         self.history = []            # changes that Undo goes back through: ("ann", entry), ("lut", [(entry, channel, old map)]),
+                                     # ("range", [(entry, channel, old black, old white)]),
                                      # ("move", (item, old parent, old index)) or ("delete", (item, entry, old parent, old index))
         self.home = {}               # list item -> the project it was read from (an image dragged to another moves there on Save)
         self.deleted = {}            # list item -> ImageEntry, for images deleted and not saved yet (out of the list; Save recycles them)
@@ -2157,8 +2291,8 @@ class XlefViewer:
         ttk.Button(self.list_bar, text="Open...", command=self.ask_open).pack(side=tk.LEFT)
         self.save_button = ttk.Button(self.list_bar, text="Save", command=self.save_annotations, state=tk.DISABLED)
         self.save_button.pack(side=tk.LEFT, padx=(4, 0))
-        Tooltip(self.save_button, "Write all unsaved changes (annotations, color maps, renames, the list's order, deleted images: "
-                                  "marked ✎ in the list) into LAS X's files, "
+        Tooltip(self.save_button, "Write all unsaved changes (annotations, color maps, contrast, renames, the list's order, deleted images: "
+                                  "marked with a red * in the list) into LAS X's files, "
                                   "keeping a copy of each file as it was. Nothing is saved until you click this.")
         # The List / Thumbnails toggle: real buttons, the one showing filled in (as the Open dialog's toggle), since ttk's flat Toolbutton
         # style looks like a label on Windows.
@@ -2175,16 +2309,20 @@ class XlefViewer:
         tree_frame = ttk.Frame(left)
         tree_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         self.list_frame = ttk.Frame(tree_frame)
-        self.tree = ttk.Treeview(self.list_frame, show="tree", selectmode="browse")
+        self.tree = ttk.Treeview(self.list_frame, show="tree", selectmode="browse", columns=("size",))
+        self.tree.column("#0", stretch=True)
+        self.tree.column("size", width=72, minwidth=60, stretch=False, anchor=tk.E)   # (full resolution's size: see _show_sizes)
         sb = ttk.Scrollbar(self.list_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=lambda *a: (sb.set(*a), self._place_list_bars()))
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.list_bars = {}          # list item -> the thin progress bar laid over the bottom of its row (see _place_list_bar)
+        self.unsaved_marks = {}      # list item -> the red * laid over its row after its name (see _place_unsaved_mark)
         self.tree.bind("<Configure>", lambda e: self._place_list_bars(), add="+")
         for ev in ("<<TreeviewOpen>>", "<<TreeviewClose>>"):
             self.tree.bind(ev, lambda e: self.root.after_idle(self._place_list_bars), add="+")
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self.root.after_idle(self._place_list_bars), add="+")   # (marks' colors)
         self.tree.bind("<ButtonPress-1>", self._tree_press, add="+")
         self.tree.bind("<B1-Motion>", self._tree_drag)
         self.tree.bind("<ButtonRelease-1>", self._tree_drop, add="+")
@@ -2205,10 +2343,15 @@ class XlefViewer:
         # Above the image: the annotation tools (as LAS X's). Nothing is written to LAS X's files until Save is clicked.
         bar = ttk.Frame(right)
         bar.pack(fill=tk.X, padx=4, pady=(4, 0))
-        ttk.Label(bar, text="Annotations:").pack(side=tk.LEFT, padx=(0, 6))
+        self.show_annotations = tk.BooleanVar(value=self.settings.get("show_annotations", True))
+        self.annotations_check = ttk.Checkbutton(bar, text="Show annotations", variable=self.show_annotations,
+                                                 command=self.on_annotations_toggle)
+        self.annotations_check.pack(side=tk.LEFT, padx=(0, 8))
+        Tooltip(self.annotations_check, "Show the lines, shapes and text drawn on this image in LAS X (and here). The tools after it "
+                                        "draw new ones.")
         self.tool_buttons = {}
         for tool, text, tip in (("select", "Select", "Select an annotation to move it (drag it), resize it (its corners), rotate it (the "
-                                 "round handle) or delete it. Double-click a text to change its words. Dragging elsewhere moves the view."),
+                                 "round handle) or delete it. Double-click a text to change its words or color. Dragging elsewhere moves the view."),
                                 ("rectangle", "Rectangle", "Draw a rectangle: drag from one corner to the other"),
                                 ("ellipse", "Ellipse", "Draw an ellipse or circle: drag across it"),
                                 ("measure", "Measure", "Draw a measuring line (its length is shown): drag from one end to the other"),
@@ -2220,12 +2363,15 @@ class XlefViewer:
             Tooltip(b, tip)
             self.tool_buttons[tool] = b
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        self.ann_color = self.settings.get("annotation_color", "#ff0000")
+        # New annotations' colors, for this run only (red and white again when the viewer starts): shapes and lines, and text.
+        self.ann_color, self.text_color = "#ff0000", "#ffffff"
+        self.settings.pop("annotation_color", None)        # (remembered by earlier versions)
         self.color_button = tk.Button(bar, text="   ", bg=self.ann_color, activebackground=self.ann_color, bd=2, cursor="hand2",
                                       command=self.choose_color)
         self.color_button.keep_colors = True
         self.color_button.pack(side=tk.LEFT, padx=(0, 2))
-        Tooltip(self.color_button, "Color of new annotations, and of the selected one")
+        Tooltip(self.color_button, "Color of new shapes and lines (red at first), and of the selected one. With Text chosen, or a text "
+                                   "selected: the color of new text (white at first), and of the selected text.")
         for text, cmd, tip in (("Delete", self.delete_annotation, "Delete the selected annotation (or press Delete)"),
                                ("Undo", self.undo_annotation, "Undo the last change: annotations or color maps, on any image (Ctrl+Z)")):
             b = ttk.Button(bar, text=text, command=cmd)
@@ -2235,6 +2381,12 @@ class XlefViewer:
         settings_button = ttk.Button(bar, text="⚙ Settings", command=self.open_settings)
         settings_button.pack(side=tk.RIGHT)
         Tooltip(settings_button, "Settings: color theme, zoomed-in pixels, renaming")
+        self.flip_x = tk.BooleanVar(value=self.settings.get("flip_left_right", False))
+        flip_check = ttk.Checkbutton(bar, text="Flip all sections", variable=self.flip_x, command=self.on_flip_toggle)
+        flip_check.pack(side=tk.RIGHT, padx=(0, 8))
+        Tooltip(flip_check, "Show every section mirrored, left for right (with its annotations); a section with \"Flip this section\" "
+                            "ticked is flipped back. Only the view is flipped: the files, and annotations drawn while flipped, keep the "
+                            "image's own left and right.")
         self.unsaved_label.pack(side=tk.RIGHT, padx=6)
         self.tool, self.selected, self.ann_drag, self.save_warned = "select", None, None, False
 
@@ -2249,41 +2401,47 @@ class XlefViewer:
         self.z_scale = tk.Scale(self.z_frame, from_=0, to=0, orient=tk.HORIZONTAL, variable=self.z_var, command=self.on_z)
         self.z_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
+        self.split_button = ttk.Button(side, text="Merge channels" if self.settings.get("separate_channels", True) else "Separate channels",
+                                       command=self.toggle_split)
+        self.split_button.pack(fill=tk.X, pady=(0, 4))
+        Tooltip(self.split_button, "Show each channel switched on in a panel of its own, side by side. Zooming or panning one moves "
+                                   "them all.")
+        self.flip_one = tk.BooleanVar(value=False)
+        self.flip_one_check = ttk.Checkbutton(side, text="Flip this section", variable=self.flip_one, command=self.on_flip_one_toggle,
+                                              state=tk.DISABLED)
+        self.flip_one_check.pack(anchor=tk.W, pady=(0, 4))
+        Tooltip(self.flip_one_check, "Show this section mirrored, left for right, e.g. one mounted the other way up from the rest "
+                                     "(remembered for it). With \"Flip all sections\" ticked too, it is shown unflipped. Only the "
+                                     "view is flipped, not the files.")
         self.ch_frame = ttk.LabelFrame(side, text="Channels")
         self.ch_frame.pack(fill=tk.BOTH, expand=True)
         btns = ttk.Frame(side)
         btns.pack(fill=tk.X, pady=(4, 0))
         ttk.Button(btns, text="Auto contrast", command=self.auto_all).pack(side=tk.LEFT, expand=True, fill=tk.X)
         ttk.Button(btns, text="LAS X contrast", command=self.lasx_all).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(4, 0))
-        self.show_annotations = tk.BooleanVar(value=self.settings.get("show_annotations", True))
-        self.annotations_check = ttk.Checkbutton(side, text="Show annotations", variable=self.show_annotations,
-                                                 command=self.on_annotations_toggle)
-        self.annotations_check.pack(anchor=tk.W, pady=(4, 0))
-        Tooltip(self.annotations_check, "Show the lines, shapes and text drawn on this image in LAS X")
 
-        self.canvas = tk.Canvas(view_row, background="black", highlightthickness=0, cursor="fleur")
+        self.canvas = self.main_canvas = tk.Canvas(view_row, background="black", highlightthickness=0, cursor="fleur")
         self.canvas.keep_colors = True        # (black in both themes)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # Channels separated (see _layout_panels): the image's canvases are a grid of panels in panel_frame, one per channel shown,
+        # all with the one view (scale, cx, cy: in a panel's own coordinates); self.canvas is the first, and the one being drawn
+        # while _each_canvas draws on each in turn.
+        self.split = self.settings.get("separate_channels", True)      # (on by default; remembered)
+        self.canvases, self.panel_channels, self.panel_cols, self.drawing_panel = [self.canvas], [None], 1, None
+        self.panel_frame = tk.Frame(view_row, background="#3a3a3a")
+        self.panel_frame.keep_colors = True
+        self.panel_frame.bind("<Configure>", lambda e: self._layout_panels())
+        self.pixel_grid = False      # (at the largest zoom, after trying to zoom in further: a line along every pixel's edge)
         self.status = ttk.Label(right, text="Open an .xlef file (File > Open, or drag it onto this window or onto RUN_XLEF_VIEWER.bat).",
                                 anchor=tk.W)
         self.status.pack(fill=tk.X)
-        self.cursor_label = ttk.Label(right, text="", anchor=tk.W, style="Muted.TLabel")
-        self.cursor_label.pack(fill=tk.X)
+        self.cursor_row = ttk.Frame(right)          # (under the pointer: its position, then each channel's value, in its color)
+        self.cursor_row.pack(fill=tk.X)
+        self.cursor_label = ttk.Label(self.cursor_row, text="", anchor=tk.W, style="Muted.TLabel")
+        self.cursor_label.pack(side=tk.LEFT)
+        self.cursor_values = []                      # ([tk.Label per channel], the channels' colors they were made for)
 
-        c = self.canvas
-        c.bind("<Configure>", lambda e: self.on_resize())
-        c.bind("<ButtonPress-1>", self.on_press)
-        c.bind("<B1-Motion>", self.on_drag)
-        c.bind("<ButtonRelease-1>", self.on_release)
-        c.bind("<MouseWheel>", self.on_wheel)
-        c.bind("<Button-4>", lambda e: self.on_wheel(e, 120))
-        c.bind("<Button-5>", lambda e: self.on_wheel(e, -120))
-        c.bind("<Motion>", self.on_motion)
-        c.bind("<Double-Button-1>", self.ann_double)
-        for b, name in ((2, "pan2"), (3, "pan3")):          # the middle and right buttons always move the view, whatever the tool
-            c.bind(f"<ButtonPress-{b}>", self.pan_start)
-            c.bind(f"<B{b}-Motion>", self.pan_move)
-            c.bind(f"<ButtonRelease-{b}>", self.pan_end)
+        self._bind_view_canvas(self.canvas)
         self.root.bind("<Delete>", lambda e: None if isinstance(e.widget, (tk.Entry, tk.Text)) else self.delete_annotation())
         self.root.bind("<Control-z>", lambda e: None if isinstance(e.widget, tk.Text) else self.undo_annotation())
         self.root.bind("<Escape>", lambda e: (setattr(self, "selected", None), self.set_tool("select"), self._draw_annotations()))
@@ -2293,9 +2451,139 @@ class XlefViewer:
         for k in range(1, 10):
             self.root.bind(str(k), lambda e, k=k: self.toggle_channel(k - 1))
         if self.dnd_files:
-            for target in (self.canvas, self.tree):
-                target.drop_target_register(self.dnd_files)
-                target.dnd_bind("<<Drop>>", self.on_drop)
+            self.tree.drop_target_register(self.dnd_files)
+            self.tree.dnd_bind("<<Drop>>", self.on_drop)
+
+    def _bind_view_canvas(self, c):
+        """The mouse on an image canvas (the one, or each panel when the channels are separated: the same view in each)."""
+        c.bind("<Configure>", lambda e: self.on_resize())
+        c.bind("<ButtonPress-1>", self.on_press)
+        c.bind("<B1-Motion>", self.on_drag)
+        c.bind("<ButtonRelease-1>", self.on_release)
+        c.bind("<MouseWheel>", self.on_wheel)
+        c.bind("<Button-4>", lambda e: self.on_wheel(e, 120))
+        c.bind("<Button-5>", lambda e: self.on_wheel(e, -120))
+        c.bind("<Motion>", self.on_motion)
+        c.bind("<Double-Button-1>", self.ann_double)
+        for b in (2, 3):          # the middle and right buttons always move the view, whatever the tool
+            c.bind(f"<ButtonPress-{b}>", self.pan_start)
+            c.bind(f"<B{b}-Motion>", self.pan_move)
+            c.bind(f"<ButtonRelease-{b}>", self.pan_end)
+        if self.dnd_files:
+            c.drop_target_register(self.dnd_files)
+            c.dnd_bind("<<Drop>>", self.on_drop)
+
+    # --- separate channels
+
+    def toggle_split(self):
+        """The "Separate channels" button: each channel switched on in a panel of its own (or, again, all mixed in one)."""
+        self.split = self.settings["separate_channels"] = not self.split
+        self._save_settings()
+        self.split_button.config(text="Merge channels" if self.split else "Separate channels")
+        self._layout_panels(force=True)
+
+    def _layout_panels(self, force=False):
+        """The image's canvases: the one, or (channels separated) a grid of panels, one per channel switched on, in as many columns as
+        make the image largest in them. Rebuilt only when that changes (the channels shown, or the best number of columns)."""
+        if self.split and self.img is None:
+            return                          # (between two images: kept as they are)
+        want = [c for c, st in enumerate(self.ch_settings) if st["on"]] if self.split else []
+        was_fit = self.img is not None and abs(self.scale - self.fit_scale) < 1e-9
+        if not want:
+            if self.canvases != [self.main_canvas]:
+                for c in self.canvases:
+                    c.destroy()
+                self.panel_frame.pack_forget()
+                self.main_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+                self.canvases, self.canvas, self.panel_channels, self.panel_cols = [self.main_canvas], self.main_canvas, [None], 1
+                self.photo = None
+                self.root.after_idle(self._relaid_out, was_fit)
+            return
+        area = self.panel_frame if self.panel_frame.winfo_ismapped() else self.main_canvas
+        w, h = max(area.winfo_width(), 1), max(area.winfo_height(), 1)
+        e, n = self.img.entry, len(want)
+        cols = max(range(1, n + 1), key=lambda k: min(w / k / e.width, h / -(-n // k) / e.height))
+        if not force and want == self.panel_channels and cols == self.panel_cols:
+            return
+        rows = -(-n // cols)
+        for c in self.canvases:
+            if c is not self.main_canvas:
+                c.destroy()
+        for k in range(max(n, 9)):
+            self.panel_frame.grid_columnconfigure(k, weight=1 if k < cols else 0, uniform="panel" if k < cols else "")
+            self.panel_frame.grid_rowconfigure(k, weight=1 if k < rows else 0, uniform="panel" if k < rows else "")
+        panels = []
+        for k in range(n):
+            c = tk.Canvas(self.panel_frame, background="black", highlightthickness=0, cursor=self.main_canvas.cget("cursor"))
+            c.keep_colors = True
+            c.grid(row=k // cols, column=k % cols, sticky="nsew", padx=(0 if k % cols == 0 else 2, 0), pady=(0 if k < cols else 2, 0))
+            self._bind_view_canvas(c)
+            panels.append(c)
+        if self.main_canvas.winfo_ismapped() or not self.panel_frame.winfo_ismapped():
+            self.main_canvas.pack_forget()
+            self.panel_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.canvases, self.canvas, self.panel_channels, self.panel_cols = panels, panels[0], want, cols
+        self.photo = None
+        self.root.after_idle(self._relaid_out, was_fit)
+
+    def _relaid_out(self, was_fit):
+        """After the canvases changed (separated, merged, a panel more or less): a view that filled the old canvas fills the new one;
+        a zoomed-in view keeps its zoom. (The one canvas, shown again, keeps its old size: no <Configure> comes to do this.)"""
+        self.root.update_idletasks()                    # (the canvases' new sizes)
+        if self.img is None:
+            return
+        if was_fit:
+            self.fit()
+        else:
+            self.clamp_view()
+            self.schedule_redraw(0)
+
+    def _each_canvas(self, draw):
+        """draw() once per canvas of the image, with self.canvas set to each in turn (self.drawing_panel: its index)."""
+        if self.drawing_panel is not None:
+            draw()
+            return
+        keep = self.canvas
+        try:
+            for k, c in enumerate(self.canvases):
+                self.canvas, self.drawing_panel = c, k
+                draw()
+        finally:
+            self.canvas, self.drawing_panel = keep, None
+
+    def _mix(self, arrays, luts):
+        """The channels' arrays mixed into one RGB picture per canvas: all of them together, or (separated) each on its own."""
+        if self.panel_channels == [None]:
+            return [composite(arrays, luts)]
+        return [composite([a if i == c else None for i, a in enumerate(arrays)], [t if i == c else None for i, t in enumerate(luts)])
+                for c in self.panel_channels]
+
+    def _draw_panel_label(self):
+        """Separated: the channel's number and name at the top left of its panel, in its color."""
+        c = self.panel_channels[self.drawing_panel or 0]
+        if c is None or self.img is None or c >= len(self.img.entry.channels):
+            return
+        ch = self.img.entry.channels[c]
+        t = self.canvas.create_text(8, 6, anchor=tk.NW, text=f"{c + 1}  {ch.name}", fill=self._swatch_color(c),
+                                    font=("Segoe UI", 10, "bold"))
+        x0, y0, x1, y1 = self.canvas.bbox(t)
+        self.canvas.tag_lower(self.canvas.create_rectangle(x0 - 4, y0 - 2, x1 + 4, y1 + 2, fill="#101010", outline=""), t)
+
+    def _draw_pixel_grid(self):
+        """At the largest zoom, once the wheel has tried to zoom in further: a line along the edges of every pixel (over the image only)."""
+        if not self.pixel_grid or self.img is None or self.scale < MAX_ZOOM - 1e-9:
+            return
+        e = self.img.entry
+        cw, ch = self.canvas_size()
+        ix0, iy0, ix1, iy1 = self._view_corners()
+        sx = lambda x: round(self._fx((x - self.cx) * self.scale + cw / 2))
+        sy = lambda y: round((y - self.cy) * self.scale + ch / 2)
+        top, bottom = max(0, sy(0)), min(ch, sy(e.height))
+        left, right = max(0, min(sx(0), sx(e.width))), min(cw, max(sx(0), sx(e.width)))
+        for x in range(max(0, int(np.ceil(ix0))), min(e.width, int(ix1)) + 1):
+            self.canvas.create_line(sx(x), top, sx(x), bottom, fill=PIXEL_GRID_COLOR, tags="pixelgrid")
+        for y in range(max(0, int(np.ceil(iy0))), min(e.height, int(iy1)) + 1):
+            self.canvas.create_line(left, sy(y), right, sy(y), fill=PIXEL_GRID_COLOR, tags="pixelgrid")
 
     # --- settings window, color theme
 
@@ -2372,6 +2660,8 @@ class XlefViewer:
         self.tree.tag_configure("project", font=("Segoe UI", 10, "bold"))
         for bar in getattr(self, "list_bars", {}).values():
             bar.configure(background=PAL["placeholder"])
+        if getattr(self, "unsaved_marks", None) or getattr(self, "list_bars", None):
+            self.root.after_idle(self._place_list_bars)     # (the marks and bars in the theme's colors)
 
     def apply_theme(self, name):
         """Switch the color theme, for everything already on screen too, and remember it."""
@@ -2411,11 +2701,20 @@ class XlefViewer:
 
     def _save_settings(self):
         try:
-            self.settings["geometry"] = self.root.geometry()
+            if self.root.state() == "normal":
+                self.normal_geometry = self.root.geometry()
+            if self.normal_geometry:
+                self.settings["geometry"] = self.normal_geometry     # (not a maximized window's: see _window_moved)
             with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
                 json.dump(self.settings, f, indent=1)
         except OSError:
             pass
+
+    def _window_moved(self, event):
+        """The window resized or moved: remembered when it is a normal window (maximized, Tk gives the full screen's size with the
+        position from before: restored as a normal window that would hang off the screen)."""
+        if event.widget is self.root and self.root.state() == "normal":
+            self.normal_geometry = self.root.geometry()
 
     def quit(self):
         if not self.unsaved_ok("Closing the viewer", "Close anyway?"):
@@ -2506,6 +2805,7 @@ class XlefViewer:
         self.projects[pid]["root"] = experiment
         experiment.path = path
         self._fill_tree(pid, experiment)
+        self._measure_sizes(pid)
         mine = self._entries_of(pid)
         n_cloud = sum(1 for e in mine.values() if e.online_only_files())
         self.status.config(text=f"{self.projects[pid]['name']}: {len(mine)} image{'s' * (len(mine) != 1)}"
@@ -2519,6 +2819,39 @@ class XlefViewer:
         elif self.img is None:
             self.show_message("Select an image" if mine else "No images in this experiment")
             self._start_slide(pid)
+
+    def _measure_sizes(self, pid):
+        """The size of each of the project's images at full resolution (its channel TIFFs), read in the background from the file
+        system only (os.stat: an online-only file is not downloaded), then shown in the list (see _show_sizes)."""
+        entries = list(self._entries_of(pid).values())
+
+        def work():
+            for e in entries:
+                total = 0
+                for f in e.all_files():
+                    try:
+                        total += os.path.getsize(f)
+                    except OSError:
+                        pass
+                e.full_bytes = total
+            self.results.put(("sizes", pid, None))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_sizes(self):
+        """The size column of the list: each image's full resolution, and the total of what each folder and project lists now
+        (images dragged in or out, or deleted, counted as they are shown)."""
+        def total(node):
+            entry = self.entries.get(node)
+            if entry is not None:
+                b = entry.full_bytes
+            else:
+                sizes = [total(child) for child in self.tree.get_children(node)]
+                b = sum(x for x in sizes if x is not None) if any(x is not None for x in sizes) else None
+            if node:
+                self.tree.set(node, "size", size_text(b) if b is not None else "")
+            return b
+        total("")
 
     def _projects_changed(self):
         """After a project was opened or closed: the thumbnail grid, the title, and the background work (thumbnails, first pictures)
@@ -2617,7 +2950,7 @@ class XlefViewer:
         self._projects_changed()
 
     def _label_item(self, item):
-        """An image's or folder's name in the list: its name (a cloud after an image with online-only files), a pencil while it has
+        """An image's or folder's name in the list: its name (a cloud after an image with online-only files), a red * after it (see _place_unsaved_mark) while it has
         unsaved changes (a rename, or edited annotations), and how far the reading of its preview has got ("45% preview": in the background, or as it is opened) while that runs. An
         image with nothing of it in memory yet (not open, not kept or preloaded: see _loaded_entries) is dimmed."""
         obj = self.entries.get(item) or self.folders.get(item)
@@ -2634,8 +2967,6 @@ class XlefViewer:
             self.tree.item(item, tags=tags)
             self.thumb_grid.set_dimmed(item, tags in (("cloud_dim",), ("dim",)))
         text = obj.name + ("  ☁" if item in self.item_cloud else "")
-        if obj.unsaved:
-            text += "  ✎"
         if item in self.preload_progress:
             text += f"  {self.preload_progress[item]}% preview"
         elif self.open_progress is not None and self.open_progress[0] == item:
@@ -2645,20 +2976,27 @@ class XlefViewer:
             text += "  ⇣ waiting" if p == "waiting" else f"  ⇣ {p}%"
         self.tree.item(item, text=text)
         self._place_list_bar(item)
+        self._place_unsaved_mark(item)
 
     def _list_bar_fraction(self, item):
+        """How far the bar under an image's name is (0-1) and its color: its preview being read (blue), else its full resolution
+        being downloaded from OneDrive (white; grey in the light theme); or (None, None)."""
         if item in self.preload_progress:
-            return self.preload_progress[item] / 100
+            return self.preload_progress[item] / 100, "#3a8fff"
         if self.open_progress is not None and self.open_progress[0] == item:
-            return self.open_progress[1] / 100
-        return None
+            return self.open_progress[1] / 100, "#3a8fff"
+        if item in self.download_progress:
+            p = self.download_progress[item]
+            return (0 if p == "waiting" else p / 100), PAL["download_bar"]
+        return None, None
 
     def _place_list_bar(self, item):
-        """The thin blue bar under an image's name in the list while its preview is read (as along a thumbnail's bottom): a small
-        canvas laid over the list, moved whenever the rows move (scrolling, folders opened or closed, resizing)."""
-        frac = self._list_bar_fraction(item) if item in self.entries else None
+        """The thin bar under an image's name in the list while its preview is read (blue, as along a thumbnail's bottom) or its full
+        resolution downloaded (white): a small canvas laid over the list, moved whenever the rows move (scrolling, folders opened or
+        closed, resizing)."""
+        frac, color = self._list_bar_fraction(item) if item in self.entries else (None, None)
         bar = self.list_bars.get(item)
-        box = self.tree.bbox(item) if frac is not None and self.tree.exists(item) else ""
+        box = self.tree.bbox(item, "#0") if frac is not None and self.tree.exists(item) else ""      # (the name's column)
         if not box:
             if bar is not None:
                 if frac is None or not self.tree.exists(item):
@@ -2673,20 +3011,96 @@ class XlefViewer:
         if bar is None:
             bar = self.list_bars[item] = tk.Canvas(self.tree, height=3, highlightthickness=0, borderwidth=0,
                                                    background=PAL["placeholder"])
-            bar.create_rectangle(0, 0, 0, 3, fill="#3a8fff", outline="", tags=("fill",))
-            # The mouse on the bar acts on the list under it (selecting, dragging, the menu, the wheel, hover notes).
-            for ev in ("<ButtonPress-1>", "<B1-Motion>", "<ButtonRelease-1>", "<Double-Button-1>", "<Button-3>", "<Motion>"):
-                bar.bind(ev, lambda e, ev=ev, bar=bar: self.tree.event_generate(
-                    ev, x=e.x + bar.winfo_x(), y=e.y + bar.winfo_y(), rootx=e.x_root, rooty=e.y_root))
-            bar.bind("<MouseWheel>", lambda e, bar=bar: self.tree.event_generate(
-                "<MouseWheel>", x=e.x + bar.winfo_x(), y=e.y + bar.winfo_y(), rootx=e.x_root, rooty=e.y_root, delta=e.delta))
+            bar.create_rectangle(0, 0, 0, 3, fill=color, outline="", tags=("fill",))
+            self._pass_mouse_to_list(bar)
         bar.coords("fill", 0, 0, width * frac, 3)
+        bar.itemconfigure("fill", fill=color)
         bar.configure(width=width)
         bar.place(x=start, y=y + h - 4, width=width, height=3)
 
     def _place_list_bars(self):
         for item in list(self.list_bars):
             self._place_list_bar(item)
+        for item in list(self.unsaved_marks):
+            self._place_unsaved_mark(item)
+
+    def _pass_mouse_to_list(self, widget):
+        """The mouse on something laid over the list (a progress bar, an unsaved mark) acts on the list under it: selecting,
+        dragging, the menu, the wheel, hover notes."""
+        for ev in ("<ButtonPress-1>", "<B1-Motion>", "<ButtonRelease-1>", "<Double-Button-1>", "<Button-3>", "<Motion>"):
+            widget.bind(ev, lambda e, ev=ev, w=widget: self.tree.event_generate(
+                ev, x=e.x + w.winfo_x(), y=e.y + w.winfo_y(), rootx=e.x_root, rooty=e.y_root))
+        widget.bind("<MouseWheel>", lambda e, w=widget: self.tree.event_generate(
+            "<MouseWheel>", x=e.x + w.winfo_x(), y=e.y + w.winfo_y(), rootx=e.x_root, rooty=e.y_root, delta=e.delta))
+
+    def _is_unsaved(self, item):
+        if item in self.projects:
+            root = self.projects[item].get("root")
+            return root is not None and root.unsaved
+        obj = self.entries.get(item) or self.folders.get(item)
+        return obj is not None and obj.unsaved
+
+    def _unsaved_what(self, item):
+        """What isn't saved yet of this image, folder or project, for the note on its red *: e.g. ["contrast", "color maps"]."""
+        obj = self.projects[item].get("root") if item in self.projects else (self.entries.get(item) or self.folders.get(item))
+        if obj is None:
+            return []
+        what = []
+        if obj.name != obj.saved_name:
+            what.append(f"renamed (was \"{obj.saved_name}\")")
+        if getattr(obj, "annotations_changed", False):
+            what.append("annotations")
+        if isinstance(obj, ImageEntry):
+            what += ["color maps"] * obj.luts_changed + ["contrast"] * obj.contrast_changed
+        if getattr(obj, "order_changed", False):
+            what.append("the order of what it holds")
+        return what
+
+    def _unsaved_tip(self, item, event):
+        """The pointer on a row's red *: a note saying what isn't saved yet. True if it is on one."""
+        mark = self.unsaved_marks.get(item)
+        if mark is None or not mark.winfo_manager():
+            return False
+        left = int(float(mark.place_info().get("x", 0)))
+        if not left - 3 <= event.x <= left + mark.winfo_reqwidth() + 3:
+            return False
+        what = self._unsaved_what(item)
+        if self.tree_tip is None:
+            self.tree_tip = PointerTip(self.tree)
+        self.tree_tip.show("Unsaved changes" + (": " + ", ".join(what) if what else "") +
+                           ".\nSave writes them into LAS X's files.", event.x_root, event.y_root)
+        return True
+
+    def _place_unsaved_mark(self, item):
+        """A red * at the end of the row's name while an image, folder or project has unsaved changes (the list can't color part of a
+        row, so it is a label laid over the list, moved with the row as the progress bars are). On a name too long for the list, it
+        sits at the list's right edge, over the name's cut-off end. The pointer on it: a note saying what isn't saved (_unsaved_tip)."""
+        mark = self.unsaved_marks.get(item)
+        if not self.tree.exists(item) or not self._is_unsaved(item):
+            if mark is not None:
+                mark.destroy()
+                del self.unsaved_marks[item]
+            return
+        box = self.tree.bbox(item, "#0")
+        if mark is None:
+            mark = self.unsaved_marks[item] = tk.Label(self.tree, text="*", bd=0, padx=1, pady=0, font=("Segoe UI", 12, "bold"))
+            mark.keep_colors = True
+            self._pass_mouse_to_list(mark)
+        if not box:
+            mark.place_forget()                 # (scrolled out of view, or in a closed folder)
+            return
+        x, y, w, h = box
+        font = tkfont.Font(font=("Segoe UI", 10, "bold")) if item in self.projects else tkfont.nametofont("TkDefaultFont")
+        start = x + 20 * (self._tree_depth(item) + 1)            # (where the name starts, as in _tree_motion)
+        left = min(start + font.measure(self.tree.item(item, "text")) + 3, x + w - mark.winfo_reqwidth() - 2)
+        style = ttk.Style()
+        selected = item in self.tree.selection()
+        bg = (style.lookup("Treeview", "background", ("selected",)) or PAL["selected"]) if selected else             (style.lookup("Treeview", "background") or PAL["field"])
+        mark.configure(fg="#ffb4b4" if selected else PAL["warn"], bg=bg)
+        if left < start:
+            mark.place_forget()                 # (no room at all in a very narrow list)
+            return
+        mark.place(x=left, y=y + (h - mark.winfo_reqheight()) // 2)
 
     def _fill_tree(self, parent, folder):
         """The folder's images and sub-folders, in LAS X's order (the order its file lists them in, which dragging changes)."""
@@ -2818,10 +3232,10 @@ class XlefViewer:
                     level = img.quick_level(max(entry.width, entry.height) * min(cw / entry.width, ch / entry.height)) or img.pyramid
                     n = len(entry.channels)
                     if level is not None:
-                        files, step = [level[0].files[(0, c)] for c in range(n)], level[1]
+                        files, step, pages = [level[0].files[(0, c)] for c in range(n)], level[1], level[0].pages
                         size = level[0].width * level[0].height * 2 * n
                     else:
-                        files, step = [entry.files[(0, c)] for c in range(n)], img.ov_step
+                        files, step, pages = [entry.files[(0, c)] for c in range(n)], img.ov_step, entry.pages
                         size = -(-entry.width // step) * -(-entry.height // step) * 2 * n
                     if any(needs_asking(f) for f in files):
                         continue                        # (large online-only files: only after asking, when opened)
@@ -2836,7 +3250,7 @@ class XlefViewer:
                             if pct != last:
                                 last = pct
                                 self.results.put(("preload_progress", gen, (item, pct)))
-                        a = read_rows(f, 1 if level is not None else step, lambda: wait(entry), progress)
+                        a = read_rows(f, 1 if level is not None else step, lambda: wait(entry), progress, page=pages.get((0, c)))
                         if not isinstance(a, np.ndarray):
                             break                       # ("stop" or "skip")
                         arrays.append(pyramid_to_original(a, entry.channels[c].max_value) if level is not None and a.dtype == np.uint8
@@ -2938,10 +3352,14 @@ class XlefViewer:
         self.img = None
         self._show_loaded()
         self.photo = None
+        self.flip_one.set(False)
+        self.flip_one_check.configure(state=tk.DISABLED)        # (no section shown)
         self.last_view_rgb = None
         self.shrunk.clear()
         self.selected = self.ann_drag = None
-        self.canvas.delete("all")
+        self._each_canvas(lambda: self.canvas.delete("all"))
+        self.cursor_label.config(text="")
+        self._show_cursor_values([])
         self.canvas_message = ""
         self.detail_pending = False
         self.detail_cache = None
@@ -2981,6 +3399,7 @@ class XlefViewer:
             return
         if entry.problem:
             self._close_image()
+            self.show_message(f"{entry.name} can't be shown.\n{entry.problem}")      # (in the image area too: not a blank)
             self.status.config(text=f"{entry.name}: {entry.problem}")
             return
         ask = [] if entry in self.kept_images else self._files_to_ask(entry)
@@ -3024,6 +3443,8 @@ class XlefViewer:
         self._show_loaded()
         # Each image opens with its own LAS X contrast; which channels are switched on carries over to images of the same channels.
         self.ch_settings = [{"on": on, "lo": c.black, "hi": c.white} for c, on in zip(entry.channels, shown)]
+        self.flip_one.set(self._section_flipped(entry))
+        self.flip_one_check.configure(state=tk.NORMAL)
         self._build_channel_controls()
         self._update_annotations_check()
         if entry.nz > 1:
@@ -3140,6 +3561,8 @@ class XlefViewer:
             swatch.keep_colors = True       # (styled by _show_channel_state)
             self.ch_widgets.append((on, slider, swatch))
             self._show_channel_state(i)
+        if self.split:
+            self._layout_panels()           # (this image's channels, each in a panel)
 
     def _show_channel_state(self, i):
         """A channel's swatch in its color (number in black or white, whichever reads), or grey when it is switched off; its slider too."""
@@ -3169,9 +3592,41 @@ class XlefViewer:
         self.schedule_redraw()
 
     def _set_lo_hi(self, i, lo, hi):
+        """A slider moved: the image's contrast changed (an unsaved change: Save writes it into its .xlif; Undo takes back the whole
+        drag at once)."""
         if i < len(self.ch_settings) and (self.ch_settings[i]["lo"], self.ch_settings[i]["hi"]) != (lo, hi):
+            step = (id(self.img.entry), i, getattr(self.ch_widgets[i][1], "presses", 0))
+            self._contrast_change([(i, lo, hi)], new_step=step != self.contrast_step)
+            self.contrast_step = step
+
+    def _contrast_change(self, changes, new_step=True):
+        """Set the shown image's contrast: changes = [(channel, black, white)], kept in its channels (so it stays when coming back to
+        the image) and remembered for Undo as one step (new_step False: part of the step before, as a slider drag)."""
+        e = self.img.entry
+        changes = [(i, lo, hi) for i, lo, hi in changes if (e.channels[i].black, e.channels[i].white) != (lo, hi)]
+        if not changes:
+            return
+        if new_step or not self.history or self.history[-1][0] != "range":
+            self.history = self.history[-199:] + [("range", [(e, i, e.channels[i].black, e.channels[i].white) for i, _, _ in changes])]
+        else:                           # (the same drag: the step keeps the values from before it)
+            have = {i for _, i, _, _ in self.history[-1][1]}
+            self.history[-1][1].extend((e, i, e.channels[i].black, e.channels[i].white) for i, _, _ in changes if i not in have)
+        for i, lo, hi in changes:
+            e.channels[i].black, e.channels[i].white = lo, hi
+            self.ch_widgets[i][1].set(lo, hi)
             self.ch_settings[i]["lo"], self.ch_settings[i]["hi"] = lo, hi
-            self.schedule_redraw()
+        self.schedule_redraw()
+        if self.contrast_job is not None:
+            self.root.after_cancel(self.contrast_job)
+        self.contrast_job = self.root.after(400, lambda: self._contrast_settled({e}))    # (not on every step of a drag)
+
+    def _contrast_settled(self, changed):
+        """After contrast of these images changed (and the slider rests): the list's "unsaved" marks, Save, their thumbnails."""
+        self.contrast_job = None
+        for e in changed:
+            self._label_item(self._item_of(e))
+        self._update_annotations_check()
+        self._refresh_thumbnails([self._item_of(e) for e in changed])
 
     def toggle_channel(self, i):
         if self.img and i < len(self.ch_settings) and not isinstance(self.root.focus_get(), tk.Entry):
@@ -3179,31 +3634,33 @@ class XlefViewer:
             on.set(not on.get())
             self._show_channel_state(i)
             self._set(i, "on", on.get())
+            if self.split:
+                self._layout_panels()       # (a panel more, or one less)
 
-    def _set_range(self, i, lo, hi):
-        self.ch_widgets[i][1].set(lo, hi)
-        self.ch_settings[i]["lo"], self.ch_settings[i]["hi"] = lo, hi
-        self.schedule_redraw()
-
-    def auto(self, i):
-        """Contrast from the overview: 0.1-99.9 percentile of the non-zero pixels (stitched scans have zero outside the tiles)."""
+    def _auto_range(self, i):
+        """Contrast from the overview: 0.1-99.9 percentile of the non-zero pixels (stitched scans have zero outside the tiles); or None."""
         if not self.img or (self.z, i) not in self.img.overviews:
-            return
+            return None
         a = self.img.overviews[(self.z, i)]
         v = a[a > 0]
         if v.size == 0:
-            return
+            return None
         lo, hi = np.percentile(v, [0.1, 99.9])
-        self._set_range(i, int(lo), max(int(hi), int(lo) + 1))
+        return i, int(lo), max(int(hi), int(lo) + 1)
+
+    def auto(self, i):
+        r = self._auto_range(i)
+        if r:
+            self._contrast_change([r])
 
     def auto_all(self):
-        for i in range(len(self.ch_settings)):
-            self.auto(i)
+        if self.img:
+            self._contrast_change([r for r in map(self._auto_range, range(len(self.ch_settings))) if r])
 
     def lasx_all(self):
+        """Back to the contrast in the image's LAS X file (as last saved)."""
         if self.img:
-            for i, ch in enumerate(self.img.entry.channels):
-                self._set_range(i, ch.black, ch.white)
+            self._contrast_change([(i, ch.saved_black, ch.saved_white) for i, ch in enumerate(self.img.entry.channels)])
 
     def on_z(self, value):
         z = int(float(value))
@@ -3235,6 +3692,7 @@ class XlefViewer:
         if not self.img:
             return
         self.scale = 0
+        self.pixel_grid = False
         self.cx, self.cy = self.img.entry.width / 2, self.img.entry.height / 2
         self.clamp_view()
         if redraw:
@@ -3248,9 +3706,12 @@ class XlefViewer:
         sx = cw / 2 if sx is None else sx
         sy = ch / 2 if sy is None else sy
         ix, iy = self.screen_to_image(sx, sy)
+        sx = self._fx(sx)
         before = (self.scale, self.cx, self.cy)
         self.scale = scale
         self.clamp_view()
+        if self.scale < MAX_ZOOM - 1e-9:
+            self.pixel_grid = False
         self.cx = ix - (sx - cw / 2) / self.scale
         self.cy = iy - (sy - ch / 2) / self.scale
         self.clamp_view()
@@ -3260,15 +3721,54 @@ class XlefViewer:
 
     def screen_to_image(self, sx, sy):
         cw, ch = self.canvas_size()
+        sx = self._fx(sx)
         return self.cx + (sx - cw / 2) / self.scale, self.cy + (sy - ch / 2) / self.scale
+
+    def _fx(self, x):
+        """Flip left-right: canvas x <-> where it would be unflipped (the view is worked out unflipped, and mirrored when drawn)."""
+        return self.canvas_size()[0] - x if self._flipped() else x
+
+    def _view_corners(self):
+        """The image points at the canvas's top-left and bottom-right corners, as if unflipped (ix0 <= ix1 either way)."""
+        cw, ch = self.canvas_size()
+        return (self.cx - cw / 2 / self.scale, self.cy - ch / 2 / self.scale,
+                self.cx + cw / 2 / self.scale, self.cy + ch / 2 / self.scale)
+
+    def on_flip_toggle(self):
+        self.settings["flip_left_right"] = self.flip_x.get()
+        if self.img:
+            self.redraw()
+
+    @staticmethod
+    def _flip_key(entry):
+        return os.path.normcase(os.path.normpath(entry.xlif_path))
+
+    def _section_flipped(self, entry):
+        return self._flip_key(entry) in self.settings.get("flipped_sections", [])
+
+    def on_flip_one_toggle(self):
+        """"Flip this section": remembered (in the settings, by the section's .xlif) until unticked."""
+        if not self.img:
+            return
+        key = self._flip_key(self.img.entry)
+        flipped = [k for k in self.settings.get("flipped_sections", []) if k != key]
+        if self.flip_one.get():
+            flipped.append(key)
+        self.settings["flipped_sections"] = flipped
+        self.redraw()
+
+    def _flipped(self):
+        """The view is mirrored: "Flip all sections" or "Flip this section", not both (both flip it back)."""
+        return self.flip_x.get() != (self.img is not None and self.flip_one.get())
 
     def show_message(self, text):
         """Words in the middle of the image area ("Loading...", ...) until a picture replaces them (any drawing clears the canvas)."""
         self.canvas_message = text
-        self.canvas.delete("all")
+        self._each_canvas(lambda: self.canvas.delete("all"))
         if text:
             cw, ch = self.canvas_size()
-            self.canvas.create_text(cw / 2, ch / 2, text=text, fill="#b0b0b0", font=("Segoe UI", 16), tags="message")
+            self.canvas.create_text(cw / 2, ch / 2, text=text, fill="#b0b0b0", font=("Segoe UI", 16), tags="message",
+                                    width=max(cw - 60, 200), justify=tk.CENTER)
 
     def on_resize(self):
         if self.photo is None and getattr(self, "canvas_message", ""):
@@ -3281,8 +3781,13 @@ class XlefViewer:
             self.schedule_redraw()
 
     def on_wheel(self, event, delta=None):
-        self._moving()
         d = event.delta if delta is None else delta
+        if d > 0 and self.img is not None and self.scale >= MAX_ZOOM - 1e-9:
+            if not self.pixel_grid:             # (at the largest zoom already: show the pixels' edges instead)
+                self.pixel_grid = True
+                self.schedule_redraw(0)
+            return
+        self._moving()
         self.zoom_to(self.scale * (1.25 ** (d / 120)), event.x, event.y)
 
     def on_press(self, event):
@@ -3311,7 +3816,7 @@ class XlefViewer:
             return
         x0, y0, cx0, cy0 = self.drag
         self._moving()
-        self.cx = cx0 - (event.x - x0) / self.scale
+        self.cx = cx0 - (event.x - x0) / self.scale * (-1 if self._flipped() else 1)
         self.cy = cy0 - (event.y - y0) / self.scale
         self.clamp_view()
         self.redraw(preview_only=True)
@@ -3328,6 +3833,7 @@ class XlefViewer:
         ix, iy = self.screen_to_image(event.x, event.y)
         if not (0 <= ix < e.width and 0 <= iy < e.height):
             self.cursor_label.config(text="")
+            self._show_cursor_values([])
             return
         x, y = int(ix), int(iy)
         parts = [f"x {x}, y {y} px"]
@@ -3337,8 +3843,28 @@ class XlefViewer:
         for c, ch in enumerate(e.channels):
             p = self.img.planes.get((self.z, c))     # only planes already open: hovering must not open files
             if p is not None and not self.loading:
-                vals.append(f"{ch.name}: {int(p[y, x])}")
-        self.cursor_label.config(text="   ".join(parts + vals))
+                vals.append((c, f"{ch.name}: {int(p[y, x])}"))
+        self.cursor_label.config(text="   ".join(parts))
+        self._show_cursor_values(vals)
+
+    def _show_cursor_values(self, vals):
+        """After the pointer's position: each channel's value under it, "DAPI: 1234", in the channel's color (made lighter or darker
+        when it would hardly show on the theme's background: see readable_color)."""
+        labels = self.cursor_values
+        while len(labels) < len(vals):
+            lb = tk.Label(self.cursor_row, text="", anchor=tk.W, padx=6, bd=0, font=tkfont.nametofont("TkDefaultFont"))
+            lb.keep_colors = True
+            labels.append(lb)
+        bg = self.root.winfo_rgb(PAL["bg"])
+        bg = tuple(v / 65535 for v in bg)
+        for k, lb in enumerate(labels):
+            if k < len(vals):
+                c, text = vals[k]
+                lb.configure(text=text, fg=readable_color(self.img.entry.channels[c].color, bg), bg=PAL["bg"])
+                if not lb.winfo_manager():
+                    lb.pack(side=tk.LEFT)
+            elif lb.winfo_manager():
+                lb.pack_forget()
 
     # --- drawing
 
@@ -3356,8 +3882,7 @@ class XlefViewer:
         and where it goes on the canvas (left, top, width, height)."""
         e = self.img.entry
         cw, ch = self.canvas_size()
-        ix0, iy0 = self.screen_to_image(0, 0)
-        ix1, iy1 = self.screen_to_image(cw, ch)
+        ix0, iy0, ix1, iy1 = self._view_corners()
         i0, j0 = max(0, int(ix0 // step)), max(0, int(iy0 // step))
         i1, j1 = min(-(-e.width // step), int(-(-ix1 // step))), min(-(-e.height // step), int(-(-iy1 // step)))
         left = round((i0 * step - self.cx) * self.scale + cw / 2)
@@ -3375,7 +3900,7 @@ class XlefViewer:
         s = self.img.ov_step
         ovs = [self.img.overviews.get((self.z, c)) if luts[c] is not None else None for c in range(n)]
         if all(lut is None for lut in luts):        # every channel switched off
-            self.canvas.delete("all")
+            self._each_canvas(lambda: self.canvas.delete("all"))
             self._draw_annotations()
             self._draw_scale_bar()
             self._draw_load_note()
@@ -3401,7 +3926,7 @@ class XlefViewer:
             if cache is not None and cache["key"] == key:
                 arrays = [a if luts[c] is not None else None for c, a in enumerate(cache["arrays"])]
                 if any(a is not None for a in arrays):
-                    self._show(composite(arrays, luts), *place, smooth=self.scale * step < 1)
+                    self._show(self._mix(arrays, luts), *place, smooth=self.scale * step < 1)
                 need = [c for c in need if cache["arrays"][c] is None]
                 if not need:
                     self.detail_pending = False
@@ -3429,7 +3954,7 @@ class XlefViewer:
                             crop[c] = self.shrunk[key]
                     for key in [k for k in self.shrunk if k[:-1] != view]:
                         del self.shrunk[key]
-                self._show(composite(crop, luts), left, top, w, h, smooth=self.scale * s < 1, overlay=self._detail_overlay(luts))
+                self._show(self._mix(crop, luts), left, top, w, h, smooth=self.scale * s < 1, overlay=self._detail_overlay(luts))
         if not detail:
             if not preview_only:
                 self.detail_pending = False
@@ -3476,8 +4001,9 @@ class XlefViewer:
         return "bilinear" if time.monotonic() < self.moving_until and self.enlarge_method in _KERNELS else self.enlarge_method
 
     def _mix_sig(self):
-        """What the mixed colours depend on: each channel on/off, its levels and its colour map."""
-        return (tuple((s["on"], s["lo"], s["hi"]) for s in self.ch_settings), tuple(c.lut for c in self.img.entry.channels))
+        """What the mixed colours depend on: each channel on/off, its levels and its colour map, and the panels (see _mix)."""
+        return (tuple((s["on"], s["lo"], s["hi"]) for s in self.ch_settings), tuple(c.lut for c in self.img.entry.channels),
+                tuple(self.panel_channels))
 
     def _detail_overlay(self, luts):
         """While a new view waits for its sharp pixels: the sharp pixels of the last sharp view, for the part of it still on screen,
@@ -3493,23 +4019,24 @@ class XlefViewer:
             return None
         sig = self._mix_sig()
         if cache.get("sig") != sig:            # (mixed once per slider setting, not on every wheel click)
-            cache["rgb"] = composite([a if luts[c] is not None else None for c, a in enumerate(arrays)], luts)
+            cache["rgb"] = self._mix([a if luts[c] is not None else None for c, a in enumerate(arrays)], luts)
             cache["sig"] = sig
-        rgb = cache["rgb"]
-        rows, cols = rgb.shape[:2]
+        rgbs = cache["rgb"]
+        rows, cols = rgbs[0].shape[:2]
         x0, y0 = i0 * st, j0 * st                           # (image pixel of rgb[0, 0])
         cw, ch = self.canvas_size()
-        vx0, vy0 = self.screen_to_image(0, 0)
-        vx1, vy1 = self.screen_to_image(cw, ch)
+        vx0, vy0, vx1, vy1 = self._view_corners()
         a0, b0 = max(0, int((vx0 - x0) // st)), max(0, int((vy0 - y0) // st))
         a1, b1 = min(cols, int(-(-(vx1 - x0) // st))), min(rows, int(-(-(vy1 - y0) // st)))
         if a1 <= a0 or b1 <= b0:
             return None
         w, h = max(1, round((a1 - a0) * st * self.scale)), max(1, round((b1 - b0) * st * self.scale))
-        part = np.ascontiguousarray(rgb[b0:b1, a0:a1])
-        im = (enlarge(part, w, h, self._draw_method()) if w > a1 - a0 or h > b1 - b0       # (zoomed in past the pixels)
-              else Image.fromarray(part).resize((w, h), Image.BILINEAR))
-        return im, round((x0 + a0 * st - self.cx) * self.scale + cw / 2), round((y0 + b0 * st - self.cy) * self.scale + ch / 2)
+        ims = []
+        for rgb in rgbs:                                    # (one per canvas)
+            part = np.ascontiguousarray(rgb[b0:b1, a0:a1])
+            ims.append(enlarge(part, w, h, self._draw_method()) if w > a1 - a0 or h > b1 - b0       # (zoomed in past the pixels)
+                       else Image.fromarray(part).resize((w, h), Image.BILINEAR))
+        return ims, round((x0 + a0 * st - self.cx) * self.scale + cw / 2), round((y0 + b0 * st - self.cy) * self.scale + ch / 2)
 
     def _kept_covers(self, step, channels):
         """The kept sharp pixels (detail_cache) cover all of the image that is in view, at `step` or finer, for these channels."""
@@ -3521,31 +4048,46 @@ class XlefViewer:
         _, _, i0, j0, i1, j1, st, _ = cache["key"]
         rows, cols = next(a.shape for a in cache["arrays"] if a is not None)
         e = self.img.entry
-        cw, ch = self.canvas_size()
-        vx0, vy0 = self.screen_to_image(0, 0)
-        vx1, vy1 = self.screen_to_image(cw, ch)
+        vx0, vy0, vx1, vy1 = self._view_corners()
         vx0, vy0, vx1, vy1 = max(vx0, 0), max(vy0, 0), min(vx1, e.width), min(vy1, e.height)     # (the part of the image in view)
         x0, y0 = i0 * st, j0 * st
         return x0 <= vx0 and y0 <= vy0 and x0 + cols * st >= min(vx1, e.width - st) and y0 + rows * st >= min(vy1, e.height - st)
 
-    def _show(self, rgb, left, top, w, h, smooth, overlay=None):
-        im = Image.fromarray(rgb)
-        if im.size != (w, h):           # (smooth: shrinking; else zoomed in past the pixels: enlarged as chosen in Settings)
-            im = im.resize((w, h), Image.BILINEAR) if smooth else enlarge(rgb, w, h, self._draw_method())
-        if overlay is not None:                 # (sharper pixels on top, where there are some for this view)
-            sharp, ox, oy = overlay
-            im.paste(sharp, (ox - left, oy - top))
-        self._put(im, left, top)
+    def _show(self, rgbs, left, top, w, h, smooth, overlay=None):
+        """rgbs: one RGB array per canvas (see _mix), all of this view."""
+        ims = []
+        for k, rgb in enumerate(rgbs):
+            im = Image.fromarray(rgb)
+            if im.size != (w, h):           # (smooth: shrinking; else zoomed in past the pixels: enlarged as chosen in Settings)
+                im = im.resize((w, h), Image.BILINEAR) if smooth else enlarge(rgb, w, h, self._draw_method())
+            if overlay is not None and k < len(overlay[0]):     # (sharper pixels on top, where there are some for this view)
+                sharp, ox, oy = overlay[0][k], overlay[1], overlay[2]
+                im.paste(sharp, (ox - left, oy - top))
+            ims.append(im)
+        self._put(ims, left, top)
 
-    def _put(self, im, left, top):
-        """A finished picture of the view (PIL image), at (left, top) on the canvas, with the annotations, scale bar and notes."""
-        self.last_view_rgb = im
-        self.photo = ImageTk.PhotoImage(im, master=self.root)
-        self.canvas.delete("all")
-        self.canvas.create_image(left, top, anchor=tk.NW, image=self.photo)
-        self._draw_annotations()
-        self._draw_scale_bar()
-        self._draw_load_note()
+    def _put(self, ims, left, top):
+        """The finished pictures of the view (PIL images, one per canvas), at (left, top) on each, with the pixel grid, the channel's
+        name (separated), the annotations, scale bar and notes. Flip left-right: mirrored here, and placed mirrored."""
+        if self._flipped():
+            ims = [im.transpose(Image.FLIP_LEFT_RIGHT) for im in ims]
+            left = self.canvas_size()[0] - left - ims[0].width
+        self.last_view = (ims, left, top, self.canvas_size(), self.panel_cols)
+        self.last_view_rgb = ims[0]
+        self.photos = [ImageTk.PhotoImage(im, master=self.root) for im in ims]
+        self.photo = self.photos[0]
+
+        def draw():
+            c = self.canvas
+            c.delete("all")
+            if self.drawing_panel < len(self.photos):
+                c.create_image(left, top, anchor=tk.NW, image=self.photos[self.drawing_panel])
+            self._draw_pixel_grid()
+            self._draw_panel_label()
+            self._draw_annotations()
+            self._draw_scale_bar()
+            self._draw_load_note()
+        self._each_canvas(draw)
         self._update_status()
 
     def _load_note(self):
@@ -3560,6 +4102,9 @@ class XlefViewer:
         return f"Loading channel {have + 1} of {n}..." if n > 1 else "Loading..."
 
     def _draw_load_note(self):
+        self._each_canvas(self._draw_load_note_here)
+
+    def _draw_load_note_here(self):
         c = self.canvas
         c.delete("loadnote")
         note = self._load_note()
@@ -3583,6 +4128,8 @@ class XlefViewer:
         n = sum(a.visible for a in self.img.entry.annotations) if self.img else 0
         self.annotations_check.configure(text=f"Show annotations ({n or 'none'})")
         changed = any(o.unsaved for o in self._all_objects())
+        for item in set(getattr(self, "unsaved_marks", {})) | set(self.projects):
+            self._place_unsaved_mark(item)          # (gone after Save or Undo; a project's own, after its rename)
         self.save_button.configure(state=tk.NORMAL if changed else tk.DISABLED)
         self.unsaved_label.configure(text="unsaved changes" if changed else "")
 
@@ -3591,7 +4138,7 @@ class XlefViewer:
         e = self.img.entry
         cw, ch = self.canvas_size()
         px, py = e.width / 2 + p[0] * 1e6 / e.pixel_um, e.height / 2 + p[1] * 1e6 / e.pixel_um
-        return (px - self.cx) * self.scale + cw / 2, (py - self.cy) * self.scale + ch / 2
+        return self._fx((px - self.cx) * self.scale + cw / 2), (py - self.cy) * self.scale + ch / 2
 
     def screen_to_m(self, sx, sy):
         e = self.img.entry
@@ -3614,6 +4161,10 @@ class XlefViewer:
         return []
 
     def _draw_annotations(self):
+        self._each_canvas(self._draw_annotations_here)
+        self._show_color()                  # (a text selected, or not: the color button shows text's color, or shapes')
+
+    def _draw_annotations_here(self):
         """The image's annotations on top of it, in image coordinates (they move and zoom with it); text and line widths stay the same
         size on screen. The selected one gets its handles."""
         c = self.canvas
@@ -3627,7 +4178,8 @@ class XlefViewer:
             pts = [self.m_to_screen(p) for p in a.points()]
             col = a.color
             if a.kind == "text":
-                t = c.create_text(*pts[0], text=a.text, fill=col, font=a.font, anchor=tk.NW, tags=tags)
+                t = c.create_text(*pts[0], text=a.text, fill=col, font=a.font, anchor=tk.NE if self._flipped() else tk.NW,
+                                  tags=tags)
                 if a.attrs.get("showBorder") == "True":
                     c.create_rectangle(*c.bbox(t), outline=col, tags=tags)
             elif a.kind in ("rectangle", "ellipse") and len(pts) >= 3:
@@ -3736,14 +4288,17 @@ class XlefViewer:
     def _update_cursor(self):
         """The pointer over the image: an hourglass while an image loads or a sharper view of it is read, else the tool's."""
         busy = self.loading or getattr(self, "detail_pending", False)
-        self.canvas.configure(cursor="watch" if busy else "fleur" if self.tool == "select" else "crosshair")
+        for c in self.canvases:
+            c.configure(cursor="watch" if busy else "fleur" if self.tool == "select" else "crosshair")
 
     def set_tool(self, tool):
+        """Choose a tool. It stays chosen for one annotation after another (Select, or Escape, to go back to selecting)."""
         self.tool = tool
         for name, b in self.tool_buttons.items():
             on = name == tool
             style_toggle(b, on)
         self._update_cursor()
+        self._show_color()
         if tool != "select" and not self.show_annotations.get():
             self.show_annotations.set(True)
             self.on_annotations_toggle()
@@ -3788,14 +4343,15 @@ class XlefViewer:
             return False
         p = self.screen_to_m(event.x, event.y)
         if self.tool == "text":
-            text = ask_text(self.root, "New text", "")
+            answer = ask_text(self.root, "New text", "", color=self.text_color)
+            text, color = answer or ("", None)
             if text:
+                self.text_color = color                 # (the next text's color too)
                 self._remember()
-                a = Annotation.new("text", self.ann_color, p, [], text=text)
+                a = Annotation.new("text", color, p, [], text=text)
                 self.img.entry.annotations.append(a)
                 self.selected = a
                 self._changed()
-            self.set_tool("select")
             return True
         if self.tool in ("rectangle", "ellipse") + TWO_POINT:
             self._remember()
@@ -3873,7 +4429,6 @@ class XlefViewer:
                 self._draw_annotations()
             else:
                 self._changed()
-            self.set_tool("select")
             return
         before = e.undo[-1][e.annotations.index(a)] if a in e.annotations else None
         if before is not None and before.attrs == a.attrs and before.verts == a.verts:
@@ -3885,10 +4440,12 @@ class XlefViewer:
         """Double-click: edit a text's words; elsewhere, fit the image to the window."""
         a = self._hit(event.x, event.y) if self.img and self.show_annotations.get() else None
         if a is not None and a.kind == "text":
-            text = ask_text(self.root, "Edit text", a.text)
-            if text is not None and text != a.text:
+            answer = ask_text(self.root, "Edit text", a.text, color=a.color)
+            if answer is not None and answer != (a.text, a.color):
+                if answer[1] != a.color:
+                    self.text_color = answer[1]         # (the color picked last is the next text's)
                 self._remember()
-                a.text = text
+                a.text, a.color = answer
                 self._changed()
             return
         self.fit()
@@ -3901,8 +4458,8 @@ class XlefViewer:
             self._changed()
 
     def undo_annotation(self, event=None):
-        """Undo (Ctrl+Z): the last change, whichever image it was on: annotations, or colour maps (one section's, or all sections' at
-        once). What is undone is still unsaved (Save writes the result)."""
+        """Undo (Ctrl+Z): the last change, whichever image it was on: annotations, contrast, or colour maps (one section's, or all
+        sections' at once). What is undone is still unsaved (Save writes the result)."""
         while self.history:
             kind, data = self.history.pop()
             if kind == "ann":
@@ -3941,6 +4498,17 @@ class XlefViewer:
                 self.tree.see(item)
                 self.status.config(text=f"Undone: deleting {e.name}")
                 return
+            if kind == "range":
+                for e, i, lo, hi in reversed(data):
+                    e.channels[i].black, e.channels[i].white = lo, hi
+                    if self.img is not None and self.img.entry is e and i < len(self.ch_widgets):
+                        self.ch_widgets[i][1].set(lo, hi)
+                        self.ch_settings[i]["lo"], self.ch_settings[i]["hi"] = lo, hi
+                self.contrast_step = None
+                self.schedule_redraw()
+                self._contrast_settled({e for e, _, _, _ in data})
+                self.status.config(text=f"Undone: contrast change on {data[0][0].name}")
+                return
             if kind == "lut":
                 for e, i, old in data:
                     e.channels[i].lut = old
@@ -3955,7 +4523,7 @@ class XlefViewer:
 
     def _luts_changed(self, changed):
         """After colour maps of these images changed (picked, or undone): the image on screen and its channel controls, the list's
-        pencils, Save, and their thumbnails."""
+        "unsaved" marks, Save, and their thumbnails."""
         if self.img is not None and self.img.entry in changed:
             for i in range(len(self.ch_widgets)):
                 on, slider, swatch = self.ch_widgets[i]
@@ -3967,6 +4535,10 @@ class XlefViewer:
         for item in items:
             self._label_item(item)
         self._update_annotations_check()
+        self._refresh_thumbnails(items)
+
+    def _refresh_thumbnails(self, items):
+        """Make these images' thumbnails again (their colour maps or contrast changed), in the background."""
         if self.thumbs_started:
             gen = self.thumb_gen
 
@@ -3980,17 +4552,32 @@ class XlefViewer:
                         self.results.put(("thumb", gen, (item, image, state)))
             threading.Thread(target=work, daemon=True).start()
 
+    def _color_is_text(self):
+        """The color button stands for text's color (with Text chosen, or a text selected), else for shapes' and lines'."""
+        a = getattr(self, "selected", None)
+        return self.tool == "text" or (self.tool == "select" and a is not None and a.kind == "text")
+
+    def _show_color(self):
+        color = self.text_color if self._color_is_text() else self.ann_color
+        if self.color_button.cget("bg") != color:
+            self.color_button.configure(bg=color, activebackground=color)
+
     def choose_color(self):
         from tkinter import colorchooser
-        _, color = colorchooser.askcolor(color=self.ann_color, parent=self.root, title="Annotation color")
+        text = self._color_is_text()
+        _, color = colorchooser.askcolor(color=self.text_color if text else self.ann_color, parent=self.root,
+                                         title="Text color" if text else "Annotation color")
         if not color:
             return
-        self.ann_color = color
-        self.color_button.configure(bg=color, activebackground=color)
-        self.settings["annotation_color"] = color
-        if self.img and self.selected in self.img.entry.annotations:
+        if text:
+            self.text_color = color
+        else:
+            self.ann_color = color
+        self._show_color()
+        a = self.selected
+        if self.img and a in self.img.entry.annotations and (a.kind == "text") == text:
             self._remember()
-            self.selected.color = color
+            a.color = color
             self._changed()
 
     def save_annotations(self):
@@ -4004,6 +4591,7 @@ class XlefViewer:
             return
         notes = [(i, o) for i, o in items if o.annotations_changed]
         maps = [(i, o) for i, o in items if isinstance(o, ImageEntry) and o.luts_changed]
+        ranges = [(i, o) for i, o in items if isinstance(o, ImageEntry) and o.contrast_changed]
         renames = [(i, o) for i, o in items if o.name != o.saved_name]
         on_disk = bool(renames) and self.settings.get("rename_files", False)
         away = [o for i, o in self.entries.items() if self.home.get(i) not in (None, self._project_of(i))]
@@ -4013,6 +4601,7 @@ class XlefViewer:
             n_del, n_away = len(self.deleted), len(away)
             what = ([f"the annotations of {len(notes)} image{'s' * (len(notes) != 1)}"] if notes else []) + \
                    ([f"the color maps of {len(maps)} image{'s' * (len(maps) != 1)}"] if maps else []) + \
+                   ([f"the contrast of {len(ranges)} image{'s' * (len(ranges) != 1)}"] if ranges else []) + \
                    ([f"{len(renames)} rename{'s' * (len(renames) != 1)}" + (" (files and folders on disk too)" if on_disk else "")]
                     if renames else []) + (["the new order of the list"] if reordered else [])
             extra = ((f"\n\n{n_away} image{'s' * (n_away != 1)} dragged into another project move{'s' * (n_away == 1)} there, files "
@@ -4041,6 +4630,13 @@ class XlefViewer:
                     c.saved_lut = c.lut
             except Exception as err:
                 failed.append(f"color maps of {e.name}: {err}")
+        for item, e in ranges:
+            try:
+                write_contrast(e.xlif_path, [(c.black, c.white) for c in e.channels], [c.max_value for c in e.channels])
+                for c in e.channels:
+                    c.saved_black, c.saved_white = c.black, c.white
+            except Exception as err:
+                failed.append(f"contrast of {e.name}: {err}")
         touched, binned, aside = set(), 0, 0
         if structure or (renames and on_disk):
             # (nothing may hold the files open while they are moved or renamed: the image on screen, kept images, background readers)
@@ -4088,7 +4684,7 @@ class XlefViewer:
                 e.annotations_changed = False
             reread |= {self._project_of(i) for i, _ in renames} - {None}
         if reread:
-            self.history = [h for h in self.history if h[0] in ("ann", "lut")]
+            self.history = [h for h in self.history if h[0] in ("ann", "lut", "range")]
         for pid in [p for p in self.projects if p in reread]:      # (paths or contents changed: read those experiments again)
             path = self.projects[pid]["path"]
             self.close_project(pid, ask=False)
@@ -4103,6 +4699,8 @@ class XlefViewer:
         """The pointer on the name of an image with a cloud, or on the cloud: a note saying what the cloud means. On a project's name:
         its full path, and whether it has unsaved changes."""
         item = self.tree.identify_row(event.y)
+        if self._unsaved_tip(item, event):
+            return
         if item in self.projects and self.tree.bbox(item):
             x, y, w, h = self.tree.bbox(item)
             start = x + 20                                       # (after the open mark)
@@ -4266,11 +4864,34 @@ class XlefViewer:
         menu.add_separator()
         if item in self.entries:
             menu.add_command(label="Delete section", command=lambda: self.delete_section(item))
+        target = self._disk_location(item)
+        if target is not None:
+            menu.add_command(label=REVEAL_LABEL, command=lambda: reveal_in_file_manager(*target))
         menu.add_command(label="Properties", command=lambda: self.show_properties(item))
         try:
             menu.tk_popup(int(x_root), int(y_root))
         finally:
             menu.grab_release()
+
+    def _disk_location(self, item):
+        """Where a list row is on disk, for "Open folder in Windows Explorer": (path, select it). An image: its first TIFF (in the
+        folder with its channels); a folder: the folder itself (its .xlcf is in its Metadata folder); a project: its .xlef."""
+        if item in self.entries:
+            e = self.entries[item]
+            files = e.all_files()
+            path = files[0] if files else e.xlif_path
+            return (path, True) if path and os.path.exists(path) else None
+        if item in self.projects:
+            path = self.projects[item]["path"]
+            return (path, True) if os.path.exists(path) else None
+        folder = self.folders.get(item)
+        path = getattr(folder, "path", None)
+        if not path:
+            return None
+        here = os.path.dirname(path)
+        if os.path.basename(here).lower() == "metadata":
+            here = os.path.dirname(here)
+        return (here, False) if os.path.isdir(here) else None
 
     def show_properties(self, item):
         """Right-click > Properties: what LAS X's Properties window shows for an image (see image_properties), or for a folder or a
@@ -4390,7 +5011,7 @@ class XlefViewer:
         e.bind("<FocusOut>", lambda ev: finish(True))
 
     def rename(self, item, new):
-        """Give an image or folder a new name: shown at once (with a pencil), written into LAS X's files by Save."""
+        """Give an image or folder a new name: shown at once (marked "unsaved"), written into LAS X's files by Save."""
         obj = self.entries.get(item) or self.folders.get(item)
         bad = [c for c in BAD_NAME_CHARS if c in new]
         if bad:
@@ -4429,19 +5050,21 @@ class XlefViewer:
 
     def _structure_changed(self, members=False):
         """After images were dragged or deleted (or that was undone): the folders and projects that now list something other than
-        their files do (a pencil after the name; Save), the thumbnails' order, and (members: images came or went) the slide."""
+        their files do ("unsaved" after the name; Save), the thumbnails' order, and (members: images came or went) the slide."""
         for item, obj in list(self.folders.items()) + [(pid, p.get("root")) for pid, p in self.projects.items()]:
             if obj is None:
                 continue
             obj.order_changed = self._shown_children(item) != obj.children
             if item in self.projects:
-                self.tree.item(item, text=self.projects[item]["name"] + ("  ✎" if obj.order_changed else ""))
+                self.tree.item(item, text=self.projects[item]["name"])
+                self._place_unsaved_mark(item)
             else:
                 self._label_item(item)
         self._update_annotations_check()
         self.thumb_grid.rows = self._grid_rows_all()
         self.thumb_grid.layout()
         self.root.after_idle(self._place_list_bars)         # (rows moved: their progress bars with them)
+        self._show_sizes()                                  # (the folders' and projects' totals)
         if members and self.slide_project in self.projects:
             self._start_slide(self.slide_project)
 
@@ -4661,6 +5284,9 @@ class XlefViewer:
                                    f"{names} {'has' if len(changed) == 1 else 'have'} unsaved changes.\n\n{doing} discards them. {question}", icon="warning", default="no", parent=self.root)
 
     def _draw_scale_bar(self):
+        self._each_canvas(self._draw_scale_bar_here)
+
+    def _draw_scale_bar_here(self):
         e = self.img.entry
         if not e.pixel_um:
             return
@@ -4742,6 +5368,9 @@ class XlefViewer:
                 if kind == "experiment":
                     self._experiment_read(gen, *data)          # (gen: the project's tree item)
                     continue
+                if kind == "sizes":
+                    self._show_sizes()
+                    continue
                 if kind in ("loaded", "error") and gen == self.generation:
                     self.thumbs_go.set()                # (the chosen image is in: the thumbnails go on)
                 if kind == "slide":
@@ -4780,7 +5409,7 @@ class XlefViewer:
                     if self.detail_cache is not None and self.detail_cache["key"] == key:
                         arrays = [a if a is not None else old for a, old in zip(arrays, self.detail_cache["arrays"])]
                     luts = make_luts(self.img.entry.channels, self.ch_settings)
-                    rgb = composite([a if lut is not None else None for a, lut in zip(arrays, luts)], luts)
+                    rgb = self._mix([a if lut is not None else None for a, lut in zip(arrays, luts)], luts)
                     self.detail_cache = {"key": key, "arrays": arrays, "rgb": rgb,          # (mixed once: reused while zooming)
                                          "sig": self._mix_sig()}
                     self._show(rgb, *place, smooth)
@@ -4799,6 +5428,15 @@ class XlefViewer:
     def save_view(self):
         if self.last_view_rgb is None:
             return
+        ims, left, top, (cw, ch), cols = self.last_view
+        if len(ims) > 1:                    # (channels separated: the panels as they are on screen, side by side)
+            rows = -(-len(ims) // cols)
+            tiled = Image.new("RGB", (cols * cw + (cols - 1) * 2, rows * ch + (rows - 1) * 2), (58, 58, 58))
+            for k, im in enumerate(ims):
+                panel = Image.new("RGB", (cw, ch))
+                panel.paste(im, (left, top))
+                tiled.paste(panel, ((k % cols) * (cw + 2), (k // cols) * (ch + 2)))
+            self.last_view_rgb = tiled
         path = filedialog.asksaveasfilename(parent=self.root, defaultextension=".png", filetypes=[("PNG", "*.png")],
                                             initialfile=f"{self.img.entry.name}.png")
         if path:
@@ -4979,16 +5617,19 @@ def ask_download(parent, title, message, all_label="Download for all sections"):
     return result[0] if result else None
 
 
-def ask_text(parent, title, initial):
-    """A small dialog for an annotation's text (several lines allowed). The text, or None if cancelled."""
+def ask_text(parent, title, initial, color=None):
+    """A small dialog for an annotation's text (several lines allowed). The text, or None if cancelled. Given a `color`, the dialog
+    also has a Color button (the color picker), and gives (text, color), or None if cancelled."""
     dlg = tk.Toplevel(parent)
     dlg.title(title)
     dlg.transient(parent)
+    dlg.geometry(f"+{parent.winfo_rootx() + 160}+{parent.winfo_rooty() + 140}")    # (over the viewer, on its monitor)
     box = tk.Text(dlg, width=40, height=5, font=("Arial", 11), undo=True)
     box.insert("1.0", initial)
     box.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 4))
     ttk.Label(dlg, text="Enter starts a new line; Ctrl+Enter is OK.", style="Muted.TLabel").pack(anchor=tk.W, padx=8)
     result = []
+    chosen = [color]
 
     def ok(event=None):
         result.append(box.get("1.0", "end-1c"))
@@ -4996,6 +5637,18 @@ def ask_text(parent, title, initial):
         return "break"
     bar = ttk.Frame(dlg)
     bar.pack(fill=tk.X, padx=8, pady=8)
+    if color is not None:
+        def pick():
+            from tkinter import colorchooser
+            _, c = colorchooser.askcolor(color=chosen[0], parent=dlg, title="Text color")
+            if c:
+                chosen[0] = c
+                swatch.configure(bg=c, activebackground=c)
+        ttk.Label(bar, text="Color").pack(side=tk.LEFT)
+        swatch = tk.Button(bar, text="   ", bg=color, activebackground=color, bd=2, cursor="hand2", command=pick)
+        swatch.keep_colors = True
+        swatch.pack(side=tk.LEFT, padx=(4, 0))
+        dlg.color_button = swatch           # (for tests)
     ttk.Button(bar, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT)
     ttk.Button(bar, text="OK", command=ok).pack(side=tk.RIGHT, padx=(0, 6))
     box.bind("<Control-Return>", ok)
@@ -5003,7 +5656,9 @@ def ask_text(parent, title, initial):
     box.focus_set()
     dlg.grab_set()
     parent.wait_window(dlg)
-    return result[0] if result else None
+    if not result:
+        return None
+    return result[0] if color is None else (result[0], chosen[0])
 
 
 if __name__ == "__main__":

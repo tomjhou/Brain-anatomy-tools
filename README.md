@@ -93,10 +93,10 @@ program offers to install the first time (a download of about 100 MB).
 A quick viewer for Leica LAS X experiments (`.xlef`): on Windows, double click RUN_XLEF_VIEWER.bat, or drop an `.xlef` file on it
 (it uses the same `.venv`, and installs numpy, tifffile and Pillow into it if they are missing). File > Open (Ctrl+O) lists the
 experiments opened recently, or lets you browse for one or drag it in; an `.xlef` can also be dragged onto the window. The left panel lists the experiment's
-images in LAS X's order; click one to see its channels overlaid in their LAS X colors, starting with LAS X's contrast settings. Mouse wheel zooms,
-dragging pans, Home (or double click) fits the image to the window, and keys 1-9 switch channels on and off. "Show annotations" draws the measuring lines (with their lengths), lines, arrows, rectangles,
+images in LAS X's order, with each image's size at full resolution (and the totals of folders and experiments); click one to see its channels overlaid in their LAS X colors, starting with LAS X's contrast settings. Mouse wheel zooms,
+dragging pans, Home (or double click) fits the image to the window, and keys 1-9 switch channels on and off. At the largest zoom, one more turn of the wheel draws a line along the edge of every pixel. Each channel switched on is shown in a panel of its own, labeled with its name (the default); zooming or panning in any panel moves them all. "Merge channels" (above the channels) overlays them in one picture instead, and "Separate channels" goes back; the choice is remembered. "Flip all sections" (top right, by Settings) shows every image mirrored, with its annotations; "Flip this section" (above the channels) mirrors just the one shown, e.g. a section mounted the other way up, and is remembered for it (with both ticked, that section is shown unflipped). Only the view is flipped, not the files; both are remembered. Under the image, the pointer's position is shown, and when zoomed in to full resolution each channel's value there, in the channel's color. "Show annotations" (at the left of the toolbar above the image, on by default) draws the measuring lines (with their lengths), lines, arrows, rectangles,
 circles/ellipses and text added to an image in LAS X. The toolbar above the image edits them: Select (drag to move, corners to resize,
-the round handle to rotate, double-click a text to change it), drawing tools, color, Delete and Undo. Changes are written into the
+the round handle to rotate, double-click a text to change its words or color), drawing tools (a tool stays chosen for one annotation after another; Select or Escape to go back), color (shapes and lines start red, text white, each time the viewer starts), Delete and Undo. Changes are written into the
 image's LAS X file (`.xlif`) only when you click Save; only the annotations in it are changed, and a copy of the file as it was is kept
 next to it (`.before_xlef_viewer.bak`). Close the experiment in LAS X before saving. "⚙ Settings" (top right) switches between
 the dark (default) and light color themes, and sets how pixels look when zoomed in past them (Mitchell-Netravali smoothing by
@@ -107,6 +107,7 @@ a swatch (click to switch it on/off) and a black/white slider. Right-click a cha
 LAS X: its list of maps (Gray, Red, ..., Glow (O&U), Spectrum, Rainbow), or any color from the picker. The choice shows on the image at
 once; apply it to This section or to All sections (the same channel in every image of the experiment), or Cancel. Undo (Ctrl+Z) takes
 it back, and Save writes it into the images' `.xlif` files, where LAS X reads it.
+The black/white sliders work the same way: a section keeps the contrast set for it (sliders, Auto contrast) when you come back to it, marked with a red * in the list (hover over it to see what is unsaved) until Save writes it into its `.xlif` (LAS X then shows the same contrast); Undo takes back a whole drag at once, and "LAS X contrast" goes back to the contrast in the file.
 
 To change the order of the images, drag their names in the list (or their thumbnails): onto the middle of a folder's name to put
 them in it, or into another open experiment, which moves the image's files (its `.xlif`, channel TIFFs and reduced copies) into that
@@ -115,7 +116,7 @@ of the list; Save removes it from LAS X's files and moves its files to the Windo
 there they go into a "Deleted by XLEF viewer" folder in the experiment's folder instead). Both can be undone (Ctrl+Z) until Save, and
 Save asks first whenever it moves or deletes files.
 
-The viewer only reads what it needs: listing the images reads only the small `.xlif` metadata files, and an image's TIFFs are
+The viewer only reads what it needs: listing the images reads only the small `.xlif` metadata files, and an image's TIFFs (one per channel, or one OME-TIFF holding all channels as its pages) are
 opened only when you select it (and then only the rows the current view needs). When the experiment has LAS X's reduced copies
 (a `Pyramid` folder), the zoomed-out picture comes from those, and full resolution is read only as you zoom in. Several experiments
 can be open at once: each one opened is added to the list as a branch of its own (right-click its name to close it); hovering over its name shows its path and any unsaved changes, and the slide

@@ -46,9 +46,12 @@ class Tooltip:
     """A small note that appears when the pointer rests on a widget. `text` may be a function returning the text, called each time the
     note is shown (for a note that depends on the state of the program)."""
 
+    CURSOR_HEIGHT = 28       # (screen pixels below the pointer that the arrow cursor may cover: the note goes below that)
+
     def __init__(self, widget, text, delay=500, wraplength=260):
         self.widget, self.text, self.delay, self.tip, self.job = widget, text, delay, None, None
         self.wraplength = wraplength
+        self.cursor = None       # (the widget's own cursor, while the note shows: the plain arrow instead, smaller than a hand)
         widget.bind("<Enter>", self.schedule, add="+")
         widget.bind("<Leave>", self.hide, add="+")
         widget.bind("<ButtonPress>", self.hide, add="+")
@@ -64,8 +67,14 @@ class Tooltip:
         self.tip.wm_overrideredirect(True)
         tk.Label(self.tip, text=text, justify=tk.LEFT, background="#ffffe0", foreground="black", relief=tk.SOLID, borderwidth=1,
                  wraplength=self.wraplength, padx=4, pady=2).pack()
-        place_on_monitor(self.tip, self.widget.winfo_rootx(), self.widget.winfo_rooty() + self.widget.winfo_height() + 4,
-                         avoid_y=self.widget.winfo_rooty())         # (below the widget, on its monitor)
+        try:
+            self.cursor = str(self.widget.cget("cursor"))
+            self.widget.configure(cursor="arrow")
+        except tk.TclError:
+            self.cursor = None
+        below = max(self.widget.winfo_rooty() + self.widget.winfo_height() + 4, self.widget.winfo_pointery() + self.CURSOR_HEIGHT)
+        place_on_monitor(self.tip, self.widget.winfo_rootx(), below, avoid_y=self.widget.winfo_rooty())   # (below the widget and
+        # the pointer, on its monitor)
 
     def hide(self, event=None):
         if self.job:
@@ -74,3 +83,9 @@ class Tooltip:
         if self.tip:
             self.tip.destroy()
             self.tip = None
+        if self.cursor is not None:
+            try:
+                self.widget.configure(cursor=self.cursor)
+            except tk.TclError:
+                pass
+            self.cursor = None

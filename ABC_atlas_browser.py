@@ -115,8 +115,8 @@ OPTIONAL_LIBRARIES = {
     'skimage': ('scikit-image', 'the translucent-surfaces background of the browser 3D view'),
     'tkinterdnd2': ('tkinterdnd2', 'dragging a CSV file into the 3D viewer window'),
 }
-# Install anything missing automatically (into the interpreter running this
-# script) instead of just listing the commands and quitting. Set False to get
+# Install anything missing automatically, without asking (into the interpreter
+# running this script), instead of just listing the commands and quitting. Set False to get
 # the old list-the-commands-and-quit behavior.
 AUTO_INSTALL_LIBRARIES = True
 # The packaged program (packaging/atlas_entry.py) has every library inside and no pip to install more with.
@@ -216,75 +216,11 @@ def _install_libraries(specs):
     return failures
 
 
-def _ask_install_choice(missing_required, missing_optional):
-    """Tell the user what's missing and ask what to do, before touching
-    anything: 'install' (pip-install it into this interpreter), 'skip'
-    (continue without; offered only when nothing *required* is missing), or
-    'quit'. Exists because the usual cause of a missing library is launching
-    from the wrong Python environment by mistake, in which case the right
-    move is to quit and relaunch from the correct one, not to build a second
-    working environment — so the interpreter in use is named up front. Closing
-    the window counts as quit. Falls back to the console when Tk isn't
-    available."""
-    lines = []
-    if missing_required:
-        lines += ["These required Python libraries are not installed:", ""]
-        lines += [f"    {name}" for name in missing_required]
-        lines += [""]
-    if missing_optional:
-        lines += ["These optional Python libraries are not installed:", ""]
-        lines += [f"    {name} (needed for {OPTIONAL_LIBRARIES[name][1]})" for name in missing_optional]
-        lines += [""]
-    lines += ["This app is running from this Python:", f"    {sys.executable}", "",
-              "If that's the wrong environment, choose Quit and relaunch from the",
-              "right one. Otherwise Install will pip-install the missing libraries",
-              "into this Python."]
-    message = "\n".join(lines)
-    print("\n" + message + "\n")
-
-    try:
-        import tkinter as tk
-        root = tk.Tk()
-        root.title("Missing Python libraries")
-        root.attributes('-topmost', True)
-        result = {'choice': 'quit'}  # closing the window == quit
-
-        def choose(choice):
-            result['choice'] = choice
-            root.destroy()
-
-        tk.Label(root, text=message, justify='left', anchor='w', padx=14, pady=12).pack()
-        buttons = tk.Frame(root)
-        buttons.pack(pady=(0, 12))
-        tk.Button(buttons, text="Install", width=14, command=lambda: choose('install')).pack(side='left', padx=6)
-        if not missing_required:
-            tk.Button(buttons, text="Continue without", width=14,
-                      command=lambda: choose('skip')).pack(side='left', padx=6)
-        tk.Button(buttons, text="Quit", width=14, command=lambda: choose('quit')).pack(side='left', padx=6)
-        root.protocol("WM_DELETE_WINDOW", lambda: choose('quit'))
-        root.mainloop()
-        return result['choice']
-    except Exception:
-        # No GUI available: fall back to the console.
-        options = "[i]nstall / [c]ontinue without / [q]uit" if not missing_required else "[i]nstall / [q]uit"
-        try:
-            answer = input(f"{options}: ").strip().lower()
-        except EOFError:
-            return 'quit'
-        if answer in ('i', 'install'):
-            return 'install'
-        if answer in ('c', 'continue') and not missing_required:
-            return 'skip'
-        return 'quit'
-
-
 def check_libraries_or_exit():
     """Look for every library this script needs, without importing them
     (importlib.util.find_spec only locates them, so this costs milliseconds).
-    Anything missing, required or optional, is reported in a dialog that
-    offers to pip-install it automatically (AUTO_INSTALL_LIBRARIES) or quit
-    (or, if only optional ones are missing, continue without) — see
-    _ask_install_choice. If installing fails: missing required libraries show
+    Anything missing, required or optional, is pip-installed at once
+    (AUTO_INSTALL_LIBRARIES), with a progress window. If installing fails: missing required libraries show
     the manual install commands and quit, since the imports below would fail
     anyway; missing optional ones only ask whether to continue. Manual
     commands are plain pip; we can't tell whether the user runs conda or a
@@ -298,11 +234,12 @@ def check_libraries_or_exit():
 
     failures = []
     if AUTO_INSTALL_LIBRARIES:
-        choice = _ask_install_choice(missing_required, missing_optional)
-        if choice == 'quit':
-            sys.exit(1)
-        if choice == 'skip':
-            return
+        # No question first: whoever starts this from a .bat file wants it to just work.
+        print("These Python libraries are not installed, so they will be installed now:")
+        for name in missing_required:
+            print(f"    {name}")
+        for name in missing_optional:
+            print(f"    {name} (optional: {OPTIONAL_LIBRARIES[name][1]})")
         specs = ([REQUIRED_LIBRARIES[name] for name in missing_required]
                  + [OPTIONAL_LIBRARIES[name][0] for name in missing_optional])
         print("Installing missing Python libraries into:", sys.executable)

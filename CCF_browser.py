@@ -174,27 +174,83 @@ def read_nifti_volume(path, with_header=False):
     return (array, raw[:max(348, offset)]) if with_header else array
 
 
-def find_atlas_cache_dir():
-    """The ABC atlas download folder: the location ABC_atlas_browser.py saved, else the default next to the repository,
-    else the user is asked (and the answer saved where ABC_atlas_browser.py will find it too). None if cancelled."""
+def ask_choice(parent, title, text, buttons):
+    """Show `text` over `parent` with one button per label in `buttons` (plus Cancel); the index of the one clicked, None if cancelled."""
+    own_root = None
+    if parent is None:
+        parent = own_root = tk.Tk()
+        own_root.withdraw()
+    dlg = tk.Toplevel(parent)
+    dlg.title(title)
+    dlg.transient(parent)
+    answer = []
+    ttk.Label(dlg, text=text, justify='left', wraplength=520).pack(padx=14, pady=(14, 8), anchor='w')
+    for i, label in enumerate(buttons):
+        ttk.Button(dlg, text=label, command=lambda i=i: (answer.append(i), dlg.destroy())).pack(fill='x', padx=14, pady=3)
+    ttk.Button(dlg, text="Cancel", command=dlg.destroy).pack(anchor='e', padx=14, pady=(8, 12))
+    dlg.bind('<Escape>', lambda e: dlg.destroy())
+    dlg.update_idletasks()
+    if own_root is None:
+        dlg.geometry(f"+{parent.winfo_rootx() + 100}+{parent.winfo_rooty() + 100}")
+    dlg.grab_set()
+    parent.wait_window(dlg)
+    if own_root is not None:
+        own_root.destroy()
+    return answer[0] if answer else None
+
+
+def remember_atlas_cache_dir(folder):
+    """Create `folder` if need be and save it as the atlas download location (where ABC_atlas_browser.py will find it too)."""
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    ATLAS_CACHE_LOCATION_FILE.write_text(json.dumps({'path': str(folder)}, indent=2), encoding='utf-8')
+    return folder
+
+
+def choose_new_atlas_cache_dir(parent):
+    """Where to put a new ABC atlas download, as one of two choices: the default folder (made at once), or a folder the user picks the
+    PARENT of (the download goes into an abc_atlas_cache subfolder of it, not into the folder itself). None if cancelled."""
+    default = DEFAULT_ATLAS_CACHE_DIR
+    sub = default.name
+    pick = ask_choice(parent, "ABC atlas download folder",
+                      "The ABC atlas data (which the CCF volume is part of) is downloaded into its own folder.",
+                      [f"Use the default folder  ({default})", f"Choose a different location...  (a '{sub}' folder is made inside it)"])
+    if pick is None:
+        return None
+    if pick == 0:
+        return remember_atlas_cache_dir(default)
+    chosen = filedialog.askdirectory(parent=parent, title=f"Choose where to create the '{sub}' folder", initialdir=str(default.parent))
+    if not chosen:
+        return None
+    chosen = Path(chosen)
+    if chosen.name != sub:                                  # (picking an existing cache folder itself uses it as it is)
+        chosen = chosen / sub
+    return remember_atlas_cache_dir(chosen)
+
+
+def find_atlas_cache_dir(parent=None):
+    """The ABC atlas download folder: the location ABC_atlas_browser.py saved, else the default next to the repository. If a saved
+    location is gone the user is asked to locate it or to download again; with nothing saved, where to put a new download. None if cancelled."""
     try:
         saved = json.loads(ATLAS_CACHE_LOCATION_FILE.read_text(encoding='utf-8')).get('path')
     except (OSError, ValueError, AttributeError):
         saved = None
     if saved and Path(saved).is_dir():
         return Path(saved)
+    if saved:
+        pick = ask_choice(parent, "ABC atlas folder not found",
+                          f"The ABC atlas download folder used before was not found:\n{saved}\n(a drive that is not connected, or the folder was moved or deleted?)",
+                          ["Locate the folder...", "Download the atlas again (choose where to put it)"])
+        if pick is None:
+            return None
+        if pick == 0:
+            chosen = filedialog.askdirectory(parent=parent, title="Locate the ABC atlas download folder", initialdir=str(Path(saved).parent))
+            return remember_atlas_cache_dir(chosen) if chosen else None
+        return choose_new_atlas_cache_dir(parent)
     if DEFAULT_ATLAS_CACHE_DIR.is_dir():
         return DEFAULT_ATLAS_CACHE_DIR
-    chosen = filedialog.askdirectory(
-        title="Where is (or should go) the ABC atlas download folder (abc_atlas_cache)?",
-        initialdir=str(DEFAULT_ATLAS_CACHE_DIR.parent))
-    if not chosen:
-        return None
-    chosen = Path(chosen)
-    chosen.mkdir(parents=True, exist_ok=True)
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    ATLAS_CACHE_LOCATION_FILE.write_text(json.dumps({'path': str(chosen)}, indent=2), encoding='utf-8')
-    return chosen
+    return choose_new_atlas_cache_dir(parent)
 
 
 ABC_ATLAS_ACCESS = 'abc_atlas_access @ https://github.com/alleninstitute/abc_atlas_access/archive/refs/heads/main.zip'   # (the zip: no git needed)
@@ -2503,7 +2559,7 @@ class CCFBrowser:
             self.run_in_thread(f"Loading {name}…", lambda: load_custom_atlas(self.atlas_path, flips), self.atlas_ready,
                                overlay="Loading Atlas…")
             return
-        base = find_atlas_cache_dir()
+        base = find_atlas_cache_dir(self.root)
         if base is None:
             self.message.configure(text="No atlas folder chosen.")
             return

@@ -34,7 +34,8 @@ for %%V in (313 312 311 310) do (
 )
 if defined PYTHON_CMD goto :venv
 
-echo Python is not installed on this computer, so it will be downloaded from python.org and installed now.
+echo No suitable Python ^(version 3.10 to 3.13, 64-bit^) was found on this computer, so Python 3.13 will be downloaded
+echo from python.org and installed now, alongside any other versions already here ^(they are left as they are^).
 echo ^(This happens once; it needs an internet connection and takes a few minutes. Please wait.^)
 echo.
 if not exist "%~dp0install_python.ps1" (
@@ -54,18 +55,27 @@ if defined PYTHON_CMD (
 if not defined PYTHON_CMD exit /b 1
 
 :venv
-REM The virtual environment, built from the Python found above. A broken one (its Python was uninstalled or replaced) is rebuilt.
+REM The virtual environment, built from the Python found above. One that doesn't start (its Python was uninstalled or replaced),
+REM or that was built from a Python version these programs don't use, is rebuilt; the message says which.
 set "VENV_DIR=%~dp0.venv"
 set "VENV_PYTHON=%VENV_DIR%\Scripts\python.exe"
-set "VENV_CHECK=import sys;sys.exit(0 if (3,10)<=sys.version_info[:2]<=(3,13) and sys.maxsize>2**32 else 1)"
-if exist "%VENV_PYTHON%" (
-  "%VENV_PYTHON%" -c "%VENV_CHECK%" >nul 2>&1
-  if errorlevel 1 (
-    echo The virtual environment in %VENV_DIR% no longer works, so it will be rebuilt.
-    echo.
-    rmdir /s /q "%VENV_DIR%"
-  )
-)
+set "VENV_CHECK=import sys;sys.exit(0 if (3,10)<=sys.version_info[:2]<=(3,13) and sys.maxsize>2**32 else 3)"
+if not exist "%VENV_PYTHON%" goto :venv_make
+"%VENV_PYTHON%" -c "%VENV_CHECK%" >nul 2>&1
+if not errorlevel 1 goto :venv_make
+REM (exit code 3: it starts, but is the wrong version; anything else: it doesn't start)
+if errorlevel 4 goto :venv_broken
+if errorlevel 3 goto :venv_version
+:venv_broken
+echo The virtual environment in %VENV_DIR% no longer starts ^(its Python was probably uninstalled or moved^), so it will be rebuilt.
+goto :venv_remove
+:venv_version
+for /f "delims=" %%W in ('call "%VENV_PYTHON%" -c "import sys,platform;print(platform.python_version(), 64 if sys.maxsize>2**32 else 32)" 2^>nul') do echo The virtual environment in %VENV_DIR% was built with Python %%W-bit, but these programs need 3.10 to 3.13, 64-bit,
+echo so it will be rebuilt with one of those.
+:venv_remove
+echo.
+rmdir /s /q "%VENV_DIR%"
+:venv_make
 if not exist "%VENV_PYTHON%" (
   echo Setting up a private Python environment in %VENV_DIR% ^(this happens once and takes a minute^)...
   "%PYTHON_CMD%" -m venv "%VENV_DIR%"

@@ -42,7 +42,9 @@ $p = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList @(
 Remove-Item $installer -Force -ErrorAction SilentlyContinue
 if ($p.ExitCode -ne 0) { throw "The Python installer failed (exit code $($p.ExitCode))" }
 
-$found = Get-ChildItem (Join-Path $env:LOCALAPPDATA "Programs\Python\Python3*\python.exe") -ErrorAction SilentlyContinue |
-    Sort-Object { [int]($_.Directory.Name -replace '\D', '') } -Descending | Select-Object -First 1
-if (-not $found) { throw "Python was installed, but its python.exe could not be found" }
-Set-Content -Path $ResultFile -Value $found.FullName -Encoding ascii
+# The one just installed, by its own folder (Python313): not just the newest there, which may be another version installed
+# earlier (e.g. by PyCharm) that these programs don't use.
+$folder = Join-Path $env:LOCALAPPDATA "Programs\Python\Python$PythonMajor$PythonMinor"
+$found = @("$folder\python.exe", "$folder-arm64\python.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $found) { throw "Python was installed, but its python.exe could not be found in $folder" }
+Set-Content -Path $ResultFile -Value $found -Encoding ascii

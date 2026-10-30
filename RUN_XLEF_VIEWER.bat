@@ -33,6 +33,10 @@ if errorlevel 1 (
   echo.
 )
 
+REM tkinterdnd2 (dragging .xlef files onto the window) is optional: the viewer works without it.
+"%PYTHON_CMD%" -c "import tkinterdnd2" >nul 2>&1
+if errorlevel 1 "%PYTHON_CMD%" -m pip install tkinterdnd2 >nul 2>&1
+
 "%PYTHON_CMD%" xlef_viewer.py %*
 if errorlevel 1 (
   echo.

@@ -1,7 +1,7 @@
 """A reusable "open a saved file" dialog for Tk programs: a toggle at the top picks one of two panels, and Open acts on the panel that is showing.
 
   Recent <things>       a list of the recently used files (with optional extra columns, filled in by a background thread), double-click opens
-  Open a <thing> file   a Browse button, a box for a typed or pasted path, and an area a file can be dragged onto from Windows Explorer
+  Browse for a <thing>  a "Choose file" button, a box for a typed or pasted path, and an area a file can be dragged onto from Explorer
 
 The module knows nothing about any program: it is given the recent paths and a few optional callbacks, and returns what was chosen. It does not
 open the file, check that it exists or remember anything (the caller keeps its own list of recent files), so it can be used as it is by any program.
@@ -45,7 +45,11 @@ def ask_open_file(parent, recent, *, title="Open", noun="file", filetypes=(("All
     drop          allow a file to be dragged in from Windows Explorer (if tkinterdnd2 and the window allow it)
     initial_dir   where the Browse dialog starts (default: the folder of the newest recent file)"""
     paths = list(recent)
+    a_noun = ("an " if noun[:1].lower() in "aeiou" else "a ") + noun          # ("an experiment", "a project")
     dlg = tk.Toplevel(parent)
+    r, g, b = dlg.winfo_rgb(dlg.cget("background"))
+    light = (0.299 * r + 0.587 * g + 0.114 * b) / 65535 > 0.5         # (the program may use a dark theme: greys that read on it)
+    muted, hint = ("#555555", "gray30") if light else ("#a8a8a8", "#b8b8b8")
     dlg.title(title)
     dlg.transient(parent)
     dlg.geometry(f"+{parent.winfo_rootx() + 120}+{parent.winfo_rooty() + 100}")
@@ -68,10 +72,10 @@ def ask_open_file(parent, recent, *, title="Open", noun="file", filetypes=(("All
         file = filedialog.askopenfilename(parent=dlg, title=title, initialdir=start or None, filetypes=list(filetypes))
         if file:
             var_file.set(os.path.normpath(file))
-    ttk.Button(top, text=f"Browse for {noun} file", command=browse).pack(side=tk.LEFT)
+    ttk.Button(top, text="Choose file", command=browse).pack(side=tk.LEFT)
     entry = ttk.Entry(top, textvariable=var_file, width=70)
     entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
-    drop_note = tk.Label(browse_panel, text=f"...or drag a {noun} file here from Windows Explorer", relief=tk.GROOVE, bd=2, fg="#555555", height=5)
+    drop_note = tk.Label(browse_panel, text=f"...or drag {a_noun}{'' if noun == 'file' else ' file'} here from Windows Explorer", relief=tk.GROOVE, bd=2, fg=muted, height=5)
     drop_note.pack(fill=tk.BOTH, expand=True, pady=(10, 4))
     if drop:
         try:
@@ -130,7 +134,7 @@ def ask_open_file(parent, recent, *, title="Open", noun="file", filetypes=(("All
                 dlg.after(100, show_details)
         dlg.after(50, show_details)
     tree.pack(fill=tk.BOTH, expand=True)
-    ttk.Label(recent_panel, text=f"Double-click a {noun}, or select it and click Open.", foreground="gray30").pack(anchor="w", pady=(4, 0))
+    ttk.Label(recent_panel, text=f"Double-click {a_noun}, or select it and click Open.", foreground=hint).pack(anchor="w", pady=(4, 0))
     if paths:
         tree.selection_set("0")
         tree.focus("0")
@@ -205,7 +209,7 @@ def ask_open_file(parent, recent, *, title="Open", noun="file", filetypes=(("All
             browse_panel.pack(fill=tk.BOTH, expand=True)
             list_buttons.pack_forget()
             entry.focus_set()
-    for key, text in (("recent", f"Recent {noun}s"), ("browse", f"Open a {noun} file")):
+    for key, text in (("recent", f"Recent {noun}s"), ("browse", f"Browse for {a_noun}")):
         b = tk.Button(toggle, text=text, font=("Segoe UI", 10, "bold"), bd=2, padx=16, pady=4, cursor="hand2", command=lambda k=key: show_mode(k))
         b.pack(side=tk.LEFT, padx=(0, 6))
         toggle_buttons[key] = b

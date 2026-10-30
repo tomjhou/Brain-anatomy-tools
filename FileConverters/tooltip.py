@@ -22,7 +22,7 @@ class Tooltip:
         text = self.text() if callable(self.text) else self.text
         self.tip = tk.Toplevel(self.widget)
         self.tip.wm_overrideredirect(True)
-        tk.Label(self.tip, text=text, justify=tk.LEFT, background="#ffffe0", relief=tk.SOLID, borderwidth=1,
+        tk.Label(self.tip, text=text, justify=tk.LEFT, background="#ffffe0", foreground="black", relief=tk.SOLID, borderwidth=1,
                  wraplength=self.wraplength, padx=4, pady=2).pack()
         self.tip.update_idletasks()
         x = min(self.widget.winfo_rootx(), self.widget.winfo_screenwidth() - self.tip.winfo_reqwidth() - 4)   # (kept on screen)

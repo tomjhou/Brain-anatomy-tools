@@ -174,6 +174,29 @@ def read_nifti_volume(path, with_header=False):
     return (array, raw[:max(348, offset)]) if with_header else array
 
 
+def is_atlas_cache(folder):
+    """Whether `folder` is an ABC atlas download folder: it has the library's releases/metadata/image_volumes folders, or it is empty (made, and
+    nothing downloaded into it yet). A folder that holds other things (e.g. the one the cache was moved out of) is not."""
+    folder = Path(folder)
+    try:
+        return (any((folder / name).is_dir() for name in ('releases', 'metadata', 'image_volumes'))
+                or (folder.is_dir() and not any(folder.iterdir())))
+    except OSError:
+        return False
+
+
+def atlas_cache_in(folder):
+    """`folder` if it is an atlas cache, else the one subfolder of it that is (a cache moved into a subfolder), else None."""
+    folder = Path(folder)
+    if is_atlas_cache(folder):
+        return folder
+    try:
+        inside = [c for c in folder.iterdir() if c.is_dir() and is_atlas_cache(c)]
+    except OSError:
+        return None
+    return inside[0] if len(inside) == 1 else None
+
+
 def ask_choice(parent, title, text, buttons):
     """Show `text` over `parent` with one button per label in `buttons` (plus Cancel); the index of the one clicked, None if cancelled."""
     own_root = None
@@ -236,20 +259,31 @@ def find_atlas_cache_dir(parent=None):
         saved = json.loads(ATLAS_CACHE_LOCATION_FILE.read_text(encoding='utf-8')).get('path')
     except (OSError, ValueError, AttributeError):
         saved = None
-    if saved and Path(saved).is_dir():
+    if saved and is_atlas_cache(saved):
         return Path(saved)
-    if saved:
-        pick = ask_choice(parent, "ABC atlas folder not found",
-                          f"The ABC atlas download folder used before was not found:\n{saved}\n(a drive that is not connected, or the folder was moved or deleted?)",
-                          ["Locate the folder...", "Download the atlas again (choose where to put it)"])
-        if pick is None:
-            return None
-        if pick == 0:
-            chosen = filedialog.askdirectory(parent=parent, title="Locate the ABC atlas download folder", initialdir=str(Path(saved).parent))
-            return remember_atlas_cache_dir(chosen) if chosen else None
-        return choose_new_atlas_cache_dir(parent)
-    if DEFAULT_ATLAS_CACHE_DIR.is_dir():
+    if saved and Path(saved).is_dir() and atlas_cache_in(saved):       # (the cache was moved into a subfolder: follow it)
+        return remember_atlas_cache_dir(atlas_cache_in(saved))
+    if not saved and is_atlas_cache(DEFAULT_ATLAS_CACHE_DIR):
         return DEFAULT_ATLAS_CACHE_DIR
+    if saved:
+        text = (f"The ABC atlas download folder used before{' holds no atlas data now' if Path(saved).is_dir() else ' was not found'}:\n{saved}\n"
+                "(a drive that is not connected, or the folder was moved or deleted?)")
+    else:
+        text = "No ABC atlas download folder is known on this computer yet."
+    pick = ask_choice(parent, "ABC atlas folder not found", text + "\n\nIf the atlas is already downloaded somewhere, locate it; otherwise download it.",
+                      ["Locate the folder...", "Download the atlas (choose where to put it)"])
+    if pick is None:
+        return None
+    if pick == 0:
+        start = Path(saved).parent if saved else DEFAULT_ATLAS_CACHE_DIR.parent
+        chosen = filedialog.askdirectory(parent=parent, title="Locate the ABC atlas download folder", initialdir=str(start))
+        if not chosen:
+            return None
+        found = atlas_cache_in(chosen)                       # (the folder itself, or the cache inside it)
+        if found is None and not messagebox.askyesno("Locate the atlas", f"{chosen}{chr(10)}does not look like an ABC atlas download folder. Use it anyway?",
+                                                      parent=parent):
+            return None
+        return remember_atlas_cache_dir(found or chosen)
     return choose_new_atlas_cache_dir(parent)
 
 
@@ -340,9 +374,9 @@ def quiet_atlas_cache_dir():
         saved = json.loads(ATLAS_CACHE_LOCATION_FILE.read_text(encoding='utf-8')).get('path')
     except (OSError, ValueError, AttributeError):
         saved = None
-    if saved and Path(saved).is_dir():
+    if saved and is_atlas_cache(saved):
         return Path(saved)
-    return DEFAULT_ATLAS_CACHE_DIR if DEFAULT_ATLAS_CACHE_DIR.is_dir() else None
+    return DEFAULT_ATLAS_CACHE_DIR if is_atlas_cache(DEFAULT_ATLAS_CACHE_DIR) else None
 
 
 def comparison_luts(alt_table, alt_size, alt_ids, ref_table, ref_size, merge_unassigned=False):

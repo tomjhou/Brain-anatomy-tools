@@ -44,7 +44,7 @@ THUMB_CACHE = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser(
 MAX_RECENT = 20
 MOVING_PAUSE = 0.25          # s without a wheel click or drag before the view counts as at rest (see XlefViewer._moving)
 HIRES_NOTE_DELAY = 0.5       # s of waiting for a sharper view before "Loading full resolution..." is shown over the image
-KEPT_IMAGES_PERCENT = 25      # share of the computer's memory (%) for the pictures of recently viewed and preloaded images, which
+KEPT_IMAGES_PERCENT = 50      # share of the computer's memory (%) for the pictures of recently viewed and preloaded images, which
                               # make switching to one instant (a setting); 500 MB if the memory's size can't be read
 KEPT_IMAGES_MAX = 80          # the most that share may be set to (the rest is for Windows, the open image and other programs)
 THUMB_SIZE = 128         # longest side of a thumbnail, screen pixels
@@ -870,7 +870,9 @@ def _write_text(path, new_text, bom):
 
 ELEMENT_NAME = re.compile(r'(<Element\b[^>]*?\bName=")([^"]*)(")')
 PREVIEW_MEMORY_NOTE = ("For the pictures of the images viewed recently, and of the ones loaded in the background so that they\n"
-                       "open at once. Memory is only taken as images are loaded.")
+                       "open at once; what they leave free keeps the full-resolution views zoomed into before, so that\n"
+                       "going back to one needs no reading (these go first when the pictures need the room).\n"
+                       "Memory is only taken as images are loaded.")
 RENAME_NOTE = ("Off: a rename changes only the name LAS X shows (in its .xlif / .xlcf).\n"
                "On: the image's .xlif and channel TIFFs, or the folder, get the new name too.")
 FLIP_NOTE = ("On: Save writes it into the section's .xlif, in a field of this viewer's own (JhouXlefViewer), so it goes\n"
@@ -2268,7 +2270,7 @@ class XlefViewer:
             self.settings["recent_files"] = [self.settings["last_file"]] if self.settings.get("last_file") else []
         self.settings.pop("last_file", None)
         if not self.settings.get("preview_memory_checked") and self.settings.get("preview_memory_percent") == 10:
-            # (10% was the default, and opening Settings used to store it: taken as the default, now 25%, once)
+            # (10% was the default, and opening Settings used to store it: taken as the default, now KEPT_IMAGES_PERCENT, once)
             self.settings.pop("preview_memory_percent")
         self.settings["preview_memory_checked"] = True
         self.native_theme = ttk.Style(self.root).theme_use()        # (Windows' own: the light theme's)
@@ -2299,6 +2301,7 @@ class XlefViewer:
         self.slide_project = None    # (the project whose slide overview shows)
         self.download_gen = 0        # (bumped when a project is closed: its downloads stop)
         self.kept_images = collections.OrderedDict()     # ImageEntry -> OpenImage, for images seen recently (see _keep_image)
+        self.regions = []            # full-resolution views read before, oldest first (see _stash_region): in the memory for previews
         self.kept_bytes = 0          # (their size, kept up to date here, for the background loader's thread to read)
         self.full_res_ok = None      # (see show_entry)
         self.contrast_step, self.contrast_job = None, None     # (the slider drag being made: one Undo step; see _set_lo_hi)
@@ -3379,7 +3382,43 @@ class XlefViewer:
 
     def _kept_changed(self):
         self.kept_bytes = sum(k.nbytes() for k in self.kept_images.values())
+        self._trim_regions()
         self._show_loaded()
+
+    def _stash_region(self, cache):
+        """A sharp view being replaced (by another one, or by leaving the image): its full-resolution pixels are kept, so that a view
+        within them later needs no reading (see _use_region). They only use the memory for previews that the previews leave free, and
+        go first, the oldest first: the previews always stay."""
+        if cache is None or self.img is None or not any(a is not None for a in cache["arrays"]):
+            return
+        self.regions.append({"entry": self.img.entry, "key": cache["key"], "arrays": cache["arrays"],
+                             "bytes": sum(a.nbytes for a in cache["arrays"] if a is not None)})
+        self._trim_regions()
+
+    def _trim_regions(self):
+        """Drop kept regions, the oldest first, until they fit beside the previews (and those of images no longer listed)."""
+        listed = set(map(id, self.entries.values()))
+        self.regions = [r for r in self.regions if id(r["entry"]) in listed]
+        room = self.kept_limit() - getattr(self, "kept_bytes", 0)
+        while self.regions and sum(r["bytes"] for r in self.regions) > room:
+            self.regions.pop(0)
+
+    def _use_region(self, step, channels):
+        """Before reading a sharp view from the files: if a kept region of this image covers it (at `step` or finer, with these
+        channels), it becomes the sharp view's pixels (the one there now is kept in its place). True if one did."""
+        if self._kept_covers(step, channels):
+            return False
+        for k in range(len(self.regions) - 1, -1, -1):          # (the newest first)
+            r = self.regions[k]
+            if r["entry"] is not self.img.entry:
+                continue
+            cache = {"key": (id(self.img),) + tuple(r["key"][1:]), "arrays": r["arrays"]}
+            if self._kept_covers(step, channels, cache):
+                del self.regions[k]
+                self._stash_region(self.detail_cache)
+                self.detail_cache = cache
+                return True
+        return False
 
     def _loaded_entries(self):
         """The images with a picture in memory: kept (recently viewed, or preloaded) or open."""
@@ -3444,6 +3483,7 @@ class XlefViewer:
     def _close_image(self):
         self.generation += 1
         self._set_open_progress(None)
+        self._stash_region(self.detail_cache)          # (its last sharp view: kept for coming back)
         if self.img:
             if not self.loading and self.img.complete(self.z):
                 self._keep_image(self.img)
@@ -3484,6 +3524,7 @@ class XlefViewer:
         for img in self.kept_images.values():
             img.close()
         self.kept_images.clear()
+        self.regions.clear()
         self._kept_changed()
 
     def on_select(self, event=None):
@@ -4098,6 +4139,7 @@ class XlefViewer:
             # at once instead of drawing the blurrier overview first and reading the files again (that blinked).
             (i0, j0, i1, j1), place = self._view_rect(step)
             key = (id(self.img), self.z, i0, j0, i1, j1, step, place)
+            self._use_region(step, need)          # (a full-resolution region kept from before, if one covers this view)
             cache = self.detail_cache
             if cache is not None and cache["key"] != key and self._kept_covers(step, need):
                 # The new view lies within the sharp pixels already here, at the detail it needs (zooming in, or panning within
@@ -4227,9 +4269,10 @@ class XlefViewer:
                        else Image.fromarray(part).resize((w, h), Image.BILINEAR))
         return ims, round((x0 + a0 * st - self.cx) * self.scale + cw / 2), round((y0 + b0 * st - self.cy) * self.scale + ch / 2)
 
-    def _kept_covers(self, step, channels):
-        """The kept sharp pixels (detail_cache) cover all of the image that is in view, at `step` or finer, for these channels."""
-        cache = self.detail_cache
+    def _kept_covers(self, step, channels, cache=None):
+        """The kept sharp pixels (detail_cache, or `cache`) cover all of the image that is in view, at `step` or finer, for these
+        channels."""
+        cache = self.detail_cache if cache is None else cache
         if cache is None or cache["key"][0] != id(self.img) or cache["key"][1] != self.z or cache["key"][6] > step:
             return False
         if any(cache["arrays"][c] is None for c in channels):
@@ -5760,6 +5803,8 @@ class XlefViewer:
                     key, arrays, place, smooth = data
                     if self.detail_cache is not None and self.detail_cache["key"] == key:
                         arrays = [a if a is not None else old for a, old in zip(arrays, self.detail_cache["arrays"])]
+                    else:
+                        self._stash_region(self.detail_cache)      # (the sharp view before: kept, for coming back to it)
                     luts = make_luts(self.img.entry.channels, self.ch_settings)
                     rgb = self._mix([a if lut is not None else None for a, lut in zip(arrays, luts)], luts)
                     self.detail_cache = {"key": key, "arrays": arrays, "rgb": rgb,          # (mixed once: reused while zooming)

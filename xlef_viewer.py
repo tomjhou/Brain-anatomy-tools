@@ -5275,8 +5275,8 @@ class XlefViewer:
         return f"Full resolution image of {entry.name} is in cloud. Zoom in or right-click to download"
 
     def _tree_motion(self, event):
-        """The pointer on the name of an image with a cloud, or on the cloud: a note saying what the cloud means. On a project's name:
-        its full path, and whether it has unsaved changes."""
+        """The pointer on an image's name (or its cloud): a note with its name, size and resolution, unsaved changes, and what the cloud
+        means (see _section_tip_text). On a project's name: its full path, and whether it has unsaved changes."""
         item = self.tree.identify_row(event.y)
         if self._unsaved_tip(item, event):
             return
@@ -5293,19 +5293,34 @@ class XlefViewer:
                 self.tree_tip = PointerTip(self.tree)
             self.tree_tip.show(f"{os.path.normpath(self.projects[item]['path'])}\n{note}", event.x_root, event.y_root)
             return
-        if item not in self.item_cloud or not self.tree.bbox(item):
+        if item not in self.entries or not self.tree.bbox(item):
             self._hide_tree_tip()
             return
         x, y, w, h = self.tree.bbox(item)
         font = tkfont.nametofont("TkDefaultFont")
         start = x + 20 * (self._tree_depth(item) + 1)            # (where the name starts: the tree's indent per level, the open mark)
-        cloud = start + font.measure(self.entries[item].name + "  ")
-        if not start - 8 <= event.x <= cloud + font.measure("☁") + 8:       # (anywhere on the name or its cloud)
+        end = start + font.measure(self.entries[item].name) + (font.measure("  ☁") if item in self.item_cloud else 0)
+        if not start - 8 <= event.x <= end + 8:                  # (anywhere on the name, or its cloud)
             self._hide_tree_tip()
             return
         if self.tree_tip is None:
             self.tree_tip = PointerTip(self.tree)
-        self.tree_tip.show(self._cloud_tip_text(self.entries[item]), event.x_root, event.y_root)
+        self.tree_tip.show(self._section_tip_text(item), event.x_root, event.y_root)
+
+    def _section_tip_text(self, item):
+        """The note on an image's name in the list: its name, its size and resolution, whether it has unsaved changes, and (online-only)
+        what its cloud means."""
+        e = self.entries[item]
+        lines = [e.name]
+        if e.problem:
+            lines.append(e.problem)
+        elif e.width:
+            lines.append(f"{e.width} x {e.height} px" + (f", {e.pixel_um:.3f} µm/px" if e.pixel_um else ""))
+        what = self._unsaved_what(item)
+        lines.append("Unsaved changes: " + ", ".join(what) if what else "No unsaved changes")
+        if item in self.item_cloud:
+            lines.append(self._cloud_tip_text(e))
+        return "\n".join(lines)
 
     def _hide_tree_tip(self):
         if self.tree_tip is not None:

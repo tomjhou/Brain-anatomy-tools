@@ -926,6 +926,7 @@ if _has_internet_connection():
             abc_cache = AbcProjectCache.from_cache_dir(download_base)
     except (OSError, botocore.exceptions.BotoCoreError) as e:      # (the connection failed after all: the local cache is used, as when offline)
         offline_reason = f"The Allen atlas server could not be reached ({type(e).__name__})."
+atlas_is_online = abc_cache is not None
 if abc_cache is not None:
     offer_atlas_release_update(abc_cache)
 else:
@@ -949,6 +950,82 @@ else:
         root.destroy()
     except Exception:
         pass                                              # (no GUI: the console line above is the notice)
+
+
+def serialize_downloads(cache):
+    """Make a download of any one file wait for another of the same file that is already running. The library writes a download straight
+    into its final file, so two at once (e.g. the launch screen's background read of the cell metadata and the browser's own load of it)
+    would write over each other, fail the checksum and start again. The second caller now waits, and then finds the file there."""
+    locks, guard = {}, threading.Lock()
+
+    def wrap(name):
+        original = getattr(cache, name)
+
+        def one_at_a_time(*args, **kwargs):
+            names = list(args) + [kwargs[k] for k in ('directory', 'file_name') if k in kwargs]       # (called by position or by keyword)
+            with guard:
+                lock = locks.setdefault(tuple(names), threading.Lock())
+            with lock:
+                return original(*args, **kwargs)
+        setattr(cache, name, one_at_a_time)
+    for method in ('get_data_path', 'get_metadata_path'):
+        wrap(method)
+
+
+serialize_downloads(abc_cache)
+
+# The big files every session needs. The first time on a computer they are downloaded in the background from the moment the program
+# starts (the raw expression data alone is ~8 GB: ten minutes or more), so that the wait is over sooner, and anything that needs them
+# waits for the download rather than starting another (see serialize_downloads).
+ATLAS_CORE_FILES = (("the cell metadata table", 'MERFISH-C57BL6J-638850', 'cell_metadata_with_cluster_annotation', 'metadata'),
+                    ("the raw MERFISH expression data", 'MERFISH-C57BL6J-638850', 'C57BL6J-638850/raw', 'data'))
+atlas_prefetch = {'thread': None, 'total_gb': 0.0}
+
+
+def start_atlas_prefetch(cache):
+    """Start downloading the core atlas files that are missing, on a background thread (nothing if all are there, or offline).
+    Fills atlas_prefetch with the thread and the size, and tells the user once what is going on."""
+    missing = []
+    for label, directory, file_name, kind in ATLAS_CORE_FILES:
+        _path, size, present = metadata_file_status(cache, directory, file_name)
+        if present is False:
+            missing.append((label, directory, file_name, kind, size))
+    if not missing:
+        return
+    total_gb = sum(m[4] or 0 for m in missing) / 1e9
+    atlas_prefetch['total_gb'] = total_gb
+
+    def work():
+        for _label, directory, file_name, kind, _size in missing:
+            try:
+                (cache.get_data_path if kind == 'data' else cache.get_metadata_path)(directory=directory, file_name=file_name)
+            except Exception as e:
+                print(f"Could not download {file_name} ({type(e).__name__}: {e}); it will be tried again when it is needed.")
+    atlas_prefetch['thread'] = threading.Thread(target=work, daemon=True)
+    atlas_prefetch['thread'].start()
+    parts = "\n".join(f"    {m[0]}: {m[4] / 1e9:.1f} GB" if m[4] else f"    {m[0]}" for m in missing)
+    message = (f"The atlas data is not on this computer yet, so it is being downloaded now (one time only):\n\n{parts}\n\n"
+               f"That is about {total_gb:.0f} GB and can take 10 minutes or much longer, depending on the connection. Progress is shown in "
+               "the console window. You can carry on to the launch screen; opening the browser will wait for the download to finish. "
+               "Keep this program open until then: an interrupted file starts again from the beginning.")
+    print("\n" + message + "\n")
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        messagebox.showinfo("Downloading the atlas", message, parent=root)
+        root.destroy()
+    except Exception:
+        pass                                              # (no GUI: the console text above is the notice)
+
+
+if atlas_is_online:
+    try:
+        start_atlas_prefetch(abc_cache)
+    except Exception as e:
+        print(f"Could not check whether the atlas data needs downloading ({e}).")
 startup_note("Atlas manifest ready.")
 
 CELL_TYPE_OPTIONS = {'1': 'Neurons', '2': 'NonNeurons', '3': 'All'}
@@ -18588,9 +18665,14 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         loaded = get_cached_raw_backed_adata(raw_backed_cache, abc_cache)
         return loaded, get_section_labels(loaded, abc_cache)
 
-    adata, section_series = run_with_loading_window(
-        "Loading the MERFISH brain atlas (4+ million cells).\n"
-        "The first load after startup can take a minute.", load_raw_and_section_labels)
+    # The first time on a computer the atlas is still downloading (gigabytes, started at program start): far longer than reading it.
+    downloading = atlas_prefetch['thread'] is not None and atlas_prefetch['thread'].is_alive()
+    if downloading:
+        loading_message = (f"Waiting for the MERFISH brain atlas to finish downloading ({atlas_prefetch['total_gb']:.0f} GB, one time only).\n"
+                           "This can take 10 minutes or more; see the console window for progress.")
+    else:
+        loading_message = "Loading the MERFISH brain atlas (4+ million cells).\nThe first load after startup can take a minute."
+    adata, section_series = run_with_loading_window(loading_message, load_raw_and_section_labels)
     print(f"Step 0: Loaded backed AnnData with {adata.n_obs} cells x {adata.n_vars} genes.")
 
     # ---------------------------------------------------------------------------

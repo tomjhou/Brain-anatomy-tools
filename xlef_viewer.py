@@ -364,13 +364,15 @@ class ImageEntry:
         self.pyramid = None      # .xlif of LAS X's first reduced copy (_pmd_0), if it made a pyramid; each level names the next
         self.full_bytes = None   # its channel TIFFs' size on disk (bytes), once measured (see XlefViewer._measure_sizes)
         self.pages = {}          # (z, c) -> page of its file, when the channels are the pages of one OME-TIFF (see _ome_pages), or a
-                                 # LofPlane, when they are all in one .lof file (see _lof_planes)
+                                 # RawPlane, when they are all in one .lof file or a block of a .lif (see _raw_planes)
         self.annotations = []    # what was drawn on the image in LAS X (Annotation objects, hidden ones too, as in the file)
         self.annotations_changed = False     # edited in the viewer and not saved yet
         self.stage_um = None     # (x, y) of the image's CENTRE on the microscope stage, um (its <Tile PosX/PosY>), to place it on the slide
         self.saved_name = name   # its name in the file (self.name may be a rename not saved yet)
         self.parent_file = None  # the .xlef/.xlcf whose <Children> refer to this image's .xlif (None: unknown)
         self.flipped = self.saved_flipped = False    # "Flip this section": as changed in the viewer / as in the file (see write_flip)
+        self.lif_block = None    # its data block, when it is an image in a .lif (or a pyramid level in a .lifext; see load_lif)
+        self.read_only = False   # from a .lif: shown, never written (changes made in the viewer are only for viewing)
 
     @property
     def path(self):
@@ -390,8 +392,8 @@ class ImageEntry:
 
     @property
     def unsaved(self):
-        return (self.annotations_changed or self.name != self.saved_name or self.luts_changed or self.contrast_changed
-                or self.flip_changed)
+        return not self.read_only and (self.annotations_changed or self.name != self.saved_name or self.luts_changed
+                                       or self.contrast_changed or self.flip_changed)
 
     def all_files(self):
         return sorted(set(self.files.values()))
@@ -410,10 +412,11 @@ class FolderEntry:
         self.parent_file = None
         self.annotations_changed = False
         self.order_changed = False   # what it lists, or their order, changed in the viewer (dragged, deleted) and not saved yet
+        self.read_only = False       # from a .lif (path None, too: nothing is dragged into or out of it)
 
     @property
     def unsaved(self):
-        return self.name != self.saved_name or self.order_changed
+        return not self.read_only and (self.name != self.saved_name or self.order_changed)
 
 
 def _resolve(ref, base_dir):
@@ -539,25 +542,17 @@ def _ome_pages(entry, element, dims, descs, base_dir):
                     break
 
 
-LofPlane = collections.namedtuple("LofPlane", "at dtype shape")
-LofPlane.__doc__ = """Where one channel (one layer) of an image is in its .lof file: `at` bytes into the file's pixels, which start after
-the file's header (see lof_data_start); rows of `shape` (rows, columns) pixels of `dtype`, one after another."""
+RawPlane = collections.namedtuple("RawPlane", "block at dtype shape")
+RawPlane.__doc__ = """Where one channel (one layer) of an image is in a LAS X raw file: in a .lof (block None), `at` bytes into the
+file's pixels, which start after its header (see lof_data_start); in a .lif or .lifext, `at` bytes into its data block `block` (see
+lif_block_start). Rows of `shape` (rows, columns) pixels of `dtype`, one after another."""
 
 
-def _lof_planes(entry, element, dims, descs, base_dir):
-    """The third way LAS X stores an image: all its channels (and layers) in one .lof file, its own raw format, named by <Memory><Block
-    File=... Offset=... Size=...>: a short header, the pixels (uncompressed, channel after channel), then the metadata again. Where each
-    channel and layer starts comes from the metadata alone (each channel's BytesInc, and the z dimension's): the .lof is not opened
-    here. Sets entry.files and entry.pages (LofPlane)."""
-    blocks = []
-    for b in element.iter("Block"):
-        if (b.get("File") or "").lower().endswith(".lof"):
-            try:
-                blocks.append((int(b.get("Offset") or 0), int(b.get("Size") or 0), _resolve(b.get("File"), base_dir)))
-            except (TypeError, ValueError):
-                continue
-    if not blocks or not entry.width or not entry.height:
-        return
+def _raw_planes(entry, dims, descs, blocks, what):
+    """Where each channel and layer of an image stored raw (uncompressed, LAS X's own formats) is: from the metadata alone (each
+    channel's BytesInc, and the z dimension's; channel after channel, or layer after layer), so the file is not opened here. blocks:
+    [(offset in the image's data, size, file, block id or None)]. Sets entry.files and entry.pages (RawPlane); `what` names the
+    file in the problem when the layout is one this viewer doesn't read."""
     try:
         x_inc, y_inc = int(dims["1"].get("BytesInc")), int(dims["2"].get("BytesInc"))
         z_inc = int(dims["3"].get("BytesInc")) if "3" in dims else 0
@@ -567,18 +562,34 @@ def _lof_planes(entry, element, dims, descs, base_dir):
         for c, cd in enumerate(descs):
             for z in range(entry.nz):
                 at = int(cd.get("BytesInc") or 0) + z * z_inc
-                for offset, size, fpath in blocks:
+                for offset, size, fpath, block in blocks:
                     if offset <= at and at + y_inc * entry.height <= offset + size:
                         entry.files[(z, c)] = fpath
-                        entry.pages[(z, c)] = LofPlane(at - offset, dtype, (entry.height, entry.width))
+                        entry.pages[(z, c)] = RawPlane(block, at - offset, dtype, (entry.height, entry.width))
                         break
     except (KeyError, TypeError, ValueError):
         entry.files.clear()
         entry.pages.clear()
-        entry.problem = entry.problem or "The data is in a .lof file laid out in a way this viewer doesn't read."
+        entry.problem = entry.problem or f"The data is in a {what} file laid out in a way this viewer doesn't read."
 
 
-def _image_entry(name, path, element, image, base_dir):
+def _lof_planes(entry, element, dims, descs, base_dir):
+    """The third way LAS X stores an image: all its channels (and layers) in one .lof file, its own raw format, named by <Memory><Block
+    File=... Offset=... Size=...>: a short header, the pixels (uncompressed, channel after channel), then the metadata again (see
+    _raw_planes)."""
+    blocks = []
+    for b in element.iter("Block"):
+        if (b.get("File") or "").lower().endswith(".lof"):
+            try:
+                blocks.append((int(b.get("Offset") or 0), int(b.get("Size") or 0), _resolve(b.get("File"), base_dir), None))
+            except (TypeError, ValueError):
+                continue
+    if blocks and entry.width and entry.height:
+        _raw_planes(entry, dims, descs, blocks, ".lof")
+
+
+def _image_entry(name, path, element, image, base_dir, lif=None):
+    """An image's ImageEntry from its <Element> (lif: (.lif or .lifext path, block id, size) when its data is a block of that file)."""
     entry = ImageEntry(name, path)
     desc = image.find("ImageDescription")
     dims = {d.get("DimID"): d for d in desc.iter("DimensionDescription")} if desc is not None else {}
@@ -637,9 +648,14 @@ def _image_entry(name, path, element, image, base_dir):
         c = int(mc.group(1)) if mc else k % nch
         z = int(mz.group(1)) if mz else (k // nch if len(frames) > nch else 0)
         entry.files[(z, c)] = fpath
-    if not frames:
+    if lif is not None:              # (in a .lif or .lifext: its data block in that file)
+        lif_path, block, size = lif
+        entry.lif_block, entry.read_only, entry.full_bytes = block, True, size
+        if entry.width and entry.height:
+            _raw_planes(entry, dims, descs, [(0, size, lif_path, block)], os.path.splitext(lif_path)[1])
+    elif not frames:
         _ome_pages(entry, element, dims, descs, base_dir)
-    if not entry.files:
+    if not entry.files and lif is None:
         _lof_planes(entry, element, dims, descs, base_dir)
     kids = element.find("Children")
     for ref in (kids if kids is not None else []):
@@ -663,6 +679,8 @@ def _image_entry(name, path, element, image, base_dir):
 def count_images(path, _seen=None):
     """How many images an .xlef holds, counting those inside its folders (.xlcf, or a nested .xlef). Reads only those container files,
     not the images' own .xlif files."""
+    if path.lower().endswith(".lif"):          # (one file: its XML lists every image)
+        return sum(1 for el in _lif_header(path)[0].iter("Element") if el.find("Data/Image") is not None and el.find("Memory") is not None)
     seen = set() if _seen is None else _seen
     key = os.path.normcase(os.path.abspath(path))
     if key in seen:
@@ -691,12 +709,17 @@ def count_images(path, _seen=None):
 
 def pyramid_note(path, n_images):
     """Whether LAS X made a pyramid (reduced copies) for an experiment's images, for the recent list: "Yes", "No", or "5 of 29". Lists
-    only the Pyramid folder's metadata (one _pmd_0.xlif per image that has a pyramid), so it is quick on a network drive too."""
+    only the Pyramid folder's metadata (one _pmd_0.xlif per image that has a pyramid), so it is quick on a network drive too. For a
+    .lif: the XML of the .lifext next to it (one group of levels per image)."""
     try:
-        names = os.listdir(os.path.join(os.path.dirname(path), "Pyramid", "Metadata"))
-    except OSError:
+        if path.lower().endswith(".lif"):
+            groups = _lif_header(os.path.splitext(path)[0] + ".lifext")[0].findall("ChildrenOf")
+            k = sum(1 for g in groups if any("_pmd_" in (e.get("Name") or "") for e in g.findall("Element")))
+        else:
+            names = os.listdir(os.path.join(os.path.dirname(path), "Pyramid", "Metadata"))
+            k = sum(1 for f in names if f.lower().endswith("_pmd_0.xlif"))
+    except (OSError, ValueError, ET.ParseError):
         return "No"
-    k = sum(1 for f in names if f.lower().endswith("_pmd_0.xlif"))
     return "No" if k == 0 else "Yes" if k >= n_images else f"{k} of {n_images}"
 
 
@@ -857,7 +880,8 @@ class Annotation:
 
 
 ANNOTATIONS_BLOCK = re.compile(r'([ \t]*)(<Attachment\b[^>]*\bName="Annotations"[^>]*?)(/>|>.*?</Attachment>)', re.S)
-BACKUP_SUFFIX = ".before_xlef_viewer.bak"
+BACKUP_SUFFIX = ".bak"
+OLD_BACKUP_SUFFIXES = (".before_xlef_viewer.bak",)       # (what earlier versions called it: such a backup is the original too)
 VIEWER_ATTACHMENT = "JhouXlefViewer"     # this viewer's own <Attachment> in an image's .xlif: what LAS X has no place for (see write_flip)
 
 
@@ -914,8 +938,10 @@ def _read_text(path):
 def _write_text(path, new_text, bom):
     """Write a LAS X file the careful way: a copy of it as it was before the viewer first changed it is kept next to it (BACKUP_SUFFIX),
     and the new text goes to a temporary file first, which then replaces the old one. Returns the backup's path."""
+    if path.lower().endswith((".lif", ".lifext", ".lof")):
+        raise ValueError(f"{os.path.basename(path)} is read only here")       # (never written into: see ImageEntry.read_only)
     path = _real_case(path)          # (so that the file keeps its name exactly as it is: LAS X's references are lower case)
-    backup = path + BACKUP_SUFFIX
+    backup =next((path + s for s in OLD_BACKUP_SUFFIXES if os.path.exists(path + s)), path + BACKUP_SUFFIX)
     if not os.path.exists(backup):
         shutil.copy2(path, backup)
     tmp = path + ".xlef_viewer_tmp"
@@ -1389,8 +1415,170 @@ def image_properties(entry, experiment_path):
     return {"header": header, "sections": sections, "stamps": stamps}
 
 
+_LIF_BLOCKS = {}      # normcase(.lif / .lifext path) -> {block id: [where its data starts, its size, checked against its header]}
+
+
+def _lif_header(path):
+    """A .lif's (or .lifext's) XML, parsed, and where the header of its first data block is. Reads only the start of the file."""
+    with open(path, "rb") as fh:
+        head = fh.read(13)
+        if len(head) < 13 or int.from_bytes(head[:4], "little") != 0x70 or head[8:9] != b"*":
+            raise ValueError(f"{os.path.basename(path)} is not a LAS X .lif file")
+        n = int.from_bytes(head[9:13], "little")
+        xml = fh.read(n * 2)
+    return ET.fromstring(xml.decode("utf-16-le")), 13 + n * 2
+
+
+def _predict_blocks(path, tops, first):
+    """Where each data block of a .lif / .lifext is, from its XML alone: LAS X writes one block per element of its tree (tops and
+    their <Children>, in that order; folders too, with no data), each after a header naming it (0x70, its length, its size, its id).
+    Checked when a block is first read (see lif_block_start)."""
+    blocks, pos = {}, first
+
+    def walk(el):
+        nonlocal pos
+        m = el.find("Memory")
+        if m is not None and m.get("MemoryBlockID"):
+            block, size = m.get("MemoryBlockID"), int(m.get("Size") or 0)
+            start = pos + 22 + 2 * len(block)
+            blocks[block] = [start, size, False]
+            pos = start + size
+        kids = el.find("Children")
+        for k in (kids if kids is not None else []):
+            if k.tag == "Element":
+                walk(k)
+
+    for t in tops:
+        walk(t)
+    _LIF_BLOCKS[os.path.normcase(path)] = blocks
+
+
+def _scan_blocks(path):
+    """A .lif's / .lifext's data blocks found by walking their headers, one after another (one small read each: on a network drive
+    a round trip each, so only when the XML's order didn't hold, see lif_block_start)."""
+    blocks = {}
+    size = os.path.getsize(path)
+    with open(path, "rb", buffering=0) as fh:
+        fh.seek(9)
+        pos = 13 + 2 * int.from_bytes(fh.read(4), "little")
+        while pos + 22 <= size:
+            fh.seek(pos)
+            head = fh.read(22)
+            if int.from_bytes(head[:4], "little") != 0x70:
+                break
+            n = int.from_bytes(head[18:22], "little")
+            block = fh.read(2 * n).decode("utf-16-le", "replace")
+            start, length = pos + 22 + 2 * n, int.from_bytes(head[9:17], "little")
+            blocks[block] = [start, length, True]
+            pos = start + length
+    return blocks
+
+
+def lif_block_start(path, block):
+    """Where data block `block` starts in a .lif / .lifext: as worked out from its XML when it was opened (see _predict_blocks),
+    checked against the block's header the first time (one small read); if that doesn't match, from walking the file's headers."""
+    key = os.path.normcase(path)
+    blocks = _LIF_BLOCKS.get(key)
+    b = blocks.get(block) if blocks else None
+    if b is not None and not b[2]:
+        n = 22 + 2 * len(block)
+        with open(path, "rb") as fh:
+            fh.seek(max(0, b[0] - n))
+            head = fh.read(n)
+        if (len(head) == n and int.from_bytes(head[:4], "little") == 0x70 and int.from_bytes(head[9:17], "little") == b[1]
+                and head[22:].decode("utf-16-le", "replace") == block):
+            b[2] = True
+        else:
+            b = None
+    if b is None:
+        _LIF_BLOCKS[key] = blocks = _scan_blocks(path)
+        b = blocks.get(block)
+        if b is None:
+            raise ValueError(f"{os.path.basename(path)} has no data block {block}")
+    return b[0]
+
+
+def _lifext_levels(path):
+    """LAS X's pyramid of the images of a .lif, from the .lifext next to it: {image's block id: key of its first level (_pmd_0)}.
+    Each level is an ImageEntry whose pixels are a block of the .lifext, put where pyramid_level finds it (_PYRAMID_LEVELS), each
+    naming the next (its .pyramid). {} if there is no .lifext, or it can't be read. Reads only the start of the .lifext (its XML)."""
+    try:
+        root, first = _lif_header(path)
+    except (OSError, ValueError, ET.ParseError):
+        return {}
+    groups = root.findall("ChildrenOf")              # (one per image: MemoryBlockID is the image's block in the .lif)
+    _predict_blocks(path, [e for g in groups for e in g.findall("Element")], first)
+
+    def level_in(elements):
+        return next((e for e in elements if e.tag == "Element" and "_pmd_" in (e.get("Name") or "")), None)
+
+    out, base = {}, os.path.dirname(path)
+    for g in groups:
+        el, prev = level_in(g), None
+        while el is not None:
+            image, mem = el.find("Data/Image"), el.find("Memory")
+            if image is None or mem is None or not mem.get("MemoryBlockID"):
+                break
+            block = mem.get("MemoryBlockID")
+            key = f"{path}|{block}"
+            level = _image_entry(el.get("Name") or "", path, el, image, base, lif=(path, block, int(mem.get("Size") or 0)))
+            _PYRAMID_LEVELS[os.path.normcase(key)] = level
+            if prev is None:
+                out[g.get("MemoryBlockID")] = key
+            else:
+                prev.pyramid = key
+            prev = level
+            kids = el.find("Children")
+            el = level_in(kids if kids is not None else [])
+    return out
+
+
+def load_lif(path):
+    """A .lif (LAS X's single-file format: every image of the experiment in one file) as a FolderEntry, as load_experiment gives an
+    .xlef: its folders and images from the XML at the start of the file, each image's pixels a data block of the file (see
+    _raw_planes, lif_block_start), and LAS X's pyramid from the .lifext next to it, if there is one (see _lifext_levels). Read only:
+    nothing is ever written into it (see ImageEntry.read_only)."""
+    root, first = _lif_header(path)
+    tops = root.findall("Element")
+    _predict_blocks(path, tops, first)
+    levels = _lifext_levels(os.path.splitext(path)[0] + ".lifext")
+    base = os.path.dirname(path)
+
+    def add(el, folder):
+        image, mem = el.find("Data/Image"), el.find("Memory")
+        if image is not None and mem is not None and mem.get("MemoryBlockID"):
+            block = mem.get("MemoryBlockID")
+            entry = _image_entry(el.get("Name") or "", path, el, image, base, lif=(path, block, int(mem.get("Size") or 0)))
+            entry.pyramid = levels.get(block)
+            entry.ref_uuid = el.get("UniqueID") or ""
+            folder.children.append(entry)
+            return
+        sub = FolderEntry(el.get("Name") or "")
+        sub.read_only = True
+        add_children(el, sub)
+        if sub.children:
+            folder.children.append(sub)
+
+    def add_children(el, folder):
+        kids = el.find("Children")
+        for k in (kids if kids is not None else []):
+            if k.tag == "Element":
+                add(k, folder)
+
+    project = FolderEntry(os.path.splitext(os.path.basename(path))[0])
+    project.read_only = True
+    for t in tops:              # (the experiment itself; its children are what the project lists)
+        if t.find("Data/Image") is not None:
+            add(t, project)
+        else:
+            add_children(t, project)
+    return project
+
+
 def load_experiment(path):
-    """The .xlef as a FolderEntry (its images and sub-folders)."""
+    """The .xlef (or .lif, see load_lif) as a FolderEntry (its images and sub-folders)."""
+    if path.lower().endswith(".lif"):
+        return load_lif(path)
     entry = load_entry(path)
     if isinstance(entry, FolderEntry):
         entry.name = entry.saved_name = os.path.splitext(os.path.basename(path))[0]     # (the project: not renamed in the viewer)
@@ -1653,31 +1841,36 @@ def lof_data_start(path):
     return _LOF_STARTS[key]
 
 
+def raw_start(path, page):
+    """Where a RawPlane's pixels start in its file."""
+    return (lof_data_start(path) if page.block is None else lif_block_start(path, page.block)) + page.at
+
+
 def plain_layout(path, page=None):
     """(offset, dtype, (rows, columns)) of a plane whose rows can be read straight from its file: a plain TIFF (see plain_tiff), or a
-    channel in a .lof (page: a LofPlane); else None (also an OME-TIFF's page)."""
+    channel in a .lof or .lif (page: a RawPlane); else None (also an OME-TIFF's page)."""
     if path is None:
         return None
-    if isinstance(page, LofPlane):
+    if isinstance(page, RawPlane):
         try:
-            return lof_data_start(path) + page.at, page.dtype, page.shape
+            return raw_start(path, page), page.dtype, page.shape
         except (OSError, ValueError):
             return None
     return plain_tiff(path) if page is None else None
 
 
 def memmap_plane(path, page=None):
-    """A plane through a memory map: a TIFF's image (or an OME-TIFF's page), or a channel in a .lof."""
-    if isinstance(page, LofPlane):
-        return np.memmap(path, page.dtype, "r", lof_data_start(path) + page.at, page.shape)
+    """A plane through a memory map: a TIFF's image (or an OME-TIFF's page), or a channel in a .lof or .lif."""
+    if isinstance(page, RawPlane):
+        return np.memmap(path, page.dtype, "r", raw_start(path, page), page.shape)
     return tifffile.memmap(path, mode="r", page=page)
 
 
 def read_whole(path, page=None):
     """A plane read in full (when it can't be memory-mapped, e.g. a compressed TIFF)."""
-    if isinstance(page, LofPlane):
+    if isinstance(page, RawPlane):
         with open(path, "rb") as fh:
-            fh.seek(lof_data_start(path) + page.at)
+            fh.seek(raw_start(path, page))
             n = page.shape[0] * page.shape[1]
             return np.frombuffer(fh.read(n * page.dtype.itemsize), page.dtype, n).reshape(page.shape)
     return tifffile.imread(path) if page is None else tifffile.imread(path, key=page)
@@ -2117,6 +2310,8 @@ def _thumb_cache_path(entry, size):
     for f in entry.all_files():
         st = os.stat(f)
         h.update(f"{os.path.normcase(f)}|{st.st_size}|{st.st_mtime_ns}".encode())
+    if entry.lif_block:              # (the images of a .lif share its one file)
+        h.update(f"|{entry.lif_block}".encode())
     return os.path.join(THUMB_CACHE, h.hexdigest() + ".png")
 
 
@@ -3278,7 +3473,7 @@ class XlefViewer:
             return {"images": str(n), "pyramid": pyramid_note(path, n), "when": when}
         result = ask_open_file(
             self.root, self.settings["recent_files"], title="Open a Leica experiment", noun="experiment",
-            filetypes=[("Leica experiment", "*.xlef *.xlif"), ("All files", "*.*")],
+            filetypes=[("Leica experiment", "*.xlef *.xlif *.lif"), ("All files", "*.*")],
             columns=[("name", "Experiment", 280, "w", True), ("images", "Images", 70, "e", False), ("pyramid", "Pyramid", 80, "w", False),
                      ("folder", "Folder", 420, "w", True), ("when", "Modified", 130, "w", False)],
             details=details, on_remove=self.remove_recent, drop=self.dnd_files is not None)
@@ -3335,9 +3530,9 @@ class XlefViewer:
             messagebox.showerror("XLEF viewer", f"Can't read {path}:\n{error}", parent=self.root)
             return
         self.add_recent(path)
-        self.tree.item(pid, text=self.projects[pid]["name"])
+        self.tree.item(pid, text=self.projects[pid]["name"] + ("   (.lif: read only)" if experiment.read_only else ""))
         self.projects[pid]["root"] = experiment
-        experiment.path = path
+        experiment.path = None if experiment.read_only else path      # (no file of its own: nothing is dragged into or out of it)
         self._fill_tree(pid, experiment)
         self._measure_sizes(pid)
         mine = self._entries_of(pid)
@@ -3361,6 +3556,8 @@ class XlefViewer:
 
         def work():
             for e in entries:
+                if e.lif_block:          # (a .lif's images share its one file: their sizes came from its metadata)
+                    continue
                 total = 0
                 for f in e.all_files():
                     try:
@@ -5709,8 +5906,8 @@ class XlefViewer:
                         f"none: into a \"Deleted by XLEF viewer\" folder in the experiment's folder)." if n_del else ""))
             if not messagebox.askokcancel(
                     "Save changes into LAS X's files",
-                    f"This writes {' and '.join(what)} into LAS X's files. A copy of each file as it is now is kept next to it "
-                    f"(ending in {BACKUP_SUFFIX}).{extra}\n\nClose this experiment in LAS X first: LAS X may otherwise overwrite "
+                    f"This writes {' and '.join(what)} into LAS X's files. An adjacent backup file will be kept "
+                    f"(ending in {BACKUP_SUFFIX}).{extra}\n\nMake sure this experiment is not also open in LAS X, which may otherwise overwrite "
                     f"these changes with its own copy.", parent=self.root):
                 return
             self.save_warned = True
@@ -6105,6 +6302,9 @@ class XlefViewer:
         keeps the old one."""
         self.rename_job = None
         obj = self.entries.get(item) or self.folders.get(item)
+        if obj is not None and obj.read_only:
+            self.status.config(text=f"{obj.name} is in a .lif file, which this viewer only reads: it can't be renamed here")
+            return
         box = self.tree.bbox(item)
         if obj is None or not box:
             return
@@ -6198,6 +6398,9 @@ class XlefViewer:
         entry = self.entries.get(item)
         parent = self.tree.parent(item)
         container = self._container(parent)
+        if entry is not None and entry.read_only:
+            messagebox.showinfo("Can't delete", "This image is in a .lif file, which this viewer only reads.", parent=self.root)
+            return
         if entry is None or container is None or container.path is None:
             messagebox.showerror("Can't delete", "The file that lists this image is unreadable, so it can't be deleted here.",
                                  parent=self.root)

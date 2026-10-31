@@ -342,6 +342,7 @@ class ImageEntry:
         self.stage_um = None     # (x, y) of the image's CENTRE on the microscope stage, um (its <Tile PosX/PosY>), to place it on the slide
         self.saved_name = name   # its name in the file (self.name may be a rename not saved yet)
         self.parent_file = None  # the .xlef/.xlcf whose <Children> refer to this image's .xlif (None: unknown)
+        self.flipped = self.saved_flipped = False    # "Flip this section": as changed in the viewer / as in the file (see write_flip)
 
     @property
     def path(self):
@@ -356,8 +357,13 @@ class ImageEntry:
         return any((c.black, c.white) != (c.saved_black, c.saved_white) for c in self.channels)
 
     @property
+    def flip_changed(self):
+        return self.flipped != self.saved_flipped
+
+    @property
     def unsaved(self):
-        return self.annotations_changed or self.name != self.saved_name or self.luts_changed or self.contrast_changed
+        return (self.annotations_changed or self.name != self.saved_name or self.luts_changed or self.contrast_changed
+                or self.flip_changed)
 
     def all_files(self):
         return sorted(set(self.files.values()))
@@ -567,6 +573,8 @@ def _image_entry(name, path, element, image, base_dir):
             entry.pyramid = _resolve(ref.get("File"), base_dir)
             break
     entry.annotations = [a for a in (Annotation.from_element(an) for an in element.iter("Annotation")) if a is not None]
+    mine = next((at for at in element.iter("Attachment") if at.get("Name") == VIEWER_ATTACHMENT), None)
+    entry.flipped = entry.saved_flipped = mine is not None and mine.get("FlipX") == "1"
     tile = next(element.iter("Tile"), None)
     try:
         if tile is not None:
@@ -768,6 +776,7 @@ class Annotation:
 
 ANNOTATIONS_BLOCK = re.compile(r'([ \t]*)(<Attachment\b[^>]*\bName="Annotations"[^>]*?)(/>|>.*?</Attachment>)', re.S)
 BACKUP_SUFFIX = ".before_xlef_viewer.bak"
+VIEWER_ATTACHMENT = "JhouXlefViewer"     # this viewer's own <Attachment> in an image's .xlif: what LAS X has no place for (see write_flip)
 
 
 def write_annotations(xlif_path, annotations):
@@ -839,6 +848,11 @@ PREVIEW_MEMORY_NOTE = ("For the pictures of the images viewed recently, and of t
                        "open at once. Memory is only taken as images are loaded.")
 RENAME_NOTE = ("Off: a rename changes only the name LAS X shows (in its .xlif / .xlcf).\n"
                "On: the image's .xlif and channel TIFFs, or the folder, get the new name too.")
+FLIP_NOTE = ("On: Save writes it into the section's .xlif, in a field of this viewer's own (JhouXlefViewer), so it goes\n"
+             "with the files to other computers. LAS X keeps such a field when it saves the file again (tried with\n"
+             "LAS X 6.2), but this isn't guaranteed: a future version of LAS X could drop it, or object to it.\n"
+             "Off: it is kept on this computer only (for each section's .xlif path), and LAS X's files are left as they are.\n"
+             "Either way, a flip already saved in a section's .xlif is shown.")
 BAD_NAME_CHARS = '\\/:*?"<>|'
 
 
@@ -897,6 +911,32 @@ def write_contrast(path, ranges, tops):
             for e, top in zip(ET.fromstring(new_text.encode("utf-8")).iter("ChannelScalingInfo"), tops)]
     if back != [tuple(r) for r in ranges]:
         raise ValueError("the contrast did not read back as written")
+    return _write_text(path, new_text, bom)
+
+
+def write_flip(path, flipped):
+    """Write "Flip this section" into an image's .xlif, in this viewer's own attachment (LAS X has no flip of its own; it keeps an
+    attachment it doesn't know when it saves the file again):  <Attachment Name="JhouXlefViewer" Application="JhouXlefViewer"
+    Version="1.0" FlipX="1" />  (FlipX="0" when unflipped). Added before </Image> if the file has none. Checked to read back; backed up
+    (see _write_text)."""
+    text, bom = _read_text(path)
+    value = "1" if flipped else "0"
+    m = re.search(rf'<Attachment\b[^>]*\bName="{VIEWER_ATTACHMENT}"[^>]*>', text)
+    if m:
+        tag, n = re.subn(r'\bFlipX="[^"]*"', f'FlipX="{value}"', m.group(0))
+        if n == 0:
+            tag = tag[:-1].rstrip("/").rstrip() + f' FlipX="{value}"' + (" />" if tag.endswith("/>") else ">")
+        new_text = text[:m.start()] + tag + text[m.end():]
+    else:
+        close = re.search(r"([ \t]*)</Image>", text)
+        if close is None:
+            raise ValueError("no <Image> element in the file")
+        nl = "\r\n" if "\r\n" in text else "\n"
+        new_text = (text[:close.start()] + close.group(1) + "  " + f'<Attachment Name="{VIEWER_ATTACHMENT}" Application='
+                    f'"{VIEWER_ATTACHMENT}" Version="1.0" FlipX="{value}" />' + nl + text[close.start():])
+    back = [at.get("FlipX") for at in ET.fromstring(new_text.encode("utf-8")).iter("Attachment") if at.get("Name") == VIEWER_ATTACHMENT]
+    if back != [value]:
+        raise ValueError("the flip did not read back as written")
     return _write_text(path, new_text, bom)
 
 
@@ -2411,8 +2451,9 @@ class XlefViewer:
                                               state=tk.DISABLED)
         self.flip_one_check.pack(anchor=tk.W, pady=(0, 4))
         Tooltip(self.flip_one_check, "Show this section mirrored, left for right, e.g. one mounted the other way up from the rest "
-                                     "(remembered for it). With \"Flip all sections\" ticked too, it is shown unflipped. Only the "
-                                     "view is flipped, not the files.")
+                                     "(Save writes it into the section's .xlif, so it goes with the files; or, see Settings, it is kept on this "
+                                     "computer). With \"Flip all "
+                                     "sections\" ticked too, it is shown unflipped. Only the view is flipped, not the image.")
         self.ch_frame = ttk.LabelFrame(side, text="Channels")
         self.ch_frame.pack(fill=tk.BOTH, expand=True)
         btns = ttk.Frame(side)
@@ -2464,6 +2505,7 @@ class XlefViewer:
         c.bind("<Button-4>", lambda e: self.on_wheel(e, 120))
         c.bind("<Button-5>", lambda e: self.on_wheel(e, -120))
         c.bind("<Motion>", self.on_motion)
+        c.bind("<Leave>", lambda e: self._hover_handles(None, None))
         c.bind("<Double-Button-1>", self.ann_double)
         for b in (2, 3):          # the middle and right buttons always move the view, whatever the tool
             c.bind(f"<ButtonPress-{b}>", self.pan_start)
@@ -2588,8 +2630,8 @@ class XlefViewer:
     # --- settings window, color theme
 
     def open_settings(self):
-        """The Settings window: the color theme (applied at once), zoomed-in pixels, whether renaming also renames files on disk, and
-        the memory for previews. Remembered."""
+        """The Settings window: the color theme (applied at once), zoomed-in pixels, whether renaming also renames files on disk,
+        whether "Flip this section" is saved into LAS X's files, and the memory for previews. Remembered."""
         if getattr(self, "settings_window", None) is not None and self.settings_window.winfo_exists():
             self.settings_window.lift()
             return
@@ -2624,6 +2666,12 @@ class XlefViewer:
             self._save_settings()
         ttk.Checkbutton(box, text="Also rename the files and folders on disk", variable=on_disk, command=set_on_disk).pack(anchor=tk.W)
         ttk.Label(box, text=RENAME_NOTE, style="Muted.TLabel", justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
+        box = ttk.LabelFrame(body, text="Flip this section", padding=(10, 6))
+        box.pack(fill=tk.X, pady=(10, 0))
+        in_files = tk.BooleanVar(dlg, self._flip_in_files())
+        ttk.Checkbutton(box, text="Save it in a custom field of LAS X's files", variable=in_files,
+                        command=lambda: self.set_flip_in_files(in_files.get())).pack(anchor=tk.W)
+        ttk.Label(box, text=FLIP_NOTE, style="Muted.TLabel", justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
         box = ttk.LabelFrame(body, text="Memory for previews", padding=(10, 6))
         box.pack(fill=tk.X, pady=(10, 0))
         row = ttk.Frame(box)
@@ -3051,7 +3099,7 @@ class XlefViewer:
         if getattr(obj, "annotations_changed", False):
             what.append("annotations")
         if isinstance(obj, ImageEntry):
-            what += ["color maps"] * obj.luts_changed + ["contrast"] * obj.contrast_changed
+            what += ["color maps"] * obj.luts_changed + ["contrast"] * obj.contrast_changed + ["flip"] * obj.flip_changed
         if getattr(obj, "order_changed", False):
             what.append("the order of what it holds")
         return what
@@ -3356,7 +3404,7 @@ class XlefViewer:
         self.flip_one_check.configure(state=tk.DISABLED)        # (no section shown)
         self.last_view_rgb = None
         self.shrunk.clear()
-        self.selected = self.ann_drag = None
+        self.selected = self.ann_drag = self.hover_ann = None
         self._each_canvas(lambda: self.canvas.delete("all"))
         self.cursor_label.config(text="")
         self._show_cursor_values([])
@@ -3743,19 +3791,71 @@ class XlefViewer:
     def _flip_key(entry):
         return os.path.normcase(os.path.normpath(entry.xlif_path))
 
+    def _flip_in_files(self):
+        """Settings: "Flip this section" is saved into the section's .xlif (see write_flip), not kept on this computer."""
+        return self.settings.get("flip_in_files", True)
+
+    def _flip_note(self, entry):
+        """This computer's note of the section's flip, by its .xlif's path (in the settings: "flipped_sections", "unflipped_sections"):
+        True, False, or None (none). Kept while "Flip this section" isn't saved into the files, or by an earlier version."""
+        key = self._flip_key(entry)
+        return (True if key in self.settings.get("flipped_sections", []) else
+                False if key in self.settings.get("unflipped_sections", []) else None)
+
+    def _set_flip_note(self, entry, flipped):
+        """Note the section's flip on this computer (None: forget the note)."""
+        key = self._flip_key(entry)
+        for name in ("flipped_sections", "unflipped_sections"):
+            if key in self.settings.get(name, []):
+                self.settings[name] = [k for k in self.settings[name] if k != key]
+        if flipped is not None:
+            self.settings.setdefault("flipped_sections" if flipped else "unflipped_sections", []).append(key)
+
     def _section_flipped(self, entry):
-        return self._flip_key(entry) in self.settings.get("flipped_sections", [])
+        """Whether the section is shown flipped. Saved into the files (the setting): as in its .xlif, or as changed here and not saved
+        yet; a note on this computer (from an earlier version, or from when the setting was off) counts as such a change, until Save
+        writes it into the file. Else: this computer's note, or, without one, the .xlif's."""
+        note = self._flip_note(entry)
+        if not self._flip_in_files():
+            return entry.flipped if note is None else note
+        if note is not None and note == entry.saved_flipped:
+            self._set_flip_note(entry, None)        # (the file says so already)
+        elif note is not None and note != entry.flipped:
+            entry.flipped = note
+            self._label_item(self._item_of(entry))
+            self._update_annotations_check()
+        return entry.flipped
 
     def on_flip_one_toggle(self):
-        """"Flip this section": remembered (in the settings, by the section's .xlif) until unticked."""
+        """"Flip this section": written into its .xlif by Save (until then, marked unsaved), or, with that setting off, noted on this
+        computer at once."""
         if not self.img:
             return
-        key = self._flip_key(self.img.entry)
-        flipped = [k for k in self.settings.get("flipped_sections", []) if k != key]
-        if self.flip_one.get():
-            flipped.append(key)
-        self.settings["flipped_sections"] = flipped
+        e = self.img.entry
+        if self._flip_in_files():
+            e.flipped = self.flip_one.get()
+            self._set_flip_note(e, None)
+            self._label_item(self._item_of(e))
+            self._update_annotations_check()
+        else:
+            self._set_flip_note(e, None if self.flip_one.get() == e.flipped else self.flip_one.get())
         self.redraw()
+
+    def set_flip_in_files(self, on):
+        """The setting: "Flip this section" saved into the files, or kept on this computer. Turned off, flips not saved yet are noted
+        on this computer instead (and are no longer unsaved); turned on, the notes become unsaved changes (see _section_flipped)."""
+        self.settings["flip_in_files"] = on
+        if not on:
+            for item, e in self.entries.items():
+                if e.flip_changed:
+                    self._set_flip_note(e, e.flipped)
+                    e.flipped = e.saved_flipped
+                    self._label_item(item)
+        self._save_settings()
+        if self.img:
+            self.flip_one.set(self._section_flipped(self.img.entry))
+            self.redraw()
+        self._update_annotations_check()
 
     def _flipped(self):
         """The view is mirrored: "Flip all sections" or "Flip this section", not both (both flip it back)."""
@@ -3808,6 +3908,22 @@ class XlefViewer:
         else:
             self.pan_end(event)
 
+    def _hover_handles(self, sx, sy):
+        """The mouse at (sx, sy), or off the image (None): the hand pointer over a handle, the move pointer over an outline, and the
+        handles of the shape or line under the mouse shown (hollow) when it isn't the selected one."""
+        on = sx is not None and self.img is not None and bool(self.img.entry.pixel_um) and self.show_annotations.get()
+        grab = self._handle_at(sx, sy) if on else None
+        hover = grab[1] if grab else self._hover_target(sx, sy) if on else None
+        if hover is self.selected:
+            hover = None
+        over = None if grab is None else "move" if grab[0] == "move" else "handle"
+        if over != getattr(self, "over_handle", None):
+            self.over_handle = over
+            self._update_cursor()
+        if hover is not getattr(self, "hover_ann", None):
+            self.hover_ann = hover
+            self._draw_annotations()
+
     def pan_start(self, event):
         self.drag = (event.x, event.y, self.cx, self.cy)
 
@@ -3829,6 +3945,7 @@ class XlefViewer:
     def on_motion(self, event):
         if not self.img:
             return
+        self._hover_handles(event.x, event.y)
         e = self.img.entry
         ix, iy = self.screen_to_image(event.x, event.y)
         if not (0 <= ix < e.width and 0 <= iy < e.height):
@@ -4210,6 +4327,95 @@ class XlefViewer:
                     c.create_oval(x - 5, y - 5, x + 5, y + 5, fill="white", outline="black", tags="ann")
                 else:
                     c.create_rectangle(x - 4, y - 4, x + 4, y + 4, fill="white", outline="black", tags="ann")
+        h = getattr(self, "hover_ann", None)
+        if h is not None and h is not a and h.visible and h in self.img.entry.annotations:
+            b = Annotation(h.attrs, h.verts)
+            self._normalize_rotation(b)              # (where its handles will be once it is grabbed: see _handle_at)
+            for name, (x, y) in self._handles(b):
+                if name != "rotate":                 # (hollow: not selected yet)
+                    c.create_rectangle(x - 4, y - 4, x + 4, y + 4, fill="", outline="white", width=2, tags="ann")
+
+    def _handle_at(self, sx, sy):
+        """What a press at canvas point (sx, sy) grabs, whatever the tool, as (name, annotation), or None: a handle within 7 px (the
+        selected annotation's, rotate included, else a corner or line end of another visible one, the one drawn last, as its handles
+        would be once it is selected); else ("move", annotation) for an outline within 6 px (a text: its box), the selected one's first."""
+        grab = self._handle_point_at(sx, sy)
+        if grab is not None or not self.img or not self.show_annotations.get():
+            return grab
+        anns = self.img.entry.annotations
+        for a in ([self.selected] if self.selected in anns else []) + anns[::-1]:
+            if a.visible and self._on_outline(a, sx, sy):
+                return "move", a
+        return None
+
+    def _on_outline(self, a, sx, sy):
+        """Whether canvas point (sx, sy) is within 6 px of annotation a's outline (a rectangle's edges, an ellipse's circumference, a
+        line), or on a text's box."""
+        if a.kind == "text":
+            box = self.canvas.bbox(f"a{self.img.entry.annotations.index(a)}")
+            return bool(box) and box[0] - 3 <= sx <= box[2] + 3 and box[1] - 3 <= sy <= box[3] + 3
+        tol = 6 / self.scale * self.img.entry.pixel_um * 1e-6          # (6 screen px, in metres)
+        p = self.screen_to_m(sx, sy)
+        if a.kind in ("rectangle", "ellipse"):
+            ha, hb = a.half_size()
+            x, y = a.to_local(*p)
+            if a.kind == "rectangle":
+                ox, oy = abs(x) - ha, abs(y) - hb
+                d = np.hypot(max(ox, 0), max(oy, 0)) if ox > 0 or oy > 0 else -max(ox, oy)
+            else:                                    # (|g| / |grad g| for g = x²/a² + y²/b² - 1: close to the true distance near it)
+                g = (x / (ha or 1e-12)) ** 2 + (y / (hb or 1e-12)) ** 2 - 1
+                d = abs(g) / (2 * np.hypot(x / (ha or 1e-12) ** 2, y / (hb or 1e-12) ** 2) or 1e-30)
+            return d <= tol
+        pts = a.points()
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+            dx, dy = x1 - x0, y1 - y0
+            t = min(max(((p[0] - x0) * dx + (p[1] - y0) * dy) / (dx * dx + dy * dy or 1), 0), 1)
+            if np.hypot(p[0] - x0 - t * dx, p[1] - y0 - t * dy) <= tol:
+                return True
+        return False
+
+    def _handle_point_at(self, sx, sy):
+        """The handle within 7 px of canvas point (sx, sy), as (name, annotation), or None (see _handle_at)."""
+        if not self.img or not self.show_annotations.get():
+            return None
+        anns = self.img.entry.annotations
+        a = self.selected
+        if a is not None and a in anns:
+            for name, (x, y) in self._handles(a):
+                if np.hypot(sx - x, sy - y) <= 7:
+                    return name, a
+        for a in reversed(anns):
+            if a is self.selected or not a.visible:
+                continue
+            b = Annotation(a.attrs, a.verts)
+            self._normalize_rotation(b)              # (a copy: selecting it normalizes it, which renames its corners)
+            for name, (x, y) in self._handles(b):
+                if name != "rotate" and np.hypot(sx - x, sy - y) <= 7:
+                    return name, a
+        return None
+
+    def _hover_target(self, sx, sy):
+        """The unselected shape or line whose handles are shown while the mouse is over it (so that they can be found and grabbed, with
+        any tool), or None: a shape whose box (an ellipse's too, as its corners are its handles) is within 10 px of (sx, sy), the
+        smallest of several; else a line within 10 px."""
+        tol = 10 / self.scale * self.img.entry.pixel_um * 1e-6
+        p = self.screen_to_m(sx, sy)
+        best = None
+        for k, a in enumerate(self.img.entry.annotations):
+            if a is self.selected or not a.visible or not self._handles(a):
+                continue
+            if a.kind in ("rectangle", "ellipse"):
+                ha, hb = a.half_size()
+                x, y = a.to_local(*p)
+                if abs(x) <= ha + tol and abs(y) <= hb + tol:
+                    best = min(best or (np.inf, 0), (ha * hb, -k))
+                continue
+            (x0, y0), (x1, y1) = a.points()
+            dx, dy = x1 - x0, y1 - y0
+            t = min(max(((p[0] - x0) * dx + (p[1] - y0) * dy) / (dx * dx + dy * dy or 1), 0), 1)
+            if np.hypot(p[0] - x0 - t * dx, p[1] - y0 - t * dy) <= tol:
+                best = min(best or (np.inf, 0), (0.0, -k))
+        return None if best is None else self.img.entry.annotations[-best[1]]
 
     def _hit(self, sx, sy):
         """The visible annotation at canvas point (sx, sy), or None: the smallest one containing it (shapes count by their inside),
@@ -4286,10 +4492,13 @@ class XlefViewer:
         return not_now(f"{e.name}: downloading its full resolution from OneDrive; the sharp view follows when it is in")
 
     def _update_cursor(self):
-        """The pointer over the image: an hourglass while an image loads or a sharper view of it is read, else the tool's."""
+        """The pointer over the image: an hourglass while an image loads or a sharper view of it is read, a hand over an annotation's
+        handle and the move arrows over its outline (they can be grabbed, whatever the tool), else the tool's."""
         busy = self.loading or getattr(self, "detail_pending", False)
         for c in self.canvases:
-            c.configure(cursor="watch" if busy else "fleur" if self.tool == "select" else "crosshair")
+            over = getattr(self, "over_handle", None)
+            c.configure(cursor="watch" if busy else "hand2" if over == "handle" else "fleur" if over == "move" or self.tool == "select"
+                        else "crosshair")
 
     def set_tool(self, tool):
         """Choose a tool. It stays chosen for one annotation after another (Select, or Escape, to go back to selecting)."""
@@ -4337,11 +4546,23 @@ class XlefViewer:
             a.set_half_size(ha, hb)
 
     def ann_press(self, event):
-        """A press on the image, when annotations are shown: starts drawing (with a drawing tool), or selects an annotation / grabs a
-        handle and starts moving it (Select). True if it was taken (else the press pans the view)."""
+        """A press on the image, when annotations are shown: grabs a handle or outline under the mouse and starts moving it (with any
+        tool: see _handle_at), else
+        starts drawing (with a drawing tool), or selects an annotation and starts moving it (Select). True if it was taken (else the
+        press pans the view)."""
         if not self.img or not self.img.entry.pixel_um or not self.show_annotations.get():
             return False
         p = self.screen_to_m(event.x, event.y)
+        grab = self._handle_at(event.x, event.y)
+        if grab is not None:                         # (whatever the tool: a handle is grabbed, not drawn from)
+            name, a = grab
+            if a is not self.selected:
+                self._normalize_rotation(a)
+                self.selected = a
+            self._remember()
+            self.ann_drag = (name, p, Annotation(a.attrs, a.verts), a)
+            self._draw_annotations()
+            return True
         if self.tool == "text":
             answer = ask_text(self.root, "New text", "", color=self.text_color)
             text, color = answer or ("", None)
@@ -4363,13 +4584,6 @@ class XlefViewer:
             self.selected = a
             self.ann_drag = ("draw", p, a)
             return True
-        a = self.selected
-        if a is not None and a in self.img.entry.annotations:
-            for name, (x, y) in self._handles(a):
-                if np.hypot(event.x - x, event.y - y) <= 7:
-                    self._remember()
-                    self.ann_drag = (name, p, Annotation(a.attrs, a.verts), a)
-                    return True
         hit = self._hit(event.x, event.y)
         if hit is not None and hit is not self.selected:
             self._normalize_rotation(hit)        # (same shape on screen; its handles then sit on its own corners and top)
@@ -4581,8 +4795,8 @@ class XlefViewer:
             self._changed()
 
     def save_annotations(self):
-        """The Save button: write every change not saved yet into LAS X's files (only ever when it is clicked): edited annotations (into
-        each image's .xlif) and renames (the Name in the .xlif / .xlcf; with "Also rename the files and folders on disk" in Settings,
+        """The Save button: write every change not saved yet into LAS X's files (only ever when it is clicked): edited annotations, color
+        maps, contrast and flips (into each image's .xlif) and renames (the Name in the .xlif / .xlcf; with "Also rename the files and folders on disk" in Settings,
         the files and folders too, see plan_disk_rename), the list's order (dragged, deleted: see _save_structure). Each changed file is
         backed up first (BACKUP_SUFFIX)."""
         items = [(i, o) for i, o in list(self.entries.items()) + list(self.folders.items())
@@ -4592,6 +4806,7 @@ class XlefViewer:
         notes = [(i, o) for i, o in items if o.annotations_changed]
         maps = [(i, o) for i, o in items if isinstance(o, ImageEntry) and o.luts_changed]
         ranges = [(i, o) for i, o in items if isinstance(o, ImageEntry) and o.contrast_changed]
+        flips = [(i, o) for i, o in items if isinstance(o, ImageEntry) and o.flip_changed]
         renames = [(i, o) for i, o in items if o.name != o.saved_name]
         on_disk = bool(renames) and self.settings.get("rename_files", False)
         away = [o for i, o in self.entries.items() if self.home.get(i) not in (None, self._project_of(i))]
@@ -4602,6 +4817,7 @@ class XlefViewer:
             what = ([f"the annotations of {len(notes)} image{'s' * (len(notes) != 1)}"] if notes else []) + \
                    ([f"the color maps of {len(maps)} image{'s' * (len(maps) != 1)}"] if maps else []) + \
                    ([f"the contrast of {len(ranges)} image{'s' * (len(ranges) != 1)}"] if ranges else []) + \
+                   ([f"the flip of {len(flips)} image{'s' * (len(flips) != 1)}"] if flips else []) + \
                    ([f"{len(renames)} rename{'s' * (len(renames) != 1)}" + (" (files and folders on disk too)" if on_disk else "")]
                     if renames else []) + (["the new order of the list"] if reordered else [])
             extra = ((f"\n\n{n_away} image{'s' * (n_away != 1)} dragged into another project move{'s' * (n_away == 1)} there, files "
@@ -4637,6 +4853,13 @@ class XlefViewer:
                     c.saved_black, c.saved_white = c.black, c.white
             except Exception as err:
                 failed.append(f"contrast of {e.name}: {err}")
+        for item, e in flips:
+            try:
+                write_flip(e.xlif_path, e.flipped)
+                e.saved_flipped = e.flipped
+                self._set_flip_note(e, None)
+            except Exception as err:
+                failed.append(f"flip of {e.name}: {err}")
         touched, binned, aside = set(), 0, 0
         if structure or (renames and on_disk):
             # (nothing may hold the files open while they are moved or renamed: the image on screen, kept images, background readers)

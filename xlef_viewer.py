@@ -3548,24 +3548,31 @@ class XlefViewer:
 
         def read(quick):
             if quick is not None or have_first:
-                files = (n if quick is not None and not have_first else 0) + n
-                report(0)
-                for c in range(n if quick is not None and not have_first else 0):
-                    if gen != self.generation:
-                        return
-                    self.results.put(("progress", gen, f"Reading {img.entry.name}: channel {c + 1} of {n} ..."))
-                    a = img._from_pyramid(c, quick)
-                    if a is None:
-                        break
-                    self.results.put(("quick", gen, (z, c, a, quick[1])))
-                    report((c + 1) / files)
+                # (the list's "% preview" is for the first picture only; the sharper level after it is read silently)
+                first = have_first
+                if not have_first:
+                    report(0)
+                    for c in range(n if quick is not None else 0):
+                        if gen != self.generation:
+                            return
+                        self.results.put(("progress", gen, f"Reading {img.entry.name}: channel {c + 1} of {n} ..."))
+                        a = img._from_pyramid(c, quick)
+                        if a is None:
+                            break
+                        self.results.put(("quick", gen, (z, c, a, quick[1])))
+                        report((c + 1) / n)
+                    else:
+                        first = quick is not None
+                if first:
+                    self.results.put(("open_progress", gen, None))
                 sharp = []
                 for c in range(n):
                     if gen != self.generation:
                         return
                     self.results.put(("progress", gen, f"Reading {img.entry.name}: sharper view, channel {c + 1} of {n} ..."))
                     sharp.append(img._from_pyramid(c))
-                    report((files - n + c + 1) / files)
+                    if not first:
+                        report((c + 1) / n)
                 if all(a is not None for a in sharp):
                     self.results.put(("sharp", gen, (z, sharp, img.pyramid[1])))
                 self.results.put(("loaded", gen, f"{mb:,.0f} MB on disk"))
@@ -4227,8 +4234,8 @@ class XlefViewer:
         self._each_canvas(self._draw_load_note_here)
 
     def _draw_load_note_here(self):
-        """The note in the middle of the canvas; separated, only on the panel of the channel being read (on the first panel if that
-        channel is switched off)."""
+        """The note in the middle of the canvas; separated, on the panel of the channel being read (on the first panel if that channel
+        is switched off), and "Pending..." on the panels of channels still to come (not empty: not read yet)."""
         c = self.canvas
         c.delete("loadnote")
         note = self._load_note()
@@ -4237,8 +4244,11 @@ class XlefViewer:
         if self.panel_channels != [None]:
             reading = next(k for k in range(len(self.img.entry.channels)) if (self.z, k) not in self.img.overviews)
             panel = self.panel_channels.index(reading) if reading in self.panel_channels else 0
-            if (self.drawing_panel or 0) != panel:
-                return
+            here = self.drawing_panel or 0
+            if here != panel:
+                if (self.z, self.panel_channels[here]) in self.img.overviews:
+                    return
+                note = "Pending..."
         cw, ch = self.canvas_size()
         t = c.create_text(cw / 2, ch / 2, text=note, fill="#e0e0e0", font=("Segoe UI", 16), tags="loadnote")
         x0, y0, x1, y1 = c.bbox(t)

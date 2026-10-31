@@ -697,6 +697,20 @@ def normalize_chosen_atlas_dir(folder):
     return folder / 'abc_atlas_cache'
 
 
+def usable_atlas_dir(folder):
+    """`folder` if it can hold the atlas download as it is (it holds one or is empty), else the one subfolder of it that
+    holds a download (the cache was moved into a subfolder), else None: it is a folder with other things in it, and the
+    download must not be dumped among them."""
+    folder = Path(folder)
+    try:
+        if looks_like_atlas_cache(folder) or not any(folder.iterdir()):
+            return folder
+        inside = [c for c in folder.iterdir() if c.is_dir() and looks_like_atlas_cache(c)]
+    except OSError:
+        return None
+    return inside[0] if len(inside) == 1 else None
+
+
 def prompt_atlas_cache_location(suggested, drives):
     """Small Tk dialog: an editable path pre-filled with `suggested`, a Browse
     button, and the free space on the chosen path's drive. Not tkinter's own
@@ -771,7 +785,7 @@ def prompt_atlas_cache_location(suggested, drives):
             from tkinter import messagebox
             messagebox.showerror("Drive not found", f"Can't find the drive for:\n{text}", parent=root)
             return
-        result['path'] = Path(text)
+        result['path'] = normalize_chosen_atlas_dir(text)       # (a typed folder is not dumped into either)
         root.destroy()
 
     def cancel(_event=None):
@@ -805,10 +819,17 @@ def choose_atlas_cache_location():
         saved = None
     if saved:
         if Path(saved).is_dir():
-            return Path(saved)
-        print(f"The saved ABC atlas location {saved} no longer exists.")
-    if DEFAULT_ATLAS_CACHE_DIR.is_dir():
-        return DEFAULT_ATLAS_CACHE_DIR
+            usable = usable_atlas_dir(saved)
+            if usable is not None:
+                if usable != Path(saved):
+                    print(f"The ABC atlas download was found inside the saved location, in {usable}.")
+                    ATLAS_CACHE_LOCATION_FILE.write_text(json.dumps({'path': str(usable)}, indent=2), encoding='utf-8')
+                return usable
+            print(f"The saved ABC atlas location {saved} holds other files and no atlas download, so it will not be used.")
+        else:
+            print(f"The saved ABC atlas location {saved} no longer exists.")
+    if DEFAULT_ATLAS_CACHE_DIR.is_dir() and usable_atlas_dir(DEFAULT_ATLAS_CACHE_DIR) is not None:
+        return usable_atlas_dir(DEFAULT_ATLAS_CACHE_DIR)
 
     drives = list_local_drives()
     print(f"No ABC atlas download found at {DEFAULT_ATLAS_CACHE_DIR}.")
@@ -826,7 +847,7 @@ def choose_atlas_cache_location():
             typed = input(f"ABC atlas location [{suggested}]: ").strip()
         except EOFError:
             typed = ''
-        chosen = Path(typed) if typed else suggested
+        chosen = normalize_chosen_atlas_dir(typed) if typed else suggested
     if chosen is None:
         print("No ABC atlas location chosen; exiting.")
         sys.exit(0)

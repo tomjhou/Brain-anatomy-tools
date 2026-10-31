@@ -34,6 +34,19 @@ from tkinter import ttk, filedialog, messagebox
 import numpy as np
 import tifffile
 from PIL import Image, ImageTk
+import logging
+
+
+class _LeicaZeroTagFilter(logging.Filter):
+    """LAS X writes each TIFF's directory with a last, all-zero entry (tag 0, data type 0). tifffile skips it and reads the image
+    correctly, but reports it as an error on the console every time such a file is opened: for every plane, every time the z slider
+    moves. Only that message is dropped; tifffile's other messages are kept."""
+
+    def filter(self, record):
+        return "invalid data type 0" not in record.getMessage()
+
+
+logging.getLogger("tifffile").addFilter(_LeicaZeroTagFilter())
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "FileConverters"))
 from open_file_dialog import ask_open_file
@@ -50,6 +63,7 @@ READ_BUDGET = 0.3            # s: a sharper picture expected to take longer than
 LEVEL_BUDGET = 1.0           # s: the same for the pyramid's whole sharper copy (read in the background, the preview shown meanwhile)
 RELAXED_ENLARGE = 2.5        # then the preview may be shown enlarged up to this much (preview pixels on screen) before reading
 PROBE_INTERVAL = 600         # s: a storage location's speed is measured again after this long (see StorageSpeed)
+Z_SETTLE_MS = 150            # ms the z slider must rest before the plane it is on is read
 HIRES_NOTE_DELAY = 0.5       # s of waiting for a sharper view before "Loading full resolution..." is shown over the image
 KEPT_IMAGES_PERCENT = 50      # share of the computer's memory (%) for the pictures of recently viewed and preloaded images, which
                               # make switching to one instant (a setting); 500 MB if the memory's size can't be read
@@ -1403,6 +1417,13 @@ def load_experiment(path):
 
 # ---------------------------------------------------------------------------------------------------------------------- pixels
 
+class StaleRead(Exception):
+    """A read that was asked for, and is no longer wanted (the user has moved on to another plane) by the time its turn comes."""
+
+
+_DECODE_LOCK = threading.Lock()     # a compressed plane is decoded in full (hundreds of MB, using every core): one at a time
+
+
 class OpenImage:
     """The selected image's TIFFs, memory-mapped (or read in full when a TIFF can't be mapped, e.g. compressed)."""
 
@@ -1459,8 +1480,10 @@ class OpenImage:
             self.planes[key] = a
         return self.planes[key]
 
-    def overview(self, z, c, progress=None):
-        """Channel c's overview for plane z (read once). progress(fraction), if given, is called as it is read from the image itself."""
+    def overview(self, z, c, progress=None, stale=None):
+        """Channel c's overview for plane z (read once). progress(fraction), if given, is called as it is read from the image itself.
+        stale(), if given, says whether the read is no longer wanted: asked when a compressed plane's turn to be decoded comes (see
+        StaleRead)."""
         key = (z, c)
         if key not in self.overviews:
             small = self._from_pyramid(c, z=z) if self.pyramid is not None else None
@@ -1468,7 +1491,7 @@ class OpenImage:
                 small = read_plain_rows(self.entry.files.get(key), self.ov_step, progress=progress,      # (several rows at once)
                                         page=self.entry.pages.get(key))
             if small is None:
-                p = self.plane(z, c)
+                p = self._plane_for_overview(z, c, stale)
                 if p is None:
                     return None
                 s = self.ov_step
@@ -1479,6 +1502,33 @@ class OpenImage:
                         progress(min(1.0, (i + 64) / small.shape[0]))
             self.overviews[key] = small
         return self.overviews[key]
+
+    def _plane_for_overview(self, z, c, stale):
+        """Plane (z, c) to take an overview from. A TIFF that can be memory-mapped is kept (the map costs nothing until it is read). A compressed
+        one is decoded in full, one plane at a time (_DECODE_LOCK), and NOT kept: it is about half a gigabyte, and a z stack scrolled through
+        would fill the memory with them (and, decoded all at once by the many reads that moving the slider starts, would make every one of
+        them crawl)."""
+        key = (z, c)
+        if key in self.planes:
+            return self.planes[key]
+        path = self.entry.files.get(key)
+        if path is None:
+            return None
+        page = self.entry.pages.get(key)
+        try:
+            a = memmap_plane(path, page)
+            keep = True
+        except (ValueError, OSError):
+            with _DECODE_LOCK:
+                if stale is not None and stale():
+                    raise StaleRead()
+                a = read_whole(path, page)
+            keep = False
+        while a.ndim > 2:        # a z stack in one file: pick the plane; extra sample axes: take the first
+            a = a[z if a.shape[0] == self.entry.nz else 0]
+        if keep:
+            self.planes[key] = a
+        return a
 
     def _from_pyramid(self, c, level_step=None, z=0):
         """Channel c of layer z from a pyramid level (default: the overview's; a file of a few MB), converted back to the image's own
@@ -4181,7 +4231,9 @@ class XlefViewer:
                     return
                 self.results.put(("progress", gen, f"Reading {img.entry.name}: channel {c + 1} of {n} ..."))
                 try:
-                    img.overview(z, c, lambda f, c=c: report((c + f) / n))
+                    img.overview(z, c, lambda f, c=c: report((c + f) / n), stale=lambda: gen != self.generation)
+                except StaleRead:
+                    return              # (the z slider has moved on: the plane that is wanted now is read by its own thread)
                 except Exception as e:
                     self.results.put(("error", gen, f"Can't read channel {c + 1} of {img.entry.name}: {e}"))
                     return
@@ -4326,10 +4378,21 @@ class XlefViewer:
         if self.img and z != self.z:
             self.z = z
             self.generation += 1
+            if getattr(self, "z_job", None) is not None:
+                self.root.after_cancel(self.z_job)
+                self.z_job = None
             if self.img.has_all(z) and (self.img.complete(z) or not self._want_sharp_level(self.img)):
                 self.redraw()
             else:
-                self._load_overviews()
+                # Dragging the slider passes every plane on the way: reading each (hundreds of MB, for a compressed stack) would bury the
+                # one that is wanted. The read starts when the slider has rested for a moment.
+                self.status.config(text=f"z = {z}: reading when the slider stops ...")
+                self.z_job = self.root.after(Z_SETTLE_MS, self._load_overviews_for_z, self.generation)
+
+    def _load_overviews_for_z(self, gen):
+        self.z_job = None
+        if self.img is not None and gen == self.generation:
+            self._load_overviews()
 
     # --- view geometry
 
@@ -6560,6 +6623,8 @@ class XlefViewer:
                     self.detail_pending = False
                     self._update_cursor()
                     self.status.config(text=data)
+                    if self.photo is None:
+                        self.show_message(data)         # (in the picture's place too: else "Loading channel 1 of 4..." stays on a black screen)
         except queue.Empty:
             pass
         self.root.after(30, self._poll_results)

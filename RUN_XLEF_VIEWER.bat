@@ -19,11 +19,11 @@ if not defined PYTHON_CMD (
   exit /b 1
 )
 
-"%PYTHON_CMD%" -c "import numpy, tifffile, PIL" >nul 2>&1
+"%PYTHON_CMD%" -c "import numpy, tifffile, PIL, imagecodecs" >nul 2>&1
 if errorlevel 1 (
-  echo Installing the libraries the viewer needs ^(numpy, tifffile, pillow^)...
+  echo Installing the libraries the viewer needs ^(numpy, tifffile, pillow, imagecodecs^)...
   echo.
-  "%PYTHON_CMD%" -m pip install numpy tifffile pillow
+  "%PYTHON_CMD%" -m pip install numpy tifffile pillow imagecodecs
   if errorlevel 1 (
     echo.
     echo The libraries could not be installed ^(see above^).

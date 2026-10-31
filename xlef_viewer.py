@@ -4581,6 +4581,22 @@ class XlefViewer:
         if f is not None and SPEED.due(f):
             threading.Thread(target=SPEED.probe, args=(f,), daemon=True).start()
 
+    def _speed_note(self, path):
+        """For a project's note: the measured speed of the drive or network share it is on, and whether that counts as slow (by a
+        typical read, a sharper preview of 8 MB in 12 reads: the real decision is made for each read, see _slow)."""
+        where = SPEED.location(path).upper() or "this drive"
+        e = SPEED.found.get(SPEED.location(path))
+        mode = self.settings.get("reading", "auto")
+        if mode != "auto":
+            return f"Reading sharper pictures: {READING_MODES[mode]} (Settings)"
+        if e is None:
+            return f"Speed of {where} not measured yet (it is when an image is opened)"
+        speed = f"{e['latency'] * 1000:.0f} ms per read, {e['rate'] / 1e6:.0f} MB/s"
+        if self._slow(SPEED.estimate(path, 8e6, 12)):
+            return (f"Slow storage ({where} measured at {speed}): previews are shown enlarged up to {RELAXED_ENLARGE:g} times\n"
+                    "before sharper pictures are read")
+        return f"Fast storage ({where} measured at {speed}): sharper pictures are read at once"
+
     def _sharp_sources(self, z, step, i0, i1):
         """For a sharp view about to be read (at `step`, columns i0..i1 of it): the sharp pixels kept from before that can give some of
         it, i.e. of this image and plane, at `step` or a finer step that divides it, and beside it left to right; the view on screen
@@ -5472,7 +5488,8 @@ class XlefViewer:
                     else "No unsaved changes")
             if self.tree_tip is None:
                 self.tree_tip = PointerTip(self.tree)
-            self.tree_tip.show(f"{os.path.normpath(self.projects[item]['path'])}\n{note}", event.x_root, event.y_root)
+            self.tree_tip.show(f"{os.path.normpath(self.projects[item]['path'])}\n{note}\n{self._speed_note(self.projects[item]['path'])}",
+                               event.x_root, event.y_root)
             return
         if item not in self.entries or not self.tree.bbox(item):
             self._hide_tree_tip()

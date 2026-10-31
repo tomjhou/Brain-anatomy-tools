@@ -3358,12 +3358,17 @@ class XlefViewer:
             self.slide.pack_forget()
             return
         ov, extent, boxes = layout
+        self.slide_entry = ov
         self.slide.set_slide(extent, boxes)
         self.slide.pack(fill=tk.X, padx=4, pady=(4, 0), before=self.list_bar)
         sel = self.tree.selection()
         if sel:
             self.slide.set_current(sel[0])
-        gen = self.slide_gen
+        self._make_slide_picture()
+
+    def _make_slide_picture(self):
+        """The picture of the slide (self.slide_entry), made in the background, with its contrast and color maps as they are now."""
+        ov, gen = self.slide_entry, self.slide_gen
 
         def work():
             try:
@@ -4222,11 +4227,18 @@ class XlefViewer:
         self._each_canvas(self._draw_load_note_here)
 
     def _draw_load_note_here(self):
+        """The note in the middle of the canvas; separated, only on the panel of the channel being read (on the first panel if that
+        channel is switched off)."""
         c = self.canvas
         c.delete("loadnote")
         note = self._load_note()
         if not note:
             return
+        if self.panel_channels != [None]:
+            reading = next(k for k in range(len(self.img.entry.channels)) if (self.z, k) not in self.img.overviews)
+            panel = self.panel_channels.index(reading) if reading in self.panel_channels else 0
+            if (self.drawing_panel or 0) != panel:
+                return
         cw, ch = self.canvas_size()
         t = c.create_text(cw / 2, ch / 2, text=note, fill="#e0e0e0", font=("Segoe UI", 16), tags="loadnote")
         x0, y0, x1, y1 = c.bbox(t)
@@ -4752,7 +4764,12 @@ class XlefViewer:
         self._refresh_thumbnails(items)
 
     def _refresh_thumbnails(self, items):
-        """Make these images' thumbnails again (their colour maps or contrast changed), in the background."""
+        """Make these images' thumbnails again (their colour maps or contrast changed), in the background; the slide's picture above
+        the list too, if it is one of them."""
+        ov = getattr(self, "slide_entry", None)
+        if ov is not None and self.slide.winfo_manager() and any(self.entries.get(i) is ov for i in items):
+            self.slide_gen += 1                 # (a picture still being made with the old contrast is dropped)
+            self._make_slide_picture()
         if self.thumbs_started:
             gen = self.thumb_gen
 
@@ -5510,8 +5527,9 @@ class XlefViewer:
         self._each_canvas(self._draw_scale_bar_here)
 
     def _draw_scale_bar_here(self):
+        """At the bottom left of the canvas; separated, on the first panel only (top left: the panels share the view's scale)."""
         e = self.img.entry
-        if not e.pixel_um:
+        if not e.pixel_um or (self.drawing_panel or 0) != 0:
             return
         cw, ch = self.canvas_size()
         um = nice_length(cw / 5 / self.scale * e.pixel_um)

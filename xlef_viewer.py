@@ -43,6 +43,8 @@ SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".xlef_viewer_settings.jso
 THUMB_CACHE = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "JhouLab", "xlef_viewer_thumbs")
 MAX_RECENT = 20
 MOVING_PAUSE = 0.25          # s without a wheel click or drag before the view counts as at rest (see XlefViewer._moving)
+DETAIL_BANDS = 10            # a sharp view is read in this many bands (top to bottom), each drawn as it comes (see XlefViewer.redraw)
+BAND_DRAW_INTERVAL = 0.2     # s: the bands that came in are drawn at most this often (drawing must not hold up the reading)
 HIRES_NOTE_DELAY = 0.5       # s of waiting for a sharper view before "Loading full resolution..." is shown over the image
 KEPT_IMAGES_PERCENT = 50      # share of the computer's memory (%) for the pictures of recently viewed and preloaded images, which
                               # make switching to one instant (a setting); 500 MB if the memory's size can't be read
@@ -1345,6 +1347,7 @@ class OpenImage:
         self.entry = entry
         self.planes = {}         # (z, c) -> 2-D array
         self.overviews = {}      # (z, c) -> downsampled array, in the image's own pixel values
+        self.layouts = {}        # (z, c) -> where its file keeps the pixels, or None (see raw_layout)
         self.ov_step = max(1, int(np.ceil(max(entry.width, entry.height) / OVERVIEW_MAX)))
         self.pyramid = self.usable_level(OVERVIEW_MAX)
         if self.pyramid is not None:
@@ -1437,9 +1440,72 @@ class OpenImage:
     def nbytes(self):
         return sum(a.nbytes for a in self.overviews.values())
 
+    def raw_layout(self, z, c):
+        """(offset, dtype) of channel c's plane z when it can be read row by row from its file (see raw_layout), else None; asked once."""
+        key = (z, c)
+        if key not in self.layouts:
+            self.layouts[key] = raw_layout(self.entry.files.get(key), self.entry.pages.get(key), (self.entry.height, self.entry.width))
+        return self.layouts[key]
+
     def close(self):
         self.planes.clear()
         self.overviews.clear()
+
+
+_READ_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=8)       # (reads of rows for a sharp view: see _RowReader)
+
+
+def raw_layout(path, page, shape):
+    """Where a plain TIFF keeps its pixels: (offset, dtype) when the file holds one uncompressed, untiled image of `shape` (rows,
+    columns), stored in one run of bytes, so that any row can be read straight from the file; else None (compressed, tiled, a z stack
+    in one file, an OME-TIFF's page...). Reads only the file's header."""
+    if path is None or page is not None:
+        return None
+    try:
+        with tifffile.TiffFile(path) as t:
+            if len(t.pages) != 1:
+                return None
+            p = t.pages[0]
+            if p.compression != 1 or p.is_tiled or p.samplesperpixel != 1 or tuple(p.shape) != tuple(shape):
+                return None
+            offs, counts = list(p.dataoffsets), list(p.databytecounts)
+            dtype = np.dtype(p.dtype).newbyteorder(t.byteorder)
+            if any(o + n != nxt for o, n, nxt in zip(offs, counts, offs[1:])) or sum(counts) != shape[0] * shape[1] * dtype.itemsize:
+                return None
+            return offs[0], dtype
+    except (OSError, ValueError, IndexError, tifffile.TiffFileError):
+        return None
+
+
+class _RowReader:
+    """Parts of rows of a plain TIFF (see raw_layout), read straight from the file by several threads at once (_READ_POOL): on a
+    network drive each read is a round trip to the server, and with several on their way at once the waits overlap. (Reading the same
+    pixels through a memory map fetched them a small piece at a time, one after another: 4-6 times slower on the network drive.)
+    Each thread opens the file once; close() closes them all."""
+
+    def __init__(self, path, offset, dtype, width):
+        self.path, self.offset, self.dtype, self.width = path, offset, dtype, width
+        self.local, self.opened, self.lock = threading.local(), [], threading.Lock()
+
+    def row(self, r, x0, n, step):
+        """Every step-th pixel of row r, n of them from column x0."""
+        fh = getattr(self.local, "fh", None)
+        if fh is None:
+            fh = self.local.fh = open(self.path, "rb", buffering=0)
+            with self.lock:
+                self.opened.append(fh)
+        size = ((n - 1) * step + 1) * self.dtype.itemsize
+        fh.seek(self.offset + (r * self.width + x0) * self.dtype.itemsize)
+        data = fh.read(size)
+        if len(data) != size:
+            raise OSError(f"{os.path.basename(self.path)} ends early")
+        return np.frombuffer(data, self.dtype)[::step]
+
+    def close(self):
+        with self.lock:
+            for fh in self.opened:
+                fh.close()
+            self.opened.clear()
 
 
 def read_rows(path, step, wait, progress, chunk=64, page=None):
@@ -3502,7 +3568,7 @@ class XlefViewer:
         self._show_cursor_values([])
         self.canvas_message = ""
         self.detail_pending = False
-        self.detail_cache = None
+        self.detail_cache = self.detail_partial = None
         self.thumbs_go.set()            # (no image is loading now)
         self._update_annotations_check()
 
@@ -4181,7 +4247,8 @@ class XlefViewer:
                             crop[c] = self.shrunk[key]
                     for key in [k for k in self.shrunk if k[:-1] != view]:
                         del self.shrunk[key]
-                self._show(self._mix(crop, luts), left, top, w, h, smooth=self.scale * s < 1, overlay=self._detail_overlay(luts))
+                self._show(self._mix(crop, luts), left, top, w, h, smooth=self.scale * s < 1,
+                           overlay=[self._detail_overlay(luts), self._partial_overlay(luts)])
         if not detail:
             if not preview_only:
                 self.detail_pending = False
@@ -4191,22 +4258,55 @@ class XlefViewer:
             return
         self.generation += 1
         self.detail_pending = True           # (an hourglass until the sharper view is in)
+        self.hires_progress = None
         self._update_cursor()
         gen, img, z = self.generation, self.img, self.z
         (i0, j0, i1, j1), place = self._view_rect(step)
         key = (id(img), z, i0, j0, i1, j1, step, place)
         smooth = self.scale * step < 1
 
+        self.detail_partial = None
+
         def work():
+            """In bands of rows, top to bottom, all channels of a band together; each band is sent on as it is in ("detail_band": drawn
+            over the blurrier picture, see _partial_overlay), the whole view at the end ("detail"). A plain TIFF is read row by row,
+            several rows at once (see _RowReader); any other through its memory map."""
+            readers = {}
             try:
-                arrays = [None] * n
+                rows, cols = j1 - j0, i1 - i0
+                band = max(8, -(-rows // DETAIL_BANDS))
                 for c in need:
+                    layout = img.raw_layout(z, c)
+                    readers[c] = (_RowReader(img.entry.files[(z, c)], layout[0], layout[1], img.entry.width)
+                                  if layout is not None else None)
+                arrays = [None] * n
+                for b0 in range(0, rows, band):
+                    b1 = min(rows, b0 + band)
                     if gen != self.generation:
                         return
-                    arrays[c] = np.ascontiguousarray(img.plane(z, c)[j0 * step:j1 * step:step, i0 * step:i1 * step:step])
+                    pending = {}
+                    for c in need:
+                        if readers[c] is not None:
+                            if arrays[c] is None:
+                                arrays[c] = np.empty((rows, cols), readers[c].dtype.newbyteorder("="))
+                            pending[c] = [_READ_POOL.submit(readers[c].row, (j0 + k) * step, i0 * step, cols, step) for k in range(b0, b1)]
+                        else:
+                            part = np.ascontiguousarray(img.plane(z, c)[(j0 + b0) * step:(j0 + b1) * step:step, i0 * step:i1 * step:step])
+                            if arrays[c] is None:
+                                arrays[c] = np.empty((rows, cols), part.dtype)
+                            arrays[c][b0:b1] = part
+                    for c, futures in pending.items():
+                        for k, f in zip(range(b0, b1), futures):
+                            arrays[c][k] = f.result()
+                    if b1 < rows:
+                        self.results.put(("detail_band", gen, (key, arrays, b1)))
                 self.results.put(("detail", gen, (key, arrays, place, smooth)))
             except Exception as e:
                 self.results.put(("error", gen, f"Can't read {img.entry.name}: {e}"))
+            finally:
+                for r in readers.values():
+                    if r is not None:
+                        r.close()
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -4269,6 +4369,30 @@ class XlefViewer:
                        else Image.fromarray(part).resize((w, h), Image.BILINEAR))
         return ims, round((x0 + a0 * st - self.cx) * self.scale + cw / 2), round((y0 + b0 * st - self.cy) * self.scale + ch / 2)
 
+    def _partial_overlay(self, luts):
+        """While a sharp view is read in bands: the bands that are in, mixed (only the new rows each time) and scaled to the view, as
+        (images, x, y) to lay over the blurrier picture; or None."""
+        p = getattr(self, "detail_partial", None)
+        if p is None or p["key"][0] != id(self.img) or p["key"][1] != self.z:
+            return None
+        _, _, i0, j0, i1, j1, st, _ = p["key"]
+        rows, arrays = p["rows"], p["arrays"]
+        on = [c for c, lut in enumerate(luts) if lut is not None]
+        if not on or any(arrays[c] is None for c in on):
+            return None
+        sig = self._mix_sig()
+        if p.get("sig") != sig:
+            p["rgb"], p["mixed"], p["sig"] = None, 0, sig
+        if p["mixed"] < rows:
+            new = self._mix([a[p["mixed"]:rows] if a is not None and luts[c] is not None else None for c, a in enumerate(arrays)], luts)
+            p["rgb"] = new if p["rgb"] is None else [np.concatenate([old, part]) for old, part in zip(p["rgb"], new)]
+            p["mixed"] = rows
+        cw, ch = self.canvas_size()
+        w, h = max(1, round((i1 - i0) * st * self.scale)), max(1, round(rows * st * self.scale))
+        ims = [enlarge(rgb, w, h, self._draw_method()) if w > rgb.shape[1] or h > rgb.shape[0]
+               else Image.fromarray(rgb).resize((w, h), Image.BILINEAR) for rgb in p["rgb"]]
+        return ims, round((i0 * st - self.cx) * self.scale + cw / 2), round((j0 * st - self.cy) * self.scale + ch / 2)
+
     def _kept_covers(self, step, channels, cache=None):
         """The kept sharp pixels (detail_cache, or `cache`) cover all of the image that is in view, at `step` or finer, for these
         channels."""
@@ -4286,15 +4410,17 @@ class XlefViewer:
         return x0 <= vx0 and y0 <= vy0 and x0 + cols * st >= min(vx1, e.width - st) and y0 + rows * st >= min(vy1, e.height - st)
 
     def _show(self, rgbs, left, top, w, h, smooth, overlay=None):
-        """rgbs: one RGB array per canvas (see _mix), all of this view."""
+        """rgbs: one RGB array per canvas (see _mix), all of this view. overlay: sharper pixels to lay on top, (images, x, y), or a list
+        of such (or None), each over the ones before."""
         ims = []
         for k, rgb in enumerate(rgbs):
             im = Image.fromarray(rgb)
             if im.size != (w, h):           # (smooth: shrinking; else zoomed in past the pixels: enlarged as chosen in Settings)
                 im = im.resize((w, h), Image.BILINEAR) if smooth else enlarge(rgb, w, h, self._draw_method())
-            if overlay is not None and k < len(overlay[0]):     # (sharper pixels on top, where there are some for this view)
-                sharp, ox, oy = overlay[0][k], overlay[1], overlay[2]
-                im.paste(sharp, (ox - left, oy - top))
+            for ov in (overlay if isinstance(overlay, list) else [overlay]):
+                if ov is not None and k < len(ov[0]):           # (sharper pixels on top, where there are some for this view)
+                    sharp, ox, oy = ov[0][k], ov[1], ov[2]
+                    im.paste(sharp, (ox - left, oy - top))
             ims.append(im)
         self._put(ims, left, top)
 
@@ -4661,7 +4787,9 @@ class XlefViewer:
         if not getattr(self, "hires_note", False):
             return
         cw, ch = self.canvas_size()
-        t = c.create_text(cw / 2, ch / 2, text="Loading full resolution...", fill="#e0e0e0", font=("Segoe UI", 16),
+        done = getattr(self, "hires_progress", None)
+        text = "Loading full resolution..." + (f" {int(100 * done)}%" if done else "")
+        t = c.create_text(cw / 2, ch / 2, text=text, fill="#e0e0e0", font=("Segoe UI", 16),
                           tags="hiresnote")
         x0, y0, x1, y1 = c.bbox(t)
         c.tag_lower(c.create_rectangle(x0 - 14, y0 - 8, x1 + 14, y1 + 8, fill="#202020", outline="#606060", tags="hiresnote"), t)
@@ -5798,9 +5926,17 @@ class XlefViewer:
                     self.loading = False
                     self.redraw()
                     self._update_cursor()
+                elif kind == "detail_band" and gen == self.generation and not self.drag:
+                    key, arrays, rows = data
+                    self.detail_partial = {"key": key, "arrays": arrays, "rows": rows}
+                    self.hires_progress = rows / (key[5] - key[3])
+                    if time.monotonic() - getattr(self, "band_drawn", 0) >= BAND_DRAW_INTERVAL:
+                        self.band_drawn = time.monotonic()
+                        self.redraw(preview_only=True)          # (the bands that are in, over the blurrier picture)
                 elif kind == "detail" and gen == self.generation and not self.drag:
                     # (kept for this view, joined to what was kept of it before, and mixed with the sliders as they are NOW)
                     key, arrays, place, smooth = data
+                    self.detail_partial, self.hires_progress = None, None
                     if self.detail_cache is not None and self.detail_cache["key"] == key:
                         arrays = [a if a is not None else old for a, old in zip(arrays, self.detail_cache["arrays"])]
                     else:

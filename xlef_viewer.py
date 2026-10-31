@@ -24,6 +24,7 @@ import uuid
 import queue
 import threading
 import concurrent.futures
+import random
 import xml.etree.ElementTree as ET
 from urllib.parse import quote, unquote
 import tkinter as tk
@@ -45,6 +46,9 @@ MAX_RECENT = 20
 MOVING_PAUSE = 0.25          # s without a wheel click or drag before the view counts as at rest (see XlefViewer._moving)
 DETAIL_BANDS = 10            # a sharp view is read in this many bands (top to bottom), each drawn as it comes (see XlefViewer.redraw)
 BAND_DRAW_INTERVAL = 0.2     # s: the bands that came in are drawn at most this often (drawing must not hold up the reading)
+READ_BUDGET = 0.3            # s: a sharper picture expected to take longer than this to read counts as slow (see XlefViewer._slow)
+RELAXED_ENLARGE = 1.3        # then the preview may be shown enlarged up to this much (preview pixels on screen) before reading
+PROBE_INTERVAL = 600         # s: a storage location's speed is measured again after this long (see StorageSpeed)
 HIRES_NOTE_DELAY = 0.5       # s of waiting for a sharper view before "Loading full resolution..." is shown over the image
 KEPT_IMAGES_PERCENT = 50      # share of the computer's memory (%) for the pictures of recently viewed and preloaded images, which
                               # make switching to one instant (a setting); 500 MB if the memory's size can't be read
@@ -877,6 +881,12 @@ PREVIEW_MEMORY_NOTE = ("For the pictures of the images viewed recently, and of t
                        "Memory is only taken as images are loaded.")
 RENAME_NOTE = ("Off: a rename changes only the name LAS X shows (in its .xlif / .xlcf).\n"
                "On: the image's .xlif and channel TIFFs, or the folder, get the new name too.")
+READING_MODES = {"auto": "Automatic (by how fast the files can be read)", "sharp": "Always the sharpest",
+                 "save": "Save reading (for a slow connection)"}
+READING_NOTE = ("Automatic: if reading a sharper picture would take more than a moment (by the speed measured for that drive or\n"
+                "network share, not by its kind), the preview is shown enlarged up to 1.3 times first, and a section's sharper\n"
+                "preview is read only once you zoom in. Where reading is quick, the sharpest picture is read at once.\n"
+                "Always the sharpest: read as soon as more detail would show. Save reading: always the slower-connection way.")
 FLIP_NOTE = ("On: Save writes it into the section's .xlif, in a field of this viewer's own (JhouXlefViewer), so it goes\n"
              "with the files to other computers. LAS X keeps such a field when it saves the file again (tried with\n"
              "LAS X 6.2), but this isn't guaranteed: a future version of LAS X could drop it, or object to it.\n"
@@ -1453,7 +1463,94 @@ class OpenImage:
         self.overviews.clear()
 
 
-_READ_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=8)       # (reads of rows for a sharp view: see _RowReader)
+class StorageSpeed:
+    """How fast each storage location (a drive, or a network share) is: the wait per read request and the transfer rate, so that
+    the time a read would take can be told before it is done (see XlefViewer._slow). Not by the kind of drive: a network drive can be
+    faster than a local disk, and the same one slower over wifi.
+    - Measured (probe) by reading a few small pieces from random places in the middle of a large image file: those are almost never
+      in Windows' file cache, so this times the storage itself. Again after PROBE_INTERVAL (e.g. moved from wifi to a cable).
+    - Kept up to date by the viewer's own reads (observe). One served from the cache looks too fast; the estimate then says "fast",
+      the next sharp view is read, and that read, from the storage, puts it right."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.found = {}              # location -> {"latency": s, "rate": bytes/s, "when": time.time()}
+        self.probing = set()
+
+    @staticmethod
+    def location(path):
+        return os.path.normcase(os.path.splitdrive(os.path.abspath(path))[0])
+
+    def estimate(self, path, nbytes, requests, parallel=1):
+        """Seconds to read nbytes in `requests` reads, `parallel` at a time, from where `path` is; None if not measured yet."""
+        e = self.found.get(self.location(path))
+        if e is None:
+            return None
+        return requests * e["latency"] / max(1, parallel) + nbytes / e["rate"]
+
+    def observe(self, path, nbytes, requests, parallel, seconds):
+        """A read was done: the estimate moves halfway (on a log scale) to what it took."""
+        with self.lock:
+            e = self.found.get(self.location(path))
+            if e is None or seconds <= 0:
+                return
+            predicted = requests * e["latency"] / max(1, parallel) + nbytes / e["rate"]
+            f = min(10.0, max(0.1, seconds / max(predicted, 1e-6))) ** 0.5
+            e["latency"] *= f
+            e["rate"] /= f
+
+    def due(self, path):
+        """Not measured yet (or not for PROBE_INTERVAL), and not being measured now."""
+        where = self.location(path)
+        e = self.found.get(where)
+        return (e is None or time.time() - e["when"] > PROBE_INTERVAL) and where not in self.probing
+
+    def probe(self, path):
+        """Measure the location of `path` (a large file, stored on this computer or the network: not an online-only one, whose read
+        would download it): 3 reads of 4 KB (the wait per request) and one of 4 MB (the rate), at random places in its middle."""
+        where = self.location(path)
+        with self.lock:
+            if where in self.probing:
+                return
+            self.probing.add(where)
+        try:
+            size = os.path.getsize(path)
+            if size < 32 << 20 or is_online_only(path):
+                return
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+            try:
+                def timed(n):
+                    os.lseek(fd, random.randrange(size // 5, size * 4 // 5 - n), os.SEEK_SET)
+                    t, got = time.perf_counter(), 0
+                    while got < n:
+                        chunk = os.read(fd, n - got)
+                        if not chunk:
+                            break
+                        got += len(chunk)
+                    return time.perf_counter() - t
+                latency = sorted(timed(4096) for _ in range(3))[1]
+                rate = (4 << 20) / max(timed(4 << 20) - latency, 1e-4)
+            finally:
+                os.close(fd)
+            with self.lock:
+                self.found[where] = {"latency": latency, "rate": rate, "when": time.time()}
+        except OSError:
+            pass
+        finally:
+            with self.lock:
+                self.probing.discard(where)
+
+    def describe(self):
+        """For Settings: what has been measured, e.g. ["M:  4 ms per read, 25 MB/s"]."""
+        return [f"{where.upper() or '(this folder)'}  {e['latency'] * 1000:.0f} ms per read, {e['rate'] / 1e6:.0f} MB/s"
+                for where, e in sorted(self.found.items())]
+
+
+SPEED = StorageSpeed()
+
+
+READ_THREADS = 8
+_READ_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=READ_THREADS)     # (reads of rows for a sharp view: see _RowReader)
 
 
 def raw_layout(path, page, shape):
@@ -2768,7 +2865,8 @@ class XlefViewer:
 
     def open_settings(self):
         """The Settings window: the color theme (applied at once), zoomed-in pixels, whether renaming also renames files on disk,
-        whether "Flip this section" is saved into LAS X's files, and the memory for previews. Remembered."""
+        whether "Flip this section" is saved into LAS X's files, when sharper pictures are read, and the memory for previews.
+        Remembered."""
         if getattr(self, "settings_window", None) is not None and self.settings_window.winfo_exists():
             self.settings_window.lift()
             return
@@ -2809,6 +2907,20 @@ class XlefViewer:
         ttk.Checkbutton(box, text="Save it in a custom field of LAS X's files", variable=in_files,
                         command=lambda: self.set_flip_in_files(in_files.get())).pack(anchor=tk.W)
         ttk.Label(box, text=FLIP_NOTE, style="Muted.TLabel", justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
+        box = ttk.LabelFrame(body, text="Reading sharper pictures", padding=(10, 6))
+        box.pack(fill=tk.X, pady=(10, 0))
+        reading = tk.StringVar(dlg, self.settings.get("reading", "auto"))
+
+        def set_reading():
+            self.settings["reading"] = reading.get()
+            self._save_settings()
+            self.redraw()
+        for value, text in READING_MODES.items():
+            ttk.Radiobutton(box, text=text, value=value, variable=reading, command=set_reading).pack(anchor=tk.W)
+        ttk.Label(box, text=READING_NOTE, style="Muted.TLabel", justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
+        measured = SPEED.describe()
+        ttk.Label(box, text="Measured: " + ("; ".join(measured) if measured else "nothing yet (it is measured as images are opened)"),
+                  style="Muted.TLabel", justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
         box = ttk.LabelFrame(body, text="Memory for previews", padding=(10, 6))
         box.pack(fill=tk.X, pady=(10, 0))
         row = ttk.Frame(box)
@@ -3579,7 +3691,7 @@ class XlefViewer:
         self._stash_partial()                           # (what was read of a sharp view still coming in, and the last whole one:
         self._stash_region(self.detail_cache)          # kept for coming back)
         if self.img:
-            if not self.loading and self.img.complete(self.z):
+            if self.img.has_all(self.z):          # (its sharper copy may still be to come, or put off: see _want_sharp_level)
                 self._keep_image(self.img)
             else:
                 self.img.close()
@@ -3658,6 +3770,7 @@ class XlefViewer:
         """Show `entry`. full_res_ok: may its large online-only full-resolution files be downloaded when zooming in needs them (True:
         agreed to already; None: ask then; False: no)."""
         self.full_res_ok = full_res_ok
+        self._probe_speed(entry)
         same_channels = (len(entry.channels) == len(self.ch_settings) and self.img is not None
                          and [c.name for c in entry.channels] == [c.name for c in self.img.entry.channels])
         shown = [st["on"] for st in self.ch_settings] if same_channels else [True] * len(entry.channels)
@@ -3693,6 +3806,10 @@ class XlefViewer:
             self.loading = False
             self.redraw()
             self._update_cursor()
+        elif instant and not self._want_sharp_level(self.img):     # (its small preview is in; the sharper copy waits for a zoom)
+            self.loading = False
+            self.redraw()
+            self._update_cursor()
         elif instant:                   # (its first picture was loaded in the background: shown now, the sharper level read next)
             self.loading = True
             self.redraw(preview_only=True)
@@ -3717,6 +3834,7 @@ class XlefViewer:
         # sharper level is read next and replaces it whole, once all its channels are in.
         quick = img.quick_level(max(img.entry.width, img.entry.height) * self.fit_scale)
         have_first = img.pyramid is not None and img.has_all(z)     # (first picture already loaded in the background: only sharpen)
+        want_sharp = have_first or self._want_sharp_level(img)       # (else the sharper copy waits until a zoom needs it)
         item = self._item_of(img.entry)
         last = [-1]
 
@@ -3752,6 +3870,9 @@ class XlefViewer:
                         first = quick is not None
                 if first:
                     self.results.put(("open_progress", gen, None))
+                    if not want_sharp:
+                        self.results.put(("loaded", gen, on_disk()))
+                        return
                 sharp = []
                 for c in range(n):
                     if gen != self.generation:
@@ -3914,7 +4035,10 @@ class XlefViewer:
         if self.img and z != self.z:
             self.z = z
             self.generation += 1
-            self._load_overviews()
+            if self.img.has_all(z) and (self.img.complete(z) or not self._want_sharp_level(self.img)):
+                self.redraw()
+            else:
+                self._load_overviews()
 
     # --- view geometry
 
@@ -4227,7 +4351,7 @@ class XlefViewer:
             return
         step = max(1, int(1 / self.scale))
         need = [c for c in range(n) if luts[c] is not None]           # (the channels to read for a sharp view, if one is needed)
-        detail = not preview_only and not self.loading and step < s
+        detail = not preview_only and not self.loading and step < s and not self._preview_will_do(s, step, need)
         if detail:
             # The sharp view's pixels for this very view are still here (only the contrast, or a channel, changed): recolor them
             # at once instead of drawing the blurrier overview first and reading the files again (that blinked).
@@ -4302,6 +4426,7 @@ class XlefViewer:
             several rows at once (see _RowReader), and only where no sharp pixels kept from before (`sources`) have its row already
             (see _fill_row); any other through its memory map."""
             readers = {}
+            tally, started = [0, 0], time.perf_counter()          # (bytes and reads from the files, for SPEED)
             try:
                 rows, cols = j1 - j0, i1 - i0
                 band = max(8, -(-rows // DETAIL_BANDS))
@@ -4322,6 +4447,9 @@ class XlefViewer:
                             pending[c] = [(k, run, _READ_POOL.submit(readers[c].row, (j0 + k) * step, (i0 + run[0]) * step, run[1] - run[0], step))
                                           for k in range(b0, b1)
                                           for run in _fill_row(arrays[c][k], c, (j0 + k) * step, i0, step, sources)]
+                            for _, (a, b), _ in pending[c]:
+                                tally[0] += ((b - a - 1) * step + 1) * readers[c].dtype.itemsize
+                                tally[1] += 1
                         else:
                             part = np.ascontiguousarray(img.plane(z, c)[(j0 + b0) * step:(j0 + b1) * step:step, i0 * step:i1 * step:step])
                             if arrays[c] is None:
@@ -4332,6 +4460,8 @@ class XlefViewer:
                             arrays[c][k, a:b] = f.result()
                     if b1 < rows:
                         self.results.put(("detail_band", gen, (key, arrays, b1)))
+                if tally[1]:
+                    SPEED.observe(img.entry.files[(z, need[0])], tally[0], tally[1], READ_THREADS, time.perf_counter() - started)
                 self.results.put(("detail", gen, (key, arrays, place, smooth)))
             except Exception as e:
                 self.results.put(("error", gen, f"Can't read {img.entry.name}: {e}"))
@@ -4400,6 +4530,56 @@ class XlefViewer:
             ims.append(enlarge(part, w, h, self._draw_method()) if w > a1 - a0 or h > b1 - b0       # (zoomed in past the pixels)
                        else Image.fromarray(part).resize((w, h), Image.BILINEAR))
         return ims, round((x0 + a0 * st - self.cx) * self.scale + cw / 2), round((y0 + b0 * st - self.cy) * self.scale + ch / 2)
+
+    def _slow(self, seconds):
+        """Whether a read expected to take `seconds` (None: not known) is slow enough to be put off (Settings: "Reading", see
+        READ_BUDGET): "Automatic" by the measured speed, else always ("Save reading") or never ("Always the sharpest")."""
+        mode = self.settings.get("reading", "auto")
+        return mode == "save" or (mode == "auto" and seconds is not None and seconds > READ_BUDGET)
+
+    def _want_sharp_level(self, img):
+        """When an image opens with its small preview: read the pyramid's sharper copy now (as before), or only once the view is
+        zoomed into far enough to need it (when reading it would be slow: see _slow and _preview_will_do)."""
+        if img.pyramid is None:
+            return True
+        level = img.pyramid[0]
+        n = len(img.entry.channels)
+        f = level.files.get((self.z, 0)) or level.files.get((0, 0))
+        return f is None or not self._slow(SPEED.estimate(f, level.width * level.height * n, 3 * n))
+
+    def _preview_will_do(self, s, step, need):
+        """The view needs more detail than the preview has (preview pixels larger than screen pixels): whether to draw the preview
+        enlarged anyway, without reading the files now. Pixels kept from before are always used. Otherwise the next read is the
+        pyramid's sharper copy (if only the small preview is in) or the full-resolution files: if that would be slow (see _slow), the
+        preview stands in until it is enlarged more than RELAXED_ENLARGE. The pyramid's copy is then read here, in the background
+        (True: the preview is drawn meanwhile); the full-resolution files are read by redraw (False)."""
+        img = self.img
+        if self._kept_covers(step, need) or any(
+                self._kept_covers(step, need, {"key": (id(img),) + tuple(r["key"][1:]), "arrays": r["arrays"]})
+                for r in self.regions if r["entry"] is img.entry):
+            return False
+        pyr = img.pyramid
+        if pyr is not None and s > pyr[1] and step >= pyr[1]:        # (the pyramid's sharper copy would do: a small read)
+            level, n = pyr[0], len(img.entry.channels)
+            f = level.files.get((self.z, 0)) or level.files.get((0, 0))
+            seconds = SPEED.estimate(f, level.width * level.height * n, 3 * n) if f else None
+            if self._slow(seconds) and self.scale * s <= RELAXED_ENLARGE:
+                return True
+            self._load_overviews()                                   # (only the sharper copy: the small one is in)
+            return True
+        (i0, j0, i1, j1), _ = self._view_rect(step)
+        f = img.entry.files.get((self.z, need[0])) if need else None
+        if f is None:
+            return False
+        nbytes = (j1 - j0) * ((i1 - i0 - 1) * step + 1) * 2 * len(need)
+        seconds = SPEED.estimate(f, nbytes, (j1 - j0) * len(need), READ_THREADS)
+        return self._slow(seconds) and self.scale * s <= RELAXED_ENLARGE
+
+    def _probe_speed(self, entry):
+        """Measure, in the background, the storage of this image's full-resolution files if it is due (see StorageSpeed)."""
+        f = next((f for f in entry.all_files() if f), None)
+        if f is not None and SPEED.due(f):
+            threading.Thread(target=SPEED.probe, args=(f,), daemon=True).start()
 
     def _sharp_sources(self, z, step, i0, i1):
         """For a sharp view about to be read (at `step`, columns i0..i1 of it): the sharp pixels kept from before that can give some of

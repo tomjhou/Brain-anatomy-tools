@@ -187,8 +187,25 @@ def recolor(widget, old, new):
         recolor(child, old, new)
 
 
+@functools.lru_cache(maxsize=None)
+def _network_drive(root):
+    """The drive (e.g. "M:\\", or a "\\\\server\\share\\" path) is on the network (asked of Windows once per drive)."""
+    if root.startswith(("\\\\", "//")):
+        return True
+    try:
+        import ctypes
+        return ctypes.windll.kernel32.GetDriveTypeW(root) == 4            # (DRIVE_REMOTE)
+    except (AttributeError, OSError):
+        return False
+
+
 def is_online_only(path):
-    """True for a cloud placeholder that isn't stored on this computer. Checking the attributes doesn't trigger a download."""
+    """True for a cloud placeholder that isn't stored on this computer. Checking the attributes doesn't trigger a download. A file on
+    a network drive is never one (OneDrive keeps its files on a local drive), and isn't asked about: over a slow connection, each
+    question is a round trip to the server."""
+    drive = os.path.splitdrive(os.path.abspath(path))[0]
+    if drive and _network_drive(drive.rstrip("\\/") + "\\"):
+        return False
     try:
         return bool(getattr(os.stat(path), "st_file_attributes", 0) & _CLOUD_ONLY_ATTRS)
     except OSError:
@@ -2855,7 +2872,7 @@ class XlefViewer:
         self._fill_tree(pid, experiment)
         self._measure_sizes(pid)
         mine = self._entries_of(pid)
-        n_cloud = sum(1 for e in mine.values() if e.online_only_files())
+        n_cloud = sum(1 for i in mine if i in self.item_cloud)        # (as _fill_tree found them: not asked of each file again)
         self.status.config(text=f"{self.projects[pid]['name']}: {len(mine)} image{'s' * (len(mine) != 1)}"
                                 + (f", {n_cloud} online-only" if n_cloud else "") + ". Click one to view it.")
         self._projects_changed()

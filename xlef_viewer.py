@@ -363,7 +363,8 @@ class ImageEntry:
         self.problem = None      # why it can't be shown, if it can't
         self.pyramid = None      # .xlif of LAS X's first reduced copy (_pmd_0), if it made a pyramid; each level names the next
         self.full_bytes = None   # its channel TIFFs' size on disk (bytes), once measured (see XlefViewer._measure_sizes)
-        self.pages = {}          # (z, c) -> page of its file, when the channels are the pages of one OME-TIFF (see _ome_pages)
+        self.pages = {}          # (z, c) -> page of its file, when the channels are the pages of one OME-TIFF (see _ome_pages), or a
+                                 # LofPlane, when they are all in one .lof file (see _lof_planes)
         self.annotations = []    # what was drawn on the image in LAS X (Annotation objects, hidden ones too, as in the file)
         self.annotations_changed = False     # edited in the viewer and not saved yet
         self.stage_um = None     # (x, y) of the image's CENTRE on the microscope stage, um (its <Tile PosX/PosY>), to place it on the slide
@@ -538,6 +539,45 @@ def _ome_pages(entry, element, dims, descs, base_dir):
                     break
 
 
+LofPlane = collections.namedtuple("LofPlane", "at dtype shape")
+LofPlane.__doc__ = """Where one channel (one layer) of an image is in its .lof file: `at` bytes into the file's pixels, which start after
+the file's header (see lof_data_start); rows of `shape` (rows, columns) pixels of `dtype`, one after another."""
+
+
+def _lof_planes(entry, element, dims, descs, base_dir):
+    """The third way LAS X stores an image: all its channels (and layers) in one .lof file, its own raw format, named by <Memory><Block
+    File=... Offset=... Size=...>: a short header, the pixels (uncompressed, channel after channel), then the metadata again. Where each
+    channel and layer starts comes from the metadata alone (each channel's BytesInc, and the z dimension's): the .lof is not opened
+    here. Sets entry.files and entry.pages (LofPlane)."""
+    blocks = []
+    for b in element.iter("Block"):
+        if (b.get("File") or "").lower().endswith(".lof"):
+            try:
+                blocks.append((int(b.get("Offset") or 0), int(b.get("Size") or 0), _resolve(b.get("File"), base_dir)))
+            except (TypeError, ValueError):
+                continue
+    if not blocks or not entry.width or not entry.height:
+        return
+    try:
+        x_inc, y_inc = int(dims["1"].get("BytesInc")), int(dims["2"].get("BytesInc"))
+        z_inc = int(dims["3"].get("BytesInc")) if "3" in dims else 0
+        dtype = {1: np.dtype("<u1"), 2: np.dtype("<u2")}.get(x_inc)
+        if dtype is None or y_inc != x_inc * entry.width:          # (each pixel one value, rows one after another: else not read)
+            raise ValueError
+        for c, cd in enumerate(descs):
+            for z in range(entry.nz):
+                at = int(cd.get("BytesInc") or 0) + z * z_inc
+                for offset, size, fpath in blocks:
+                    if offset <= at and at + y_inc * entry.height <= offset + size:
+                        entry.files[(z, c)] = fpath
+                        entry.pages[(z, c)] = LofPlane(at - offset, dtype, (entry.height, entry.width))
+                        break
+    except (KeyError, TypeError, ValueError):
+        entry.files.clear()
+        entry.pages.clear()
+        entry.problem = entry.problem or "The data is in a .lof file laid out in a way this viewer doesn't read."
+
+
 def _image_entry(name, path, element, image, base_dir):
     entry = ImageEntry(name, path)
     desc = image.find("ImageDescription")
@@ -599,6 +639,8 @@ def _image_entry(name, path, element, image, base_dir):
         entry.files[(z, c)] = fpath
     if not frames:
         _ome_pages(entry, element, dims, descs, base_dir)
+    if not entry.files:
+        _lof_planes(entry, element, dims, descs, base_dir)
     kids = element.find("Children")
     for ref in (kids if kids is not None else []):
         if "_pmd_" in unquote(ref.get("File", "")).lower():
@@ -613,11 +655,8 @@ def _image_entry(name, path, element, image, base_dir):
             entry.stage_um = (float(tile.get("PosX")) * 1e6, float(tile.get("PosY")) * 1e6)
     except (TypeError, ValueError):
         pass
-    if not entry.problem:
-        if not entry.files:
-            entry.problem = "The metadata names no image files (perhaps the data is in a .lof file, which this viewer doesn't read)."
-        elif any(f.lower().endswith(".lof") for f in entry.files.values()):
-            entry.problem = "The data is in a .lof file, which this viewer doesn't read."
+    if not entry.problem and not entry.files:
+        entry.problem = "The metadata names no image files."
     return entry
 
 
@@ -648,6 +687,17 @@ def count_images(path, _seen=None):
         else:
             n += 1
     return n
+
+
+def pyramid_note(path, n_images):
+    """Whether LAS X made a pyramid (reduced copies) for an experiment's images, for the recent list: "Yes", "No", or "5 of 29". Lists
+    only the Pyramid folder's metadata (one _pmd_0.xlif per image that has a pyramid), so it is quick on a network drive too."""
+    try:
+        names = os.listdir(os.path.join(os.path.dirname(path), "Pyramid", "Metadata"))
+    except OSError:
+        return "No"
+    k = sum(1 for f in names if f.lower().endswith("_pmd_0.xlif"))
+    return "No" if k == 0 else "Yes" if k >= n_images else f"{k} of {n_images}"
 
 
 def _count_folder(folder):
@@ -876,6 +926,8 @@ def _write_text(path, new_text, bom):
 
 
 ELEMENT_NAME = re.compile(r'(<Element\b[^>]*?\bName=")([^"]*)(")')
+THUMB_CACHE_NOTE = ("Kept in {folder},\n"
+                    "so that they show at once next time. Cleared, they are made again as they are needed (reading the images).")
 PREVIEW_MEMORY_NOTE = ("For the pictures of the images viewed recently, and of the ones loaded in the background so that they\n"
                        "open at once; what they leave free keeps the full-resolution views zoomed into before, so that\n"
                        "going back to one needs no reading (these go first when the pictures need the room).\n"
@@ -1399,9 +1451,9 @@ class OpenImage:
                 return None
             page = self.entry.pages.get(key)
             try:
-                a = tifffile.memmap(path, mode="r", page=page)
+                a = memmap_plane(path, page)
             except (ValueError, OSError):
-                a = tifffile.imread(path, key=page if page is not None else 0) if page is not None else tifffile.imread(path)
+                a = read_whole(path, page)
             while a.ndim > 2:        # a z stack in one file: pick the plane; extra sample axes: take the first
                 a = a[z if a.shape[0] == self.entry.nz else 0]
             self.planes[key] = a
@@ -1412,6 +1464,9 @@ class OpenImage:
         key = (z, c)
         if key not in self.overviews:
             small = self._from_pyramid(c, z=z) if self.pyramid is not None else None
+            if small is None:
+                small = read_plain_rows(self.entry.files.get(key), self.ov_step, progress=progress,      # (several rows at once)
+                                        page=self.entry.pages.get(key))
             if small is None:
                 p = self.plane(z, c)
                 if p is None:
@@ -1431,7 +1486,7 @@ class OpenImage:
         overview is then read from the image itself)."""
         level, s = level_step or self.pyramid
         try:
-            small = tifffile.imread(level.files[(z, c)])
+            small = read_whole(level.files[(z, c)], level.pages.get((z, c)))
         except (OSError, ValueError, KeyError):
             return None
         while small.ndim > 2:
@@ -1463,7 +1518,7 @@ class OpenImage:
         """(offset, dtype) of a pyramid level's channel c, layer z, read row by row (see raw_layout), else None; asked once."""
         key = (id(level), z, c)
         if key not in self.layouts:
-            self.layouts[key] = raw_layout(level.files.get((z, c)), None, (level.height, level.width))
+            self.layouts[key] = raw_layout(level.files.get((z, c)), level.pages.get((z, c)), (level.height, level.width))
         return self.layouts[key]
 
     def close(self):
@@ -1561,26 +1616,78 @@ READ_THREADS = 8
 _READ_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=READ_THREADS)     # (reads of rows for a sharp view: see _RowReader)
 
 
-def raw_layout(path, page, shape):
-    """Where a plain TIFF keeps its pixels: (offset, dtype) when the file holds one uncompressed, untiled image of `shape` (rows,
-    columns), stored in one run of bytes, so that any row can be read straight from the file; else None (compressed, tiled, a z stack
-    in one file, an OME-TIFF's page...). Reads only the file's header."""
-    if path is None or page is not None:
-        return None
+def plain_tiff(path):
+    """Where a plain TIFF keeps its pixels: (offset, dtype, (rows, columns)) when the file holds one uncompressed, untiled 2-D image,
+    stored in one run of bytes, so that any row can be read straight from the file; else None (compressed, tiled, a z stack in one
+    file, ...). Reads only the file's header."""
     try:
         with tifffile.TiffFile(path) as t:
             if len(t.pages) != 1:
                 return None
             p = t.pages[0]
-            if p.compression != 1 or p.is_tiled or p.samplesperpixel != 1 or tuple(p.shape) != tuple(shape):
+            if p.compression != 1 or p.is_tiled or p.samplesperpixel != 1 or len(p.shape) != 2:
                 return None
+            shape = tuple(p.shape)
             offs, counts = list(p.dataoffsets), list(p.databytecounts)
             dtype = np.dtype(p.dtype).newbyteorder(t.byteorder)
             if any(o + n != nxt for o, n, nxt in zip(offs, counts, offs[1:])) or sum(counts) != shape[0] * shape[1] * dtype.itemsize:
                 return None
-            return offs[0], dtype
+            return offs[0], dtype, shape
     except (OSError, ValueError, IndexError, tifffile.TiffFileError):
         return None
+
+
+_LOF_STARTS = {}      # normcase(.lof path) -> where its pixels start
+
+
+def lof_data_start(path):
+    """Where a .lof file's pixels start: after its header block (0x70, the block's length, then LAS X's tags and the pixels' size).
+    Read once per file (a round trip to the server on a network drive), then remembered."""
+    key = os.path.normcase(path)
+    if key not in _LOF_STARTS:
+        with open(path, "rb") as fh:
+            head = fh.read(8)
+        if len(head) < 8 or int.from_bytes(head[:4], "little") != 0x70:
+            raise ValueError(f"{os.path.basename(path)} is not a LAS X .lof file")
+        _LOF_STARTS[key] = 8 + int.from_bytes(head[4:8], "little")
+    return _LOF_STARTS[key]
+
+
+def plain_layout(path, page=None):
+    """(offset, dtype, (rows, columns)) of a plane whose rows can be read straight from its file: a plain TIFF (see plain_tiff), or a
+    channel in a .lof (page: a LofPlane); else None (also an OME-TIFF's page)."""
+    if path is None:
+        return None
+    if isinstance(page, LofPlane):
+        try:
+            return lof_data_start(path) + page.at, page.dtype, page.shape
+        except (OSError, ValueError):
+            return None
+    return plain_tiff(path) if page is None else None
+
+
+def memmap_plane(path, page=None):
+    """A plane through a memory map: a TIFF's image (or an OME-TIFF's page), or a channel in a .lof."""
+    if isinstance(page, LofPlane):
+        return np.memmap(path, page.dtype, "r", lof_data_start(path) + page.at, page.shape)
+    return tifffile.memmap(path, mode="r", page=page)
+
+
+def read_whole(path, page=None):
+    """A plane read in full (when it can't be memory-mapped, e.g. a compressed TIFF)."""
+    if isinstance(page, LofPlane):
+        with open(path, "rb") as fh:
+            fh.seek(lof_data_start(path) + page.at)
+            n = page.shape[0] * page.shape[1]
+            return np.frombuffer(fh.read(n * page.dtype.itemsize), page.dtype, n).reshape(page.shape)
+    return tifffile.imread(path) if page is None else tifffile.imread(path, key=page)
+
+
+def raw_layout(path, page, shape):
+    """(offset, dtype) of a plane that can be read row by row (see plain_layout) holding an image of `shape` (rows, columns); else
+    None."""
+    found = plain_layout(path, page)
+    return found[:2] if found is not None and found[2] == tuple(shape) else None
 
 
 class _RowReader:
@@ -1663,17 +1770,48 @@ def _fill_row(out, c, y, i0, step, sources):
     return list(zip(edges[::2].tolist(), edges[1::2].tolist()))
 
 
+def read_plain_rows(path, step, wait=None, progress=None, chunk=64, page=None):
+    """Every step-th row and column of a plain TIFF or a .lof's channel (see plain_layout), several rows read at once (see _RowReader:
+    on a network drive several times faster than through a memory map, which fetches them one after another); None if it isn't one.
+    wait() and progress(fraction), if given, as for read_rows."""
+    found = plain_layout(path, page)
+    if found is None:
+        return None
+    offset, dtype, (h, w) = found
+    reader = _RowReader(path, offset, dtype, w)
+    try:
+        rows, cols = -(-h // step), -(-w // step)
+        out = np.empty((rows, cols), reader.out_dtype)
+        for i in range(0, rows, chunk):
+            if wait is not None:
+                state = wait()
+                if state != "go":
+                    return state
+            futures = [_READ_POOL.submit(reader.row, k * step, 0, cols, step) for k in range(i, min(rows, i + chunk))]
+            for k, f in enumerate(futures):
+                out[i + k] = f.result()
+            if progress is not None:
+                progress(min(1.0, (i + chunk) / rows))
+        return out
+    finally:
+        reader.close()
+
+
 def read_rows(path, step, wait, progress, chunk=64, page=None):
     """Every step-th row and column of a TIFF (step 1: all of it), read in chunks of rows so that a background read can pause between
     them: wait() is called before each chunk and blocks while it should pause; anything but "go" from it ends the read and is returned.
     progress(fraction) is called after each chunk. Returns the array, or wait()'s answer, or "skip" for a compressed image that is too
-    big to read whole in the background."""
+    big to read whole in the background. A plain TIFF's or a .lof's rows are read several at once (see read_plain_rows)."""
+    if step > 1:
+        a = read_plain_rows(path, step, wait, progress, chunk, page)
+        if a is not None:
+            return a
     try:
-        src = tifffile.memmap(path, mode="r", page=page)          # (page: one of an OME-TIFF's channels; None: the file's image)
+        src = memmap_plane(path, page)          # (page: one of an OME-TIFF's channels, or a .lof's; None: the file's image)
     except (ValueError, OSError):
         if step != 1:
             return "skip"
-        a = tifffile.imread(path, key=page or 0)            # (a small compressed pyramid level: read whole)
+        a = read_whole(path, page or 0)            # (a small compressed pyramid level: read whole)
         while a.ndim > 2:
             a = a[0]
         progress(1.0)
@@ -1945,6 +2083,34 @@ class RangeSlider(tk.Canvas):
                 self.command(lo, hi)
 
 
+def thumb_cache_size():
+    """(number of thumbnails, bytes) saved in THUMB_CACHE."""
+    count = size = 0
+    try:
+        with os.scandir(THUMB_CACHE) as it:
+            for f in it:
+                if f.is_file() and f.name.endswith(".png"):
+                    count += 1
+                    size += f.stat().st_size
+    except OSError:
+        pass
+    return count, size
+
+
+def clear_thumb_cache():
+    """Delete the saved thumbnails (only this viewer's .png files in THUMB_CACHE): they are made again as they are needed."""
+    try:
+        with os.scandir(THUMB_CACHE) as it:
+            names = [f.path for f in it if f.is_file() and f.name.endswith(".png")]
+    except OSError:
+        return
+    for path in names:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def _thumb_cache_path(entry, size):
     """Where the thumbnail of `entry` is cached: named by its files' paths, sizes and dates (os.stat only: no download)."""
     h = hashlib.sha1(f"{size}|lasx-contrast|{'|'.join(f'{c.lut}:{c.black}-{c.white}' for c in entry.channels)}".encode())     # (the second part changes whenever thumbnails are drawn differently)
@@ -2004,9 +2170,10 @@ def _thumb_source(entry, size):
     return None, "cloud"
 
 
-def make_thumbnail(entry, size=THUMB_SIZE):
+def make_thumbnail(entry, size=THUMB_SIZE, preview=None):
     """(PIL image, "ok"), or (None, "cloud") when the files are online-only (they are NOT read), or (None, "none").
-    Made from the smallest fitting level of LAS X's pyramid if there is one (a few KB per channel), else from every n-th row and column
+    Made from the image's preview if it is in memory (`preview`: each channel's array of layer 0, at any step: nothing is read), else
+    from the smallest fitting level of LAS X's pyramid if there is one (a few KB per channel), else from every n-th row and column
     of the image itself, and shown with the image's contrast (LAS X's, or as changed in the viewer), as the main view first shows it."""
     if entry.problem or not entry.files or not entry.width:
         return None, "none"
@@ -2014,28 +2181,37 @@ def make_thumbnail(entry, size=THUMB_SIZE):
         cache = _thumb_cache_path(entry, size)
         if os.path.isfile(cache):
             return Image.open(cache).convert("RGB"), "ok"
-        source, files = _thumb_source(entry, size)
+        if preview is not None and all(a is not None for a in preview) and max(preview[0].shape) >= size:
+            source, files = None, None
+        else:
+            source, files = _thumb_source(entry, size)
+            if source is None:
+                return None, files
     except (OSError, ET.ParseError):
         return None, "none"
-    if source is None:
-        return None, files
-    step = max(1, max(source.width, source.height) // size)       # (rounded down: the resize below makes it exactly `size`)
     arrays = []
-    for c, f in enumerate(files):
+    if source is None:
+        step = max(1, max(preview[0].shape) // size)
+        arrays = [np.ascontiguousarray(a[::step, ::step]) for a in preview]
+    else:
+        step = max(1, max(source.width, source.height) // size)       # (rounded down: the resize below makes it exactly `size`)
+    for c, f in enumerate(files or []):
         if f is None:
             arrays.append(None)
             continue
-        page = source.pages.get((0, c))                         # (one of an OME-TIFF's pages, or None)
-        try:
-            a = tifffile.memmap(f, mode="r", page=page)
-        except (ValueError, OSError):
-            if os.path.getsize(f) > THUMB_MAX_READ:
-                return None, "none"
-            a = tifffile.imread(f, key=page or 0)
-        while a.ndim > 2:
-            a = a[0]
-        small = np.ascontiguousarray(a[::step, ::step])
-        del a
+        page = source.pages.get((0, c))                         # (one of an OME-TIFF's pages, a .lof's channel, or None)
+        small = read_plain_rows(f, step, page=page)             # (several rows at once)
+        if small is None:
+            try:
+                a = memmap_plane(f, page)
+            except (ValueError, OSError):
+                if os.path.getsize(f) > THUMB_MAX_READ:
+                    return None, "none"
+                a = read_whole(f, page or 0)
+            while a.ndim > 2:
+                a = a[0]
+            small = np.ascontiguousarray(a[::step, ::step])
+            del a
         if source is not entry and small.dtype == np.uint8:      # a pyramid level: back to the image's own values
             small = pyramid_to_original(small, entry.channels[len(arrays)].max_value)
         arrays.append(small)
@@ -2544,7 +2720,9 @@ class XlefViewer:
         self.preload_progress = {}   # list item -> percent, while the background loader reads it
         self.open_progress = None    # (list item, percent) while the preview of the image opened is read
         self.preload_full = []       # images the background loader left out because the memory for previews was full
-        self.thumbs_busy = False     # (the thumbnail thread is running: the background loader waits for it while they are shown)
+        self.thumbs_busy = False     # (the thumbnail thread is running)
+        self.preloading = None       # (the background loader's thumb_gen while it runs: see _start_preload)
+        self.unkept_previews = {}    # entry -> its preview's arrays, loaded in the background but not kept (no room), for its thumbnail
         self.thumbs_shown = False    # (the thumbnail grid is showing, not the list: the thumbnail thread pauses otherwise)
         self.detail_cache = None     # the sharp view's pixels for the view on screen: {"key", "arrays"} (see redraw)
         self.download_queue = []     # list items whose full resolution is to be downloaded from OneDrive (see download_full_res)
@@ -2983,6 +3161,27 @@ class XlefViewer:
         percent.trace_add("write", set_percent)
         set_percent()
         ttk.Label(box, text=PREVIEW_MEMORY_NOTE, style="Muted.TLabel", justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
+        box = ttk.LabelFrame(body, text="Saved thumbnails", padding=(10, 6))
+        box.pack(fill=tk.X, pady=(10, 0))
+        row = ttk.Frame(box)
+        row.pack(anchor=tk.W, fill=tk.X)
+        saved = ttk.Label(row)
+
+        def show_saved():
+            count, size = thumb_cache_size()
+            saved.config(text=f"{count} thumbnail{'s' if count != 1 else ''}, "
+                             + (f"{size / 1e3:,.0f} KB" if size < 1e6 else size_text(size)))
+            clear.config(state=tk.NORMAL if count else tk.DISABLED)
+
+        def clear_saved():
+            clear_thumb_cache()
+            show_saved()
+        clear = ttk.Button(row, text="Clear saved thumbnails", command=clear_saved)
+        clear.pack(side=tk.LEFT)
+        saved.pack(side=tk.LEFT, padx=(8, 0))
+        show_saved()
+        ttk.Label(box, text=THUMB_CACHE_NOTE.format(folder=THUMB_CACHE), style="Muted.TLabel", justify=tk.LEFT).pack(anchor=tk.W,
+                                                                                                                    pady=(2, 0))
         ttk.Button(body, text="Close", command=dlg.destroy).pack(anchor=tk.E, pady=(10, 0))
         dlg.bind("<Escape>", lambda e: dlg.destroy())
 
@@ -3075,12 +3274,13 @@ class XlefViewer:
         dialog)."""
         def details(path):
             when = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(path)))
-            return {"images": str(count_images(path)), "when": when}
+            n = count_images(path)
+            return {"images": str(n), "pyramid": pyramid_note(path, n), "when": when}
         result = ask_open_file(
             self.root, self.settings["recent_files"], title="Open a Leica experiment", noun="experiment",
             filetypes=[("Leica experiment", "*.xlef *.xlif"), ("All files", "*.*")],
-            columns=[("name", "Experiment", 280, "w", True), ("images", "Images", 70, "e", False), ("folder", "Folder", 420, "w", True),
-                     ("when", "Modified", 130, "w", False)],
+            columns=[("name", "Experiment", 280, "w", True), ("images", "Images", 70, "e", False), ("pyramid", "Pyramid", 80, "w", False),
+                     ("folder", "Folder", 420, "w", True), ("when", "Modified", 130, "w", False)],
             details=details, on_remove=self.remove_recent, drop=self.dnd_files is not None)
         if result:
             path, from_list = result
@@ -3193,10 +3393,11 @@ class XlefViewer:
         self.thumb_gen += 1
         self.thumbs_started = False
         self.preload_full = []
+        self.unkept_previews.clear()
         self.thumb_grid.set_items(self._grid_rows_all(), message="No images" if self.projects else "Open an experiment", keep=True)
+        self._start_preload()               # (first: the thumbnails wait for its previews, see _start_thumbnails)
         if self.view_mode.get() == "thumbs":
             self._start_thumbnails()
-        self._start_preload()
         self._update_title()
 
     def _update_title(self):
@@ -3498,7 +3699,11 @@ class XlefViewer:
 
     def _start_thumbnails(self):
         """Make the thumbnails in a background thread, in list order. Only images stored on this computer are read (and only every n-th
-        row of them); online-only ones get a placeholder. Made once per experiment, and cached on disk."""
+        row of them); online-only ones get a placeholder. Made once per experiment, and cached on disk.
+        An image whose thumbnail would be read from its own files (no pyramid) gets it from its preview instead, as the background
+        loader brings that in (see _start_preload): one reader of the files, not two (scattered rows, for a thumbnail, cost the
+        network drive's disks a seek each: as long as reading the denser preview). Only those the loader leaves out (memory full,
+        ...) are read here, once it has finished."""
         if self.thumbs_started or not self.entries:
             return
         self.thumbs_started = True
@@ -3513,38 +3718,81 @@ class XlefViewer:
                 if gen == self.thumb_gen:
                     self.thumbs_busy = False
 
-        def make_all():
-            for item, entry in todo:
-                # An image being opened comes first: wait (reading nothing) until it is shown, sharp level included. While the list
-                # is showing instead of the thumbnails, wait too: the background loader goes first then.
-                while not self.thumbs_go.wait(0.2) or not self.thumbs_shown:
-                    if gen != self.thumb_gen:
-                        return
-                    if not self.thumbs_shown:
-                        time.sleep(0.2)
+        def go():
+            """An image being opened comes first: wait (reading nothing) until it is shown, sharp level included. While the list is
+            showing instead of the thumbnails, wait too. False: another experiment."""
+            while not self.thumbs_go.wait(0.2) or not self.thumbs_shown:
                 if gen != self.thumb_gen:
+                    return False
+                if not self.thumbs_shown:
+                    time.sleep(0.2)
+            return gen == self.thumb_gen
+
+        def make(item, entry, preview):
+            try:
+                image, state = make_thumbnail(entry, preview=preview)
+            except Exception:
+                image, state = None, "none"
+            self.results.put(("thumb", gen, (item, image, state)))
+            self.unkept_previews.pop(entry, None)
+
+        def from_own_files(entry):
+            """The thumbnail would be read from the image's own files (not cached, no pyramid level)."""
+            try:
+                return not os.path.isfile(_thumb_cache_path(entry, THUMB_SIZE)) and _thumb_source(entry, THUMB_SIZE)[0] is entry
+            except (OSError, ET.ParseError):
+                return False
+
+        def make_all():
+            later = []                                   # (made from their previews, as the background loader brings them in)
+            for item, entry in todo:
+                if not go():
                     return
-                try:
-                    image, state = make_thumbnail(entry)
-                except Exception:
-                    image, state = None, "none"
-                self.results.put(("thumb", gen, (item, image, state)))
+                preview = self._preview_arrays(entry)
+                if preview is None and self.preloading == gen and from_own_files(entry):
+                    later.append((item, entry))
+                    continue
+                make(item, entry, preview)
+            while later:
+                waiting = []
+                for item, entry in later:
+                    if not go():
+                        return
+                    preview = self._preview_arrays(entry)
+                    if preview is None and self.preloading == gen:
+                        waiting.append((item, entry))
+                    else:                                # (else the loader left it out: read here, the loader being done)
+                        make(item, entry, preview)
+                later = waiting
+                if later:
+                    time.sleep(0.2)
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _preview_arrays(self, entry):
+        """The preview of an image if it is in memory (kept, or open), each channel's array of layer 0 (at the preview's step), for its
+        thumbnail; else None."""
+        img = self.kept_images.get(entry)
+        if img is None and self.img is not None and self.img.entry is entry:
+            img = self.img
+        if img is None or not img.has_all(0):
+            return self.unkept_previews.get(entry)
+        return [img.overviews.get((0, c)) for c in range(len(entry.channels))]
+
     def _start_preload(self):
         """Load each image's first picture (the pyramid level that fills the window, as when it is opened) in the background, in list
-        order, after the thumbnails (while they are showing; before them while the list is), and keep it with the recently viewed images: picking it then shows it at once, and only its sharper
-        level is still read. It only fills memory that is free (the share set in Settings: see kept_limit), and stops when that is
+        order, and keep it with the recently viewed images: picking it then shows it at once. The thumbnails of images without a
+        pyramid are made from these (see _start_thumbnails). It only fills memory that is free (the share set in Settings: see kept_limit), and stops when that is
         used up, saying so in the status bar. An image being opened comes first: the loader pauses, mid-file if need be, until that image is shown, then goes on where it stopped. Images
         whose files would need asking (large and online-only: see needs_asking) are skipped."""
         gen, todo = self.thumb_gen, list(self.entries.items())
         cw, ch = self.canvas_size()
+        self.preloading = gen
 
         def wait(entry):
-            """Wait while thumbnails are made (when they are showing) or an image is opened; "stop" (another experiment), "skip"
-            (this image needs no preloading any more: it is open, or kept) or "go"."""
-            while (self.thumbs_busy and self.thumbs_shown) or not self.thumbs_go.is_set():
+            """Wait while an image is opened; "stop" (another experiment), "skip" (this image needs no preloading any more: it is
+            open, or kept) or "go"."""
+            while not self.thumbs_go.is_set():
                 if gen != self.thumb_gen:
                     return "stop"
                 time.sleep(0.05)
@@ -3555,6 +3803,12 @@ class XlefViewer:
             return "go"
 
         def work():
+            try:
+                load_all()
+            finally:
+                self.results.put(("preload_done", gen, None))     # (after its last picture: see _start_thumbnails)
+
+        def load_all():
             first = next((f for _, e in todo for f in e.all_files() if f), None)
             if first is not None and SPEED.due(first):
                 SPEED.probe(first)                  # (the storage's speed, as early as can be: see StorageSpeed)
@@ -3614,6 +3868,8 @@ class XlefViewer:
         img.overviews = {(0, c): a for c, a in enumerate(arrays)}
         img.ov_step = step
         if self.kept_bytes + img.nbytes() > self.kept_limit():
+            if self.thumb_grid.thumbs.get(item, (None, None))[1] != "ok":
+                self.unkept_previews[entry] = arrays            # (still read once only: its thumbnail is made from it)
             return
         self.kept_images[entry] = img
         self.kept_images.move_to_end(entry, last=False)         # (dropped before any image that was actually looked at)
@@ -5386,7 +5642,7 @@ class XlefViewer:
                 for item in items:
                     if item is not None and gen == self.thumb_gen:
                         try:
-                            image, state = make_thumbnail(self.entries[item])
+                            image, state = make_thumbnail(self.entries[item], preview=self._preview_arrays(self.entries[item]))
                         except Exception:
                             image, state = None, "none"
                         self.results.put(("thumb", gen, (item, image, state)))
@@ -6200,6 +6456,10 @@ class XlefViewer:
                 if kind == "thumb":
                     if gen == self.thumb_gen:
                         self.thumb_grid.set_thumb(*data)
+                    continue
+                if kind == "preload_done":
+                    if self.preloading == gen:
+                        self.preloading = None
                     continue
                 if kind == "preload_full":
                     if gen == self.thumb_gen:

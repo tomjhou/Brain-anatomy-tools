@@ -1508,6 +1508,32 @@ class _RowReader:
             self.opened.clear()
 
 
+def _fill_row(out, c, y, i0, step, sources):
+    """One row of a sharp view being read (out: its pixels, every step-th of image row y, from column i0 * step): the parts of it
+    that sharp pixels kept from before have (sources: [(their step, i0, j0, arrays)], see XlefViewer._sharp_sources) are copied in;
+    returns the runs still to read from the file: [(first, end)] (indices into out)."""
+    n = len(out)
+    have = np.zeros(n, bool)
+    for st, ri0, rj0, arrays in sources:
+        a = arrays[c] if c < len(arrays) else None
+        if a is None or y % st:
+            continue
+        ry = y // st - rj0
+        if not 0 <= ry < a.shape[0]:
+            continue
+        lo = max(0, -(-ri0 * st // step) - i0)                     # (the columns of out that fall within its columns)
+        hi = min(n, -(-(ri0 + a.shape[1]) * st // step) - i0)
+        if hi <= lo:
+            continue
+        first = (i0 + lo) * step // st - ri0
+        out[lo:hi] = a[ry, first:first + (hi - lo - 1) * (step // st) + 1:step // st]
+        have[lo:hi] = True
+    if have.all():
+        return []
+    edges = np.flatnonzero(np.diff(np.concatenate(([True], have, [True])).astype(np.int8)))
+    return list(zip(edges[::2].tolist(), edges[1::2].tolist()))
+
+
 def read_rows(path, step, wait, progress, chunk=64, page=None):
     """Every step-th row and column of a TIFF (step 1: all of it), read in chunks of rows so that a background read can pause between
     them: wait() is called before each chunk and blocks while it should pause; anything but "go" from it ends the read and is returned.
@@ -3549,7 +3575,8 @@ class XlefViewer:
     def _close_image(self):
         self.generation += 1
         self._set_open_progress(None)
-        self._stash_region(self.detail_cache)          # (its last sharp view: kept for coming back)
+        self._stash_partial()                           # (what was read of a sharp view still coming in, and the last whole one:
+        self._stash_region(self.detail_cache)          # kept for coming back)
         if self.img:
             if not self.loading and self.img.complete(self.z):
                 self._keep_image(self.img)
@@ -4265,12 +4292,14 @@ class XlefViewer:
         key = (id(img), z, i0, j0, i1, j1, step, place)
         smooth = self.scale * step < 1
 
-        self.detail_partial = None
+        self._stash_partial()
+        sources = self._sharp_sources(z, step, i0, i1)
 
         def work():
             """In bands of rows, top to bottom, all channels of a band together; each band is sent on as it is in ("detail_band": drawn
             over the blurrier picture, see _partial_overlay), the whole view at the end ("detail"). A plain TIFF is read row by row,
-            several rows at once (see _RowReader); any other through its memory map."""
+            several rows at once (see _RowReader), and only where no sharp pixels kept from before (`sources`) have its row already
+            (see _fill_row); any other through its memory map."""
             readers = {}
             try:
                 rows, cols = j1 - j0, i1 - i0
@@ -4289,15 +4318,17 @@ class XlefViewer:
                         if readers[c] is not None:
                             if arrays[c] is None:
                                 arrays[c] = np.empty((rows, cols), readers[c].dtype.newbyteorder("="))
-                            pending[c] = [_READ_POOL.submit(readers[c].row, (j0 + k) * step, i0 * step, cols, step) for k in range(b0, b1)]
+                            pending[c] = [(k, run, _READ_POOL.submit(readers[c].row, (j0 + k) * step, (i0 + run[0]) * step, run[1] - run[0], step))
+                                          for k in range(b0, b1)
+                                          for run in _fill_row(arrays[c][k], c, (j0 + k) * step, i0, step, sources)]
                         else:
                             part = np.ascontiguousarray(img.plane(z, c)[(j0 + b0) * step:(j0 + b1) * step:step, i0 * step:i1 * step:step])
                             if arrays[c] is None:
                                 arrays[c] = np.empty((rows, cols), part.dtype)
                             arrays[c][b0:b1] = part
                     for c, futures in pending.items():
-                        for k, f in zip(range(b0, b1), futures):
-                            arrays[c][k] = f.result()
+                        for k, (a, b), f in futures:
+                            arrays[c][k, a:b] = f.result()
                     if b1 < rows:
                         self.results.put(("detail_band", gen, (key, arrays, b1)))
                 self.results.put(("detail", gen, (key, arrays, place, smooth)))
@@ -4368,6 +4399,32 @@ class XlefViewer:
             ims.append(enlarge(part, w, h, self._draw_method()) if w > a1 - a0 or h > b1 - b0       # (zoomed in past the pixels)
                        else Image.fromarray(part).resize((w, h), Image.BILINEAR))
         return ims, round((x0 + a0 * st - self.cx) * self.scale + cw / 2), round((y0 + b0 * st - self.cy) * self.scale + ch / 2)
+
+    def _sharp_sources(self, z, step, i0, i1):
+        """For a sharp view about to be read (at `step`, columns i0..i1 of it): the sharp pixels kept from before that can give some of
+        it, i.e. of this image and plane, at `step` or a finer step that divides it, and beside it left to right; the view on screen
+        first, then the kept regions, newest first: [(step, i0, j0, arrays)] (see _fill_row). The arrays are not changed afterwards
+        (a kept region is replaced, never written into), so the reading thread may use them."""
+        out = []
+        caches = [self.detail_cache] + [r for r in reversed(self.regions) if r["entry"] is self.img.entry]
+        for k, cache in enumerate(caches):
+            if cache is None or (k == 0 and cache["key"][0] != id(self.img)):
+                continue
+            _, cz, ri0, rj0, ri1, rj1, st, _ = cache["key"]
+            if cz != z or step % st or ri1 * st <= i0 * step or ri0 * st >= i1 * step:
+                continue
+            out.append((st, ri0, rj0, cache["arrays"]))
+        return out
+
+    def _stash_partial(self):
+        """A sharp view's reading being given up (the view moved on): the bands of it that are in are kept as a region (see
+        _stash_region), so that coming back, or a view overlapping it, need not read them again."""
+        p, self.detail_partial = getattr(self, "detail_partial", None), None
+        if p is None or not p["rows"] or p["key"][0] != id(self.img):
+            return
+        k, rows = p["key"], p["rows"]
+        self._stash_region({"key": k[:5] + (k[3] + rows,) + k[6:], "arrays": [a[:rows].copy() if a is not None else None
+                                                                             for a in p["arrays"]]})
 
     def _partial_overlay(self, luts):
         """While a sharp view is read in bands: the bands that are in, mixed (only the new rows each time) and scaled to the view, as

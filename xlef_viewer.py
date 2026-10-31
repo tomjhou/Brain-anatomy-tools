@@ -43,9 +43,10 @@ SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".xlef_viewer_settings.jso
 THUMB_CACHE = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "JhouLab", "xlef_viewer_thumbs")
 MAX_RECENT = 20
 MOVING_PAUSE = 0.25          # s without a wheel click or drag before the view counts as at rest (see XlefViewer._moving)
-HIRES_NOTE_DELAY = 0.5       # s of waiting for a sharper view before "Loading high-resolution images..." is shown over the image
-KEPT_IMAGES_PERCENT = 10      # share of the computer's memory (%) for the pictures of recently viewed and preloaded images, which
+HIRES_NOTE_DELAY = 0.5       # s of waiting for a sharper view before "Loading full resolution..." is shown over the image
+KEPT_IMAGES_PERCENT = 25      # share of the computer's memory (%) for the pictures of recently viewed and preloaded images, which
                               # make switching to one instant (a setting); 500 MB if the memory's size can't be read
+KEPT_IMAGES_MAX = 80          # the most that share may be set to (the rest is for Windows, the open image and other programs)
 THUMB_SIZE = 128         # longest side of a thumbnail, screen pixels
 THUMB_MAX_READ = 64e6    # a TIFF that can't be memory-mapped (compressed) is read whole for its thumbnail only up to this size (bytes)
 
@@ -2266,6 +2267,10 @@ class XlefViewer:
         if "recent_files" not in self.settings:       # (settings written before there was a recent list)
             self.settings["recent_files"] = [self.settings["last_file"]] if self.settings.get("last_file") else []
         self.settings.pop("last_file", None)
+        if not self.settings.get("preview_memory_checked") and self.settings.get("preview_memory_percent") == 10:
+            # (10% was the default, and opening Settings used to store it: taken as the default, now 25%, once)
+            self.settings.pop("preview_memory_percent")
+        self.settings["preview_memory_checked"] = True
         self.native_theme = ttk.Style(self.root).theme_use()        # (Windows' own: the light theme's)
         self.theme = self.settings.get("theme", "dark")
         if self.theme not in THEMES:
@@ -2717,18 +2722,24 @@ class XlefViewer:
 
         def set_percent(*_):
             try:
-                value = min(80, max(1, int(percent.get())))
+                value = min(KEPT_IMAGES_MAX, max(1, int(percent.get())))
             except (tk.TclError, ValueError):
                 return                      # (while typing)
-            more = value > self.settings.get("preview_memory_percent", KEPT_IMAGES_PERCENT)
-            self.settings["preview_memory_percent"] = value
-            self._save_settings()
+            old = self.settings.get("preview_memory_percent", KEPT_IMAGES_PERCENT)
+            if value != old:                # (opening Settings stores nothing: the default stays the default)
+                self.settings["preview_memory_percent"] = value
+                self._save_settings()
             amount.config(text=f"% of this computer's memory ({size_text(self.kept_limit())})")
-            if more and self.preload_full:
+            if value > old and self.preload_full:
                 self._projects_changed()    # (the background loader goes on with the sections it left out)
-            elif not more:
+            elif value < old:
                 self._keep_within_limit()
-        ttk.Spinbox(row, from_=1, to=80, increment=5, width=4, textvariable=percent).pack(side=tk.LEFT)
+
+        def allowed(text):
+            """What may be typed: a whole number from 1 to KEPT_IMAGES_MAX (or nothing, while typing)."""
+            return text == "" or (text.isdigit() and 1 <= int(text) <= KEPT_IMAGES_MAX)
+        ttk.Spinbox(row, from_=1, to=KEPT_IMAGES_MAX, increment=5, width=4, textvariable=percent, validate="key",
+                    validatecommand=(dlg.register(allowed), "%P")).pack(side=tk.LEFT)
         amount.pack(side=tk.LEFT, padx=(4, 0))
         percent.trace_add("write", set_percent)
         set_percent()
@@ -4574,9 +4585,16 @@ class XlefViewer:
         self._hires_note_timer()
 
     def _hires_note_timer(self):
-        """While a sharper view is read (after the image itself has loaded): "Loading high-resolution images..." over the image once it
+        """While a sharper view is read (after the image itself has loaded): "Loading full resolution..." over the image once it
         has taken HIRES_NOTE_DELAY (a short wait needs no words: the hourglass says enough); gone when it is in."""
         waiting = getattr(self, "detail_pending", False) and not self.loading
+        if not self.loading:
+            # (the background loader and the thumbnails wait meanwhile, mid-file if need be: on a network drive they would share
+            # the connection with it; see thumbs_go)
+            if waiting:
+                self.thumbs_go.clear()
+            else:
+                self.thumbs_go.set()
         job = getattr(self, "hires_job", None)
         if waiting and job is None and not getattr(self, "hires_note", False):
             self.hires_job = self.root.after(int(HIRES_NOTE_DELAY * 1000), self._show_hires_note)
@@ -4600,7 +4618,7 @@ class XlefViewer:
         if not getattr(self, "hires_note", False):
             return
         cw, ch = self.canvas_size()
-        t = c.create_text(cw / 2, ch / 2, text="Loading high-resolution images...", fill="#e0e0e0", font=("Segoe UI", 16),
+        t = c.create_text(cw / 2, ch / 2, text="Loading full resolution...", fill="#e0e0e0", font=("Segoe UI", 16),
                           tags="hiresnote")
         x0, y0, x1, y1 = c.bbox(t)
         c.tag_lower(c.create_rectangle(x0 - 14, y0 - 8, x1 + 14, y1 + 8, fill="#202020", outline="#606060", tags="hiresnote"), t)

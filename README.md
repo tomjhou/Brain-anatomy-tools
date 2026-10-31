@@ -107,7 +107,7 @@ a swatch (click to switch it on/off) and a black/white slider. Right-click a cha
 LAS X: its list of maps (Gray, Red, ..., Glow (O&U), Spectrum, Rainbow), or any color from the picker. The choice shows on the image at
 once; apply it to This section or to All sections (the same channel in every image of the experiment), or Cancel. Undo (Ctrl+Z) takes
 it back, and Save writes it into the images' `.xlif` files, where LAS X reads it.
-The black/white sliders work the same way: a section keeps the contrast set for it (sliders, Auto contrast) when you come back to it, marked with a red * in the list (hover over it to see what is unsaved; hovering over a section's name shows its name, size and resolution, and its unsaved changes too) until Save writes it into its `.xlif` (LAS X then shows the same contrast); Undo takes back a whole drag at once, and "LAS X contrast" goes back to the contrast in the file.
+The black/white sliders work the same way: a section keeps the contrast set for it (sliders, Auto contrast) when you come back to it, marked with a red * in the list (hover over it to see what is unsaved; hovering over a section's name shows its name, size and resolution, the number of layers of a z-stack, and its unsaved changes too) until Save writes it into its `.xlif` (LAS X then shows the same contrast); Undo takes back a whole drag at once, and "LAS X contrast" goes back to the contrast in the file.
 
 To change the order of the images, drag their names in the list (or their thumbnails): onto the middle of a folder's name to put
 them in it, or into another open experiment, which moves the image's files (its `.xlif`, channel TIFFs and reduced copies) into that

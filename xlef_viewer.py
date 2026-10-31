@@ -1361,13 +1361,14 @@ class OpenImage:
 
     def usable_level(self, size):
         """(level, step) when a view can come from LAS X's pyramid: the smallest level at least `size` across, stored on this computer,
-        8-bit, exactly 1/step of the image's size. None otherwise (no pyramid, a z stack, a level file that needs asking, ...)."""
+        8-bit, exactly 1/step of the image's size, with the image's layers (a z-stack's pyramid has a file per layer). None otherwise
+        (no pyramid, a level file that needs asking, ...)."""
         e = self.entry
-        if e.nz != 1 or not e.pyramid:
+        if not e.pyramid:
             return None
         try:
             level = pyramid_level(e, size)
-            if level is None or not level.width:
+            if level is None or not level.width or level.nz != e.nz:
                 return None
             step = round(e.width / level.width)
             if step < 2 or step & (step - 1) or e.width // step != level.width or e.height // step != level.height:
@@ -1399,7 +1400,7 @@ class OpenImage:
         """Channel c's overview for plane z (read once). progress(fraction), if given, is called as it is read from the image itself."""
         key = (z, c)
         if key not in self.overviews:
-            small = self._from_pyramid(c) if self.pyramid is not None else None
+            small = self._from_pyramid(c, z=z) if self.pyramid is not None else None
             if small is None:
                 p = self.plane(z, c)
                 if p is None:
@@ -1413,13 +1414,13 @@ class OpenImage:
             self.overviews[key] = small
         return self.overviews[key]
 
-    def _from_pyramid(self, c, level_step=None):
-        """Channel c from a pyramid level (default: the overview's; a file of a few MB), converted back to the image's own values with
-        LAS X's fixed gamma (see PYRAMID_GAMMA): the image's own files are not touched. None if the level can't be used (the overview is
-        then read from the image itself)."""
+    def _from_pyramid(self, c, level_step=None, z=0):
+        """Channel c of layer z from a pyramid level (default: the overview's; a file of a few MB), converted back to the image's own
+        values with LAS X's fixed gamma (see PYRAMID_GAMMA): the image's own files are not touched. None if the level can't be used (the
+        overview is then read from the image itself)."""
         level, s = level_step or self.pyramid
         try:
-            small = tifffile.imread(level.files[(0, c)])
+            small = tifffile.imread(level.files[(z, c)])
         except (OSError, ValueError, KeyError):
             return None
         while small.ndim > 2:
@@ -3415,7 +3416,7 @@ class XlefViewer:
                 state = wait(entry)
                 if state == "stop":
                     return
-                if state == "skip" or entry.problem or not entry.width or entry.nz != 1:
+                if state == "skip" or entry.problem or not entry.width:       # (a z-stack: its first layer, the one it opens on)
                     continue
                 try:
                     img = OpenImage(entry)
@@ -3430,7 +3431,7 @@ class XlefViewer:
                     if any(needs_asking(f) for f in files):
                         continue                        # (large online-only files: only after asking, when opened)
                     if self.kept_bytes + size > self.kept_limit():
-                        self.results.put(("preload_full", gen, [e for i, e in todo[todo.index((item, entry)):] if e.nz == 1]))
+                        self.results.put(("preload_full", gen, [e for i, e in todo[todo.index((item, entry)):]]))
                         return                          # (memory for kept images is full)
                     arrays, last = [], -1
                     for c, f in enumerate(files):
@@ -3649,7 +3650,7 @@ class XlefViewer:
     def _files_to_ask(self, entry):
         """The large online-only files (see needs_asking) that showing `entry` would read: none when its pyramid can be used (its
         full-resolution files are then read only when zooming in, and asked about then), else its own."""
-        if entry.nz == 1 and entry.pyramid and OpenImage(entry).pyramid is not None:
+        if entry.pyramid and OpenImage(entry).pyramid is not None:
             return []
         return [f for f in entry.all_files() if needs_asking(f)]
 
@@ -3742,7 +3743,7 @@ class XlefViewer:
                         if gen != self.generation:
                             return
                         self.results.put(("progress", gen, f"Reading {img.entry.name}: channel {c + 1} of {n} ..."))
-                        a = img._from_pyramid(c, quick)
+                        a = img._from_pyramid(c, quick, z=z)
                         if a is None:
                             break
                         self.results.put(("quick", gen, (z, c, a, quick[1])))
@@ -3756,7 +3757,7 @@ class XlefViewer:
                     if gen != self.generation:
                         return
                     self.results.put(("progress", gen, f"Reading {img.entry.name}: sharper view, channel {c + 1} of {n} ..."))
-                    sharp.append(img._from_pyramid(c))
+                    sharp.append(img._from_pyramid(c, z=z))
                     if not first:
                         report((c + 1) / n)
                 if all(a is not None for a in sharp):
@@ -5308,14 +5309,17 @@ class XlefViewer:
         self.tree_tip.show(self._section_tip_text(item), event.x_root, event.y_root)
 
     def _section_tip_text(self, item):
-        """The note on an image's name in the list: its name, its size and resolution, whether it has unsaved changes, and (online-only)
-        what its cloud means."""
+        """The note on an image's name in the list: its name, its size and resolution (and layers, for a z-stack), whether it has unsaved
+        changes, and (online-only) what its cloud means."""
         e = self.entries[item]
         lines = [e.name]
         if e.problem:
             lines.append(e.problem)
         elif e.width:
             lines.append(f"{e.width} x {e.height} px" + (f", {e.pixel_um:.3f} µm/px" if e.pixel_um else ""))
+            if e.nz > 1:
+                lines.append(f"z-stack of {e.nz} layers, shown one at a time: the \"Z plane\" slider (above the channels) picks which\n"
+                             f"(it opens on the first, or on the layer last shown of another z-stack)")
         what = self._unsaved_what(item)
         lines.append("Unsaved changes: " + ", ".join(what) if what else "No unsaved changes")
         if item in self.item_cloud:

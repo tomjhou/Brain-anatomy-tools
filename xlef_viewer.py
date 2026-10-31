@@ -1507,12 +1507,6 @@ class StorageSpeed:
             e["latency"] *= f
             e["rate"] /= f
 
-    def wait(self, path, timeout):
-        """Wait (up to `timeout` s) while the location of `path` is being measured."""
-        end, where = time.time() + timeout, self.location(path)
-        while where in self.probing and time.time() < end:
-            time.sleep(0.02)
-
     def due(self, path):
         """Not measured yet (or not for PROBE_INTERVAL), and not being measured now."""
         where = self.location(path)
@@ -3858,10 +3852,10 @@ class XlefViewer:
         else:
             self._load_overviews()
 
-    def _load_overviews(self, sharpen=False):
+    def _load_overviews(self):
         """Read the overview of each channel in the background (the first read of a file is the slow part), showing each as it comes.
-        With a pyramid, its sharper copy after the first picture only if reading it is quick (see _want_sharp_level, decided once the
-        storage's speed is known), or if `sharpen` (a zoom needs it)."""
+        With a pyramid, not its sharper copy after the first picture: its part in view is read when a zoom needs it (see
+        _want_sharp_level)."""
         img, z, gen = self.img, self.z, self.generation
         self.loading = True
         self._update_cursor()
@@ -3909,15 +3903,9 @@ class XlefViewer:
                         report((c + 1) / n)
                     else:
                         first = quick is not None
-                if first and not sharpen:
-                    # (the storage's speed is often still being measured as the first picture comes in, e.g. for the first image
-                    # opened: see _start_preload. Not measured at all, e.g. no file large enough: read, as before)
-                    full = next((f for f in img.entry.all_files() if f), None)
-                    if full is not None:
-                        SPEED.wait(full, 3)
                 if first:
                     self.results.put(("open_progress", gen, None))
-                    if not sharpen and not self._want_sharp_level(img):     # (the sharper copy waits until a zoom needs it)
+                    if not self._want_sharp_level(img):     # (the sharper copy waits until a zoom needs it)
                         self.results.put(("loaded", gen, on_disk()))
                         return
                 sharp = []
@@ -4604,14 +4592,12 @@ class XlefViewer:
         return mode == "save" or (mode == "auto" and seconds is not None and seconds > budget)
 
     def _want_sharp_level(self, img):
-        """When an image opens with its small preview: read the pyramid's sharper copy now (as before), or only once the view is
-        zoomed into far enough to need it (when reading it would be slow: see _slow and _read_plan)."""
+        """When an image opens with its small preview: read the pyramid's sharper copy whole now, or not (the usual): its part in
+        view is read once the view is zoomed into far enough to need it (see _read_plan)."""
         if img.pyramid is None:
             return True
         level = img.pyramid[0]
-        n = len(img.entry.channels)
-        f = level.files.get((self.z, 0)) or level.files.get((0, 0))
-        return f is None or not self._slow(SPEED.estimate(f, level.width * level.height * n, 3 * n), LEVEL_BUDGET)
+        return (level.files.get((self.z, 0)) or level.files.get((0, 0))) is None
 
     def _covered_at(self, step, need):
         """The sharp pixels kept from before (the view's, or a kept region) cover all of the view at `step` or finer."""
@@ -4625,8 +4611,8 @@ class XlefViewer:
         True: nothing now, the preview (or sharp pixels kept from before) is drawn enlarged; or (step, level): a sharp view to read at
         that step, from that pyramid level (its pixels in view only), or from the full-resolution files (level None).
         - Pixels kept from before at `step` are always used (read at `step`: see redraw).
-        - Fast storage (see _slow, by the time the pyramid's whole sharper copy would take): that copy is read whole, in the background
-          (True meanwhile), when it gives all the detail needed; else the full-resolution files.
+        - Fast storage (see _slow, by the time the pyramid's whole sharper copy would take): read as soon as more detail would show,
+          the sharper copy's pixels in view when it gives all the detail needed, else the full-resolution files.
         - Slow storage: what is shown (the preview, or a sharper view kept from before) stands in until it is enlarged more than
           RELAXED_ENLARGE; then the sharper copy's pixels in view are read, or, if those too would be enlarged more than that, the
           full-resolution files."""
@@ -4643,10 +4629,7 @@ class XlefViewer:
             f = level.files.get((self.z, 0)) or level.files.get((0, 0))
             slow = self._slow(SPEED.estimate(f, level.width * level.height * n, 3 * n) if f else None, LEVEL_BUDGET)
             if not slow:
-                if step >= pyr[1]:
-                    self._load_overviews(sharpen=True)               # (only the sharper copy: the small one is in)
-                    return True
-                return step, None
+                return (pyr[1], level) if step >= pyr[1] else (step, None)
             if self.scale * shown <= RELAXED_ENLARGE:
                 return True
             if self.scale * pyr[1] <= RELAXED_ENLARGE or step >= pyr[1]:
@@ -4685,7 +4668,7 @@ class XlefViewer:
         if self._slow(SPEED.estimate(path, 32e6, 12), LEVEL_BUDGET):
             return (f"Slow storage ({where} measured at {speed}): previews are shown enlarged up to {RELAXED_ENLARGE:g} times\n"
                     "before sharper pictures are read")
-        return f"Fast storage ({where} measured at {speed}): sharper pictures are read at once"
+        return f"Fast storage ({where} measured at {speed}): sharper pictures are read as soon as you zoom in"
 
     def _sharp_sources(self, z, step, i0, i1):
         """For a sharp view about to be read (at `step`, columns i0..i1 of it): the sharp pixels kept from before that can give some of

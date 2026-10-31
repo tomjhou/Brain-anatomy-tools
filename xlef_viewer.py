@@ -43,6 +43,7 @@ SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".xlef_viewer_settings.jso
 THUMB_CACHE = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "JhouLab", "xlef_viewer_thumbs")
 MAX_RECENT = 20
 MOVING_PAUSE = 0.25          # s without a wheel click or drag before the view counts as at rest (see XlefViewer._moving)
+HIRES_NOTE_DELAY = 0.5       # s of waiting for a sharper view before "Loading high-resolution images..." is shown over the image
 KEPT_IMAGES_PERCENT = 10      # share of the computer's memory (%) for the pictures of recently viewed and preloaded images, which
                               # make switching to one instant (a setting); 500 MB if the memory's size can't be read
 THUMB_SIZE = 128         # longest side of a thumbnail, screen pixels
@@ -3939,6 +3940,10 @@ class XlefViewer:
                 self.pixel_grid = True
                 self.schedule_redraw(0)
             return
+        if d < 0 and self.pixel_grid:           # (back from the grid: the same zoom, smooth again)
+            self.pixel_grid = False
+            self.schedule_redraw(0)
+            return
         self._moving()
         self.zoom_to(self.scale * (1.25 ** (d / 120)), event.x, event.y)
 
@@ -4167,6 +4172,10 @@ class XlefViewer:
             self.redraw()                   # (from the pixels already here: nothing is read again)
 
     def _draw_method(self):
+        """How zoomed-in pixels are enlarged: as chosen in Settings (bilinear while moving, for speed); with the pixel grid shown, as
+        squares of one color each, filling the grid's cells."""
+        if self.pixel_grid:
+            return "nearest"
         return "bilinear" if time.monotonic() < self.moving_until and self.enlarge_method in _KERNELS else self.enlarge_method
 
     def _mix_sig(self):
@@ -4256,6 +4265,7 @@ class XlefViewer:
             self._draw_annotations()
             self._draw_scale_bar()
             self._draw_load_note()
+            self._draw_hires_note_here()      # (still waiting for the sharper view: the note stays over the new picture)
         self._each_canvas(draw)
         self._update_status()
 
@@ -4561,6 +4571,39 @@ class XlefViewer:
             over = getattr(self, "over_handle", None)
             c.configure(cursor="watch" if busy else "hand2" if over == "handle" else "fleur" if over == "move" or self.tool == "select"
                         else "crosshair")
+        self._hires_note_timer()
+
+    def _hires_note_timer(self):
+        """While a sharper view is read (after the image itself has loaded): "Loading high-resolution images..." over the image once it
+        has taken HIRES_NOTE_DELAY (a short wait needs no words: the hourglass says enough); gone when it is in."""
+        waiting = getattr(self, "detail_pending", False) and not self.loading
+        job = getattr(self, "hires_job", None)
+        if waiting and job is None and not getattr(self, "hires_note", False):
+            self.hires_job = self.root.after(int(HIRES_NOTE_DELAY * 1000), self._show_hires_note)
+        elif not waiting:
+            if job is not None:
+                self.root.after_cancel(job)
+                self.hires_job = None
+            if getattr(self, "hires_note", False):
+                self.hires_note = False
+                self._each_canvas(lambda: self.canvas.delete("hiresnote"))
+
+    def _show_hires_note(self):
+        self.hires_job = None
+        if getattr(self, "detail_pending", False) and not self.loading and self.img is not None:
+            self.hires_note = True
+            self._each_canvas(self._draw_hires_note_here)
+
+    def _draw_hires_note_here(self):
+        c = self.canvas
+        c.delete("hiresnote")
+        if not getattr(self, "hires_note", False):
+            return
+        cw, ch = self.canvas_size()
+        t = c.create_text(cw / 2, ch / 2, text="Loading high-resolution images...", fill="#e0e0e0", font=("Segoe UI", 16),
+                          tags="hiresnote")
+        x0, y0, x1, y1 = c.bbox(t)
+        c.tag_lower(c.create_rectangle(x0 - 14, y0 - 8, x1 + 14, y1 + 8, fill="#202020", outline="#606060", tags="hiresnote"), t)
 
     def set_tool(self, tool):
         """Choose a tool. It stays chosen for one annotation after another (Select, or Escape, to go back to selecting)."""

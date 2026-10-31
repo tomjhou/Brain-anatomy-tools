@@ -23,6 +23,7 @@ import hashlib
 import uuid
 import queue
 import threading
+import concurrent.futures
 import xml.etree.ElementTree as ET
 from urllib.parse import quote, unquote
 import tkinter as tk
@@ -417,14 +418,19 @@ def _children(element, base_dir, container=None):
     kids = element.find("Children")
     if kids is None:
         return out
+    refs = []
     for ref in kids.findall("Reference"):
         f = ref.get("File")
         if not f:
             continue
         path = _resolve(f, base_dir)
-        if os.path.basename(path).lower().startswith("iomanagerconfigu"):
-            continue
-        entry = load_entry(path)
+        if not os.path.basename(path).lower().startswith("iomanagerconfigu"):
+            refs.append((ref, path))
+    # (read together, not one after another: on a network drive each file costs a round trip to the server, and over wifi those
+    # added up to seconds; the order stays the file's)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        entries = list(pool.map(load_entry, [path for _, path in refs]))
+    for (ref, _), entry in zip(refs, entries):
         if entry is not None:
             entry.parent_file = container
             entry.ref_uuid = ref.get("UUID") or ""
@@ -1733,14 +1739,26 @@ def pyramid_to_original(small, max_value):
     return lut[small]
 
 
+_PYRAMID_LEVELS = {}      # normcase(.xlif path) -> its ImageEntry (None: no such file)
+
+
+def _pyramid_entry(path):
+    """A pyramid level's .xlif, read once and then remembered: opening an image, its quick picture, its thumbnail and the background
+    loader each walk the levels, and on a network drive each read is a round trip to the server. (LAS X's levels don't change.)"""
+    key = os.path.normcase(path)
+    if key not in _PYRAMID_LEVELS:
+        _PYRAMID_LEVELS[key] = load_entry(path) if os.path.isfile(path) else None
+    return _PYRAMID_LEVELS[key]
+
+
 def pyramid_level(entry, size):
     """The smallest level of LAS X's pyramid (reduced 8-bit copies, _pmd_0 = 1/2 size, _pmd_1 = 1/4, ...) that is still at least `size`
     on its longest side, as an ImageEntry, or None if there is no pyramid. Reads only the levels' small .xlif files."""
     best, path = None, entry.pyramid
     for _ in range(16):
-        if not path or not os.path.isfile(path):
+        if not path:
             break
-        level = load_entry(path)
+        level = _pyramid_entry(path)
         if not isinstance(level, ImageEntry) or level.problem or len(level.channels) != len(entry.channels):
             break
         if best is not None and max(level.width, level.height) < size:
@@ -3542,7 +3560,12 @@ class XlefViewer:
         self.loading = True
         self._update_cursor()
         n = len(img.entry.channels)
-        mb = sum(os.path.getsize(f) for f in img.entry.all_files() if os.path.exists(f)) / 1e6
+
+        def on_disk():
+            """For the status bar once it is read (asked of the files there, in the background: a round trip each on a network drive)."""
+            mb = (img.entry.full_bytes if img.entry.full_bytes is not None else
+                  sum(os.path.getsize(f) for f in img.entry.all_files() if os.path.exists(f))) / 1e6
+            return f"{mb:,.0f} MB on disk"
         # With a pyramid, a level about the size of the fit view comes first (a quarter of the data, or less); the overview's own,
         # sharper level is read next and replaces it whole, once all its channels are in.
         quick = img.quick_level(max(img.entry.width, img.entry.height) * self.fit_scale)
@@ -3592,7 +3615,7 @@ class XlefViewer:
                         report((c + 1) / n)
                 if all(a is not None for a in sharp):
                     self.results.put(("sharp", gen, (z, sharp, img.pyramid[1])))
-                self.results.put(("loaded", gen, f"{mb:,.0f} MB on disk"))
+                self.results.put(("loaded", gen, on_disk()))
                 return
             for c in range(n):
                 if gen != self.generation:
@@ -3604,7 +3627,7 @@ class XlefViewer:
                     self.results.put(("error", gen, f"Can't read channel {c + 1} of {img.entry.name}: {e}"))
                     return
                 self.results.put(("overview", gen, None))
-            self.results.put(("loaded", gen, f"{mb:,.0f} MB on disk"))
+            self.results.put(("loaded", gen, on_disk()))
 
         threading.Thread(target=work, daemon=True).start()
         self.status.config(text=f"Reading {img.entry.name} ...")

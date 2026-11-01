@@ -2,11 +2,11 @@
 ## Overview
 
 This folder contains three tools for analyzing brain section data. They can be run by double
-clicking Windows .bat files that start with the word RUN_, in the repository's top folder (two folders up from this one), e.g.:
+clicking Windows .bat files that start with the word run-, in the repository's top folder (two folders up from this one), e.g.:
 
-    RUN_ASSEMBLER.bat
-    RUN_LIFCONVERTER.bat
-    RUN_TIFS_TO_JP2.bat
+    run-assembler.bat
+    run-lifconverter.bat
+    run-tifs-to-jp2.bat
 
 When you first run any of these, it will auto-create a local Python environment in a `.venv` folder (in the repository's top folder, shared with the ABC and CCF browsers) and auto-install the libraries it needs; for the assembler this took about 30
 seconds. These three tools need about 400MB of free space; the ABC browser's much larger libraries bring the shared `.venv`
@@ -25,7 +25,7 @@ neighbors, then exports a new JPX. At any time you can save, reload, or re-edit 
 
 ## Running it ...
 
-Double-click `RUN_ASSEMBLER.bat` for the start window. The workflow proceeds in 5 steps:
+Double-click `run-assembler.bat` for the start window. The workflow proceeds in 5 steps:
 
 1. **Load images** (`section_loader.py`): choose Zeiss `.czi` slide scans, .jpx image stacks from NeuroInfo,
    .xml reconstruction files from NeuroInfo, or individual JP2 image files. Once you've selected the images,
@@ -79,7 +79,7 @@ https://github.com/ome/bioformats/blob/master/components/formats-gpl/src/loci/fo
 
 ## 3. TIFF TO JP2 converter
 
-This program converts Leica TIFF exports to JPEG2000 files for NeuroInfo (double click `RUN_TIFS_TO_JP2.bat`).
+This program converts Leica TIFF exports to JPEG2000 files for NeuroInfo (double click `run-tifs-to-jp2.bat`).
 
 `tifs_to_jp2.py` merges per-channel greyscale TIFFs exported from Leica (`<section>--C00.tif` ... `--C03.tif`)
 into one multi-channel JPEG2000 per section, with the same header layout NeuroInfo/Microfile+ writes

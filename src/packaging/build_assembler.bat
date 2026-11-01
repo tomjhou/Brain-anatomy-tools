@@ -2,7 +2,7 @@
 REM Builds the packaged section assembler and aligner on this computer, as the release workflow does:
 REM   packaging\dist\SectionAssembler\SectionAssembler.exe   (Python and every library inside)
 REM   packaging\dist\SectionAssembler.zip                    (what is handed to users)
-REM It uses the same virtual environment as the RUN_*.bat files (the .venv folder: see ensure_python.bat), in which the program's own libraries
+REM It uses the same virtual environment as the run-*.bat files (the .venv folder: see ensure_python.bat), in which the program's own libraries
 REM are what the program installed there; only PyInstaller is added to it.
 setlocal
 title Building the packaged section assembler

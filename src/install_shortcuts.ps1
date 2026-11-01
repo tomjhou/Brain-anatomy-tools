@@ -2,17 +2,19 @@
 # Run by INSTALL_APPS.bat. A shortcut runs cmd.exe with the .bat, which (unlike the .bat itself) Windows lets you pin to the taskbar.
 # Each shortcut also gets its program's app ID, the one the program declares when it starts (app_identity.py), so that Windows shows
 # the running program on the pinned button instead of as a separate Python button.
-# Running it again replaces the shortcuts, so after moving this folder just run it again.
+# Running it again replaces the shortcuts, so after moving this folder, or when an icon has changed, just run it again.
 param([string]$Desktop = [Environment]::GetFolderPath("Desktop"),
-      [string]$StartMenu = (Join-Path ([Environment]::GetFolderPath("Programs")) "Brain anatomy tools"))
+      [string]$StartMenu = (Join-Path ([Environment]::GetFolderPath("Programs")) "Brain anatomy tools"),
+      [string]$IconCopies = (Join-Path $env:LOCALAPPDATA "JhouLab\icons"),
+      [string]$Pinned = (Join-Path $env:APPDATA "Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"))
 
 $ErrorActionPreference = "Stop"
 $here = $PSScriptRoot                  # src, with the icons
 $top = Split-Path -Parent $here        # the repository's top folder, with the .bat files
 $apps = @(   # AppId and Icon as in APPS in app_identity.py
-    @{ Name = "Leica xlef viewer"; Bat = "RUN_XLEF_VIEWER.bat";       Icon = "xlef_viewer.ico";       AppId = "JhouLab.BrainAnatomyTools.XlefViewer" },
-    @{ Name = "CCF browser";       Bat = "RUN_CCF_BROWSER.bat";       Icon = "ccf_browser.ico";       AppId = "JhouLab.BrainAnatomyTools.CCFBrowser" },
-    @{ Name = "ABC atlas browser"; Bat = "RUN_ABC_ATLAS_BROWSER.bat"; Icon = "abc_atlas_browser.ico"; AppId = "JhouLab.BrainAnatomyTools.ABCAtlasBrowser" }
+    @{ Name = "Leica xlef viewer"; Bat = "run-xlef-viewer.bat";       Icon = "xlef_viewer.ico";       AppId = "JhouLab.BrainAnatomyTools.XlefViewer" },
+    @{ Name = "CCF browser";       Bat = "run-ccf-browser.bat";       Icon = "ccf_browser.ico";       AppId = "JhouLab.BrainAnatomyTools.CCFBrowser" },
+    @{ Name = "ABC atlas browser"; Bat = "run-abc-atlas-browser.bat"; Icon = "abc_atlas_browser.ico"; AppId = "JhouLab.BrainAnatomyTools.ABCAtlasBrowser" }
 )
 
 # WScript.Shell can't set a shortcut's app ID (the System.AppUserModel.ID property), so that is done through the shell's property store.
@@ -46,25 +48,60 @@ public static class ShortcutAppId {
             finally { Marshal.FreeCoTaskMem(value.Text); }
         } finally { Marshal.ReleaseComObject(store); }
     }
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    static extern void SHChangeNotify(int eventId, uint flags, string item1, IntPtr item2);
+    // Tells Explorer and the taskbar that a shortcut changed (SHCNE_UPDATEITEM), or with no path that icons may have (SHCNE_ASSOCCHANGED).
+    public static void Notify(string shortcut) {
+        if (shortcut == null) SHChangeNotify(0x08000000, 0, null, IntPtr.Zero);
+        else SHChangeNotify(0x00002000, 0x0005 /* SHCNF_PATHW */, shortcut, IntPtr.Zero);
+    }
 }
 "@
 
 $cmd = Join-Path $env:SystemRoot "System32\cmd.exe"
 $shell = New-Object -ComObject WScript.Shell
 
+function Write-Shortcut($path, $app) {
+    $link = $shell.CreateShortcut($path)
+    $link.TargetPath = $cmd
+    # "call" keeps the quotes intact when a file dropped on the shortcut is added after them
+    $link.Arguments = '/c call "' + (Join-Path $top $app.Bat) + '"'
+    $link.WorkingDirectory = $top
+    $link.IconLocation = $app.IconCopy + ",0"
+    $link.Description = $app.Name
+    $link.Save()
+    [ShortcutAppId]::Set($path, $app.AppId)
+}
+
+# Windows caches a shortcut's icon by the icon file's path, and the taskbar goes on showing a pinned one's old picture after the file
+# changes. So the shortcuts point at a copy of each icon named after its contents (e.g. %LOCALAPPDATA%\JhouLab\icons\ccf_browser-1a2b3c4d.ico):
+# a changed icon gets a new path, which nothing has cached.
+New-Item -ItemType Directory -Force $IconCopies | Out-Null
+foreach ($app in $apps) {
+    $source = Join-Path $here ("icons\" + $app.Icon)
+    $stem = [IO.Path]::GetFileNameWithoutExtension($app.Icon)
+    $hash = (Get-FileHash $source -Algorithm SHA256).Hash.Substring(0, 8).ToLower()
+    $app.IconCopy = Join-Path $IconCopies "$stem-$hash.ico"
+    if (-not (Test-Path $app.IconCopy)) { Copy-Item $source $app.IconCopy }
+    Get-ChildItem $IconCopies -Filter "$stem-*.ico" | Where-Object FullName -ne $app.IconCopy | Remove-Item -ErrorAction SilentlyContinue
+}
+
 foreach ($folder in @($Desktop, $StartMenu)) {
     New-Item -ItemType Directory -Force $folder | Out-Null
     foreach ($app in $apps) {
-        $path = Join-Path $folder ($app.Name + ".lnk")
-        $link = $shell.CreateShortcut($path)
-        $link.TargetPath = $cmd
-        # "call" keeps the quotes intact when a file dropped on the shortcut is added after them
-        $link.Arguments = '/c call "' + (Join-Path $top $app.Bat) + '"'
-        $link.WorkingDirectory = $top
-        $link.IconLocation = (Join-Path $here ("icons\" + $app.Icon)) + ",0"
-        $link.Description = $app.Name
-        $link.Save()
-        [ShortcutAppId]::Set($path, $app.AppId)
+        Write-Shortcut (Join-Path $folder ($app.Name + ".lnk")) $app
     }
     Write-Host "Shortcuts made in $folder"
 }
+
+# Shortcuts already pinned to the taskbar are Windows' own copies of ours: bring them up to date too (the icon, and the .bat they run,
+# which may have been renamed or moved).
+foreach ($app in $apps) {
+    $path = Join-Path $Pinned ($app.Name + ".lnk")
+    if (Test-Path $path) {
+        Write-Shortcut $path $app
+        [ShortcutAppId]::Notify($path)
+        Write-Host "Updated the pinned $($app.Name)"
+    }
+}
+[ShortcutAppId]::Notify($null)

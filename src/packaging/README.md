@@ -23,7 +23,7 @@ A user updates by downloading the zip again.
 
 ## Building it on this computer
 
-`src\packaging\build_assembler.bat` does what the workflow does, in the shared `.venv` of the `RUN_*.bat` files (see `src\ensure_python.bat`);
+`src\packaging\build_assembler.bat` does what the workflow does, in the shared `.venv` of the `run-*.bat` files (see `src\ensure_python.bat`);
 the result is `src\packaging\dist\SectionAssembler.zip`.
 
 ## What is where

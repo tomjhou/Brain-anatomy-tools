@@ -1,7 +1,7 @@
 @echo off
 REM Makes desktop and Start menu shortcuts, each with its own icon, for the xlef viewer, CCF browser and ABC atlas browser
-REM (double-click this file in Windows Explorer). Unlike the RUN_*.bat files, the shortcuts can be pinned to the taskbar.
-REM Run it again after moving this folder. See src\install_shortcuts.ps1.
+REM (double-click this file in Windows Explorer). Unlike the run-*.bat files, the shortcuts can be pinned to the taskbar.
+REM Run it again after moving this folder, or when an icon has changed (it updates pinned shortcuts too). See src\install_shortcuts.ps1.
 setlocal
 cd /d "%~dp0"
 title Install app shortcuts
@@ -17,8 +17,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo Done. To pin one to the taskbar, right-click its desktop shortcut (Windows 11: Show more options)
-echo and choose "Pin to taskbar", or drag it onto the taskbar. They are also in the Start menu,
+echo Done. The desktop shortcuts can be opened directly or dragged to the taskbar. They are also in the Start menu,
 echo under "Brain anatomy tools".
 echo.
 pause

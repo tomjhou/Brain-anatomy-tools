@@ -12,7 +12,7 @@ the scripts and files they use, are in `src/`.
 
 Windows won't pin a .bat file to the taskbar, so double click `INSTALL_APPS.bat` once: it makes shortcuts, each with its own icon, for
 the xlef viewer, CCF browser and ABC atlas browser, on the desktop and in the Start menu (under "Brain anatomy tools"). Drag them onto
-the taskbar (or right-click, Pin to taskbar). Run it again if you move this folder. A pinned shortcut and its running program share one taskbar button with the
+the taskbar (or right-click, Pin to taskbar). Run it again if you move this folder, or after an icon changes (Windows otherwise keeps showing the old one; this updates pinned shortcuts too). A pinned shortcut and its running program share one taskbar button with the
 program's own icon (the programs declare the same app ID as their shortcuts: see `src/app_identity.py`). The xlef viewer and CCF browser close
 their console window once they have started; their output then goes to `%LOCALAPPDATA%\JhouLab\logs`, and an error is shown in a message box.
 The icons are in `src/icons/` (`make_icons.py` draws them).
@@ -20,7 +20,7 @@ The icons are in `src/icons/` (`make_icons.py` draws them).
 
 ## 1. Section alignment program for Windows
 
-The section assembler and aligner (in `src/FileConverters/`; run from the source with `RUN_ASSEMBLER.bat`) can read NeuroInfo reconstructions (.xml or .jpx) or raw image
+The section assembler and aligner (in `src/FileConverters/`; run from the source with `run-assembler.bat`) can read NeuroInfo reconstructions (.xml or .jpx) or raw image
 files (Zeiss .czi, or jp2 images), detect sections, sort them in order, and adjust alignment and section outlines to
 create serial-section stacks.
 
@@ -57,7 +57,7 @@ Since the atlas cache can reach about 100 GB, make sure the drive you choose has
 ### Running from the source
 
 If you plan to edit or debug code, you'll need to run from source. The easiest way on Windows is to
-double click RUN_ABC_ATLAS_BROWSER.bat. The first time you run it, it creates and installs a
+double click run-abc-atlas-browser.bat. The first time you run it, it creates and installs a
 shared `.venv` (see above), which takes about 30 seconds for the section assembler, and longer for the
 ABC browser. The `.venv` will be about 300MB with the assembler, and grow to about 1.1 GB with the ABC
 browser. This only happens once, and it does not alter existing Python environments.
@@ -91,14 +91,14 @@ from any working directory. If you choose your own cache location, this may not 
 
 Scroll through the Allen CCF annotation volume (coronal, sagittal or horizontal slices) and plot cells from CSV files on it:
 the coordinates exported by the ABC browser's "Export coordinates" button, or a marker export from NeuroInfo. On Windows, double
-click RUN_CCF_BROWSER.bat (it uses the same `.venv`; if that lacks pandas or Pillow they are installed first, and the Allen Institute's
+click run-ccf-browser.bat (it uses the same `.venv`; if that lacks pandas or Pillow they are installed first, and the Allen Institute's
 `abc_atlas_access` library, which brings about 300 MB of dependencies, is installed the first time the atlas is needed; neither needs git). The
 25 um annotation volume (3.6 MB) comes from the ABC atlas cache, and is downloaded on first use, after asking, if it is not there yet. Making surface meshes of regions needs the `vtk` library, which the
 program offers to install the first time (a download of about 100 MB).
 
 ## 4. XLEF viewer
 
-A quick viewer for Leica LAS X experiments (`.xlef`): on Windows, double click RUN_XLEF_VIEWER.bat, or drop an `.xlef` file on it
+A quick viewer for Leica LAS X experiments (`.xlef`): on Windows, double click run-xlef-viewer.bat, or drop an `.xlef` file on it
 (it uses the same `.venv`, and installs numpy, tifffile and Pillow into it if they are missing). File > Open (Ctrl+O) lists the
 experiments opened recently (with a Pyramid column: whether LAS X made reduced copies of its images, which open much faster; "Yes", "No", or e.g. "5 of 29"), or lets you browse for one or drag it in; an `.xlef` can also be dragged onto the window. A `.lif` (LAS X's single-file format) opens the same way, with LAS X's pyramid from the `.lifext` next to it, but read only: its images can't be renamed, deleted or moved, and changes made in the view (annotations, contrast, colors) aren't saved. The left panel lists the experiment's
 images in LAS X's order, with each image's size at full resolution (and the totals of folders and experiments); click one to see its channels overlaid in their LAS X colors, starting with LAS X's contrast settings. Mouse wheel zooms,

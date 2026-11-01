@@ -1,8 +1,8 @@
 @echo off
-REM Finds Python 3.10 to 3.13 (64-bit) for the RUN_*.bat files, installing Python 3.13 first when there is none.
+REM Finds Python 3.10 to 3.13 (64-bit) for the run-*.bat files, installing Python 3.13 first when there is none.
 REM Usage:  call "path\to\ensure_python.bat"   (sets PYTHON_CMD; if it is not set afterwards, Python could not be found or installed)
 REM It looks through the py launcher, then "python" / "python3", then for a per-user install that is not on PATH yet. The installation is for the current user only and needs no administrator rights.
-REM PYTHON_CMD ends up as the python.exe of a virtual environment, the ".venv" folder in the repository's top folder (next to the RUN_*.bat files), built from the Python found here. All the RUN_*.bat
+REM PYTHON_CMD ends up as the python.exe of a virtual environment, the ".venv" folder in the repository's top folder (next to the run-*.bat files), built from the Python found here. All the run-*.bat
 REM files share it, and missing libraries are installed into it rather than into the computer's Python. Deleting the .venv folder starts it afresh.
 
 set "PYTHON_CMD="

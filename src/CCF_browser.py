@@ -46,7 +46,7 @@ def startup_note(message):
 
 def ensure_libraries(required):
     """Install, with pip into this Python, the libraries ({import name: pip name}) that are missing, as the other tools do: the shared .venv of
-    the RUN_*.bat files has only those of whichever tool was run first, so the browser must not assume the rest are there. A packaged
+    the run-*.bat files has only those of whichever tool was run first, so the browser must not assume the rest are there. A packaged
     program has its libraries inside."""
     missing = [pip for module, pip in required.items() if importlib.util.find_spec(module) is None]
     if not missing or getattr(sys, 'frozen', False):

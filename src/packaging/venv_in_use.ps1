@@ -24,5 +24,5 @@ foreach ($p in $running) {
 }
 Write-Host ""
 Write-Host "Windows keeps the libraries they use locked, so the build could not replace them and would leave the environment half changed."
-Write-Host "Close them (the atlas browser, the assembler, any window started by a RUN_*.bat file) and run this again."
+Write-Host "Close them (the atlas browser, the assembler, any window started by a run-*.bat file) and run this again."
 exit 1

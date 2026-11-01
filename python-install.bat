@@ -1,6 +1,6 @@
 @echo off
 REM Installs the Python libraries used by ABC_atlas_browser.py and CCF_browser.py into the private virtual environment (the .venv folder)
-REM that the RUN_*.bat files use; see ensure_python.bat, which finds Python and makes the environment first if needed.
+REM that the run-*.bat files use; see ensure_python.bat, which finds Python and makes the environment first if needed.
 setlocal
 cd /d "%~dp0"
 call "%~dp0src\ensure_python.bat"

@@ -3161,7 +3161,7 @@ class XlefViewer:
         self.panel_frame.keep_colors = True
         self.panel_frame.bind("<Configure>", lambda e: self._layout_panels())
         self.pixel_grid = False      # (at the largest zoom, after trying to zoom in further: a line along every pixel's edge)
-        self.status = ttk.Label(right, text="Open an .xlef file (File > Open, or drag it onto this window or onto RUN_XLEF_VIEWER.bat).",
+        self.status = ttk.Label(right, text="Open an .xlef file (File > Open, or drag it onto this window or onto run-xlef-viewer.bat).",
                                 anchor=tk.W)
         self.status.pack(fill=tk.X)
         self.cursor_row = ttk.Frame(right)          # (under the pointer: its position, then each channel's value, in its color)
@@ -4836,11 +4836,47 @@ class XlefViewer:
             parts.append(f"({x * e.pixel_um:,.1f}, {y * e.pixel_um:,.1f} µm)")
         vals = []
         for c, ch in enumerate(e.channels):
-            p = self.img.planes.get((self.z, c))     # only planes already open: hovering must not open files
-            if p is not None and not self.loading:
-                vals.append((c, f"{ch.name}: {int(p[y, x])}"))
+            v = self._value_at(c, x, y)
+            if v is not None:
+                vals.append((c, f"{ch.name}: {'' if v[1] else '≈'}{v[0]}"))
+        if any("≈" in text for _, text in vals):
+            parts.append("(≈: from the zoomed-out picture; zoom in for exact values)")
         self.cursor_label.config(text="   ".join(parts))
         self._show_cursor_values(vals)
+
+    def _value_at(self, c, x, y):
+        """Channel c's value at image pixel (x, y) of the plane shown, from pixels already in memory (hovering must not open files):
+        (value, exact), or None. Exact from a whole plane, or from sharp pixels read at full resolution (the view on screen, one being
+        read, or one kept from before); otherwise the nearest pixel of a coarser copy (a zoomed-out sharp view, or the overview, which
+        may come from LAS X's 8-bit pyramid), only near the pixel's value."""
+        img = self.img
+        p = img.planes.get((self.z, c))
+        if p is not None and not self.loading:
+            return int(p[y, x]), True
+        best = None
+        partial = getattr(self, "detail_partial", None)
+        regions = [r for r in reversed(self.regions) if r["entry"] is img.entry]      # (kept regions: of this image, newest first)
+        for k, cache in enumerate([self.detail_cache, partial] + regions):
+            if cache is None or (k < 2 and cache["key"][0] != id(img)):           # (the view on screen, or being read: of this image?)
+                continue
+            _, cz, i0, j0, i1, j1, st, _ = cache["key"]
+            a = cache["arrays"][c] if c < len(cache["arrays"]) else None
+            if cz != self.z or a is None:
+                continue
+            row, col = y // st - j0, x // st - i0
+            rows = cache["rows"] if cache is partial else a.shape[0]
+            if 0 <= row < min(rows, a.shape[0]) and 0 <= col < a.shape[1] and (best is None or st < best[1]):
+                best = (int(a[row, col]), st)
+                if st == 1:
+                    break
+        if best is not None:
+            return best[0], best[1] == 1
+        ov = img.overviews.get((self.z, c))
+        if ov is not None:
+            s = img.ov_step
+            row, col = min(y // s, ov.shape[0] - 1), min(x // s, ov.shape[1] - 1)
+            return int(ov[row, col]), False
+        return None
 
     def _show_cursor_values(self, vals):
         """After the pointer's position: each channel's value under it, "DAPI: 1234", in the channel's color (made lighter or darker

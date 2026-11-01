@@ -24,25 +24,51 @@ def clip(layer, mask):
 
 
 def xlef_viewer():
-    """A fluorescence section: a dim coronal slice on black with green and magenta labelled cells."""
-    im = tile((8, 8, 14, 255))
-    section = Image.new("L", im.size, 0)
-    d = ImageDraw.Draw(section)
-    d.ellipse((150, 200, 880, 830), fill=255)                  # the slice: two hemispheres, notched at the top midline
-    d.ellipse((440, 130, 584, 300), fill=0)
-    glow = Image.new("RGBA", im.size, (0, 0, 0, 0))
-    ImageDraw.Draw(glow).rectangle((0, 0, BIG, BIG), fill=(40, 70, 120, 255))
-    im.alpha_composite(clip(glow, section))
-    cells = Image.new("RGBA", im.size, (0, 0, 0, 0))
-    d = ImageDraw.Draw(cells)
-    rnd = random.Random(4)
-    for colour, (cx, cy) in (((60, 255, 90, 255), (380, 470)), ((255, 60, 220, 255), (640, 560))):
-        for _ in range(26):
-            x, y, r = cx + rnd.gauss(0, 95), cy + rnd.gauss(0, 85), rnd.uniform(26, 46)
-            d.ellipse((x - r, y - r, x + r, y + r), fill=colour)
-    halo = cells.filter(ImageFilter.GaussianBlur(28))
-    im.alpha_composite(clip(halo, section))
-    im.alpha_composite(clip(cells, section))
+    """A coronal section in two flat reds, traced from a real fluorescence image (xlef_section.webp): dim tissue, the two bright striata,
+    and the ventricles in black. Needs numpy and scipy (both in the .venv once the ABC browser has run)."""
+    import numpy as np
+    from PIL import ImageEnhance
+    from scipy import ndimage
+
+    photo = Image.open(os.path.join(HERE, "xlef_section.webp")).convert("RGB")
+    # The section alone: the largest bright area, without thin things (a stray fibre, the scale bar's text) or holes (the ventricles).
+    tissue = ndimage.binary_opening(np.asarray(photo).max(axis=2) > 22, iterations=4)
+    labels, _ = ndimage.label(tissue)
+    section = ndimage.binary_fill_holes(ndimage.binary_closing(labels == np.bincount(labels.ravel())[1:].argmax() + 1, iterations=6))
+    ys, xs = np.nonzero(section)
+    box = (xs.min(), ys.min(), xs.max() + 1, ys.max() + 1)
+    sec = photo.crop(box)
+    sec = ImageEnhance.Color(ImageEnhance.Contrast(ImageEnhance.Brightness(sec).enhance(1.9)).enhance(1.3)).enhance(1.3)
+    w = int(BIG * 0.92)                                        # filling most of the tile, a little taller than the photo
+    h = int(w * sec.height / sec.width * 1.12)
+    if h > BIG * 0.92:
+        w, h = int(w * BIG * 0.92 / h), int(BIG * 0.92)
+    x, y = (BIG - w) // 2, (BIG - h) // 2
+    rgb = Image.new("RGB", (BIG, BIG)); rgb.paste(sec.resize((w, h), Image.LANCZOS), (x, y))
+    mask = Image.new("L", (BIG, BIG)); mask.paste(Image.fromarray((section * 255).astype(np.uint8)).crop(box).resize((w, h)), (x, y))
+    mask = mask.filter(ImageFilter.GaussianBlur(10)).point(lambda v: 255 if v > 128 else 0)   # a smooth outline
+    inside = np.asarray(mask) > 0
+
+    # Bright: the brightest third of the (smoothed) tissue, keeping only the two largest areas, the striata (no bright patches of cortex).
+    lum = np.asarray(rgb.filter(ImageFilter.MedianFilter(31)).filter(ImageFilter.GaussianBlur(8)).convert("L")).astype(float)
+    labels, _ = ndimage.label((lum > np.percentile(lum[inside], 67)) & inside)
+    sizes = np.bincount(labels.ravel()); sizes[0] = 0
+    bright = ndimage.binary_fill_holes(np.isin(labels, np.argsort(sizes)[-2:]))
+    bright = np.asarray(Image.fromarray((bright * 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(6))) > 128
+    # Ventricles: large dark areas well inside the section.
+    raw = np.asarray(rgb.convert("L").filter(ImageFilter.GaussianBlur(3))).astype(float)
+    holes = ndimage.binary_opening((raw < 25) & ndimage.binary_erosion(inside, iterations=25), iterations=3)
+    labels, _ = ndimage.label(holes)
+    holes = (np.bincount(labels.ravel()) > 600)[labels] & (labels > 0)
+
+    out = np.zeros((BIG, BIG, 3), np.uint8)
+    out[inside] = (95, 18, 10)
+    out[bright & inside] = (240, 45, 25)
+    out[holes] = (0, 0, 0)
+    layer = Image.fromarray(out).filter(ImageFilter.ModeFilter(9)).convert("RGBA")
+    layer.putalpha(mask)
+    im = tile((0, 0, 0, 255))
+    im.alpha_composite(clip(layer, im.getchannel("A")))
     return im
 
 

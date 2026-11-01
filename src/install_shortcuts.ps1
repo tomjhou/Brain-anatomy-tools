@@ -7,6 +7,8 @@ param([string]$Desktop = [Environment]::GetFolderPath("Desktop"),
       [string]$StartMenu = (Join-Path ([Environment]::GetFolderPath("Programs")) "Brain anatomy tools"),
       [string]$IconCopies = (Join-Path $env:LOCALAPPDATA "JhouLab\icons"),
       [string]$Pinned = (Join-Path $env:APPDATA "Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"),
+      [string]$UninstallCopy = (Join-Path $env:LOCALAPPDATA "JhouLab\uninstall"),
+      [string]$RegistryKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\JhouLab.BrainAnatomyTools",
       [switch]$NoStartMenuRestart)   # (for tests: leave the Start menu alone)
 
 $ErrorActionPreference = "Stop"
@@ -107,6 +109,27 @@ foreach ($app in $apps) {
     }
 }
 [ShortcutAppId]::Notify($null)
+
+# An entry in Settings > Apps (for this user; no administrator needed), whose Uninstall runs uninstall_apps.ps1. It runs a copy kept
+# outside the repository, so that it still removes the shortcuts and the entry itself if the repository folder was deleted first.
+New-Item -ItemType Directory -Force $UninstallCopy | Out-Null
+$uninstaller = Join-Path $UninstallCopy "uninstall_apps.ps1"
+Copy-Item (Join-Path $here "uninstall_apps.ps1") $uninstaller -Force
+$size = 0
+foreach ($f in [IO.Directory]::EnumerateFiles($top, "*", [IO.SearchOption]::AllDirectories)) { $size += ([IO.FileInfo]$f).Length }
+New-Item -Path $RegistryKey -Force | Out-Null
+$entry = @{
+    DisplayName     = "Brain anatomy tools"
+    DisplayIcon     = $apps[0].IconCopy
+    Publisher       = "Jhou Lab"
+    InstallLocation = $top
+    URLInfoAbout    = "https://github.com/tomjhou/Brain-anatomy-tools"
+    UninstallString = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$uninstaller`" -Repo `"$top`""
+}
+foreach ($name in $entry.Keys) { New-ItemProperty -Path $RegistryKey -Name $name -Value $entry[$name] -PropertyType String -Force | Out-Null }
+foreach ($name in @("NoModify", "NoRepair")) { New-ItemProperty -Path $RegistryKey -Name $name -Value 1 -PropertyType DWord -Force | Out-Null }
+New-ItemProperty -Path $RegistryKey -Name EstimatedSize -Value ([int]($size / 1KB)) -PropertyType DWord -Force | Out-Null   # (KB)
+Write-Host "Listed in Settings > Apps as ""Brain anatomy tools"" (uninstall from there, or with UNINSTALL_APPS.bat)"
 
 # The Start menu keeps icons in a cache of its own, read when its process starts, so after a new icon it shows the old one until the next
 # sign-in. Restarting that process (Windows starts it again at once; a Start menu open just then closes) makes it read them now.

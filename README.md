@@ -17,6 +17,11 @@ program's own icon (the programs declare the same app ID as their shortcuts: see
 their console window once they have started; their output then goes to `%LOCALAPPDATA%\JhouLab\logs`, and an error is shown in a message box.
 The icons are in `src/icons/` (`make_icons.py` draws them).
 
+`INSTALL_APPS.bat` also lists the tools in Windows' Settings > Apps, as "Brain anatomy tools". Uninstall there, or `UNINSTALL_APPS.bat`, removes
+the shortcuts, icons, logs and thumbnails, then asks about each of the `.venv`, the browsers' caches and settings, the xlef viewer's
+settings and the ABC atlas download (Enter keeps it). It never touches projects or outputs; unpin taskbar buttons and delete this folder
+by hand.
+
 
 ## 1. Section alignment program for Windows
 

@@ -3019,9 +3019,9 @@ class XlefViewer:
         ttk.Button(self.list_bar, text="Open...", command=self.ask_open).pack(side=tk.LEFT)
         self.save_button = ttk.Button(self.list_bar, text="Save", command=self.save_annotations, state=tk.DISABLED)
         self.save_button.pack(side=tk.LEFT, padx=(4, 0))
-        Tooltip(self.save_button, "Write all unsaved changes (annotations, color maps, contrast, renames, the list's order, deleted images: "
+        Tooltip(self.save_button, "Write all unsaved changes ("
                                   "marked with a red * in the list) into LAS X's files, "
-                                  "keeping a copy of each file as it was. Nothing is saved until you click this.")
+                                  "keeping a backup of the original version. Nothing is saved until you click this.")
         # The List / Thumbnails toggle: real buttons, the one showing filled in (as the Open dialog's toggle), since ttk's flat Toolbutton
         # style looks like a label on Windows.
         self.view_mode = tk.StringVar(value=self.settings.get("view_mode", "list"))

@@ -6,7 +6,8 @@
 param([string]$Desktop = [Environment]::GetFolderPath("Desktop"),
       [string]$StartMenu = (Join-Path ([Environment]::GetFolderPath("Programs")) "Brain anatomy tools"),
       [string]$IconCopies = (Join-Path $env:LOCALAPPDATA "JhouLab\icons"),
-      [string]$Pinned = (Join-Path $env:APPDATA "Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"))
+      [string]$Pinned = (Join-Path $env:APPDATA "Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"),
+      [switch]$NoStartMenuRestart)   # (for tests: leave the Start menu alone)
 
 $ErrorActionPreference = "Stop"
 $here = $PSScriptRoot                  # src, with the icons
@@ -77,12 +78,13 @@ function Write-Shortcut($path, $app) {
 # changes. So the shortcuts point at a copy of each icon named after its contents (e.g. %LOCALAPPDATA%\JhouLab\icons\ccf_browser-1a2b3c4d.ico):
 # a changed icon gets a new path, which nothing has cached.
 New-Item -ItemType Directory -Force $IconCopies | Out-Null
+$newIcon = $false
 foreach ($app in $apps) {
     $source = Join-Path $here ("icons\" + $app.Icon)
     $stem = [IO.Path]::GetFileNameWithoutExtension($app.Icon)
     $hash = (Get-FileHash $source -Algorithm SHA256).Hash.Substring(0, 8).ToLower()
     $app.IconCopy = Join-Path $IconCopies "$stem-$hash.ico"
-    if (-not (Test-Path $app.IconCopy)) { Copy-Item $source $app.IconCopy }
+    if (-not (Test-Path $app.IconCopy)) { Copy-Item $source $app.IconCopy; $newIcon = $true }
     Get-ChildItem $IconCopies -Filter "$stem-*.ico" | Where-Object FullName -ne $app.IconCopy | Remove-Item -ErrorAction SilentlyContinue
 }
 
@@ -105,3 +107,10 @@ foreach ($app in $apps) {
     }
 }
 [ShortcutAppId]::Notify($null)
+
+# The Start menu keeps icons in a cache of its own, read when its process starts, so after a new icon it shows the old one until the next
+# sign-in. Restarting that process (Windows starts it again at once; a Start menu open just then closes) makes it read them now.
+if ($newIcon -and -not $NoStartMenuRestart) {
+    Stop-Process -Name StartMenuExperienceHost -Force -ErrorAction SilentlyContinue
+    Write-Host "Restarted the Start menu, so that it shows the new icons"
+}

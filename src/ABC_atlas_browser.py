@@ -52,6 +52,9 @@ import threading
 import subprocess
 from pathlib import Path
 import importlib.util
+from app_identity import use_app_identity
+
+use_app_identity('abc_atlas_browser')   # its own taskbar icon and button, not Python's (Windows)
 
 _STARTUP_T0 = time.perf_counter()
 
@@ -347,7 +350,7 @@ from abc_core import (
     COORD_SETTINGS, DATASET_NAME, DEFAULT_BREGMA_CCF_AP_MM, DEFAULT_GREY_RGBA, FRAME_STATE, GRID_CACHE_DPI, RECON_FILES,
     coordinate_frame_name, dataset_prefix, grid_cache_layout, grid_cache_png, reconstructed_in_use,
     record_run_opened as core_record_run_opened,
-    IMPUTED_DATASET_DIRECTORY, IMPUTED_DATASET_FILE_NAME, MULTI_GENE_BRIGHT_BLUE, NON_NEURON_CLASS_IDS, SCRIPT_DIR, SECTION_COL,
+    IMPUTED_DATASET_DIRECTORY, IMPUTED_DATASET_FILE_NAME, MULTI_GENE_BRIGHT_BLUE, NON_NEURON_CLASS_IDS, DEFAULTS_DIR, SECTION_COL,
     SECTION_COORDS_CACHE_VERSION, SETTINGS_FILE, SPATIAL_CSV_CACHE_VERSION, SPATIAL_CSV_CHUNK_SIZE, ZOOM_DEBUG_DIAGNOSTICS,
     Z_MODE_OPTIONS, _expr_column_cache, _get_full_gene_column, _read_section_coordinates, _spatial_csv_cache_path,
     build_neuron_class_colors, ccf_files_missing, class_id_to_color, ensure_spatial_load_started, extract_leading_numeric_id,
@@ -618,7 +621,7 @@ def show_coordinate_settings_dialog(abc_cache):
 # Where the ABC atlas download lives. By default it's next to this repository,
 # in the parent folder. If it isn't there, the user picks a location once (see
 # choose_atlas_cache_location) and the choice is remembered in this file.
-DEFAULT_ATLAS_CACHE_DIR = SCRIPT_DIR.parent / 'abc_atlas_cache'
+DEFAULT_ATLAS_CACHE_DIR = DEFAULTS_DIR / 'abc_atlas_cache'
 ATLAS_CACHE_LOCATION_FILE = CACHE_DIR / 'abc_atlas_cache_location.json'
 # Free space a drive should have to hold the atlas download. A typical cache for
 # this app, including the imputed gene dataset, is around 75 GB.
@@ -19293,7 +19296,7 @@ _recent_folders = load_recent_output_folders()
 # First launch: a folder next to this repository (so, next to the default atlas
 # location), which needs no drive letter or user name and isn't cloud-synced
 # the way Documents often is. After that, the most recently used folder.
-DEFAULT_OUTPUT_FOLDER = (Path.home() / 'Documents' if RUNNING_PACKAGED else SCRIPT_DIR.parent) / 'ABC_atlas_browser_output'
+DEFAULT_OUTPUT_FOLDER = (Path.home() / 'Documents' if RUNNING_PACKAGED else DEFAULTS_DIR) / 'ABC_atlas_browser_output'
 _initial_out_folder = resolve_out_folder(_recent_folders[0] if _recent_folders else str(DEFAULT_OUTPUT_FOLDER))
 session_state = {'out_folder': _initial_out_folder}
 startup_note("Opening the launch screen...")

@@ -15,6 +15,9 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: src   # the code is in src/; the steps' paths are relative to it
     steps:
       - uses: actions/checkout@v4
 
@@ -56,15 +59,15 @@ jobs:
         with:
           name: ABCAtlasBrowser-windows
           path: |
-            ABCAtlasBrowser-*.zip
-            SHA256SUMS-atlas.txt
+            src/ABCAtlasBrowser-*.zip
+            src/SHA256SUMS-atlas.txt
 
       - name: Attach it to the release
         if: startsWith(github.ref, 'refs/tags/atlas-v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            ABCAtlasBrowser-*.zip
-            SHA256SUMS-atlas.txt
+            src/ABCAtlasBrowser-*.zip
+            src/SHA256SUMS-atlas.txt
           generate_release_notes: true
           make_latest: false        # (the assembler's releases keep the "Latest" mark that the README's assembler link relies on)

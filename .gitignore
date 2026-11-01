@@ -9,6 +9,6 @@ __pycache__/
 # Private Python environment made by ensure_python.bat
 .venv/
 
-# Packaging (see packaging/): what the build makes
-packaging/build/
-packaging/dist/
+# Packaging (see src/packaging/): what the build makes
+src/packaging/build/
+src/packaging/dist/

@@ -1,5 +1,5 @@
 # PyInstaller spec for the section assembler and aligner: one folder, SectionAssembler\SectionAssembler.exe, with Python and every library inside.
-# Build it from the repository's root:   pyinstaller packaging/assembler.spec --noconfirm --distpath packaging/dist --workpath packaging/build
+# Build it from the repository's src folder (the workflow runs it there):   pyinstaller packaging/assembler.spec --noconfirm --distpath packaging/dist --workpath packaging/build
 # (packaging/build_assembler.bat does that in a virtual environment of its own; the release workflow in .github/workflows does it on a tag.)
 import os
 

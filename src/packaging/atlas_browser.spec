@@ -1,5 +1,5 @@
 # PyInstaller spec for the ABC atlas browser: one folder, ABCAtlasBrowser\ABCAtlasBrowser.exe, with Python and every library inside.
-# Build it from the repository's root:   pyinstaller packaging/atlas_browser.spec --noconfirm --distpath packaging/dist --workpath packaging/build
+# Build it from the repository's src folder (the workflow runs it there):   pyinstaller packaging/atlas_browser.spec --noconfirm --distpath packaging/dist --workpath packaging/build
 # (packaging/build_atlas_browser.bat does that in the repository's virtual environment; the release workflow in .github/workflows does it on a tag.)
 # The program keeps its console window (console=True): the browser asks things there now and then.
 import os

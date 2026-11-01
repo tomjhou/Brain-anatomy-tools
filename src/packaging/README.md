@@ -23,8 +23,8 @@ A user updates by downloading the zip again.
 
 ## Building it on this computer
 
-`packaging\build_assembler.bat` does what the workflow does, in the shared `.venv` of the `RUN_*.bat` files (see `ensure_python.bat`);
-the result is `packaging\dist\SectionAssembler.zip`.
+`src\packaging\build_assembler.bat` does what the workflow does, in the shared `.venv` of the `RUN_*.bat` files (see `src\ensure_python.bat`);
+the result is `src\packaging\dist\SectionAssembler.zip`.
 
 ## What is where
 
@@ -63,9 +63,9 @@ browser link names a specific release (`atlas-v1.0.0`): change it when a new ver
 
 ## Building it on this computer
 
-`packaging\build_atlas_browser.bat` does what the workflow does, in the shared `.venv` (see `ensure_python.bat`): it installs the pinned libraries
+`src\packaging\build_atlas_browser.bat` does what the workflow does, in the shared `.venv` (see `src\ensure_python.bat`): it installs the pinned libraries
 of `requirements-atlas.txt` (about a gigabyte), runs the self-test from the source,
-builds, runs the self-test on the package and zips it into `packaging\dist\ABCAtlasBrowser.zip`.
+builds, runs the self-test on the package and zips it into `src\packaging\dist\ABCAtlasBrowser.zip`.
 
 ## What is where
 
@@ -73,7 +73,7 @@ builds, runs the self-test on the package and zips it into `packaging\dist\ABCAt
   (the UMAP's compiled parts: the first UMAP run on a computer compiles for about a minute) and holds the console open on a crash.
 - `atlas_browser.spec`: the PyInstaller recipe (the libraries that load things by name are taken whole).
 - `requirements-atlas.txt`: the pinned libraries.
-- `atlas_version.py` (repository root): `"dev"` in the source; the workflow writes the tag's version into it.
+- `src/atlas_version.py`: `"dev"` in the source; the workflow writes the tag's version into it.
 - Where the packaged program keeps things, because its own folder is replaced by every new version: caches, settings and the Tk settings under
   `%LOCALAPPDATA%\JhouLab\ABCAtlasBrowser\program`; the default output folder is `Documents\ABC_atlas_browser_output`; the atlas download location
   is asked on the first run (the default, `%LOCALAPPDATA%\JhouLab\ABCAtlasBrowser\abc_atlas_cache`, is only a suggestion; the atlas is several gigabytes).

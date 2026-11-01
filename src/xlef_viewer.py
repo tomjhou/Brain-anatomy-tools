@@ -7069,4 +7069,7 @@ def ask_text(parent, title, initial, color=None):
 
 
 if __name__ == "__main__":
+    from app_identity import use_app_identity, use_windowless_log
+    use_windowless_log("xlef_viewer", "The xlef viewer")
+    use_app_identity("xlef_viewer")
     XlefViewer(sys.argv[1] if len(sys.argv) > 1 else None).run()

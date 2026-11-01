@@ -2,12 +2,12 @@
 REM Starts the ABC atlas browser (double-click this file in Windows Explorer).
 REM Finds Python (installing Python 3.13 first if there is none): see ensure_python.bat.
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0src"
 title ABC atlas browser
 echo ==== ABC atlas browser ====
 echo.
 
-call "%~dp0ensure_python.bat"
+call "%~dp0src\ensure_python.bat"
 
 if not defined PYTHON_CMD (
   echo Python could not be found or installed automatically.

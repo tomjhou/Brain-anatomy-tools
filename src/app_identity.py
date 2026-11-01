@@ -1,0 +1,127 @@
+"""Gives a program run from the source its own icon and taskbar button on Windows, so that it shows as itself rather than as Python.
+
+Windows groups taskbar buttons by an "app ID". Every Python program shares python.exe's, so a running viewer would sit under a Python
+button beside, not on, its pinned shortcut. Each program declares its own ID here (for the process, and on each of its windows), and
+install_shortcuts.ps1 stamps the same ID on the shortcuts it makes (keep APPS below and $apps there in step). Each Tk window gets the
+program's icon from the icons folder.
+
+For a program started with pythonw.exe (no console window), output and errors would vanish: use_windowless_log sends them to a log file
+and shows errors in a message box."""
+import os
+import sys
+import traceback
+
+ICON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
+APPS = {   # program: (app ID, icon file)
+    "xlef_viewer": ("JhouLab.BrainAnatomyTools.XlefViewer", "xlef_viewer.ico"),
+    "ccf_browser": ("JhouLab.BrainAnatomyTools.CCFBrowser", "ccf_browser.ico"),
+    "abc_atlas_browser": ("JhouLab.BrainAnatomyTools.ABCAtlasBrowser", "abc_atlas_browser.ico"),
+}
+
+
+def use_app_identity(program):
+    """Call before the program's first window. Not for the packaged .exe: its pinned shortcut has no app ID, so declaring one would split
+    the running window from the pinned button, and the .exe has its own icon."""
+    if sys.platform != "win32" or getattr(sys, "frozen", False):
+        return
+    app_id, icon = APPS[program]
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+    except (AttributeError, OSError):
+        pass
+    icon_path = os.path.join(ICON_DIR, icon)
+    if not os.path.exists(icon_path):
+        icon_path = None
+    import tkinter
+
+    def stamp(window):
+        # The process-wide ID above isn't enough on its own: a window started from the pinned shortcut still got a Python button of its
+        # own until the window itself carried the ID. So each window gets it when it is shown (Tk makes the outer window only then).
+        try:
+            _set_window_app_id(int(window.wm_frame(), 16), app_id)
+        except (tkinter.TclError, ValueError, OSError):
+            pass
+
+    def patch(cls, set_icon):
+        init = cls.__init__
+
+        def init_with_identity(self, *args, **kwargs):
+            init(self, *args, **kwargs)
+            if set_icon and icon_path:   # (on a Tk root, "default" covers every window in it)
+                try:
+                    self.iconbitmap(default=icon_path)
+                except tkinter.TclError:
+                    pass
+            self.bind("<Map>", lambda event: stamp(self) if event.widget is self else None, add="+")
+        cls.__init__ = init_with_identity
+    patch(tkinter.Tk, True)          # every Tk root (some programs make several)
+    patch(tkinter.Toplevel, False)   # and every other window, e.g. dialogs
+
+
+def _set_window_app_id(hwnd, app_id):
+    """Puts the app ID on one window (its System.AppUserModel.ID property, through the shell's property store for the window)."""
+    import ctypes
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("data1", ctypes.c_uint32), ("data2", ctypes.c_uint16), ("data3", ctypes.c_uint16), ("data4", ctypes.c_ubyte * 8)]
+
+    class PROPERTYKEY(ctypes.Structure):
+        _fields_ = [("fmtid", GUID), ("pid", ctypes.c_uint32)]
+
+    class PROPVARIANT(ctypes.Structure):
+        _fields_ = [("vt", ctypes.c_ushort), ("reserved", ctypes.c_ushort * 3), ("value", ctypes.c_void_p), ("padding", ctypes.c_void_p)]
+
+    def guid(text):
+        g = GUID()
+        ctypes.windll.ole32.IIDFromString(ctypes.c_wchar_p(text), ctypes.byref(g))
+        return g
+    iid = guid("{886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99}")   # IPropertyStore
+    key = PROPERTYKEY(guid("{9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}"), 5)   # System.AppUserModel.ID
+    store = ctypes.c_void_p()
+    if ctypes.windll.shell32.SHGetPropertyStoreForWindow(ctypes.c_void_p(hwnd), ctypes.byref(iid), ctypes.byref(store)) != 0:
+        return
+    # its methods: QueryInterface, AddRef, Release (2), GetCount, GetAt, GetValue, SetValue (6), Commit
+    methods = ctypes.cast(store, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+    set_value = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(PROPERTYKEY), ctypes.POINTER(PROPVARIANT))(methods[6])
+    release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(methods[2])
+    text = ctypes.create_unicode_buffer(app_id)
+    value = PROPVARIANT(31, (0, 0, 0), ctypes.addressof(text))   # VT_LPWSTR; SetValue copies it
+    try:
+        set_value(store, ctypes.byref(key), ctypes.byref(value))
+    finally:
+        release(store)
+
+
+def use_windowless_log(program, title):
+    """Started with pythonw.exe there is no console: send what would have been printed to a log file, and show errors (uncaught ones, and
+    the first in a Tk callback) in a message box that names the log. Returns the log's path, or None when there is a console."""
+    if sys.stdout is not None and sys.stderr is not None:
+        return None
+    folder = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "JhouLab", "logs")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, program + ".log")
+    sys.stdout = sys.stderr = open(path, "w", encoding="utf-8", buffering=1)
+    shown = []
+
+    def tell(kind, value, tb):
+        traceback.print_exception(kind, value, tb)
+        if shown:
+            return
+        shown.append(True)
+        try:
+            import tkinter
+            from tkinter import messagebox
+            own = None if tkinter._default_root is not None else tkinter.Tk()
+            if own is not None:
+                own.withdraw()
+            messagebox.showerror(title, f"{title} hit an error:\n\n{kind.__name__}: {value}\n\nThe details are in\n{path}")
+            if own is not None:
+                own.destroy()
+        except Exception:
+            pass
+
+    sys.excepthook = tell
+    import tkinter
+    tkinter.Tk.report_callback_exception = lambda self, kind, value, tb: tell(kind, value, tb)
+    return path

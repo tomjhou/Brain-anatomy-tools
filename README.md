@@ -6,13 +6,21 @@ Although written in Python, you do NOT need to install anything yourself. Just r
 instructions below, and the computer sets up what it needs on its own. The .exe has Python and every library inside it. Currently
 the section assembler (section 1) and the ABC atlas browser (section 2) have .exe releases; the other tools need to be run from .bat
 files. The first time you run a .bat file, it finds Python (installing Python 3.13 if there is none), builds a private `.venv` folder next
-to it, and installs the libraries it needs into that; this needs an internet connection, and it leaves any Python you already
-have untouched. All the .bat files share the one `.venv`.
+to it (in this top folder), and installs the libraries it needs into that; this needs an internet connection, and it leaves any Python you already
+have untouched. All the .bat files share the one `.venv`. Everything you run is in this top folder; the programs themselves, and
+the scripts and files they use, are in `src/`.
+
+Windows won't pin a .bat file to the taskbar, so double click `INSTALL_APPS.bat` once: it makes shortcuts, each with its own icon, for
+the xlef viewer, CCF browser and ABC atlas browser, on the desktop and in the Start menu (under "Brain anatomy tools"). Drag them onto
+the taskbar (or right-click, Pin to taskbar). Run it again if you move this folder. A pinned shortcut and its running program share one taskbar button with the
+program's own icon (the programs declare the same app ID as their shortcuts: see `src/app_identity.py`). The xlef viewer and CCF browser close
+their console window once they have started; their output then goes to `%LOCALAPPDATA%\JhouLab\logs`, and an error is shown in a message box.
+The icons are in `src/icons/` (`make_icons.py` draws them).
 
 
 ## 1. Section alignment program for Windows
 
-The section assembler and aligner (in `FileConverters/`) can read NeuroInfo reconstructions (.xml or .jpx) or raw image
+The section assembler and aligner (in `src/FileConverters/`; run from the source with `RUN_ASSEMBLER.bat`) can read NeuroInfo reconstructions (.xml or .jpx) or raw image
 files (Zeiss .czi, or jp2 images), detect sections, sort them in order, and adjust alignment and section outlines to
 create serial-section stacks.
 
@@ -23,7 +31,7 @@ This program is available as a Windows .exe program with everything inside it, s
 2. Unzip it anywhere and run `SectionAssembler\SectionAssembler.exe`.
 
 Windows may warn "Windows protected your PC" the first time, because the program is not code-signed: choose More info, then Run anyway.
-To update, download the zip again. How it is built: `packaging/README.md`.
+To update, download the zip again. How it is built: `src/packaging/README.md`.
 
 
 ## 2. Allen ABC atlas browser
@@ -54,7 +62,7 @@ shared `.venv` (see above), which takes about 30 seconds for the section assembl
 ABC browser. The `.venv` will be about 300MB with the assembler, and grow to about 1.1 GB with the ABC
 browser. This only happens once, and it does not alter existing Python environments.
 
-On other systems, or to use your own Python environment, install Python and run `python ABC_atlas_browser.py` from that
+On other systems, or to use your own Python environment, install Python and run `python src/ABC_atlas_browser.py` from that
 environment (e.g. after `conda activate <env>`): at startup it checks for missing libraries and pip-installs them into it.
 
 
@@ -62,14 +70,14 @@ environment (e.g. after `conda activate <env>`): at startup it checks for missin
 
 - **ABC atlas download:** The packaged Windows ABC browser program keeps the
   ABC atlas cache in locations described under "Windows standalone .exe program" above.
-  When run from source (using `.bat` files or `python ABC_atlas_browser.py`)
+  When run from source (using `.bat` files or `python src/ABC_atlas_browser.py`)
   for the first time, the app looks for a folder abc_atlas_cache in the PARENT
   folder of the repository. If not found, the app lists your local drives and their
   free space, and asks once where to put it (or where an existing download is),
   suggesting a drive with enough room. The choice is saved in
   `cache_local/abc_atlas_cache_location.json`; delete that file to be asked again.
   Atlas files are downloaded on first use.
-- **Local cache:** `cache_local` inside this repository (git-ignored). Section
+- **Local cache:** `src/cache_local` inside this repository (git-ignored; the Settings file is `src/viewer_settings.json`). Section
   images and processed files are regenerated as needed. The packaged Windows program has no repository
   folder of its own to write in (a new version replaces its files), so its `cache_local` is
   `%LOCALAPPDATA%\JhouLab\ABCAtlasBrowser\program\cache_local`, and the Settings file

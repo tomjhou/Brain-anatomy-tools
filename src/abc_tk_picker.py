@@ -1313,7 +1313,7 @@ def main(argv=None):
     status = tk.StringVar(root, "Opening the atlas...")
     ttk.Label(root, textvariable=status, padding=30).pack()
     root.update()
-    base = Path(os.environ.get("ABC_ATLAS_CACHE", str(core.SCRIPT_DIR.parent / "abc_atlas_cache")))
+    base = Path(os.environ.get("ABC_ATLAS_CACHE", str(core.DEFAULTS_DIR / "abc_atlas_cache")))
     cache = AbcProjectCache.from_local_cache(base)
     path = cache.get_data_path(directory="MERFISH-C57BL6J-638850", file_name="C57BL6J-638850/raw")
     adata = anndata.read_h5ad(path, backed="r")

@@ -3,7 +3,7 @@ REM Installs the Python libraries used by ABC_atlas_browser.py and CCF_browser.p
 REM that the RUN_*.bat files use; see ensure_python.bat, which finds Python and makes the environment first if needed.
 setlocal
 cd /d "%~dp0"
-call "%~dp0ensure_python.bat"
+call "%~dp0src\ensure_python.bat"
 if not defined PYTHON_CMD (
   echo Python could not be found or installed automatically.
   echo Please install it from https://www.python.org/downloads/ ^(tick "Add python.exe to PATH"^)

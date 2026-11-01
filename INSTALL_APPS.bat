@@ -1,0 +1,24 @@
+@echo off
+REM Makes desktop and Start menu shortcuts, each with its own icon, for the xlef viewer, CCF browser and ABC atlas browser
+REM (double-click this file in Windows Explorer). Unlike the RUN_*.bat files, the shortcuts can be pinned to the taskbar.
+REM Run it again after moving this folder. See src\install_shortcuts.ps1.
+setlocal
+cd /d "%~dp0"
+title Install app shortcuts
+echo ==== Making shortcuts for the Brain anatomy tools ====
+echo.
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\install_shortcuts.ps1"
+if errorlevel 1 (
+  echo.
+  echo The shortcuts could not be made ^(see above^).
+  pause
+  exit /b 1
+)
+
+echo.
+echo Done. To pin one to the taskbar, right-click its desktop shortcut (Windows 11: Show more options)
+echo and choose "Pin to taskbar", or drag it onto the taskbar. They are also in the Start menu,
+echo under "Brain anatomy tools".
+echo.
+pause

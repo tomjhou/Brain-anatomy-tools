@@ -3,12 +3,12 @@ REM Starts the section workflow (step 1: find the sections on .czi slide scans; 
 REM Finds Python (installing Python 3.13 first if there is none): see ensure_python.bat.
 REM Missing libraries are installed automatically on first run.
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0src\FileConverters"
 title Steps 1-3, brain assembler
 echo ==== Brain assembler: step 1 load/detect, step 2 detect outlines, step 3 order ====
 echo.
 
-call "%~dp0..\ensure_python.bat"
+call "%~dp0src\ensure_python.bat"
 
 if not defined PYTHON_CMD (
   echo Python could not be found or installed automatically.

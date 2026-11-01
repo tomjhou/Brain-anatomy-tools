@@ -2,14 +2,13 @@
 ## Overview
 
 This folder contains three tools for analyzing brain section data. They can be run by double
-clicking Windows .bat files that start with the word RUN_, e.g.:
+clicking Windows .bat files that start with the word RUN_, in the repository's top folder (two folders up from this one), e.g.:
 
     RUN_ASSEMBLER.bat
     RUN_LIFCONVERTER.bat
     RUN_TIFS_TO_JP2.bat
 
-When you first run any of these, it will auto-create a local Python environment in a `.venv` folder (in the folder above this
-one, shared with the ABC and CCF browsers) and auto-install the libraries it needs; for the assembler this took about 30
+When you first run any of these, it will auto-create a local Python environment in a `.venv` folder (in the repository's top folder, shared with the ABC and CCF browsers) and auto-install the libraries it needs; for the assembler this took about 30
 seconds. These three tools need about 400MB of free space; the ABC browser's much larger libraries bring the shared `.venv`
 to about 1.1GB. It only does this once, and all tools use the same `.venv`, for efficiency.
 

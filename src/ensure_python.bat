@@ -2,10 +2,14 @@
 REM Finds Python 3.10 to 3.13 (64-bit) for the RUN_*.bat files, installing Python 3.13 first when there is none.
 REM Usage:  call "path\to\ensure_python.bat"   (sets PYTHON_CMD; if it is not set afterwards, Python could not be found or installed)
 REM It looks through the py launcher, then "python" / "python3", then for a per-user install that is not on PATH yet. The installation is for the current user only and needs no administrator rights.
-REM PYTHON_CMD ends up as the python.exe of a virtual environment, the ".venv" folder next to this file, built from the Python found here. All the RUN_*.bat
+REM PYTHON_CMD ends up as the python.exe of a virtual environment, the ".venv" folder in the repository's top folder (next to the RUN_*.bat files), built from the Python found here. All the RUN_*.bat
 REM files share it, and missing libraries are installed into it rather than into the computer's Python. Deleting the .venv folder starts it afresh.
 
 set "PYTHON_CMD="
+
+REM The ABC atlas and CCF browsers keep their settings and caches beside their code. Before the code moved into the src folder
+REM (November 2026) that was the repository's top folder, so move any found there (once).
+for %%F in (cache_local viewer_settings.json) do if exist "%~dp0..\%%F" if not exist "%~dp0%%F" move "%~dp0..\%%F" "%~dp0%%F" >nul
 
 REM Which versions to use: the newest Python often has no prebuilt libraries (numpy, h5py, ...) for a while, and the py launcher
 REM and PATH prefer the newest. So only 3.10 to 3.13 (64-bit) are used; with none of those, 3.13 is installed (next to any other).
@@ -57,7 +61,7 @@ if not defined PYTHON_CMD exit /b 1
 :venv
 REM The virtual environment, built from the Python found above. One that doesn't start (its Python was uninstalled or replaced),
 REM or that was built from a Python version these programs don't use, is rebuilt; the message says which.
-set "VENV_DIR=%~dp0.venv"
+set "VENV_DIR=%~dp0..\.venv"
 set "VENV_PYTHON=%VENV_DIR%\Scripts\python.exe"
 set "VENV_CHECK=import sys;sys.exit(0 if (3,10)<=sys.version_info[:2]<=(3,13) and sys.maxsize>2**32 else 3)"
 if not exist "%VENV_PYTHON%" goto :venv_make

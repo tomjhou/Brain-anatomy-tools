@@ -31,7 +31,10 @@ import threading
 import time
 from pathlib import Path
 
+from app_identity import use_windowless_log
+
 _STARTUP_T0 = time.perf_counter()
+use_windowless_log('ccf_browser', 'The CCF browser')   # started without a console (pythonw.exe): output to a log file
 
 
 def startup_note(message):
@@ -72,7 +75,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CACHE_DIR = SCRIPT_DIR / 'cache_local'
 ATLAS_CACHE_LOCATION_FILE = CACHE_DIR / 'abc_atlas_cache_location.json'   # shared with ABC_atlas_browser.py
 SETTINGS_FILE = CACHE_DIR / 'ccf_browser_settings.json'
-DEFAULT_ATLAS_CACHE_DIR = SCRIPT_DIR.parent / 'abc_atlas_cache'
+BESIDE_REPOSITORY = SCRIPT_DIR.parent.parent   # the code is in the repository's src folder
+DEFAULT_ATLAS_CACHE_DIR = BESIDE_REPOSITORY / 'abc_atlas_cache'
 
 VOLUME_DIRECTORY = 'Allen-CCF-2020'
 VOLUME_FILE_NAME = 'annotation_25'
@@ -1931,7 +1935,7 @@ class CCFBrowser:
         stem = source.name[:-len(default)] if source and source.name.lower().endswith(default) else 'annotation_25'
         kind = tk.StringVar()
         chosen = filedialog.asksaveasfilename(
-            title="Save the edited volume", parent=parent, initialdir=str((source.parent if source else SCRIPT_DIR.parent)),
+            title="Save the edited volume", parent=parent, initialdir=str((source.parent if source else BESIDE_REPOSITORY)),
             initialfile=f"{stem}_edited{default}", defaultextension=default, typevariable=kind,
             filetypes=[(SAVE_FORMATS[ext], f"*{ext}") for ext in order])
         if not chosen:
@@ -2964,7 +2968,7 @@ class CCFBrowser:
         if fmt is None:
             return
         source = Path(self.atlas_path) if self.atlas_path else None
-        folder = getattr(self, 'image_dir', None) or (source.parent if source else SCRIPT_DIR.parent)
+        folder = getattr(self, 'image_dir', None) or (source.parent if source else BESIDE_REPOSITORY)
         chosen = filedialog.asksaveasfilename(
             title="Export image", parent=self.root, initialdir=str(folder), defaultextension='.' + fmt,
             initialfile=f"{self.view_name.lower()}_{self.slice + 1}.{fmt}", filetypes=[(fmt.upper() + " image", '*.' + fmt)])
@@ -3671,6 +3675,8 @@ class CCFBrowser:
 
 
 def main():
+    from app_identity import use_app_identity
+    use_app_identity("ccf_browser")
     startup_note("Opening the window...")
     CCFBrowser().run()
 

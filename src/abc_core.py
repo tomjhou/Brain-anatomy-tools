@@ -39,6 +39,10 @@ if getattr(sys, 'frozen', False):
 else:
     SCRIPT_DIR = Path(__file__).resolve().parent
 
+# Where the default atlas cache and output folders go: beside the "program" folder when packaged, and beside the repository when run from
+# the source (the code is in the repository's src folder, so that is two levels up).
+DEFAULTS_DIR = SCRIPT_DIR.parent if getattr(sys, 'frozen', False) else SCRIPT_DIR.parent.parent
+
 
 # Local cache dir for anything expensive to regenerate but cheap to keep on
 # disk (the section-picker grid image, processed .h5ad files, ...). Defined up

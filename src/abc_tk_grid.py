@@ -547,7 +547,7 @@ def main():
     import anndata
     from abc_atlas_access.abc_atlas_cache.abc_project_cache import AbcProjectCache
     core.load_coordinate_settings()
-    base = Path(os.environ.get("ABC_ATLAS_CACHE", str(core.SCRIPT_DIR.parent / "abc_atlas_cache")))
+    base = Path(os.environ.get("ABC_ATLAS_CACHE", str(core.DEFAULTS_DIR / "abc_atlas_cache")))
     cache = AbcProjectCache.from_local_cache(base)
     adata = anndata.read_h5ad(cache.get_data_path(directory="MERFISH-C57BL6J-638850", file_name="C57BL6J-638850/raw"), backed="r")
     sections = core.get_section_labels(adata, cache)

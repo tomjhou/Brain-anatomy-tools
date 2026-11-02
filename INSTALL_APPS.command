@@ -8,6 +8,7 @@
 # atlas browser always opens in Terminal: it prints its progress there and asks questions there).
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
+source "$REPO/src/terminal_window.sh"     # (press_enter_to_close)
 APPS_DIR="${APPS_DIR:-$HOME/Applications}"      # (tests set APPS_DIR, and APPS_TEST: see the end)
 echo "==== Making apps for the Brain anatomy tools ===="
 echo
@@ -50,6 +51,10 @@ PLIST
             echo "if [ -x \"\$PY\" ] && \"\$PY\" -c \"import $libs\" >/dev/null 2>&1; then"
             echo "    cd \"\$REPO/src\" && JHOULAB_WINDOWLESS=1 exec \"\$PY\" $program >/dev/null 2>&1"
             echo 'fi'
+            echo '# Not yet: once the setup is done, the run-*.command starts this app again (it finds this note), so that the program runs as'
+            echo '# this app, not as Terminal, from the first time (see hand_off_to_app in src/terminal_window.sh).'
+            echo 'mkdir -p "$HOME/Library/Caches/JhouLab"'
+            echo "cd \"\$(dirname \"\$0\")/../..\" && pwd > \"\$HOME/Library/Caches/JhouLab/${command%.command}.handoff\""
         fi
         echo 'exec open -a Terminal "$COMMAND"'
     } > "$app/Contents/MacOS/launcher"
@@ -77,5 +82,5 @@ echo "Done. The apps are in $APPS_DIR (opening it now): drag them to the Dock to
 echo "They are also in Launchpad and Spotlight."
 if [ -z "$APPS_TEST" ]; then                      # (tests set it: no Finder window, no waiting)
     open "$APPS_DIR"
-    read -r -p "Press Enter to close this window. " _
+    press_enter_to_close 0
 fi

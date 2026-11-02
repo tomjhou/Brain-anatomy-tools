@@ -13,6 +13,7 @@ SETTINGS_PATH and messagebox, pump root.update(), grab ImageTk.getimage(app.phot
 """
 import os
 import re
+import errno
 import sys
 import json
 import time
@@ -508,6 +509,16 @@ def _folder_from_disk(xlcf_path):
     return folder if folder.children else None
 
 
+def read_error_text(path, e):
+    """The error of a file that can't be read, with what to do when it is macOS refusing access (EPERM, "Operation not permitted": a
+    network or removable volume, Desktop, Documents or Downloads, before the program was allowed in)."""
+    text = f"Can't read {os.path.basename(path)}: {e}"
+    if sys.platform == "darwin" and getattr(e, "errno", None) == errno.EPERM:
+        text += ("\n\nmacOS did not allow this program to read it. In System Settings > Privacy & Security > Files and Folders, turn on "
+                 "\"Network Volumes\" (or the folder) for the Leica xlef viewer and Python, then open it again.")
+    return text
+
+
 def load_entry(path):
     """An .xlif/.xlef file as an ImageEntry, a FolderEntry, or None if it holds neither."""
     try:
@@ -518,7 +529,7 @@ def load_entry(path):
             if folder is not None:
                 return folder
         entry = ImageEntry(os.path.splitext(os.path.basename(path))[0], path)
-        entry.problem = f"Can't read {os.path.basename(path)}: {e}"
+        entry.problem = read_error_text(path, e)
         return entry
     element = root.find("Element")
     if element is None:
@@ -3609,7 +3620,7 @@ class XlefViewer:
             if self.img is None:
                 self.show_message("")
             self.status.config(text=f"Can't read {os.path.basename(path)}")
-            messagebox.showerror("XLEF viewer", f"Can't read {path}:\n{error}", parent=self.root)
+            messagebox.showerror("XLEF viewer", read_error_text(path, error), parent=self.root)
             return
         self.add_recent(path)
         self.tree.item(pid, text=self.projects[pid]["name"] + ("   (.lif: read only)" if experiment.read_only else ""))

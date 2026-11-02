@@ -7,6 +7,7 @@
 REPO="$(cd "$(dirname "$0")" && pwd)"
 APPS_DIR="${APPS_DIR:-$HOME/Applications}"      # (tests set these, and ANSWERS: the answers to the questions, e.g. "ynyn")
 LIBRARY="${LIBRARY:-$HOME/Library}"
+source "$REPO/src/terminal_window.sh"     # (press_enter_to_close)
 XLEF_SETTINGS="${XLEF_SETTINGS:-$HOME/.xlef_viewer_settings.json}"
 asked=0
 
@@ -32,7 +33,7 @@ echo
 # Programs running from the environment keep files in it (and in the caches) open: they must be closed first.
 if pgrep -f "$REPO/.venv-macos/" >/dev/null 2>&1; then
     echo "Some of the tools are still running. Close them (and any Terminal window started by a run-*.command file), then run this again."
-    [ -z "$ANSWERS" ] && read -r -p "Press Enter to close this window. " _
+    [ -z "$ANSWERS" ] && press_enter_to_close 1
     exit 1
 fi
 
@@ -43,6 +44,7 @@ for name in "Leica xlef viewer" "CCF browser" "ABC atlas browser"; do      # (on
 done
 remove "$LIBRARY/Logs/JhouLab" "the logs"
 remove "$LIBRARY/Caches/JhouLab/xlef_viewer_thumbs" "the xlef viewer's thumbnails"
+rm -f "$LIBRARY"/Caches/JhouLab/*.handoff     # (notes the apps leave for their first setup: see src/terminal_window.sh)
 rmdir "$LIBRARY/Caches/JhouLab" 2>/dev/null
 
 echo
@@ -79,5 +81,5 @@ echo
 echo "Done. Still to do by hand, if you want them gone:"
 echo "  - apps kept in the Dock: drag each out of the Dock"
 echo "  - the program files themselves: delete the folder $REPO"
-[ -z "$ANSWERS" ] && read -r -p "Press Enter to close this window. " _
+[ -z "$ANSWERS" ] && press_enter_to_close 0
 exit 0

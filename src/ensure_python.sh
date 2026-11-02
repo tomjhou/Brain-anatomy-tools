@@ -5,6 +5,7 @@
 
 PYTHON_CMD=""
 _here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$_here/terminal_window.sh"     # (close_window_and_exit, press_enter_to_close, hand_off_to_app)
 _venv="$(dirname "$_here")/.venv-macos"
 
 _acceptable() {   # a Python 3.10 to 3.13, 64-bit, with tkinter (Homebrew's Python has it only with the python-tk package)

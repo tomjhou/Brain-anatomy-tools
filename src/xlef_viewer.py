@@ -54,7 +54,11 @@ import leica_luts           # (LAS X's colour maps, sampled: see lut_table)
 from tooltip import Tooltip, place_on_monitor, monitor_area
 
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".xlef_viewer_settings.json")
-THUMB_CACHE = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "JhouLab", "xlef_viewer_thumbs")
+THUMB_CACHE = (os.path.join(os.path.expanduser("~"), "Library", "Caches", "JhouLab", "xlef_viewer_thumbs") if sys.platform == "darwin" else
+               os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "JhouLab", "xlef_viewer_thumbs"))
+# macOS: Tk 8.6 reports the right mouse button as button 2 (Tk 8.7 and later, as 3, as elsewhere), and shortcuts use the Command key
+RIGHT_CLICKS = ("<Button-2>", "<Button-3>") if sys.platform == "darwin" else ("<Button-3>",)
+SHORTCUT = "Command" if sys.platform == "darwin" else "Control"
 MAX_RECENT = 20
 MOVING_PAUSE = 0.25          # s without a wheel click or drag before the view counts as at rest (see XlefViewer._moving)
 DETAIL_BANDS = 10            # a sharp view is read in this many bands (top to bottom), each drawn as it comes (see XlefViewer.redraw)
@@ -279,6 +283,12 @@ def readable_color(rgb, background, min_contrast=3.0):
         if (max(lc, lb) + 0.05) / (min(lc, lb) + 0.05) >= min_contrast:
             break
     return "#%02x%02x%02x" % tuple(round(255 * v) for v in c)
+
+
+def wheel_notches(delta):
+    """A mouse wheel event's delta, in notches of the wheel (positive: away from the user). Windows reports 120 a notch; Tk 8.6 on macOS
+    reports about 1 a notch (and a trackpad, 1 for each small step)."""
+    return delta / 120 if sys.platform != "darwin" or abs(delta) >= 120 else delta
 
 
 REVEAL_LABEL = ("Open folder in Windows Explorer" if sys.platform == "win32" else "Show in Finder" if sys.platform == "darwin"
@@ -1293,7 +1303,14 @@ def children_text(container, listed, children):
 
 
 def send_to_recycle_bin(paths):
-    """Move files to the Windows Recycle Bin (they can be restored from there). Raises OSError if Windows refuses."""
+    """Move files to the Windows Recycle Bin, or the macOS Trash (they can be restored from there). Raises OSError if that fails."""
+    if sys.platform == "darwin":       # (through Finder, so that Put Back works)
+        import subprocess
+        names = ", ".join('POSIX file "%s"' % os.path.abspath(p).replace("\\", "\\\\").replace('"', '\\"') for p in paths)
+        done = subprocess.run(["osascript", "-e", f'tell application "Finder" to delete {{{names}}}'], capture_output=True, text=True)
+        if done.returncode:
+            raise OSError(f"Finder could not move them to the Trash ({done.stderr.strip()})")
+        return
     import ctypes
     from ctypes import wintypes
 
@@ -1310,7 +1327,20 @@ def send_to_recycle_bin(paths):
 
 
 def has_recycle_bin(path):
-    """Does the drive of `path` have a Recycle Bin? Local drives do; network drives don't (Windows would delete outright there)."""
+    """Does the drive of `path` have a Recycle Bin? Local drives do; network drives don't (Windows would delete outright there).
+    macOS: a local disk has a Trash; a network volume (mounted under /Volumes by smbfs, afpfs or nfs) has none."""
+    if sys.platform == "darwin":       # (the type of the volume holding it: the mount point that is the longest start of its path)
+        import subprocess
+        try:
+            mounts = subprocess.run(["mount"], capture_output=True, text=True).stdout
+        except OSError:
+            return False
+        where, best, kind = os.path.abspath(path), "", ""
+        for line in mounts.splitlines():          # "<device> on <mount point> (<type>, <options>)"
+            m = re.match(r".* on (.+) \(([^,)]+)", line)
+            if m and (where == m[1] or where.startswith(m[1].rstrip("/") + "/")) and len(m[1]) > len(best):
+                best, kind = m[1], m[2].strip()
+        return kind not in ("smbfs", "afpfs", "nfs", "webdav")
     import ctypes
     drive = os.path.splitdrive(os.path.abspath(path))[0] + "\\"
     return ctypes.windll.kernel32.GetDriveTypeW(drive) in (2, 3)        # (DRIVE_REMOVABLE, DRIVE_FIXED)
@@ -2641,10 +2671,11 @@ class ThumbGrid(ttk.Frame):
         self.canvas.bind("<ButtonPress-1>", self._click)
         self.canvas.bind("<B1-Motion>", self._drag)
         self.canvas.bind("<ButtonRelease-1>", self._release)
-        self.canvas.bind("<Button-3>", self._menu)
+        for ev in RIGHT_CLICKS:
+            self.canvas.bind(ev, self._menu)
         self.canvas.bind("<Motion>", self._motion)
         self.canvas.bind("<Leave>", lambda e: self._hide_tip())
-        self.canvas.bind("<MouseWheel>", lambda e: self.canvas.yview_scroll(int(-e.delta / 120), "units"))
+        self.canvas.bind("<MouseWheel>", lambda e: self.canvas.yview_scroll(-round(wheel_notches(e.delta)), "units"))
         for key, d in (("Left", -1), ("Right", 1), ("Up", "-row"), ("Down", "row")):
             self.canvas.bind(f"<{key}>", lambda e, d=d: self._step(d))
 
@@ -3056,7 +3087,8 @@ class XlefViewer:
         self.tree.bind("<ButtonRelease-1>", self._tree_drop, add="+")
         self.tree.bind("<Motion>", self._tree_motion, add="+")
         self.tree.bind("<Leave>", lambda e: self._hide_tree_tip(), add="+")
-        self.tree.bind("<Button-3>", self._tree_menu, add="+")
+        for ev in RIGHT_CLICKS:
+            self.tree.bind(ev, self._tree_menu, add="+")
         self.tree_tip = None
         self.tree.bind("<Double-Button-1>", lambda e: self._cancel_rename_job(), add="+")
         self.thumb_grid = ThumbGrid(tree_frame, on_click=self.select_item, on_menu=lambda item, x, y: self._item_menu(item, x, y),
@@ -3172,10 +3204,10 @@ class XlefViewer:
 
         self._bind_view_canvas(self.canvas)
         self.root.bind("<Delete>", lambda e: None if isinstance(e.widget, (tk.Entry, tk.Text)) else self.delete_annotation())
-        self.root.bind("<Control-z>", lambda e: None if isinstance(e.widget, tk.Text) else self.undo_annotation())
+        self.root.bind(f"<{SHORTCUT}-z>", lambda e: None if isinstance(e.widget, tk.Text) else self.undo_annotation())
         self.root.bind("<Escape>", lambda e: (setattr(self, "selected", None), self.set_tool("select"), self._draw_annotations()))
         self.set_tool("select")
-        self.root.bind("<Control-o>", lambda e: self.ask_open())
+        self.root.bind(f"<{SHORTCUT}-o>", lambda e: self.ask_open())
         self.root.bind("<Home>", lambda e: self.fit())
         for k in range(1, 10):
             self.root.bind(str(k), lambda e, k=k: self.toggle_channel(k - 1))
@@ -3809,7 +3841,7 @@ class XlefViewer:
     def _pass_mouse_to_list(self, widget):
         """The mouse on something laid over the list (a progress bar, an unsaved mark) acts on the list under it: selecting,
         dragging, the menu, the wheel, hover notes."""
-        for ev in ("<ButtonPress-1>", "<B1-Motion>", "<ButtonRelease-1>", "<Double-Button-1>", "<Button-3>", "<Motion>"):
+        for ev in ("<ButtonPress-1>", "<B1-Motion>", "<ButtonRelease-1>", "<Double-Button-1>", *RIGHT_CLICKS, "<Motion>"):
             widget.bind(ev, lambda e, ev=ev, w=widget: self.tree.event_generate(
                 ev, x=e.x + w.winfo_x(), y=e.y + w.winfo_y(), rootx=e.x_root, rooty=e.y_root))
         widget.bind("<MouseWheel>", lambda e, w=widget: self.tree.event_generate(
@@ -4456,14 +4488,16 @@ class XlefViewer:
             swatch = tk.Label(f, text=str(i + 1), width=3, font=("Segoe UI", 9, "bold"), cursor="hand2", relief=tk.RAISED, bd=1)
             swatch.pack(pady=(0, 2))
             swatch.bind("<Button-1>", lambda e, i=i: self.toggle_channel(i))
-            swatch.bind("<Button-3>", lambda e, i=i: self.pick_channel_color(i))
+            for ev in RIGHT_CLICKS:
+                swatch.bind(ev, lambda e, i=i: self.pick_channel_color(i))
             tip = ((ch.name + "\n" if ch.named else "") + f"Click to show or hide this channel (or press {i + 1}).\n"
                    "Right-click to change its color.")
             Tooltip(swatch, tip)
             slider = RangeSlider(f, ch.max_value, st["lo"], st["hi"], color, command=lambda lo, hi, i=i: self._set_lo_hi(i, lo, hi),
                                  vertical=True)
             slider.pack(fill=tk.Y, expand=True)
-            slider.bind("<Button-3>", lambda e, i=i: self.pick_channel_color(i))
+            for ev in RIGHT_CLICKS:
+                slider.bind(ev, lambda e, i=i: self.pick_channel_color(i))
             slider.bind("<Double-Button-1>", lambda e, i=i, s=slider: (s.undo_press(), self.pick_channel_color(i)))
             swatch.color = color
             swatch.keep_colors = True       # (styled by _show_channel_state)
@@ -4766,7 +4800,7 @@ class XlefViewer:
             self.schedule_redraw(0)
             return
         self._moving()
-        self.zoom_to(self.scale * (1.25 ** (d / 120)), event.x, event.y)
+        self.zoom_to(self.scale * (1.25 ** wheel_notches(d)), event.x, event.y)
 
     def on_press(self, event):
         self.canvas.focus_set()
@@ -6930,7 +6964,7 @@ class LutChooser:
             self.list.create_image(4, y + 3, anchor=tk.NW, image=photo, tags=(f"row{k}",))
             self.list.create_text(self.STRIP_W + 12, y + self.ROW / 2, anchor=tk.W, text=name, fill=PAL["field_fg"], tags=(f"row{k}",))
         self.list.bind("<Button-1>", lambda e: self._pick_row(self.list.canvasy(e.y)))
-        self.list.bind("<MouseWheel>", lambda e: self.list.yview_scroll(int(-e.delta / 120), "units"))
+        self.list.bind("<MouseWheel>", lambda e: self.list.yview_scroll(-round(wheel_notches(e.delta)), "units"))
         right = ttk.Frame(body, padding=(14, 0, 0, 0))
         right.pack(side=tk.LEFT, fill=tk.Y)
         ttk.Label(right, text="Any color:").pack(anchor=tk.W)
@@ -7094,7 +7128,7 @@ def ask_text(parent, title, initial, color=None):
         dlg.color_button = swatch           # (for tests)
     ttk.Button(bar, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT)
     ttk.Button(bar, text="OK", command=ok).pack(side=tk.RIGHT, padx=(0, 6))
-    box.bind("<Control-Return>", ok)
+    box.bind(f"<{SHORTCUT}-Return>", ok)
     dlg.bind("<Escape>", lambda e: dlg.destroy())
     box.focus_set()
     dlg.grab_set()

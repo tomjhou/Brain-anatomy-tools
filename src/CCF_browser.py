@@ -77,6 +77,16 @@ ATLAS_CACHE_LOCATION_FILE = CACHE_DIR / 'abc_atlas_cache_location.json'   # shar
 SETTINGS_FILE = CACHE_DIR / 'ccf_browser_settings.json'
 BESIDE_REPOSITORY = SCRIPT_DIR.parent.parent   # the code is in the repository's src folder
 DEFAULT_ATLAS_CACHE_DIR = BESIDE_REPOSITORY / 'abc_atlas_cache'
+# macOS: Tk 8.6 reports the right mouse button as button 2 (Tk 8.7 and later, as 3, as elsewhere), and shortcuts use the Command key
+RIGHT_CLICKS = ('<Button-2>', '<Button-3>') if sys.platform == 'darwin' else ('<Button-3>',)
+SHORTCUT = 'Command' if sys.platform == 'darwin' else 'Control'
+
+
+def wheel_notches(delta):
+    """A mouse wheel event's delta, in notches of the wheel (positive: away from the user). Windows reports 120 a notch; Tk 8.6 on macOS
+    reports about 1 a notch (and a trackpad, 1 for each small step)."""
+    return delta / 120 if sys.platform != 'darwin' or abs(delta) >= 120 else delta
+
 
 VOLUME_DIRECTORY = 'Allen-CCF-2020'
 VOLUME_FILE_NAME = 'annotation_25'
@@ -1576,7 +1586,8 @@ class CCFBrowser:
         self.canvas.bind('<B1-Motion>', self.on_drag)
         self.canvas.bind('<ButtonRelease-1>', self.on_release)
         self.canvas.bind('<MouseWheel>', self.on_wheel)
-        self.canvas.bind('<Button-3>', self.on_right_click)
+        for ev in RIGHT_CLICKS:
+            self.canvas.bind(ev, self.on_right_click)
         root.bind('<Left>', lambda e: self.step(-1))
         root.bind('<Right>', lambda e: self.step(1))
         root.bind('<Prior>', lambda e: self.step(-10))
@@ -1587,7 +1598,7 @@ class CCFBrowser:
         root.bind('<equal>', lambda e: self.zoom_at(1.25))
         root.bind('<minus>', lambda e: self.zoom_at(0.8))
         root.bind('0', lambda e: self.fit_to_window())
-        root.bind('<Control-c>', self.repeat_copy_key)
+        root.bind(f'<{SHORTCUT}-c>', self.repeat_copy_key)
         if self.dnd is not None:
             for slot, widgets in zip(self.slots, self.slot_widgets):   # onto an entry box: that slot
                 widgets['entry'].drop_target_register(self.dnd_files)
@@ -3147,7 +3158,7 @@ class CCFBrowser:
         elif ctrl == self.wheel_zoom_var.get():   # slices
             self.step(direction)
         else:
-            self.zoom_at(1.2 ** (event.delta / 120.0), (self.pane_x(event.x), event.y))
+            self.zoom_at(1.2 ** wheel_notches(event.delta), (self.pane_x(event.x), event.y))
 
     def pane_count(self):
         """2 in the Differences view once the standard atlas to compare with is loaded, else 1."""

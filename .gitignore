@@ -8,6 +8,8 @@ __pycache__/
 .vscode/
 # Private Python environment made by ensure_python.bat
 .venv/
+# and its macOS counterpart, made by src/ensure_python.sh
+.venv-macos/
 
 # Packaging (see src/packaging/): what the build makes
 src/packaging/build/

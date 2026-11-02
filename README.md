@@ -22,6 +22,15 @@ the shortcuts, icons, logs and thumbnails, then asks about each of the `.venv`, 
 settings and the ABC atlas download (Enter keeps it). It never touches projects or outputs; unpin taskbar buttons and delete this folder
 by hand.
 
+**On a Mac** (not yet tried on one: please report what doesn't work), each `run-….bat` has a `run-….command` twin, double-clicked in
+Finder (the first time, right-click it and choose Open: macOS asks before running a script it hasn't seen). It finds Python 3.10 to 3.13,
+with tkinter, but can't install it: if there is none, it says to install Python 3.13 from python.org. Its private environment is
+`.venv-macos`, so that a folder shared with Windows keeps both. `INSTALL_APPS.command` makes an app for each of the xlef viewer, CCF browser and
+ABC atlas browser in `~/Applications`, with its own icon, to drag to the Dock; the first start opens Terminal to set things up, later ones
+(except the ABC browser's, which talks in its Terminal window) start the program directly, logging to `~/Library/Logs/JhouLab`. A
+running program shows its own icon in the Dock, but is named "Python" there and in the menu bar, and appears beside, not on, its app.
+`UNINSTALL_APPS.command` removes the apps and asks about the rest, as on Windows.
+
 
 ## 1. Section alignment program for Windows
 

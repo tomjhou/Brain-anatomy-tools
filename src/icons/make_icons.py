@@ -125,4 +125,10 @@ if __name__ == "__main__":
     for name, draw in (("xlef_viewer", xlef_viewer), ("ccf_browser", ccf_browser), ("abc_atlas_browser", abc_atlas_browser)):
         big = draw()
         big.resize((256, 256), Image.LANCZOS).save(os.path.join(HERE, name + ".ico"), sizes=SIZES)
-        print("wrote", name + ".ico")
+        # macOS: icons sit within a margin of the square (Apple's grid: 824 of 1024 pixels), as an .icns for the app made by
+        # INSTALL_APPS.command, and a .png that the program sets as its Dock icon when it starts (see app_identity.py)
+        mac = Image.new("RGBA", (BIG, BIG), (0, 0, 0, 0))
+        mac.alpha_composite(big.resize((824, 824), Image.LANCZOS), (100, 100))
+        mac.save(os.path.join(HERE, name + ".icns"))
+        mac.resize((256, 256), Image.LANCZOS).save(os.path.join(HERE, name + ".png"))
+        print("wrote", name + ".ico, .icns and .png")

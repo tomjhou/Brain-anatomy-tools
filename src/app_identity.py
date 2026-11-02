@@ -1,36 +1,45 @@
-"""Gives a program run from the source its own icon and taskbar button on Windows, so that it shows as itself rather than as Python.
+"""Gives a program run from the source its own icon and taskbar button on Windows (and its own Dock icon on macOS), so that it shows as
+itself rather than as Python.
 
 Windows groups taskbar buttons by an "app ID". Every Python program shares python.exe's, so a running viewer would sit under a Python
 button beside, not on, its pinned shortcut. Each program declares its own ID here (for the process, and on each of its windows), and
 install_shortcuts.ps1 stamps the same ID on the shortcuts it makes (keep APPS below and $apps there in step). Each Tk window gets the
 program's icon from the icons folder.
 
-For a program started with pythonw.exe (no console window), output and errors would vanish: use_windowless_log sends them to a log file
-and shows errors in a message box."""
+On macOS there is no such ID: the Dock shows a running program as the app it belongs to, here Python. Each program only sets the Dock
+icon to its own (from the .png in the icons folder), so the running program looks right, though still named "Python".
+
+For a program started with pythonw.exe (no console window), or on macOS from its app made by INSTALL_APPS.command (which sets
+JHOULAB_WINDOWLESS=1), output and errors would vanish: use_windowless_log sends them to a log file and shows errors in a message box."""
 import os
 import sys
 import traceback
 
 ICON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
-APPS = {   # program: (app ID, icon file)
-    "xlef_viewer": ("JhouLab.BrainAnatomyTools.XlefViewer", "xlef_viewer.ico"),
-    "ccf_browser": ("JhouLab.BrainAnatomyTools.CCFBrowser", "ccf_browser.ico"),
-    "abc_atlas_browser": ("JhouLab.BrainAnatomyTools.ABCAtlasBrowser", "abc_atlas_browser.ico"),
+APPS = {   # program: (app ID, icon files' name: .ico for Windows, .png for macOS)
+    "xlef_viewer": ("JhouLab.BrainAnatomyTools.XlefViewer", "xlef_viewer"),
+    "ccf_browser": ("JhouLab.BrainAnatomyTools.CCFBrowser", "ccf_browser"),
+    "abc_atlas_browser": ("JhouLab.BrainAnatomyTools.ABCAtlasBrowser", "abc_atlas_browser"),
 }
 
 
 def use_app_identity(program):
     """Call before the program's first window. Not for the packaged .exe: its pinned shortcut has no app ID, so declaring one would split
     the running window from the pinned button, and the .exe has its own icon."""
-    if sys.platform != "win32" or getattr(sys, "frozen", False):
+    if getattr(sys, "frozen", False):
         return
     app_id, icon = APPS[program]
+    if sys.platform == "darwin":
+        _use_dock_icon(os.path.join(ICON_DIR, icon + ".png"))
+        return
+    if sys.platform != "win32":
+        return
     try:
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
     except (AttributeError, OSError):
         pass
-    icon_path = os.path.join(ICON_DIR, icon)
+    icon_path = os.path.join(ICON_DIR, icon + ".ico")
     if not os.path.exists(icon_path):
         icon_path = None
     import tkinter
@@ -57,6 +66,23 @@ def use_app_identity(program):
         cls.__init__ = init_with_identity
     patch(tkinter.Tk, True)          # every Tk root (some programs make several)
     patch(tkinter.Toplevel, False)   # and every other window, e.g. dialogs
+
+
+def _use_dock_icon(png):
+    """macOS: each Tk root sets the Dock icon (and its windows' icons) to the png."""
+    if not os.path.exists(png):
+        return
+    import tkinter
+    init = tkinter.Tk.__init__
+
+    def init_with_icon(self, *args, **kwargs):
+        init(self, *args, **kwargs)
+        try:
+            self._dock_icon = tkinter.PhotoImage(master=self, file=png)   # (kept: Tk drops an image nothing refers to)
+            self.iconphoto(True, self._dock_icon)
+        except tkinter.TclError:
+            pass
+    tkinter.Tk.__init__ = init_with_icon
 
 
 def _set_window_app_id(hwnd, app_id):
@@ -94,11 +120,15 @@ def _set_window_app_id(hwnd, app_id):
 
 
 def use_windowless_log(program, title):
-    """Started with pythonw.exe there is no console: send what would have been printed to a log file, and show errors (uncaught ones, and
-    the first in a Tk callback) in a message box that names the log. Returns the log's path, or None when there is a console."""
-    if sys.stdout is not None and sys.stderr is not None:
+    """Started with pythonw.exe there is no console (nor from a macOS app, which says so with JHOULAB_WINDOWLESS=1): send what would have
+    been printed to a log file, and show errors (uncaught ones, and the first in a Tk callback) in a message box that names the log.
+    Returns the log's path, or None when there is a console."""
+    if sys.stdout is not None and sys.stderr is not None and os.environ.get("JHOULAB_WINDOWLESS") != "1":
         return None
-    folder = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "JhouLab", "logs")
+    if sys.platform == "darwin":
+        folder = os.path.join(os.path.expanduser("~"), "Library", "Logs", "JhouLab")
+    else:
+        folder = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "JhouLab", "logs")
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, program + ".log")
     sys.stdout = sys.stderr = open(path, "w", encoding="utf-8", buffering=1)

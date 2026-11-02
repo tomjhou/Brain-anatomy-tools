@@ -1,3 +1,6 @@
 # Batch files must keep Windows (CRLF) line endings or cmd.exe misreads them
 *.bat text eol=crlf
 *.ps1 text eol=crlf
+# and the macOS scripts must keep Unix (LF) line endings, or bash misreads them
+*.command text eol=lf
+*.sh text eol=lf

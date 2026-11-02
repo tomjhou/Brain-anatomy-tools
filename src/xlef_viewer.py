@@ -63,6 +63,8 @@ RIGHT_CLICKS = ("<Button-2>", "<Button-3>") if sys.platform == "darwin" else ("<
 SHORTCUT = "Command" if sys.platform == "darwin" else "Control"
 MAX_RECENT = 20
 MOVING_PAUSE = 0.25          # s without a wheel click or drag before the view counts as at rest (see XlefViewer._moving)
+FINER_CROP_BYTES = 32e6      # a compressed plane is decoded whole anyway: a view of it is kept finer than the zoom needs (up to full resolution)
+                             # while it takes no more than this per channel, so that zooming further in needs no new reading
 DETAIL_BANDS = 10            # a sharp view is read in this many bands (top to bottom), each drawn as it comes (see XlefViewer.redraw)
 BAND_DRAW_INTERVAL = 0.2     # s: the bands that came in are drawn at most this often (drawing must not hold up the reading)
 READ_BUDGET = 0.3            # s: a sharper picture expected to take longer than this to read counts as slow (see XlefViewer._slow)
@@ -758,6 +760,58 @@ def pyramid_note(path, n_images):
     except (OSError, ValueError, ET.ParseError):
         return "No"
     return "No" if k == 0 else "Yes" if k >= n_images else f"{k} of {n_images}"
+
+
+def _resolution_text(step):
+    """How much of the image's resolution a read at `step` (every step-th pixel, in each direction) has: "full resolution", "1/2 resolution"."""
+    return "full resolution" if step == 1 else f"1/{step} resolution"
+
+
+def tiff_compression(path):
+    """The compression of a TIFF's first image, as "none", "LZW", "ADOBE_DEFLATE", ...; None if it can't be told. Reads the header only."""
+    try:
+        with tifffile.TiffFile(path) as t:
+            c = t.pages[0].compression
+        return "none" if int(c) == 1 else getattr(c, "name", str(c))
+    except Exception:
+        return None
+
+
+def storage_notes(entries, path):
+    """For a project's note: how its pixels are stored (separate TIFFs, OME-TIFF, or raw data in .lof/.lif), whether they are compressed
+    (the first image of up to 5 images spread through the project is looked at; an online-only file is not, since reading it would
+    download it), and whether LAS X made pyramids (see pyramid_note). A list of lines."""
+    shown = [e for e in entries if e.width and e.files]
+    n = len(shown)
+    kinds = {"raw": [], "ome": [], "tiff": []}
+    for e in shown:
+        raw = e.lif_block is not None or any(isinstance(p, RawPlane) for p in e.pages.values())
+        kinds["raw" if raw else "ome" if e.pages else "tiff"].append(e)
+    names = {"raw": "raw data (.lof / .lif)", "ome": "OME-TIFF (all channels in one file)", "tiff": "separate TIFFs (one per channel and layer)"}
+    present = [k for k in kinds if kinds[k]]
+    lines = []
+    if present:
+        lines.append("Stored as: " + (names[present[0]] if len(present) == 1 else
+                                      ", ".join(f"{names[k]} {len(kinds[k])} of {n}" for k in present)))
+    tiffs = kinds["tiff"] + kinds["ome"]
+    found, looked = set(), 0
+    for e in [tiffs[int(i * len(tiffs) / 5)] for i in range(5)] if len(tiffs) > 5 else tiffs:
+        f = next(iter(e.all_files()), None)
+        if f and not is_online_only(f):
+            comp = tiff_compression(f)
+            if comp is not None:
+                found.add(comp)
+                looked += 1
+    if kinds["raw"]:
+        found.add("none")
+    if found:
+        text = next(iter(found)) if len(found) == 1 else "mixed (" + ", ".join(sorted(found)) + ")"
+        lines.append(f"Compression: {text}" + (f" (looked at {looked} of {len(tiffs)} images)" if len(tiffs) > looked and tiffs else ""))
+    elif tiffs:
+        lines.append("Compression: not checked (the files are online-only)")
+    if n:
+        lines.append("Pyramids: " + pyramid_note(path, n).replace("Yes", "yes").replace("No", "none"))
+    return lines
 
 
 def _count_folder(folder):
@@ -1661,6 +1715,7 @@ class OpenImage:
     def __init__(self, entry):
         self.entry = entry
         self.planes = {}         # (z, c) -> 2-D array
+        self.decoded = set()     # the keys of `planes` that were decoded in full (hundreds of MB each), not memory-mapped
         self.overviews = {}      # (z, c) -> downsampled array, in the image's own pixel values
         self.layouts = {}        # (z, c) -> where its file keeps the pixels, or None (see raw_layout)
         self.ov_step = max(1, int(np.ceil(max(entry.width, entry.height) / OVERVIEW_MAX)))
@@ -1695,21 +1750,44 @@ class OpenImage:
         except (OSError, ET.ParseError):
             return None
 
-    def plane(self, z, c):
+    def plane(self, z, c, stale=None, keep=True):
+        """Plane (z, c), whole. One that can't be memory-mapped (compressed) is decoded here, one at a time (_DECODE_LOCK; a zoom starts
+        a read at each wheel click, and decoding the same plane in all of them at once made each crawl and filled the memory), and only
+        the current layer's are kept (none, with keep=False: for a layer being read ahead, see XlefViewer._start_prefetch). stale(), if
+        given, says the read is no longer wanted, asked when its turn comes (see StaleRead)."""
         key = (z, c)
-        if key not in self.planes:
-            path = self.entry.files.get(key)
-            if path is None:
-                return None
-            page = self.entry.pages.get(key)
-            try:
-                a = memmap_plane(path, page)
-            except (ValueError, OSError):
-                a = read_whole(path, page)
+        a = self.planes.get(key)
+        if a is not None:
+            return a
+        path = self.entry.files.get(key)
+        if path is None:
+            return None
+        page = self.entry.pages.get(key)
+
+        def one_plane(a):
             while a.ndim > 2:        # a z stack in one file: pick the plane; extra sample axes: take the first
                 a = a[z if a.shape[0] == self.entry.nz else 0]
+            return a
+        try:
+            a = one_plane(memmap_plane(path, page))
             self.planes[key] = a
-        return self.planes[key]
+            return a
+        except (ValueError, OSError):
+            pass
+        with _DECODE_LOCK:
+            a = self.planes.get(key)          # (decoded by another read while this one waited)
+            if a is None:
+                if stale is not None and stale():
+                    raise StaleRead()
+                a = one_plane(read_whole(path, page))
+                if not keep:
+                    return a
+                for k in [k for k in self.decoded if k[0] != z]:      # (a z stack scrolled through would fill the memory)
+                    self.decoded.discard(k)
+                    self.planes.pop(k, None)
+                self.decoded.add(key)
+                self.planes[key] = a
+        return a
 
     def overview(self, z, c, progress=None, stale=None):
         """Channel c's overview for plane z (read once). progress(fraction), if given, is called as it is read from the image itself.
@@ -1733,6 +1811,12 @@ class OpenImage:
                         progress(min(1.0, (i + 64) / small.shape[0]))
             self.overviews[key] = small
         return self.overviews[key]
+
+    def remember_overview(self, z, c, p):
+        """Plane (z, c)'s overview, from the plane p as it was just read for something else (so that moving to this layer later needs
+        no second read of it); not if there is one already, or the overviews come from a pyramid."""
+        if (z, c) not in self.overviews and self.pyramid is None:
+            self.overviews[(z, c)] = np.ascontiguousarray(p[::self.ov_step, ::self.ov_step])
 
     def _plane_for_overview(self, z, c, stale):
         """Plane (z, c) to take an overview from. A TIFF that can be memory-mapped is kept (the map costs nothing until it is read). A compressed
@@ -1804,6 +1888,7 @@ class OpenImage:
 
     def close(self):
         self.planes.clear()
+        self.decoded.clear()
         self.overviews.clear()
 
 
@@ -3014,6 +3099,10 @@ class XlefViewer:
         self.unkept_previews = {}    # entry -> its preview's arrays, loaded in the background but not kept (no room), for its thumbnail
         self.thumbs_shown = False    # (the thumbnail grid is showing, not the list: the thumbnail thread pauses otherwise)
         self.detail_cache = None     # the sharp view's pixels for the view on screen: {"key", "arrays"} (see redraw)
+        self.sharp_level = None      # the pyramid level the last sharp view was read from (None: from the full-resolution files)
+        self.prefetch = None         # the reading of the same view in the other layers of a z-stack: {"sig", "token", "state"} (see _start_prefetch)
+        self.prefetch_token = 0
+        self.prefetch_full = None    # the view whose layers did not all fit in the memory for kept views (not tried again until it changes)
         self.download_queue = []     # list items whose full resolution is to be downloaded from OneDrive (see download_full_res)
         self.download_progress = {}  # list item -> "waiting" or percent, while it is queued or downloading
         self.download_thread = self.download_stop = None
@@ -3169,12 +3258,6 @@ class XlefViewer:
         view_row.pack(fill=tk.BOTH, expand=True)
         side = ttk.Frame(view_row)
         side.pack(side=tk.RIGHT, fill=tk.Y, padx=4, pady=4)        # (packed before the image, so a narrow window shrinks the image)
-        self.z_frame = ttk.Frame(side)
-        ttk.Label(self.z_frame, text="Z plane").pack(side=tk.LEFT)
-        self.z_var = tk.IntVar(value=0)
-        self.z_scale = tk.Scale(self.z_frame, from_=0, to=0, orient=tk.HORIZONTAL, variable=self.z_var, command=self.on_z)
-        self.z_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
         self.split_button = ttk.Button(side, text="Merge channels" if self.settings.get("separate_channels", True) else "Separate channels",
                                        command=self.toggle_split)
         self.split_button.pack(fill=tk.X, pady=(0, 4))
@@ -3188,8 +3271,23 @@ class XlefViewer:
                                      "(Save writes it into the section's .xlif, so it goes with the files; or, see Settings, it is kept on this "
                                      "computer). With \"Flip all "
                                      "sections\" ticked too, it is shown unflipped. Only the view is flipped, not the image.")
-        self.ch_frame = ttk.LabelFrame(side, text="Channels")
-        self.ch_frame.pack(fill=tk.BOTH, expand=True)
+        mid = ttk.Frame(side)
+        mid.pack(fill=tk.BOTH, expand=True)
+        # A z-stack's plane slider, left of the channels' sliders: vertical, plane 1 at the top, with a button at each end to move by one
+        # plane. (Planes are numbered from 1 everywhere they are shown; self.z, and the files' keys, count from 0.)
+        self.z_frame = ttk.Frame(mid)
+        ttk.Label(self.z_frame, text="Z plane").pack(side=tk.TOP)
+        self.z_up = ttk.Button(self.z_frame, text="▲", width=3, command=lambda: self.step_z(-1))
+        self.z_up.pack(side=tk.TOP)
+        Tooltip(self.z_up, "Previous plane (one closer to plane 1)")
+        self.z_var = tk.IntVar(value=1)
+        self.z_scale = tk.Scale(self.z_frame, from_=1, to=1, orient=tk.VERTICAL, variable=self.z_var, command=self.on_z)
+        self.z_scale.pack(side=tk.TOP, fill=tk.Y, expand=True)
+        self.z_down = ttk.Button(self.z_frame, text="▼", width=3, command=lambda: self.step_z(1))
+        self.z_down.pack(side=tk.TOP)
+        Tooltip(self.z_down, "Next plane")
+        self.ch_frame = ttk.LabelFrame(mid, text="Channels")
+        self.ch_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
         btns = ttk.Frame(side)
         btns.pack(fill=tk.X, pady=(4, 0))
         ttk.Button(btns, text="Auto contrast", command=self.auto_all).pack(side=tk.LEFT, expand=True, fill=tk.X)
@@ -4270,6 +4368,8 @@ class XlefViewer:
 
     def _close_image(self):
         self.generation += 1
+        self.prefetch_token += 1
+        self.prefetch = None
         self._set_open_progress(None)
         self._stash_partial()                           # (what was read of a sharp view still coming in, and the last whole one:
         self._stash_region(self.detail_cache)          # kept for coming back)
@@ -4379,9 +4479,9 @@ class XlefViewer:
         self._build_channel_controls()
         self._update_annotations_check()
         if entry.nz > 1:
-            self.z_scale.config(to=entry.nz - 1)
-            self.z_var.set(self.z)
-            self.z_frame.pack(fill=tk.X, padx=4, before=self.ch_frame)
+            self.z_scale.config(to=entry.nz)
+            self.z_var.set(self.z + 1)
+            self.z_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 4), before=self.ch_frame)
         else:
             self.z_frame.pack_forget()
         self.fit(redraw=False)
@@ -4409,6 +4509,7 @@ class XlefViewer:
         self.loading = True
         self._update_cursor()
         n = len(img.entry.channels)
+        plane = f", z {z + 1}" if img.entry.nz > 1 else ""          # (numbered from 1, as the slider is)
 
         def on_disk():
             """For the status bar once it is read (asked of the files there, in the background: a round trip each on a network drive)."""
@@ -4444,7 +4545,7 @@ class XlefViewer:
                     for c in range(n if quick is not None else 0):
                         if gen != self.generation:
                             return
-                        self.results.put(("progress", gen, f"Reading {img.entry.name}: channel {c + 1} of {n} ..."))
+                        self.results.put(("progress", gen, f"Reading {img.entry.name}{plane}: channel {c + 1} of {n} ..."))
                         a = img._from_pyramid(c, quick, z=z)
                         if a is None:
                             break
@@ -4461,7 +4562,7 @@ class XlefViewer:
                 for c in range(n):
                     if gen != self.generation:
                         return
-                    self.results.put(("progress", gen, f"Reading {img.entry.name}: sharper view, channel {c + 1} of {n} ..."))
+                    self.results.put(("progress", gen, f"Reading {img.entry.name}{plane}: sharper view, channel {c + 1} of {n} ..."))
                     sharp.append(img._from_pyramid(c, z=z))
                     if not first:
                         report((c + 1) / n)
@@ -4472,7 +4573,7 @@ class XlefViewer:
             for c in range(n):
                 if gen != self.generation:
                     return
-                self.results.put(("progress", gen, f"Reading {img.entry.name}: channel {c + 1} of {n} ..."))
+                self.results.put(("progress", gen, f"Reading {img.entry.name}{plane}: channel {c + 1} of {n} ..."))
                 try:
                     img.overview(z, c, lambda f, c=c: report((c + f) / n), stale=lambda: gen != self.generation)
                 except StaleRead:
@@ -4484,7 +4585,7 @@ class XlefViewer:
             self.results.put(("loaded", gen, on_disk()))
 
         threading.Thread(target=work, daemon=True).start()
-        self.status.config(text=f"Reading {img.entry.name} ...")
+        self.status.config(text=f"Reading {img.entry.name}{plane} ...")
 
     # --- channel controls
 
@@ -4618,8 +4719,15 @@ class XlefViewer:
         if self.img:
             self._contrast_change([(i, ch.saved_black, ch.saved_white) for i, ch in enumerate(self.img.entry.channels)])
 
+    def step_z(self, delta):
+        """The z buttons: one plane up or down (not past the first or last)."""
+        if self.img and self.img.entry.nz > 1:
+            shown = min(max(self.z + 1 + delta, 1), self.img.entry.nz)
+            self.z_var.set(shown)
+            self.on_z(shown)
+
     def on_z(self, value):
-        z = int(float(value))
+        z = int(float(value)) - 1          # (the slider counts planes from 1)
         if self.img and z != self.z:
             self.z = z
             self.generation += 1
@@ -4627,11 +4735,17 @@ class XlefViewer:
                 self.root.after_cancel(self.z_job)
                 self.z_job = None
             if self.img.has_all(z) and (self.img.complete(z) or not self._want_sharp_level(self.img)):
+                # (a note left by a layer the slider passed on the way, "reading when the slider stops", would stay: nothing reads now)
+                self.status.config(text=f"Layer {z + 1} of {self.img.entry.nz}")
+                # A read of the layer passed on the way is stale now and ends without saying so (see _load_overviews): its "loading" would
+                # stay, with the hourglass, and keep the sharp view of this layer from being drawn (see redraw).
+                self.loading = False
+                self._set_open_progress(None)
                 self.redraw()
             else:
                 # Dragging the slider passes every plane on the way: reading each (hundreds of MB, for a compressed stack) would bury the
                 # one that is wanted. The read starts when the slider has rested for a moment.
-                self.status.config(text=f"z = {z}: reading when the slider stops ...")
+                self.status.config(text=f"z = {z + 1}: reading when the slider stops ...")
                 self.z_job = self.root.after(Z_SETTLE_MS, self._load_overviews_for_z, self.generation)
 
     def _load_overviews_for_z(self, gen):
@@ -4999,6 +5113,7 @@ class XlefViewer:
         detail, level = plan is not True, None
         if detail:
             step, level = plan                    # (level: read from the pyramid's sharper copy, see _read_plan)
+            self.sharp_level = level
             # The sharp view's pixels for this very view are still here (only the contrast, or a channel, changed): recolor them
             # at once instead of drawing the blurrier overview first and reading the files again (that blinked).
             (i0, j0, i1, j1), place = self._detail_rect(step, level)
@@ -5022,6 +5137,7 @@ class XlefViewer:
                 if not need:
                     self.detail_pending = False
                     self._update_cursor()
+                    self._start_prefetch()
                     return
                 ovs = [None] * n                  # (skip the overview: the sharp view stays while the missing channel is read)
         if any(o is not None for o in ovs):
@@ -5057,7 +5173,10 @@ class XlefViewer:
         self.generation += 1
         self.detail_pending = True           # (an hourglass until the sharper view is in)
         self.hires_progress = None
-        self.hires_label = "Loading full resolution..." if level is None else "Loading a sharper view..."
+        self.hires_label = ("Loading full resolution..." if step == 1 else "Loading a sharper image...") if level is None             else "Loading a sharper view..."
+        if level is None:
+            where = f"Layer {self.z + 1} of {self.img.entry.nz}; " if self.img.entry.nz > 1 else ""
+            self.status.config(text=f"{where}reading this view at {_resolution_text(step)} ...")
         self._update_cursor()
         gen, img, z = self.generation, self.img, self.z
         (i0, j0, i1, j1), place = self._detail_rect(step, level)
@@ -5089,6 +5208,23 @@ class XlefViewer:
                         readers[c] = _RowReader(f, layout[0], layout[1], img.entry.width) if layout is not None else None
                     files[c] = f
                 arrays = [None] * n
+                if level is None and all(readers[c] is None for c in need):
+                    # Planes that are decoded whole (compressed): every pixel of the view is in memory once they are, so the view is kept as
+                    # fine as FINER_CROP_BYTES allows, not just as fine as this zoom shows: zooming in further finds it already here.
+                    stale = lambda: gen != self.generation
+                    planes = {c: img.plane(z, c, stale=stale) for c in need}
+                    if not any(isinstance(pl, np.memmap) for pl in planes.values()):
+                        itemsize = max(pl.dtype.itemsize for pl in planes.values())
+                        f = next((d for d in range(1, step + 1) if step % d == 0
+                                  and rows * cols * (step // d) ** 2 * itemsize <= FINER_CROP_BYTES), step)
+                        if f < step:
+                            k = step // f
+                            ent = img.entry
+                            fi0, fj0, fi1, fj1 = i0 * k, j0 * k, min(-(-ent.width // f), i1 * k), min(-(-ent.height // f), j1 * k)
+                            for c in need:
+                                arrays[c] = np.ascontiguousarray(planes[c][fj0 * f:fj1 * f:f, fi0 * f:fi1 * f:f])
+                            self.results.put(("detail", gen, ((id(img), z, fi0, fj0, fi1, fj1, f, place), arrays, place, self.scale * f < 1)))
+                            return
                 for b0 in range(0, rows, band):
                     b1 = min(rows, b0 + band)
                     if gen != self.generation:
@@ -5105,7 +5241,7 @@ class XlefViewer:
                                 tally[0] += readers[c].cost(b - a, step)
                                 tally[1] += 1
                         else:
-                            part = np.ascontiguousarray(img.plane(z, c)[(j0 + b0) * step:(j0 + b1) * step:step, i0 * step:i1 * step:step])
+                            part = np.ascontiguousarray(img.plane(z, c, stale=lambda: gen != self.generation)[(j0 + b0) * step:(j0 + b1) * step:step, i0 * step:i1 * step:step])
                             if arrays[c] is None:
                                 arrays[c] = np.empty((rows, cols), part.dtype)
                             arrays[c][b0:b1] = part
@@ -5117,6 +5253,8 @@ class XlefViewer:
                 if tally[1]:
                     SPEED.observe(files[need[0]], tally[0], tally[1], READ_THREADS, time.perf_counter() - started)
                 self.results.put(("detail", gen, (key, arrays, place, smooth)))
+            except StaleRead:
+                return                  # (the view has moved on: the read that is wanted now has its own thread)
             except Exception as e:
                 self.results.put(("error", gen, f"Can't read {img.entry.name}: {e}"))
             finally:
@@ -5269,6 +5407,113 @@ class XlefViewer:
             return (f"Slow storage ({where} measured at {speed}): previews are shown enlarged up to {RELAXED_ENLARGE:g} times\n"
                     "before sharper pictures are read")
         return f"Fast storage ({where} measured at {speed}): sharper pictures are read as soon as you zoom in"
+
+    def _prefetch_sig(self):
+        """What a layer read ahead depends on: the image, the layer shown, and the view. Any change ends the reading."""
+        return (id(self.img), self.z, self.scale, self.cx, self.cy, self.canvas_size())
+
+    def _start_prefetch(self):
+        """A z-stack's sharp view has come in: read the same view of the other layers in the background, the nearest first (z-1, z+1,
+        z-2, ...), and keep each as a region (see _stash_region), so that moving the z slider to it draws at once (see _use_region),
+        for a "movie" of the layers. It ends when the layer or the view changes (the layers read so far stay, for the same view);
+        it starts again once the new layer's view is in. Not for a view read from a pyramid level (small files: quick already)."""
+        img, cache = self.img, self.detail_cache
+        e = img.entry if img is not None else None
+        if (e is None or e.nz < 2 or self.sharp_level is not None or self.loading or cache is None or cache["key"][0] != id(img)
+                or cache["key"][1] != self.z or not self.settings.get("preload_layers", True)):
+            return
+        sig = self._prefetch_sig()
+        if self.prefetch is not None and self.prefetch["sig"] == sig:
+            return
+        tail = cache["key"][2:]
+        if self.prefetch_full == (id(img), tail):
+            return
+        have = {r["key"][1] for r in self.regions if r["entry"] is e and r["key"][2:] == tail}
+        order = [z for d in range(1, e.nz) for z in (self.z - d, self.z + d) if 0 <= z < e.nz and z not in have
+                 and not any(is_online_only(f) for f in (e.files.get((z, c)) for c in range(len(e.channels))) if f)]
+        self.prefetch_token += 1
+        if not order:
+            self.prefetch = {"sig": sig, "token": self.prefetch_token, "state": "done"}
+            self.status.config(text=f"Layer {self.z + 1} of {e.nz}; all layers of this view are ready")
+            return
+        token = self.prefetch_token
+        self.prefetch = {"sig": sig, "token": token, "state": "running", "order": order, "step": tail[4]}
+        (i0, j0, i1, j1), step = tail[:4], tail[4]
+        rows, cols = j1 - j0, i1 - i0
+        n = len(e.channels)
+        zs = len(order)
+
+        def stale():
+            return token != self.prefetch_token or self._prefetch_sig() != sig
+
+        def read(z):
+            arrays = []
+            for c in range(n):
+                if stale():
+                    raise StaleRead()
+                layout = img.raw_layout(z, c)
+                if layout is not None:
+                    reader = _RowReader(e.files[(z, c)], layout[0], layout[1], e.width)
+                    try:
+                        futures = [_READ_POOL.submit(reader.row, (j0 + k) * step, i0 * step, cols, step) for k in range(rows)]
+                        a = np.empty((rows, cols), reader.out_dtype)
+                        for k, f in enumerate(futures):
+                            a[k] = f.result()
+                    finally:
+                        reader.close()
+                    img.overview(z, c, stale=stale)         # (the layer's preview too: the slider needs it to move there at once)
+                else:
+                    p = img.plane(z, c, stale=stale, keep=False)
+                    a = np.ascontiguousarray(p[j0 * step:j1 * step:step, i0 * step:i1 * step:step])
+                    img.remember_overview(z, c, p)
+                arrays.append(a)
+            return arrays
+
+        def work():
+            try:
+                for k, z in enumerate(order):
+                    arrays = read(z)
+                    self.results.put(("prefetched", token, ((id(img), z) + tuple(tail), arrays, k + 1, zs)))
+                self.results.put(("prefetch_done", token, None))
+            except StaleRead:
+                pass
+            except Exception as ex:
+                self.results.put(("prefetch_done", token, f"Reading the other layers stopped: {ex}"))
+
+        self.status.config(text=self._prefetch_note(order, 0))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _prefetch_note(self, order, done):
+        """The status line while layers are read ahead: the layer shown, the layer being read now (both numbered from 1), and how many
+        of the layers still to be read, that one included, are unread."""
+        return (f"Layer {self.z + 1} of {self.img.entry.nz}; reading layer {order[done] + 1} at "
+                f"{_resolution_text(self.prefetch['step'])} ({len(order) - done} unread, nearest layers first)")
+
+    def _prefetch_result(self, kind, token, data):
+        """A layer read ahead (kept as a region, if it fits in the memory for kept views), or the end of the reading."""
+        p = self.prefetch
+        if self.img is None or p is None or p["token"] != token:
+            return
+        if kind == "prefetch_done":
+            p["state"] = "done"
+            self.status.config(text=data or f"Layer {self.z + 1} of {self.img.entry.nz}; all layers of this view are ready: the z slider "
+                                    f"shows them at once")
+            return
+        key, arrays, k, total = data
+        if key[0] != id(self.img):
+            return
+        size = sum(a.nbytes for a in arrays)
+        room = self.kept_limit() - self.kept_bytes - sum(r["bytes"] for r in self.regions)
+        if size > room:
+            self.prefetch_token += 1
+            p["state"] = "full"
+            self.prefetch_full = (id(self.img), tuple(key[2:]))
+            self.status.config(text=f"Layer {self.z + 1} of {self.img.entry.nz}; read {k - 1} of {total} other layers of this view, "
+                                    f"then the memory for previews was full (Settings: raise it to keep more)")
+            return
+        self.regions.append({"entry": self.img.entry, "key": key, "arrays": arrays, "bytes": size})
+        if k < total:
+            self.status.config(text=self._prefetch_note(p["order"], k))
 
     def _sharp_sources(self, z, step, i0, i1):
         """For a sharp view about to be read (at `step`, columns i0..i1 of it): the sharp pixels kept from before that can give some of
@@ -6184,7 +6429,14 @@ class XlefViewer:
         path = self.projects[pid]["path"]
         n = len(self._entries_of(pid))
         changed = self._unsaved_names(pid)
-        lines = [os.path.normpath(path), ", ".join(filter(None, [f"{n} image{'s' * (n != 1)}", self._size_note(pid)])),
+        facts = self.projects[pid].get("storage")
+        if facts is None:
+            try:
+                facts = storage_notes(list(self._entries_of(pid).values()), path)
+            except Exception:
+                facts = []
+            self.projects[pid]["storage"] = facts
+        lines = [os.path.normpath(path), ", ".join(filter(None, [f"{n} image{'s' * (n != 1)}", self._size_note(pid)])), *facts,
                  f"Unsaved changes: {', '.join(changed[:5])}{' and more' if len(changed) > 5 else ''}" if changed else "No unsaved changes",
                  self._speed_note(path)]
         return "\n".join(line for line in lines if line)
@@ -6219,7 +6471,7 @@ class XlefViewer:
             if self._size_note(item):
                 lines.append(self._size_note(item))
             if e.nz > 1:
-                lines.append(f"z-stack of {e.nz} layers, shown one at a time: the \"Z plane\" slider (above the channels) picks which\n"
+                lines.append(f"z-stack of {e.nz} layers, shown one at a time: the \"Z plane\" slider (left of the channels) picks which\n"
                              f"(it opens on the first, or on the layer last shown of another z-stack)")
         what = self._unsaved_what(item)
         lines.append("Unsaved changes: " + ", ".join(what) if what else "No unsaved changes")
@@ -6838,6 +7090,9 @@ class XlefViewer:
                     if gen == self.thumb_gen:
                         self.thumb_grid.set_thumb(*data)
                     continue
+                if kind in ("prefetched", "prefetch_done"):
+                    self._prefetch_result(kind, gen, data)
+                    continue
                 if kind == "preload_done":
                     if self.preloading == gen:
                         self.preloading = None
@@ -6935,6 +7190,7 @@ class XlefViewer:
                     self._show(rgb, *place, smooth)
                     self.detail_pending = False
                     self._update_cursor()
+                    self._start_prefetch()
                 elif kind == "error":
                     self._set_open_progress(None)
                     self.loading = False

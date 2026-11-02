@@ -52,10 +52,30 @@ logging.getLogger("tifffile").addFilter(_LeicaZeroTagFilter())
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "FileConverters"))
 from open_file_dialog import ask_open_file
 import leica_luts           # (LAS X's colour maps, sampled: see lut_table)
+import xlef_pyramids        # (pyramids for an experiment that has none: see XlefViewer.make_pyramids)
 from color_button import ColorButton
 from tooltip import Tooltip, place_on_monitor, monitor_area
 
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".xlef_viewer_settings.json")
+# With XLEF_TRACE set in the environment, one line per decision of the viewer goes to xlef_viewer_trace.log in the temp folder: for finding
+# out why a view looks wrong. (Not set: nothing is written, and the calls below are skipped.)
+TRACE_PATH = os.path.join(os.environ.get("TEMP") or os.path.expanduser("~"), "xlef_viewer_trace.log") if os.environ.get("XLEF_TRACE") else None
+
+
+def trace(*parts):
+    try:
+        t = time.time()
+        with open(TRACE_PATH, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%H:%M:%S", time.localtime(t)) + f".{int(t * 1000) % 1000:03d} " + " ".join(str(p) for p in parts) + "\n")
+    except OSError:
+        pass
+
+
+if TRACE_PATH:
+    try:
+        os.remove(TRACE_PATH)
+    except OSError:
+        pass
 THUMB_CACHE = (os.path.join(os.path.expanduser("~"), "Library", "Caches", "JhouLab", "xlef_viewer_thumbs") if sys.platform == "darwin" else
                os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "JhouLab", "xlef_viewer_thumbs"))
 # macOS: Tk 8.6 reports the right mouse button as button 2 (Tk 8.7 and later, as 3, as elsewhere), and shortcuts use the Command key
@@ -1702,6 +1722,9 @@ def load_experiment(path):
 
 # ---------------------------------------------------------------------------------------------------------------------- pixels
 
+_SAME = object()      # (a default for _start_prefetch: the pyramid level of the sharp view on show)
+
+
 class StaleRead(Exception):
     """A read that was asked for, and is no longer wanted (the user has moved on to another plane) by the time its turn comes."""
 
@@ -1716,12 +1739,43 @@ class OpenImage:
         self.entry = entry
         self.planes = {}         # (z, c) -> 2-D array
         self.decoded = set()     # the keys of `planes` that were decoded in full (hundreds of MB each), not memory-mapped
-        self.overviews = {}      # (z, c) -> downsampled array, in the image's own pixel values
+        self.overviews = {}      # (z, c) -> downsampled array, in the image's own pixel values, every ov_step-th pixel
+        self.stashed = {}        # step -> overviews at that step, while another step is the one on show (see use_step)
+        self.compressed = {}     # (z, c) -> whether its plane is in a compressed TIFF (see is_compressed)
+        self.step_lock = threading.Lock()
         self.layouts = {}        # (z, c) -> where its file keeps the pixels, or None (see raw_layout)
         self.ov_step = max(1, int(np.ceil(max(entry.width, entry.height) / OVERVIEW_MAX)))
         self.pyramid = self.usable_level(OVERVIEW_MAX)
         if self.pyramid is not None:
             self.ov_step = self.pyramid[1]
+
+    def is_compressed(self, z, c):
+        """Plane (z, c) is in a compressed TIFF: reading any of it decodes the whole plane (seconds). Asked once, from the file's header."""
+        key = (z, c)
+        if key not in self.compressed:
+            path = self.entry.files.get(key)
+            self.compressed[key] = bool(path) and self.entry.pages.get(key) is None and tiff_compression(path) not in (None, "none")
+        return self.compressed[key]
+
+    def overview_step(self):
+        """The step of the overviews that overview() reads: the pyramid's, else ov_step."""
+        return self.pyramid[1] if self.pyramid is not None else self.ov_step
+
+    def use_step(self, step):
+        """Show overviews at `step` (a coarser one first, from a small pyramid level; later the pyramid's own): the ones kept at the step
+        being left wait, and the ones kept for the new step come back. Overviews at different steps are never in `overviews` together:
+        the picture takes its pixels as every ov_step-th, so an array of another step shows the wrong part of the image."""
+        with self.step_lock:
+            if step != self.ov_step:
+                self.stashed[self.ov_step] = self.overviews
+                self.overviews = self.stashed.pop(step, {})
+                self.ov_step = step
+
+    def _keep_overview(self, z, c, small, step):
+        """Keep an overview made at `step` for plane z, channel c: with the ones on show if that is their step, else for when it is."""
+        with self.step_lock:
+            target = self.overviews if step == self.ov_step else self.stashed.setdefault(step, {})
+            target.setdefault((z, c), small)
 
     def quick_level(self, size):
         """(level, step) of a smaller pyramid level, at least `size` across (the fit view's size on screen), to show first while the
@@ -1794,29 +1848,32 @@ class OpenImage:
         stale(), if given, says whether the read is no longer wanted: asked when a compressed plane's turn to be decoded comes (see
         StaleRead)."""
         key = (z, c)
-        if key not in self.overviews:
-            small = self._from_pyramid(c, z=z) if self.pyramid is not None else None
-            if small is None:
-                small = read_plain_rows(self.entry.files.get(key), self.ov_step, progress=progress,      # (several rows at once)
-                                        page=self.entry.pages.get(key))
-            if small is None:
-                p = self._plane_for_overview(z, c, stale)
-                if p is None:
-                    return None
-                s = self.ov_step
-                small = np.empty((-(-p.shape[0] // s), -(-p.shape[1] // s)), p.dtype)
-                for i in range(0, small.shape[0], 64):          # (in chunks of rows, so that the progress can be shown)
-                    small[i:i + 64] = p[i * s:(i + 64) * s:s, ::s]
-                    if progress is not None:
-                        progress(min(1.0, (i + 64) / small.shape[0]))
-            self.overviews[key] = small
-        return self.overviews[key]
+        step = self.overview_step()
+        have = self.overviews if step == self.ov_step else self.stashed.get(step, {})
+        if key in have:
+            return have[key]
+        small = self._from_pyramid(c, z=z) if self.pyramid is not None else None
+        if small is None:
+            small = read_plain_rows(self.entry.files.get(key), step, progress=progress,      # (several rows at once)
+                                    page=self.entry.pages.get(key))
+        if small is None:
+            p = self._plane_for_overview(z, c, stale)
+            if p is None:
+                return None
+            s = step
+            small = np.empty((-(-p.shape[0] // s), -(-p.shape[1] // s)), p.dtype)
+            for i in range(0, small.shape[0], 64):          # (in chunks of rows, so that the progress can be shown)
+                small[i:i + 64] = p[i * s:(i + 64) * s:s, ::s]
+                if progress is not None:
+                    progress(min(1.0, (i + 64) / small.shape[0]))
+        self._keep_overview(z, c, small, step)
+        return small
 
     def remember_overview(self, z, c, p):
         """Plane (z, c)'s overview, from the plane p as it was just read for something else (so that moving to this layer later needs
         no second read of it); not if there is one already, or the overviews come from a pyramid."""
         if (z, c) not in self.overviews and self.pyramid is None:
-            self.overviews[(z, c)] = np.ascontiguousarray(p[::self.ov_step, ::self.ov_step])
+            self._keep_overview(z, c, np.ascontiguousarray(p[::self.ov_step, ::self.ov_step]), self.ov_step)
 
     def _plane_for_overview(self, z, c, stale):
         """Plane (z, c) to take an overview from. A TIFF that can be memory-mapped is kept (the map costs nothing until it is read). A compressed
@@ -1870,7 +1927,7 @@ class OpenImage:
                 and (self.pyramid is None or self.ov_step == self.pyramid[1]))
 
     def nbytes(self):
-        return sum(a.nbytes for a in self.overviews.values())
+        return sum(a.nbytes for a in self.overviews.values()) + sum(a.nbytes for d in self.stashed.values() for a in d.values())
 
     def raw_layout(self, z, c):
         """(offset, dtype) of channel c's plane z when it can be read row by row from its file (see raw_layout), else None; asked once."""
@@ -1890,6 +1947,7 @@ class OpenImage:
         self.planes.clear()
         self.decoded.clear()
         self.overviews.clear()
+        self.stashed.clear()
 
 
 class StorageSpeed:
@@ -2113,6 +2171,29 @@ class _LevelRowReader(_RowReader):
 
     def cost(self, n, step):
         return super().cost(n, step // self.level_step)
+
+
+def read_level_crop(img, level, z, channels, step, rect):
+    """The view rect = (i0, j0, i1, j1: columns and rows of a [::step, ::step] array, `step` being the level's) of layer z from a pyramid
+    level, in the image's own values: a list with an array for each of `channels` (None for the others). None if a channel's level file
+    cannot be read row by row."""
+    i0, j0, i1, j1 = rect
+    rows, cols = j1 - j0, i1 - i0
+    out = [None] * len(img.entry.channels)
+    for c in channels:
+        layout = img.level_layout(level, z, c)
+        if layout is None or level.files.get((z, c)) is None:
+            return None
+        reader = _LevelRowReader(level.files[(z, c)], layout[0], layout[1], level.width, step, img.entry.channels[c].max_value)
+        try:
+            futures = [_READ_POOL.submit(reader.row, (j0 + k) * step, i0 * step, cols, step) for k in range(rows)]
+            a = np.empty((rows, cols), reader.out_dtype)
+            for k, f in enumerate(futures):
+                a[k] = f.result()
+        finally:
+            reader.close()
+        out[c] = a
+    return out
 
 
 def _fill_row(out, c, y, i0, step, sources):
@@ -3100,12 +3181,17 @@ class XlefViewer:
         self.thumbs_shown = False    # (the thumbnail grid is showing, not the list: the thumbnail thread pauses otherwise)
         self.detail_cache = None     # the sharp view's pixels for the view on screen: {"key", "arrays"} (see redraw)
         self.sharp_level = None      # the pyramid level the last sharp view was read from (None: from the full-resolution files)
+        self.interim_status = ""     # the status line while a pyramid level is shown in place of a view still being decoded (see redraw)
+        self.interim_level = None    # that pyramid level
         self.prefetch = None         # the reading of the same view in the other layers of a z-stack: {"sig", "token", "state"} (see _start_prefetch)
         self.prefetch_token = 0
+        self.overview_prefetch = None    # id of the image whose other layers' previews are being (or were) read ahead (see _start_overview_prefetch)
+        self.overview_token = 0
         self.prefetch_full = None    # the view whose layers did not all fit in the memory for kept views (not tried again until it changes)
         self.download_queue = []     # list items whose full resolution is to be downloaded from OneDrive (see download_full_res)
         self.download_progress = {}  # list item -> "waiting" or percent, while it is queued or downloading
         self.download_thread = self.download_stop = None
+        self.pyramid_job = self.pyramid_thread = None       # the pyramids being made, if any (see make_pyramids)
         self.canvas_message = ""
         self.thumbs_go = threading.Event()      # cleared while a chosen image loads: the thumbnail thread waits, so the image comes first
         self.thumbs_go.set()
@@ -3121,9 +3207,12 @@ class XlefViewer:
 
     def _build(self):
         menu = tk.Menu(self.root)
-        fm = tk.Menu(menu, tearoff=0)
+        fm = tk.Menu(menu, tearoff=0, postcommand=self._update_file_menu)
+        self.file_menu = fm
         fm.add_command(label="Open (recent or browse)...", accelerator="Ctrl+O", command=self.ask_open)
         fm.add_command(label="Save view as PNG...", command=self.save_view)
+        fm.add_command(label=PYRAMID_MENU, command=self.make_pyramids_command)
+        self.pyramid_menu_index = fm.index("end")
         fm.add_separator()
         fm.add_command(label="Quit", command=self.quit)
         menu.add_cascade(label="File", menu=fm)
@@ -3643,6 +3732,9 @@ class XlefViewer:
             return
         self._save_settings()
         self.generation += 1
+        if self.pyramid_job is not None:               # (stopped, and what it had written taken back, before the window goes)
+            self.pyramid_job.cancel.set()
+            self.pyramid_thread.join(10)
         if self.img:
             self.img.close()
         self.root.destroy()
@@ -3679,7 +3771,7 @@ class XlefViewer:
                 return
             self.open_xlef(path)
 
-    def open_xlef(self, path):
+    def open_xlef(self, path, offer_pyramids=True):
         path = os.path.normpath(path)
         if not os.path.isfile(path):
             messagebox.showerror("XLEF viewer", f"File not found:\n{path}", parent=self.root)
@@ -3694,7 +3786,7 @@ class XlefViewer:
         # _experiment_read() takes it from there.
         name = os.path.splitext(os.path.basename(path))[0]
         pid = self.tree.insert("", tk.END, text=f"{name}   (loading...)", open=True, tags=("project",))
-        self.projects[pid] = {"path": path, "name": name}
+        self.projects[pid] = {"path": path, "name": name, "offer_pyramids": offer_pyramids}
         self.tree.see(pid)
         if self.img is None:
             self.show_message("Loading...")
@@ -3742,6 +3834,183 @@ class XlefViewer:
         elif self.img is None:
             self.show_message("Select an image" if mine else "No images in this experiment")
             self._start_slide(pid)
+        if self.projects[pid].get("offer_pyramids") and not experiment.read_only:
+            self.root.after(800, lambda: self._offer_pyramids(pid))        # (after the first image has begun to load)
+
+    # --- pyramids for an experiment LAS X made none for
+
+    def _pyramid_candidates(self, pid):
+        """For experiment `pid`: the images that can get a pyramid, and [(name, why not)] for the ones that cannot and have none."""
+        can, cannot = [], []
+        for e in self._entries_of(pid).values():
+            reason = xlef_pyramids.why_not(e, is_online_only)
+            if reason is None:
+                can.append(e)
+            elif e.pyramid is None:
+                cannot.append((e.name, reason))
+        return can, cannot
+
+    def _offer_pyramids(self, pid):
+        """An experiment was just opened: if some of its images have no pyramid, offer to make them (once; "Don't ask again" is
+        remembered for the experiment)."""
+        if pid not in self.projects or self.pyramid_job is not None:
+            return
+        path = self.projects[pid]["path"]
+        if os.path.splitext(path)[0].endswith(xlef_pyramids.SUFFIX) or os.path.normcase(path) in self.settings.get("pyramid_declined", []):
+            return
+        can, _ = self._pyramid_candidates(pid)
+        if can:
+            self.make_pyramids(pid, offered=True)
+
+    def _pyramid_project(self):
+        """The experiment File > Make pyramids is for: that of the selected row (an image, folder or the experiment itself), else the only
+        experiment open; None if neither (several are open and nothing is selected)."""
+        selected = self.tree.selection()
+        pid = self._project_of(selected[0]) if selected else None
+        if pid is None and len(self.projects) == 1:
+            pid = next(iter(self.projects))
+        return pid if pid is not None and "root" in self.projects[pid] else None
+
+    def _update_file_menu(self):
+        """As the File menu opens: its pyramids entry names the experiment it is for. Dimmed if there is none, if none of its images needs
+        a pyramid made (they have them, or cannot get them), or while pyramids are being made."""
+        pid = self._pyramid_project()
+        name = self.projects[pid]["name"] if pid is not None else None
+        if name is None:
+            label, usable = PYRAMID_MENU, False
+        elif self.pyramid_job is not None:
+            label, usable = f"Make pyramids for \"{name}\"... (being made)", False
+        elif not self._pyramid_candidates(pid)[0]:
+            label, usable = f"Make pyramids for \"{name}\" (none needed)", False
+        else:
+            label, usable = f"Make pyramids for \"{name}\"...", True
+        self.file_menu.entryconfigure(self.pyramid_menu_index, label=label, state=tk.NORMAL if usable else tk.DISABLED)
+
+    def make_pyramids_command(self):
+        """File > Make pyramids for "name"...: for the experiment of the selected row, or the only one open."""
+        pid = self._pyramid_project()
+        if pid is None:
+            messagebox.showinfo("Make pyramids", "Open an experiment, and select it or one of its images, first.", parent=self.root)
+            return
+        can, cannot = self._pyramid_candidates(pid)
+        if not can:
+            why = "\n".join(f"  {name}: {reason}" for name, reason in cannot[:12])
+            messagebox.showinfo("Make pyramids", "None of this experiment's images needs a pyramid made."
+                                + (f"\n\n{why}" + ("\n  ..." if len(cannot) > 12 else "") if why else ""), parent=self.root)
+            return
+        self.make_pyramids(pid)
+
+    def make_pyramids(self, pid, offered=False):
+        """Ask, then make the pyramids of experiment `pid` in a new project beside it (see xlef_pyramids), in the background, with a
+        window to show how far it has got. offered: the question comes from opening the experiment (it can be answered "Don't ask
+        again"), not from the menu."""
+        if self.pyramid_job is not None:
+            messagebox.showinfo("Make pyramids", "Pyramids are being made already.", parent=self.root)
+            return
+        project = self.projects[pid]
+        path, name = project["path"], project["name"]
+        new_xlef, _ = xlef_pyramids.project_files(path)
+        if os.path.isfile(new_xlef):
+            pick = ask_choice(self.root, "Pyramids made already",
+                              f"{os.path.basename(new_xlef)} is beside this experiment: it is a copy with pyramids made earlier.",
+                              [("Open it", "open"), ("Make them again", "again")]
+                              + ([("Don't ask again", "never", PYRAMID_LATER_TIP)] if offered else []))
+            if pick == "open":
+                self.open_xlef(new_xlef, offer_pyramids=False)
+                return
+            if pick == "never":
+                self.settings.setdefault("pyramid_declined", []).append(os.path.normcase(path))
+                self._save_settings()
+            if pick != "again":
+                return
+        can, cannot = self._pyramid_candidates(pid)
+        planes, extra, seconds = xlef_pyramids.estimate(can)
+        full = sum(e.full_bytes or 0 for e in can) or 1
+        minutes = max(1, round(seconds / 60))
+        time_text = "under a minute or two" if seconds < 90 else f"roughly {minutes} minutes"
+        message = (
+            f"\"{name}\" has no pyramids for {len(can)} of its images. A pyramid is a set of reduced copies of an image, which LAS X "
+            f"makes for most experiments. With them, the viewer shows an image (zoomed out, or scrolling through a z-stack) far faster, "
+            f"because it reads a small copy instead of the whole image.\n\n"
+            f"Making them adds about {extra / 1e9:.1f} GB of files"
+            + (f" (about {100 * extra / full:.0f}% more than the images)" if full > 1 else "")
+            + f" and takes {time_text} (a guess: {planes} image planes to read; compressed images are slower).\n\n"
+            f"Nothing in the experiment is changed. A new project, \"{os.path.basename(new_xlef)}\", is written beside it, with the "
+            f"pyramids in a folder next to it; it refers to the original image files, so they must stay where they are. Annotations and "
+            f"other changes made later in one of the two projects are not made in the other."
+            + (f"\n\nNot made: {len(cannot)} image{'s' * (len(cannot) != 1)} (online-only, inside a .lif file, or small already)." if cannot else ""))
+        pick = ask_choice(self.root, "Make pyramids?", message,
+                          [("Make pyramids", "make"), ("Not now" if offered else "Cancel", None)]
+                          + ([("Don't ask again for this experiment", "never", PYRAMID_LATER_TIP)] if offered else []))
+        if pick == "never":
+            self.settings.setdefault("pyramid_declined", []).append(os.path.normcase(path))
+            self._save_settings()
+            self.status.config(text="Pyramids can still be made later: File > Make pyramids for this experiment")
+        if pick != "make":
+            return
+        self._run_pyramids(pid, can, new_xlef)
+
+    def _run_pyramids(self, pid, entries, new_xlef):
+        """Make the pyramids in a thread and show a window with the progress and a Cancel button; when done, offer to open the result."""
+        state = {"done": 0, "total": sum(e.nz * len(e.channels) for e in entries), "name": "", "finished": False, "result": None,
+                 "error": None}
+        job = xlef_pyramids.Job(self.projects[pid]["path"], entries, read_plane_whole,
+                                progress=lambda d, t, n: state.update(done=d, total=t, name=n))
+
+        def work():
+            try:
+                state["result"] = job.run()
+            except xlef_pyramids.Cancelled:
+                state["result"] = None
+            except Exception as e:
+                state["error"] = e
+            state["finished"] = True
+        self.pyramid_job = job
+        self.pyramid_thread = threading.Thread(target=work, daemon=True)
+        started = time.monotonic()
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Making pyramids")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        body = ttk.Frame(dlg, padding=14)
+        body.pack(fill=tk.BOTH, expand=True)
+        label = ttk.Label(body, text="Starting ...", width=62)
+        label.pack(anchor=tk.W)
+        bar = ttk.Progressbar(body, length=440, maximum=max(1, state["total"]))
+        bar.pack(fill=tk.X, pady=(8, 8))
+        ttk.Label(body, text="The experiment itself is not changed. Stopping takes back what has been written.",
+                  style="Muted.TLabel").pack(anchor=tk.W)
+        button = ttk.Button(body, text="Cancel", command=job.cancel.set)
+        button.pack(side=tk.RIGHT, pady=(10, 0))
+        dlg.protocol("WM_DELETE_WINDOW", job.cancel.set)
+        dlg.geometry(f"+{self.root.winfo_rootx() + 200}+{self.root.winfo_rooty() + 160}")
+        self.pyramid_thread.start()
+
+        def poll():
+            done, total = state["done"], state["total"]
+            bar["value"] = done
+            seconds = int(time.monotonic() - started)
+            label.config(text=("Stopping ..." if job.cancel.is_set() else f"{state['name']}: plane {done} of {total}")
+                         + f"   ({seconds // 60}:{seconds % 60:02d})")
+            self.status.config(text=f"Making pyramids: plane {done} of {total} ...")
+            if not state["finished"]:
+                self.root.after(300, poll)
+                return
+            dlg.destroy()
+            self.pyramid_job = self.pyramid_thread = None
+            if state["error"] is not None:
+                self.status.config(text="Making pyramids failed")
+                messagebox.showerror("Make pyramids", f"The pyramids could not be made (what was written is taken back):\n\n"
+                                                      f"{state['error']}", parent=self.root)
+            elif state["result"] is None:
+                self.status.config(text="Making pyramids stopped; nothing was kept")
+            else:
+                self.status.config(text=f"Pyramids made in {seconds // 60}:{seconds % 60:02d}")
+                if ask_choice(self.root, "Pyramids made", f"Made pyramids for {len(entries)} image{'s' * (len(entries) != 1)} in "
+                              f"{seconds // 60}:{seconds % 60:02d}.\n\nThe new project is {state['result']}\n\nOpen it now?",
+                              [("Open it", "open"), ("Not now", None)]) == "open":
+                    self.open_xlef(state["result"], offer_pyramids=False)
+        poll()
 
     def _measure_sizes(self, pid):
         """The size of each of the project's images at full resolution (its channel TIFFs), read in the background from the file
@@ -4256,8 +4525,8 @@ class XlefViewer:
         self.thumb_grid.set_progress(item, None)
         if entry in self.kept_images or (self.img is not None and self.img.entry is entry):
             return
-        img.overviews = {(0, c): a for c, a in enumerate(arrays)}
-        img.ov_step = step
+        img.use_step(step)
+        img.overviews.update({(0, c): a for c, a in enumerate(arrays)})
         if self.kept_bytes + img.nbytes() > self.kept_limit():
             if self.thumb_grid.thumbs.get(item, (None, None))[1] != "ok":
                 self.unkept_previews[entry] = arrays            # (still read once only: its thumbnail is made from it)
@@ -4368,6 +4637,8 @@ class XlefViewer:
 
     def _close_image(self):
         self.generation += 1
+        self.overview_token += 1
+        self.overview_prefetch = None
         self.prefetch_token += 1
         self.prefetch = None
         self._set_open_progress(None)
@@ -4489,10 +4760,12 @@ class XlefViewer:
             self.loading = False
             self.redraw()
             self._update_cursor()
+            self._start_overview_prefetch()
         elif instant and not self._want_sharp_level(self.img):     # (its small preview is in; the sharper copy waits for a zoom)
             self.loading = False
             self.redraw()
             self._update_cursor()
+            self._start_overview_prefetch()
         elif instant:                   # (its first picture was loaded in the background: shown now, the sharper level read next)
             self.loading = True
             self.redraw(preview_only=True)
@@ -4529,6 +4802,9 @@ class XlefViewer:
             if pct != last[0]:
                 last[0] = pct
                 self.results.put(("open_progress", gen, (item, pct)))
+
+        if quick is None and not have_first:
+            img.use_step(img.overview_step())       # (read below with img.overview(): at the pyramid's own step)
 
         def work():
             try:
@@ -4728,12 +5004,15 @@ class XlefViewer:
 
     def on_z(self, value):
         z = int(float(value)) - 1          # (the slider counts planes from 1)
+        if TRACE_PATH and self.img and z != self.z:
+            trace(f"on_z {self.z + 1} -> {z + 1}: previews in for it: {self.img.has_all(z)}, complete: {self.img.complete(z)}")
         if self.img and z != self.z:
             self.z = z
             self.generation += 1
             if getattr(self, "z_job", None) is not None:
                 self.root.after_cancel(self.z_job)
                 self.z_job = None
+            self._use_prefetched_previews(z)
             if self.img.has_all(z) and (self.img.complete(z) or not self._want_sharp_level(self.img)):
                 # (a note left by a layer the slider passed on the way, "reading when the slider stops", would stay: nothing reads now)
                 self.status.config(text=f"Layer {z + 1} of {self.img.entry.nz}")
@@ -4747,6 +5026,20 @@ class XlefViewer:
                 # one that is wanted. The read starts when the slider has rested for a moment.
                 self.status.config(text=f"z = {z + 1}: reading when the slider stops ...")
                 self.z_job = self.root.after(Z_SETTLE_MS, self._load_overviews_for_z, self.generation)
+                if any(r["entry"] is self.img.entry and r["key"][1] == z for r in self.regions):
+                    # A sharp view of this layer was read ahead: drawn now (it also becomes the kept view, which the previews' redraws
+                    # below are laid over: else they draw the coarse preview alone, enlarged, until the layer is loaded).
+                    self.redraw()
+
+    def _use_prefetched_previews(self, z):
+        """Moving to layer z: if its previews were read ahead at the pyramid's own step while the viewer was showing a coarser one (the
+        first picture of a pyramid: see use_step), show the finer ones: sharper, and nothing to load."""
+        img = self.img
+        fine = img.overview_step()
+        if (img.pyramid is not None and fine != img.ov_step and not img.has_all(z)
+                and all((z, c) in img.stashed.get(fine, {}) for c in range(len(img.entry.channels)))):
+            img.use_step(fine)
+            self.shrunk.clear()
 
     def _load_overviews_for_z(self, gen):
         self.z_job = None
@@ -5111,6 +5404,12 @@ class XlefViewer:
         need = [c for c in range(n) if luts[c] is not None]           # (the channels to read for a sharp view, if one is needed)
         plan = self._read_plan(s, step, need) if not preview_only and not self.loading and step < s else True
         detail, level = plan is not True, None
+        if TRACE_PATH:
+            c = self.detail_cache
+            trace(f"redraw {'preview-only' if preview_only else 'full'}: layer {self.z + 1}, zoom {self.scale:.3f}, needs step {step}, previews at step {s} "
+                  f"(shown: {self.img.ov_step}), loading={self.loading}, plan="
+                  f"{'none' if plan is True else (plan[0], 'pyramid level' if plan[1] is not None else 'full-resolution files')}, "
+                  f"kept view: {'none' if c is None else ('layer %d, step %d' % (c['key'][1] + 1, c['key'][6]))}, regions: {len(self.regions)}")
         if detail:
             step, level = plan                    # (level: read from the pyramid's sharper copy, see _read_plan)
             self.sharp_level = level
@@ -5119,11 +5418,16 @@ class XlefViewer:
             (i0, j0, i1, j1), place = self._detail_rect(step, level)
             key = (id(self.img), self.z, i0, j0, i1, j1, step, place)
             self._use_region(step, need)          # (a full-resolution region kept from before, if one covers this view)
+            fin = self._interim_level(level, step, need)
+            if fin is not None:
+                self._use_region(fin[1], need)    # (else the pyramid's finest level, read ahead for this layer: shown while it is decoded)
             cache = self.detail_cache
             if cache is not None and cache["key"] != key and self._kept_covers(step, need):
                 # The new view lies within the sharp pixels already here, at the detail it needs (zooming in, or panning within
                 # them): draw it from those; reading the files again would bring the same pixels.
                 overlay = self._detail_overlay(luts)
+                if TRACE_PATH:
+                    trace("  drawn from the sharp pixels kept (no read)" if overlay is not None else "  kept pixels cover the view but gave no picture")
                 if overlay is not None:
                     self._put(*overlay)
                     self.detail_pending = False
@@ -5131,6 +5435,8 @@ class XlefViewer:
                     return
             if cache is not None and cache["key"] == key:
                 arrays = [a if luts[c] is not None else None for c, a in enumerate(cache["arrays"])]
+                if TRACE_PATH:
+                    trace("  the kept sharp view is exactly this view: drawn from it")
                 if any(a is not None for a in arrays):
                     self._show(self._mix(arrays, luts), *place, smooth=self.scale * step < 1)
                 need = [c for c in need if cache["arrays"][c] is None]
@@ -5179,12 +5485,15 @@ class XlefViewer:
             self.status.config(text=f"{where}reading this view at {_resolution_text(step)} ...")
         self._update_cursor()
         gen, img, z = self.generation, self.img, self.z
+        if TRACE_PATH:
+            trace(f"  read started (generation {gen}): layer {z + 1}, step {step}, {'pyramid level' if level is not None else 'full-resolution files'}")
         (i0, j0, i1, j1), place = self._detail_rect(step, level)
         key = (id(img), z, i0, j0, i1, j1, step, place)
         smooth = self.scale * step < 1
 
         self._stash_partial()
         sources = self._sharp_sources(z, step, i0, i1)
+        interim = self._interim_view(level, step, need)
 
         def work():
             """In bands of rows, top to bottom, all channels of a band together; each band is sent on as it is in ("detail_band": drawn
@@ -5209,6 +5518,11 @@ class XlefViewer:
                     files[c] = f
                 arrays = [None] * n
                 if level is None and all(readers[c] is None for c in need):
+                    if interim is not None and gen == self.generation:
+                        ilevel, istep, irect, iplace, ismooth = interim
+                        quick = read_level_crop(img, ilevel, z, need, istep, irect)
+                        if quick is not None and gen == self.generation:
+                            self.results.put(("detail", gen, ((id(img), z) + tuple(irect) + (istep, iplace), quick, iplace, ismooth, True)))
                     # Planes that are decoded whole (compressed): every pixel of the view is in memory once they are, so the view is kept as
                     # fine as FINER_CROP_BYTES allows, not just as fine as this zoom shows: zooming in further finds it already here.
                     stale = lambda: gen != self.generation
@@ -5263,6 +5577,33 @@ class XlefViewer:
                         r.close()
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _interim_level(self, level, step, need):
+        """(level, its step) of the pyramid's finest level when a view at `step` from the full-resolution files (level None) would have
+        to decode compressed planes whole (seconds), and that level is sharper than the preview, so that it can be shown meanwhile;
+        else None."""
+        img, z = self.img, self.z
+        if level is not None or not any((z, c) not in img.planes and img.is_compressed(z, c) for c in need):
+            return None
+        if any(img.raw_layout(z, c) is not None for c in need):
+            return None
+        fin = img.usable_level(max(img.entry.width, img.entry.height) / 2 - 2)
+        return fin if fin is not None and step < fin[1] < img.ov_step else None
+
+    def _interim_view(self, level, step, need):
+        """A quick look to show while a compressed plane is decoded whole: (level, its step, rect, place, smooth) for read_level_crop and
+        _show; None if there is no need for one, or the pixels are here already (kept from before). Sets the status line text for when
+        it is in."""
+        fin = self._interim_level(level, step, need)
+        if fin is None or self._covered_at(fin[1], need):
+            return None
+        rect, place = self._detail_rect(fin[1], fin[0])
+        z, img = self.z, self.img
+        where = f"Layer {z + 1} of {img.entry.nz}; " if img.entry.nz > 1 else ""
+        self.interim_status = (f"{where}reading this view at {_resolution_text(step)}; the {_resolution_text(fin[1])} "
+                               f"pyramid copy is shown meanwhile ...")
+        self.interim_level = fin[0]
+        return fin[0], fin[1], rect, place, self.scale * fin[1] < 1
 
     def _moving(self):
         """The view is being zoomed or dragged: until it rests for MOVING_PAUSE, enlarged pixels are drawn the fast way (bilinear),
@@ -5358,6 +5699,12 @@ class XlefViewer:
         if self._covered_at(step, need):
             return step, None
         pyr = img.pyramid
+        if pyr is not None:
+            # (A level of the pyramid that has the detail this zoom needs, if there is one, is the sharper copy to read from: 8-bit and
+            # uncompressed, far less to read than the full-resolution files, which a compressed TIFF must decode whole.)
+            best = img.usable_level(max(img.entry.width, img.entry.height) / step)
+            if best is not None and best[1] < pyr[1]:
+                pyr = best
         shown = s
         if pyr is not None and pyr[1] < s and self._covered_at(pyr[1], need):
             shown = pyr[1]                                           # (the sharper copy's pixels in view are in)
@@ -5412,32 +5759,35 @@ class XlefViewer:
         """What a layer read ahead depends on: the image, the layer shown, and the view. Any change ends the reading."""
         return (id(self.img), self.z, self.scale, self.cx, self.cy, self.canvas_size())
 
-    def _start_prefetch(self):
+    def _start_prefetch(self, level=_SAME):
         """A z-stack's sharp view has come in: read the same view of the other layers in the background, the nearest first (z-1, z+1,
         z-2, ...), and keep each as a region (see _stash_region), so that moving the z slider to it draws at once (see _use_region),
         for a "movie" of the layers. It ends when the layer or the view changes (the layers read so far stay, for the same view);
-        it starts again once the new layer's view is in. Not for a view read from a pyramid level (small files: quick already)."""
+        it starts again once the new layer's view is in. A view that was read from a pyramid level is read from the other layers' levels."""
         img, cache = self.img, self.detail_cache
         e = img.entry if img is not None else None
-        if (e is None or e.nz < 2 or self.sharp_level is not None or self.loading or cache is None or cache["key"][0] != id(img)
+        if (e is None or e.nz < 2 or self.loading or cache is None or cache["key"][0] != id(img)
                 or cache["key"][1] != self.z or not self.settings.get("preload_layers", True)):
             return
+        if level is _SAME:
+            level = self.sharp_level
         sig = self._prefetch_sig()
-        if self.prefetch is not None and self.prefetch["sig"] == sig:
-            return
         tail = cache["key"][2:]
+        if self.prefetch is not None and self.prefetch["sig"] == sig and self.prefetch.get("tail") == tail:
+            return
         if self.prefetch_full == (id(img), tail):
             return
         have = {r["key"][1] for r in self.regions if r["entry"] is e and r["key"][2:] == tail}
+        files = (level.files if level is not None else e.files)
         order = [z for d in range(1, e.nz) for z in (self.z - d, self.z + d) if 0 <= z < e.nz and z not in have
-                 and not any(is_online_only(f) for f in (e.files.get((z, c)) for c in range(len(e.channels))) if f)]
+                 and not any(f is None or is_online_only(f) for f in (files.get((z, c)) for c in range(len(e.channels))))]
         self.prefetch_token += 1
         if not order:
-            self.prefetch = {"sig": sig, "token": self.prefetch_token, "state": "done"}
+            self.prefetch = {"sig": sig, "token": self.prefetch_token, "state": "done", "tail": tail}
             self.status.config(text=f"Layer {self.z + 1} of {e.nz}; all layers of this view are ready")
             return
         token = self.prefetch_token
-        self.prefetch = {"sig": sig, "token": token, "state": "running", "order": order, "step": tail[4]}
+        self.prefetch = {"sig": sig, "token": token, "state": "running", "order": order, "step": tail[4], "tail": tail}
         (i0, j0, i1, j1), step = tail[:4], tail[4]
         rows, cols = j1 - j0, i1 - i0
         n = len(e.channels)
@@ -5451,9 +5801,15 @@ class XlefViewer:
             for c in range(n):
                 if stale():
                     raise StaleRead()
-                layout = img.raw_layout(z, c)
-                if layout is not None:
-                    reader = _RowReader(e.files[(z, c)], layout[0], layout[1], e.width)
+                if level is not None:        # (this layer's file of the same pyramid level, as the sharp view was read: see redraw)
+                    layout = img.level_layout(level, z, c)
+                    if layout is None:
+                        return None          # (not a plain file: this layer is left out)
+                    reader = _LevelRowReader(level.files[(z, c)], layout[0], layout[1], level.width, step, e.channels[c].max_value)
+                else:
+                    layout = img.raw_layout(z, c)
+                    reader = _RowReader(e.files[(z, c)], layout[0], layout[1], e.width) if layout is not None else None
+                if reader is not None:
                     try:
                         futures = [_READ_POOL.submit(reader.row, (j0 + k) * step, i0 * step, cols, step) for k in range(rows)]
                         a = np.empty((rows, cols), reader.out_dtype)
@@ -5473,7 +5829,8 @@ class XlefViewer:
             try:
                 for k, z in enumerate(order):
                     arrays = read(z)
-                    self.results.put(("prefetched", token, ((id(img), z) + tuple(tail), arrays, k + 1, zs)))
+                    if arrays is not None:
+                        self.results.put(("prefetched", token, ((id(img), z) + tuple(tail), arrays, k + 1, zs)))
                 self.results.put(("prefetch_done", token, None))
             except StaleRead:
                 pass
@@ -5482,6 +5839,50 @@ class XlefViewer:
 
         self.status.config(text=self._prefetch_note(order, 0))
         threading.Thread(target=work, daemon=True).start()
+
+    def _start_overview_prefetch(self):
+        """A z-stack with a pyramid is shown: read the previews of its other layers from the pyramid in the background, the nearest first,
+        so that the z slider moves to any of them at once, also with the whole image in view (nothing to zoom into: the sharp views
+        read ahead by _start_prefetch only start once one is read). Small files; not for a stack without a pyramid (a preview of each of
+        its layers is a whole decoded plane, seconds each: see xlef_pyramids for making one)."""
+        img = self.img
+        if (img is None or img.entry.nz < 2 or img.pyramid is None or self.loading or self.overview_prefetch == id(img)
+                or not self.settings.get("preload_layers", True)):
+            return
+        self.overview_prefetch = id(img)
+        e, level = img.entry, img.pyramid[0]
+        n = len(e.channels)
+        order = [z for d in range(1, e.nz) for z in (self.z - d, self.z + d) if 0 <= z < e.nz and not img.has_all(z)
+                 and all(level.files.get((z, c)) and not needs_asking(level.files[(z, c)]) for c in range(n))]
+        if not order:
+            return
+        self.overview_token += 1
+        token = self.overview_token
+
+        def work():
+            try:
+                for k, z in enumerate(order):
+                    for c in range(n):
+                        if token != self.overview_token:
+                            return
+                        img.overview(z, c, stale=lambda: token != self.overview_token)
+                    self.results.put(("overviews_read", token, (id(img), k + 1, len(order))))
+            except StaleRead:
+                pass
+            except Exception:
+                pass            # (a layer that cannot be read ahead is read when it is wanted)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _overviews_read(self, token, data):
+        """Another layer's preview was read ahead: say so on the status line (unless the sharp views are being read ahead: its note is
+        the more useful one)."""
+        img_id, k, total = data
+        if token != self.overview_token or self.img is None or id(self.img) != img_id:
+            return
+        if self.prefetch is not None and self.prefetch.get("state") == "running":
+            return
+        what = "all layers can be scrolled through" if k == total else f"previews of the other layers read: {k} of {total}"
+        self.status.config(text=f"Layer {self.z + 1} of {self.img.entry.nz}; {what}")
 
     def _prefetch_note(self, order, done):
         """The status line while layers are read ahead: the layer shown, the layer being read now (both numbered from 1), and how many
@@ -6382,7 +6783,7 @@ class XlefViewer:
         for pid in [p for p in self.projects if p in reread]:      # (paths or contents changed: read those experiments again)
             path = self.projects[pid]["path"]
             self.close_project(pid, ask=False)
-            self.open_xlef(path)
+            self.open_xlef(path, offer_pyramids=False)
 
     # --- the cloud after a name: what it means, and downloading full resolution
 
@@ -6581,6 +6982,9 @@ class XlefViewer:
 
     def _project_menu(self, menu, pid):
         if pid in self.projects:
+            if "root" in self.projects[pid] and self.pyramid_job is None and self._pyramid_candidates(pid)[0]:
+                menu.add_command(label=f"Make pyramids for {self.projects[pid]['name']}...",
+                                 command=lambda: self.make_pyramids(pid))
             menu.add_command(label=f"Close project {self.projects[pid]['name']}", command=lambda: self.close_project(pid))
 
     def _item_menu(self, item, x_root, y_root):
@@ -7086,12 +7490,17 @@ class XlefViewer:
         try:
             while True:
                 kind, gen, data = self.results.get_nowait()
+                if TRACE_PATH and kind not in ("thumb", "progress", "preload_progress", "open_progress", "prefetched", "detail_band"):
+                    trace(f"result {kind}: generation {gen}, current {self.generation}{'' if gen == self.generation else '  (STALE: ignored)'}")
                 if kind == "thumb":
                     if gen == self.thumb_gen:
                         self.thumb_grid.set_thumb(*data)
                     continue
                 if kind in ("prefetched", "prefetch_done"):
                     self._prefetch_result(kind, gen, data)
+                    continue
+                if kind == "overviews_read":
+                    self._overviews_read(gen, data)
                     continue
                 if kind == "preload_done":
                     if self.preloading == gen:
@@ -7152,13 +7561,12 @@ class XlefViewer:
                     # (the overview's arrays and its step change together, so that every channel shown is at one step)
                     if kind == "quick":
                         z, c, a, step = data
-                        if self.img.ov_step != step:
-                            self.img.overviews, self.img.ov_step = {}, step
+                        self.img.use_step(step)
                         self.img.overviews[(z, c)] = a
                     else:
                         z, arrays, step = data
-                        self.img.overviews = {(z, c): a for c, a in enumerate(arrays)}
-                        self.img.ov_step = step
+                        self.img.use_step(step)
+                        self.img.overviews.update({(z, c): a for c, a in enumerate(arrays)})
                     self.shrunk.clear()
                     self.redraw(preview_only=True)
                 elif kind == "open_progress" and gen == self.generation:
@@ -7168,6 +7576,7 @@ class XlefViewer:
                     self.loading = False
                     self.redraw()
                     self._update_cursor()
+                    self._start_overview_prefetch()
                 elif kind == "detail_band" and gen == self.generation and not self.drag:
                     key, arrays, rows = data
                     self.detail_partial = {"key": key, "arrays": arrays, "rows": rows}
@@ -7177,7 +7586,8 @@ class XlefViewer:
                         self.redraw(preview_only=True)          # (the bands that are in, over the blurrier picture)
                 elif kind == "detail" and gen == self.generation and not self.drag:
                     # (kept for this view, joined to what was kept of it before, and mixed with the sliders as they are NOW)
-                    key, arrays, place, smooth = data
+                    key, arrays, place, smooth, *flag = data
+                    interim = bool(flag and flag[0])          # (a quick look from the pyramid: the full-resolution read is still to come)
                     self.detail_partial, self.hires_progress = None, None
                     if self.detail_cache is not None and self.detail_cache["key"] == key:
                         arrays = [a if a is not None else old for a, old in zip(arrays, self.detail_cache["arrays"])]
@@ -7188,6 +7598,10 @@ class XlefViewer:
                     self.detail_cache = {"key": key, "arrays": arrays, "rgb": rgb,          # (mixed once: reused while zooming)
                                          "sig": self._mix_sig()}
                     self._show(rgb, *place, smooth)
+                    if interim:
+                        self.status.config(text=self.interim_status)
+                        self._start_prefetch(self.interim_level)           # (the same quick look of the other layers, nearest first)
+                        continue
                     self.detail_pending = False
                     self._update_cursor()
                     self._start_prefetch()
@@ -7364,6 +7778,55 @@ class LutChooser:
     def cancel(self):
         self._show(self.original)
         self.win.destroy()
+
+
+PYRAMID_MENU = "Make pyramids for the selected experiment..."
+PYRAMID_LATER_TIP = ("This experiment won't be offered pyramids again when it is opened. You can still make them any time: "
+                     "right-click the experiment (or one of its images) in the list > Make pyramids, or File > Make pyramids for "
+                     "the selected experiment (its name is in the menu entry).")
+
+
+def read_plane_whole(entry, z, c):
+    """Plane (z, c) of an ImageEntry, whole (a memory map when the file allows it, else read in full)."""
+    path, page = entry.files[(z, c)], entry.pages.get((z, c))
+    try:
+        a = memmap_plane(path, page)
+    except (ValueError, OSError):
+        a = read_whole(path, page)
+    while a.ndim > 2:
+        a = a[z if a.shape[0] == entry.nz else 0]
+    return a
+
+
+def ask_choice(parent, title, message, choices):
+    """A question with a button for each of `choices` [(label, value) or (label, value, tooltip)], the first the default (Return);
+    Escape or closing gives None."""
+    dlg = tk.Toplevel(parent)
+    dlg.title(title)
+    dlg.transient(parent)
+    dlg.resizable(False, False)
+    body = ttk.Frame(dlg, padding=14)
+    body.pack(fill=tk.BOTH, expand=True)
+    ttk.Label(body, text=message, wraplength=520, justify=tk.LEFT).pack(anchor=tk.W)
+    bar = ttk.Frame(body)
+    bar.pack(fill=tk.X, pady=(14, 0))
+    result = []
+
+    def pick(value):
+        result.append(value)
+        dlg.destroy()
+    buttons = [ttk.Button(bar, text=c[0], command=lambda v=c[1]: pick(v)) for c in choices]
+    for b, c in zip(reversed(buttons), reversed(choices)):
+        b.pack(side=tk.RIGHT, padx=(6, 0))
+        if len(c) > 2:
+            Tooltip(b, c[2])
+    buttons[0].focus_set()
+    dlg.bind("<Return>", lambda e: pick(choices[0][1]))
+    dlg.bind("<Escape>", lambda e: pick(None))
+    dlg.geometry(f"+{parent.winfo_rootx() + 140}+{parent.winfo_rooty() + 100}")
+    dlg.grab_set()
+    parent.wait_window(dlg)
+    return result[0] if result else None
 
 
 def ask_download(parent, title, message, all_label="Download for all sections"):

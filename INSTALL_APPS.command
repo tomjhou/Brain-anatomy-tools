@@ -51,7 +51,10 @@ PLIST
             echo "if [ -x \"\$PY\" ] && \"\$PY\" -c \"import $libs\" >/dev/null 2>&1; then"
             echo "    cd \"\$REPO/src\" && JHOULAB_WINDOWLESS=1 exec \"\$PY\" $program >/dev/null 2>&1"
             echo 'fi'
-            echo '# Not yet: once the setup is done, the run-*.command starts this app again (it finds this note), so that the program runs as'
+            echo '# Not yet. Being set up already (the app clicked again while Terminal was busy with it)? Then just show that window: a second'
+            echo '# run would start the program from Terminal after the first had started the app, giving two windows.'
+            echo 'if pgrep -f "$COMMAND" >/dev/null 2>&1; then exec open -a Terminal; fi'
+            echo '# Once the setup is done, the run-*.command starts this app again (it finds this note), so that the program runs as'
             echo '# this app, not as Terminal, from the first time (see hand_off_to_app in src/terminal_window.sh).'
             echo 'mkdir -p "$HOME/Library/Caches/JhouLab"'
             echo "cd \"\$(dirname \"\$0\")/../..\" && pwd > \"\$HOME/Library/Caches/JhouLab/${command%.command}.handoff\""

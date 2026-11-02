@@ -2394,22 +2394,40 @@ def nice_length(um):
 HIST_BINS = 4096              # (a channel's counts are kept in this many bins over 0..its largest value: fine enough for a dim 16-bit image)
 HIST_SAMPLE = 1_000_000      # (pixels: an overview larger than this is sampled evenly for its histogram)
 HIST_HEIGHT = 120
+HIST_TIP = ("Histogram of the plane shown (all of it, not just the part in view), for each channel switched on, in its color and on a "
+            "log scale. The vertical bars are its black and white levels (drag one to move it; Shift: slower); it is darker outside "
+            "them. Pixels of value 0 (e.g. outside a stitched scan) are left out.")
 
 
 class HistogramView(tk.Canvas):
     """The histogram of the channels switched on, each in its own color, translucent so that they show through one another; counts are
     drawn on a log scale (the background is most of an image). A channel's black and white levels are vertical bars in its color, and
     its histogram is darker outside them. The axis runs from 0 to the largest of the white levels and the brightest pixels (its end is
-    written under the right corner). show() is given the channels: dicts {bins, width (of a bin, in pixel values), color (r, g, b: 0-1),
-    black, white}; bins None while the image is not read yet."""
+    written under the right corner). show() is given the channels: dicts {index, bins, width (of a bin, in pixel values), color (r, g,
+    b: 0-1), black, white, max}; bins None while the image is not read yet.
+    A bar can be dragged (Shift: 10x slower): command(index, black, white, first) is called on every change (first: the drag's first),
+    and the axis keeps its end until the mouse is let go (else it would move under a white level being dragged up). Where bars lie on
+    one another, the one grabbed is the channel with the most pixels there. The button in the top right corner (its symbol: corner)
+    calls popout(), as does a double click away from the bars."""
 
     FILL = 0.6          # (how opaque a histogram is)
     OUTSIDE = 0.3       # (its brightness outside the black/white levels)
+    REACH = 5           # (px: how near a bar the mouse must be to grab it)
 
-    def __init__(self, parent):
+    def __init__(self, parent, command=None, popout=None, corner="\u21f1"):
         super().__init__(parent, highlightthickness=0, background=PAL["bg"], width=170, height=HIST_HEIGHT)
         self.channels, self.picture = [], None
+        self.command, self.popout, self.corner = command, popout, corner
+        self.heights = {}           # (channel index: its drawn height at each x, to choose between bars on one another)
+        self.top = None             # (the axis' end while a bar is dragged)
+        self.drag = self.hover = None
         self.bind("<Configure>", lambda e: self._draw())
+        self.bind("<Motion>", self._move)
+        self.bind("<Leave>", lambda e: self.drag is None and self._set_hover(None))
+        self.bind("<ButtonPress-1>", self._press)
+        self.bind("<B1-Motion>", self._motion)
+        self.bind("<ButtonRelease-1>", self._release)
+        self.bind("<Double-Button-1>", lambda e: self.popout and self._bar_at(e.x) is None and self.popout())
 
     def show(self, channels):
         self.channels = channels
@@ -2427,41 +2445,127 @@ class HistogramView(tk.Canvas):
                     top = max(top, (np.searchsorted(cum, 0.999 * cum[-1]) + 1) * c["width"])
         return top * 1.03
 
+    def _axis(self):
+        return self.top if self.top is not None else self.span(self.channels)
+
+    def _x(self, value, top):
+        W = self.winfo_width()
+        return min(max(value / top * W, 0), W - 1)
+
+    def _bar_at(self, x):
+        """The bar nearest x, within REACH: (channel index, "black" or "white"); None if there is none."""
+        best, top = None, self._axis()
+        for c in self.channels:
+            for which in ("black", "white"):
+                bx = self._x(c[which], top)
+                d = abs(x - bx)
+                if d > self.REACH:
+                    continue
+                if c["black"] == c["white"]:             # (both bars in one place: the one on the mouse's side)
+                    which = "white" if x >= bx else "black"
+                h = self.heights.get(c["index"])
+                tall = h[int(min(bx, len(h) - 1))] if h is not None and len(h) else 0
+                rank = (round(d), -tall)                 # (nearest first; of bars on one another, the most pixels)
+                if best is None or rank < best[0]:
+                    best = (rank, (c["index"], which))
+        return best and best[1]
+
+    def _set_hover(self, bar):
+        if bar != self.hover:
+            self.hover = bar
+            self.configure(cursor="sb_h_double_arrow" if bar else "")
+            self._draw()
+
+    def _move(self, event):
+        if self.drag is None and not self._on_corner():
+            self._set_hover(self._bar_at(event.x) if self.command else None)
+
+    def _on_corner(self):
+        return "corner" in self.gettags("current")
+
+    def _press(self, event):
+        if self._on_corner():
+            if self.popout:
+                self.popout()
+            return
+        bar = self._bar_at(event.x) if self.command else None
+        if bar is None:
+            return
+        c = next(c for c in self.channels if c["index"] == bar[0])
+        self.top = self._axis()
+        self.drag = (bar[0], bar[1], event.x, c["black"], c["white"], True)
+        self._set_hover(bar)
+        self._draw()
+
+    def _motion(self, event):
+        if self.drag is None:
+            return
+        i, which, x0, black, white, first = self.drag
+        c = next((c for c in self.channels if c["index"] == i), None)
+        if c is None:
+            return
+        dv = round((event.x - x0) / max(self.winfo_width(), 1) * self.top * (0.1 if event.state & 0x0001 else 1))
+        if which == "black":
+            lo, hi = min(max(black + dv, 0), white), white
+        else:
+            lo, hi = black, max(min(white + dv, c["max"]), black)
+        if (lo, hi) != (c["black"], c["white"]):
+            self.drag = (i, which, x0, black, white, False)
+            self.command(i, lo, hi, first)
+
+    def _release(self, event):
+        if self.drag is not None:
+            self.drag, self.top, self.hover = None, None, None
+            self._set_hover(self._bar_at(event.x))
+            self._draw()
+
     def _draw(self):
         self.delete("all")
         self.picture = None
         W, H = self.winfo_width(), self.winfo_height()
-        if W < 8 or H < 30 or not self.channels:
+        if W < 8 or H < 30:
             return
-        top = self.span(self.channels)
         plot = H - 14                                       # (the rest: the axis' end values)
-        bg = np.array([k / 257 for k in self.winfo_rgb(PAL["bg"])])
-        img = np.empty((plot, W, 3))
-        img[:] = bg
-        edges = np.linspace(0, top, W + 1)
-        rows = np.arange(plot)[::-1, None]                  # (distance from the bottom)
-        bars = []
-        for c in self.channels:
-            rgb = np.array(c["color"]) * 255
-            x_lo, x_hi = (min(max(c[k] / top * W, 0), W - 1) for k in ("black", "white"))
-            if c["bins"] is not None:
-                cum = np.concatenate(([0.0], np.cumsum(c["bins"])))
-                counts = np.diff(np.interp(edges / c["width"], np.arange(len(cum)), cum))
-                logs = np.log1p(np.maximum(counts, 0))
-                if logs.max() > 0:
-                    height = np.where(counts > 0, np.maximum(logs / logs.max() * plot, 1), 0)
-                    fill = rows < height[None, :]
-                    x = np.arange(W)
-                    color = np.where(((x >= x_lo) & (x <= x_hi))[:, None], rgb, rgb * self.OUTSIDE)
-                    img = np.where(fill[:, :, None], img * (1 - self.FILL) + color[None, :, :] * self.FILL, img)
-            bars.append((x_lo, x_hi, "#%02x%02x%02x" % tuple(int(k) for k in rgb)))
-        self.picture = ImageTk.PhotoImage(Image.fromarray(np.clip(img, 0, 255).astype(np.uint8)))
-        self.create_image(0, 0, anchor=tk.NW, image=self.picture)
-        for x_lo, x_hi, color in bars:
-            for x in (x_lo, x_hi):
-                self.create_line(x, 0, x, plot, fill=color, width=2)
-        self.create_text(1, H - 1, anchor=tk.SW, text="0", fill=PAL["muted"], font=("Segoe UI", 8))
-        self.create_text(W - 1, H - 1, anchor=tk.SE, text=str(int(top)), fill=PAL["muted"], font=("Segoe UI", 8))
+        if self.channels:
+            top = self._axis()
+            bg = np.array([k / 257 for k in self.winfo_rgb(PAL["bg"])])
+            img = np.empty((plot, W, 3))
+            img[:] = bg
+            edges = np.linspace(0, top, W + 1)
+            rows = np.arange(plot)[::-1, None]              # (distance from the bottom)
+            bars = []
+            self.heights = {}
+            for c in self.channels:
+                rgb = np.array(c["color"]) * 255
+                x_lo, x_hi = self._x(c["black"], top), self._x(c["white"], top)
+                if c["bins"] is not None:
+                    cum = np.concatenate(([0.0], np.cumsum(c["bins"])))
+                    counts = np.diff(np.interp(edges / c["width"], np.arange(len(cum)), cum))
+                    logs = np.log1p(np.maximum(counts, 0))
+                    if logs.max() > 0:
+                        height = np.where(counts > 0, np.maximum(logs / logs.max() * plot, 1), 0)
+                        self.heights[c["index"]] = height
+                        fill = rows < height[None, :]
+                        x = np.arange(W)
+                        color = np.where(((x >= x_lo) & (x <= x_hi))[:, None], rgb, rgb * self.OUTSIDE)
+                        img = np.where(fill[:, :, None], img * (1 - self.FILL) + color[None, :, :] * self.FILL, img)
+                bars.append((c, x_lo, x_hi, "#%02x%02x%02x" % tuple(int(k) for k in rgb)))
+            self.picture = ImageTk.PhotoImage(Image.fromarray(np.clip(img, 0, 255).astype(np.uint8)), master=self)
+            self.create_image(0, 0, anchor=tk.NW, image=self.picture)
+            for c, x_lo, x_hi, color in bars:
+                for which, x in (("black", x_lo), ("white", x_hi)):
+                    lit = self.hover == (c["index"], which)
+                    self.create_line(x, 0, x, plot, fill=color, width=4 if lit else 2)
+                    if lit and self.drag is not None:       # (the value being set, beside the bar, on the side with room)
+                        left = x > W / 2
+                        self.create_text(x - 5 if left else x + 5, 2, anchor=tk.NE if left else tk.NW, text=f"{which} {c[which]}",
+                                         fill=PAL["fg"], font=("Segoe UI", 8))
+            self.create_text(1, H - 1, anchor=tk.SW, text="0", fill=PAL["muted"], font=("Segoe UI", 8))
+            self.create_text(W - 1, H - 1, anchor=tk.SE, text=str(int(top)), fill=PAL["muted"], font=("Segoe UI", 8))
+        if self.popout:
+            self.create_text(W - 2, 0, anchor=tk.NE, text=self.corner, fill=PAL["muted"], font=("Segoe UI", 11), tags=("corner",))
+            self.tag_bind("corner", "<Enter>", lambda e: self.drag is None and self.configure(cursor="hand2"))
+            self.tag_bind("corner", "<Leave>", lambda e: self.drag is None and self.configure(cursor=""))
 
 
 class RangeSlider(tk.Canvas):
@@ -3457,12 +3561,14 @@ class XlefViewer:
         btns.pack(fill=tk.X, pady=(4, 0))
         ttk.Button(btns, text="Auto contrast", command=self.auto_all).pack(side=tk.LEFT, expand=True, fill=tk.X)
         ttk.Button(btns, text="LAS X contrast", command=self.lasx_all).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(4, 0))
-        self.hist = HistogramView(side)
+        self.contrast_buttons = btns
+        self.hist = HistogramView(side, command=self._hist_dragged, popout=self.toggle_hist_window)
         self.hist.pack(fill=tk.X, pady=(4, 0))
-        self.hist_key, self.hist_cache = None, collections.OrderedDict()
-        Tooltip(self.hist, "Histogram of the plane shown (all of it, not just the part in view), for each channel switched on, in its "
-                           "color and on a log scale. The vertical bars are its black and white levels; it is darker outside them. "
-                           "Pixels of value 0 (e.g. outside a stitched scan) are left out.")
+        self.hist_key, self.hist_cache, self.hist_window, self.hist_float = None, collections.OrderedDict(), None, None
+        Tooltip(self.hist, HIST_TIP + " The button in the corner (or a double click) opens it in a window of its own, which can be "
+                           "made larger.")
+        if self.settings.get("histogram_window"):
+            self.root.after_idle(self.toggle_hist_window)
 
         self.canvas = self.main_canvas = tk.Canvas(view_row, background="black", highlightthickness=0, cursor="fleur")
         self.canvas.keep_colors = True        # (black in both themes)
@@ -3798,6 +3904,8 @@ class XlefViewer:
                 self.normal_geometry = self.root.geometry()
             if self.normal_geometry:
                 self.settings["geometry"] = self.normal_geometry     # (not a maximized window's: see _window_moved)
+            if getattr(self, "hist_window", None) is not None:
+                self.settings["histogram_geometry"] = self.hist_window.geometry()
             with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
                 json.dump(self.settings, f, indent=1)
         except OSError:
@@ -4078,15 +4186,15 @@ class XlefViewer:
         full = sum(e.full_bytes or 0 for e in can) or 1
         minutes = max(1, round(seconds / 60))
         time_text = "under a minute or two" if seconds < 90 else f"roughly {minutes} minutes"
+        total = len(self._entries_of(pid))
         message = (
-            f"\"{name}\" has no pyramids for {len(can)} of its images. A pyramid is a set of reduced copies of an image, which LAS X "
-            f"makes for most experiments. With them, the viewer shows an image (zoomed out, or scrolling through a z-stack) far faster, "
-            f"because it reads a small copy instead of the whole image.\n\n"
+            f"\"{name}\" has no pyramids for {len(can)} of its {total} image{'s' * (total != 1)}. A pyramid is a set of reduced resolution copies of an image, which LAS X "
+            f"makes for most experiments to greatly speed up image display when zoomed out.\n\n"
             f"Making them adds about {extra / 1e9:.1f} GB of files"
             + (f" (about {100 * extra / full:.0f}% more than the images)" if full > 1 else "")
-            + f" and takes {time_text} (a guess: {planes} image planes to read; compressed images are slower).\n\n"
-            f"Nothing in the experiment is changed. A new project, \"{os.path.basename(new_xlef)}\", is written beside it, with the "
-            f"pyramids in a folder next to it; it refers to the original image files, so they must stay where they are. Annotations and "
+            + f" and is estimated to take {time_text} for all {planes} channels.\n\n"
+            f"Making pyramids will write a new project, \"{os.path.basename(new_xlef)}\" and a new pyramid folder alongside the existing project, "
+            f"and the original project will not be altered. Both projects will refer to the same full-resolution images, so they must stay where they are. Annotations and "
             f"other changes made later in one of the two projects are not made in the other."
             + (f"\n\nNot made: {len(cannot)} image{'s' * (len(cannot) != 1)} (online-only, inside a .lif file, or small already)." if cannot else ""))
         pick = ask_choice(self.root, "Make pyramids?", message,
@@ -5567,9 +5675,43 @@ class XlefViewer:
         if key == self.hist_key:
             return
         self.hist_key = key
-        self.hist.show([{"bins": None if a is None else self._hist_bins(a, ch.max_value),
-                         "width": (ch.max_value + 1) / min(HIST_BINS, ch.max_value + 1), "color": ch.color,
-                         "black": st["lo"], "white": st["hi"]} for i, ch, st, a in chans])
+        (self.hist_float or self.hist).show(
+            [{"index": i, "bins": None if a is None else self._hist_bins(a, ch.max_value),
+              "width": (ch.max_value + 1) / min(HIST_BINS, ch.max_value + 1), "color": ch.color,
+              "black": st["lo"], "white": st["hi"], "max": ch.max_value} for i, ch, st, a in chans])
+
+    def _hist_dragged(self, i, lo, hi, first):
+        """A black or white bar of the histogram was dragged: as the channel's slider would (a drag is one step of Undo)."""
+        if self.img and i < len(self.ch_settings):
+            self._contrast_change([(i, lo, hi)], new_step=first)
+            self.contrast_step = None
+            self._hist_refresh()          # (at once, not with the image's redraw: the bar follows the mouse)
+
+    def toggle_hist_window(self):
+        """The histogram in a window of its own (it can be made larger, for finer black/white levels), or back below the sliders.
+        Remembered, with the window's size and place."""
+        if self.hist_window is None:
+            win = self.hist_window = tk.Toplevel(self.root)
+            win.title("Histogram")
+            win.transient(self.root)            # (kept above the viewer)
+            win.configure(background=PAL["bg"])
+            win.geometry(on_screen_geometry(self.root, self.settings.get("histogram_geometry") or
+                                            f"520x260+{self.root.winfo_rootx() + 200}+{self.root.winfo_rooty() + 200}"))
+            self.hist_float = HistogramView(win, command=self._hist_dragged, popout=self.toggle_hist_window, corner="⇲")
+            self.hist_float.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+            Tooltip(self.hist_float, HIST_TIP + " The button in the corner (or closing this window) puts it back below the sliders.")
+            win.protocol("WM_DELETE_WINDOW", self.toggle_hist_window)
+            win.bind("<Escape>", lambda e: self.toggle_hist_window())
+            self.hist.pack_forget()
+        else:
+            self.settings["histogram_geometry"] = self.hist_window.geometry()
+            self.hist_window.destroy()
+            self.hist_window = self.hist_float = None
+            self.hist.pack(fill=tk.X, pady=(4, 0), after=self.contrast_buttons)
+        self.settings["histogram_window"] = self.hist_window is not None
+        self._save_settings()
+        self.hist_key = None
+        self._hist_refresh()
 
     def redraw(self, preview_only=False):
         """Draw at once from the overview; if the view needs more detail than the overview has, read it from the files in the background."""
@@ -7968,9 +8110,8 @@ class LutChooser:
 
 
 PYRAMID_MENU = "Make pyramids for the selected experiment..."
-PYRAMID_LATER_TIP = ("This experiment won't be offered pyramids again when it is opened. You can still make them any time: "
-                     "right-click the experiment (or one of its images) in the list > Make pyramids, or File > Make pyramids for "
-                     "the selected experiment (its name is in the menu entry).")
+PYRAMID_LATER_TIP = ("If this button is clicked, this experiment won't be offered pyramids again when opened. You can still make them later by "
+                     "right-clicking the experiment in the list, or from the File > Make pyramids menu.")
 
 
 def read_plane_whole(entry, z, c):

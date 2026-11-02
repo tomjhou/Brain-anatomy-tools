@@ -20,6 +20,8 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from color_button import ColorButton
+
 SELECTED_BG = "#2f6fd4"      # the toggle button of the panel showing
 IDLE_BG = "#e8e8e8"
 IDLE_HOVER_BG = "#d8d8d8"
@@ -210,7 +212,7 @@ def ask_open_file(parent, recent, *, title="Open", noun="file", filetypes=(("All
             list_buttons.pack_forget()
             entry.focus_set()
     for key, text in (("recent", f"Recent {noun}s"), ("browse", f"Browse for {a_noun}")):
-        b = tk.Button(toggle, text=text, font=("Segoe UI", 10, "bold"), bd=2, padx=16, pady=4, cursor="hand2", command=lambda k=key: show_mode(k))
+        b = ColorButton(toggle, text=text, font=("Segoe UI", 10, "bold"), bd=2, padx=16, pady=4, cursor="hand2", command=lambda k=key: show_mode(k))
         b.pack(side=tk.LEFT, padx=(0, 6))
         toggle_buttons[key] = b
     show_mode(mode.get())

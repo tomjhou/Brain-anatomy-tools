@@ -52,6 +52,7 @@ logging.getLogger("tifffile").addFilter(_LeicaZeroTagFilter())
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "FileConverters"))
 from open_file_dialog import ask_open_file
 import leica_luts           # (LAS X's colour maps, sampled: see lut_table)
+from color_button import ColorButton
 from tooltip import Tooltip, place_on_monitor, monitor_area
 
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".xlef_viewer_settings.json")
@@ -148,6 +149,7 @@ THEMES = {
              "off_white": "#9a9a9a", "off_line": "#666666"},
 }
 PAL = dict(THEMES["dark"])
+SETTINGS_NAME = "Settings…" if sys.platform == "darwin" else "⚙ Settings"     # (the Settings button: see where it is made)
 
 
 def style_theme(root, name, native):
@@ -3070,7 +3072,7 @@ class XlefViewer:
         self.view_buttons = {}
         for value, text, tip in (("thumbs", "Thumbnails", "Show the images as a grid of thumbnails"),
                                  ("list", "List", "Show the images as a list of names")):      # (packed from the right)
-            b = tk.Button(self.list_bar, text=text, bd=2, padx=10, pady=1, cursor="hand2",
+            b = ColorButton(self.list_bar, text=text, bd=2, padx=10, pady=1, cursor="hand2",
                           command=lambda v=value: (self.view_mode.set(v), self.show_view_mode()))
             b.pack(side=tk.RIGHT, padx=(3, 0))
             Tooltip(b, tip)
@@ -3129,7 +3131,7 @@ class XlefViewer:
                                 ("line", "Line", "Draw a line: drag from one end to the other"),
                                 ("arrow", "Arrow", "Draw an arrow: drag from its tail to its head"),
                                 ("text", "Text", "Add text: click where its top-left corner goes")):
-            b = tk.Button(bar, text=text, bd=2, padx=8, pady=1, cursor="hand2", command=lambda t=tool: self.set_tool(t))
+            b = ColorButton(bar, text=text, bd=2, padx=8, pady=1, cursor="hand2", command=lambda t=tool: self.set_tool(t))
             b.pack(side=tk.LEFT, padx=(0, 2))
             Tooltip(b, tip)
             self.tool_buttons[tool] = b
@@ -3137,7 +3139,7 @@ class XlefViewer:
         # New annotations' colors, for this run only (red and white again when the viewer starts): shapes and lines, and text.
         self.ann_color, self.text_color = "#ff0000", "#ffffff"
         self.settings.pop("annotation_color", None)        # (remembered by earlier versions)
-        self.color_button = tk.Button(bar, text="   ", bg=self.ann_color, activebackground=self.ann_color, bd=2, cursor="hand2",
+        self.color_button = ColorButton(bar, text="   ", bg=self.ann_color, activebackground=self.ann_color, bd=2, cursor="hand2",
                                       command=self.choose_color)
         self.color_button.keep_colors = True
         self.color_button.pack(side=tk.LEFT, padx=(0, 2))
@@ -3149,7 +3151,8 @@ class XlefViewer:
             b.pack(side=tk.LEFT, padx=(4, 0))
             Tooltip(b, tip)
         self.unsaved_label = ttk.Label(bar, text="", style="Warn.TLabel")          # ("unsaved changes": Save is left of the list)
-        settings_button = ttk.Button(bar, text="⚙ Settings", command=self.open_settings)
+        # (on macOS "Settings...": Tk there measures the gear narrower than it draws it, and cut off the end of "Settings")
+        settings_button = ttk.Button(bar, text=SETTINGS_NAME, command=self.open_settings)
         settings_button.pack(side=tk.RIGHT)
         Tooltip(settings_button, "Settings: color theme, zoomed-in pixels, renaming")
         self.flip_x = tk.BooleanVar(value=self.settings.get("flip_left_right", False))
@@ -6783,7 +6786,7 @@ class XlefViewer:
     def _preload_full_text(self):
         n = sum(1 for e in self.preload_full if e not in self.kept_images and not (self.img is not None and self.img.entry is e))
         return (f"⚠ The memory for previews ({size_text(self.kept_limit())}) is full: {n} more section"
-                f"{'s were' if n != 1 else ' was'} not preloaded. It can be increased in ⚙ Settings.")
+                f"{'s were' if n != 1 else ' was'} not preloaded. It can be increased in {SETTINGS_NAME}.")
 
     def _preload_full_note(self):
         """The background loader stopped with the memory for previews full: say so (and again after each image's own line)."""
@@ -7133,7 +7136,7 @@ def ask_text(parent, title, initial, color=None):
                 chosen[0] = c
                 swatch.configure(bg=c, activebackground=c)
         ttk.Label(bar, text="Color").pack(side=tk.LEFT)
-        swatch = tk.Button(bar, text="   ", bg=color, activebackground=color, bd=2, cursor="hand2", command=pick)
+        swatch = ColorButton(bar, text="   ", bg=color, activebackground=color, bd=2, cursor="hand2", command=pick)
         swatch.keep_colors = True
         swatch.pack(side=tk.LEFT, padx=(4, 0))
         dlg.color_button = swatch           # (for tests)

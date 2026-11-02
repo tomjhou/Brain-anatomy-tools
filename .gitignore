@@ -14,3 +14,6 @@ __pycache__/
 # Packaging (see src/packaging/): what the build makes
 src/packaging/build/
 src/packaging/dist/
+
+# macOS Finder's per-folder view settings
+.DS_Store

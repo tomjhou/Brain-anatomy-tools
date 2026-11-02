@@ -2667,14 +2667,14 @@ class ThumbGrid(ttk.Frame):
     def __init__(self, parent, on_click, size=THUMB_SIZE, on_menu=None, on_drop=None, name_tip=None):
         super().__init__(parent)
         self.on_click, self.size, self.on_menu, self.on_drop = on_click, size, on_menu, on_drop
-        self.name_tip, self.tip = name_tip, None     # (name_tip(item): the note to show while the pointer is on its name, or None)
+        self.name_tip, self.tip = name_tip, None     # (name_tip(item): the note on an image's tile or a heading (its list item), or None)
         self.press = None         # (a thumbnail pressed: (item, x, y, dragging yet); dropped on another: on_drop(item, target, after))
         self.canvas = tk.Canvas(self, highlightthickness=0, background=PAL["grid"], takefocus=True)
         sb = ttk.Scrollbar(self, orient=tk.VERTICAL, command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=sb.set)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.rows = []            # ("project", name, its list item), ("folder", name) or ("image", item, name, tag)
+        self.rows = []            # ("project", name, its list item), ("folder", name, its list item) or ("image", item, name, tag)
         self.thumbs = {}          # item -> (PhotoImage or None, state)
         self.dimmed = set()       # items whose names are dimmed (nothing of the image in memory yet: see set_dimmed)
         self.selected = None
@@ -2707,15 +2707,15 @@ class ThumbGrid(ttk.Frame):
             self.canvas.itemconfigure(f"name:{item}", fill=self._name_color(item, tag))
 
     def _motion(self, event):
-        """The pointer on an image's name: its note (see name_tip) beside the pointer, if it has one."""
+        """The pointer on an image's tile, or on a project's or folder's heading: its note (see name_tip) beside the pointer."""
         c = self.canvas
         x, y = c.canvasx(event.x), c.canvasy(event.y)
         text = None
         if self.name_tip is not None and self.press is None:
             for obj in c.find_overlapping(x - 1, y - 1, x + 1, y + 1):
-                name = next((t[5:] for t in c.gettags(obj) if t.startswith("name:")), None)
-                if name is not None:
-                    text = self.name_tip(name)
+                item = next((t.split(":", 1)[1] for t in c.gettags(obj) if t.startswith(("i:", "proj:", "fold:"))), None)
+                if item is not None:
+                    text = self.name_tip(item)
                     break
         if text is None:
             self._hide_tip()
@@ -2819,7 +2819,7 @@ class ThumbGrid(ttk.Frame):
                 if col:
                     y, col = y + tile_h + self.GAP, 0
                 t = c.create_text(self.GAP, y, anchor=tk.NW, text=row[1], font=("Segoe UI", 10, "bold"), fill=PAL["tile_text"],
-                                  width=max(width - 2 * self.GAP, 40))            # (a long path wraps)
+                                  width=max(width - 2 * self.GAP, 40), tags=(f"fold:{row[2]}",))            # (a long path wraps)
                 y = c.bbox(t)[3] + 6
                 continue
             _, item, name, tag = row
@@ -3106,7 +3106,7 @@ class XlefViewer:
         self.tree.bind("<Double-Button-1>", lambda e: self._cancel_rename_job(), add="+")
         self.thumb_grid = ThumbGrid(tree_frame, on_click=self.select_item, on_menu=lambda item, x, y: self._item_menu(item, x, y),
                                     on_drop=self._grid_drop,
-                                    name_tip=lambda item: self._cloud_tip_text(self.entries[item]) if item in self.item_cloud else None)
+                                    name_tip=self._grid_tip_text)
         self.thumb_gen = 0           # bumped for each experiment opened: thumbnails made for an earlier one are dropped
         self.thumbs_started = False
         self._tree_tag_colors()
@@ -3986,7 +3986,7 @@ class XlefViewer:
                 rows.append(("image", item, self.entries[item].name, tag))
             else:
                 folder = path + (self.tree.item(item, "text"),)
-                rows.append(("folder", " / ".join(folder)))
+                rows.append(("folder", " / ".join(folder), item))
                 rows.extend(self._grid_rows(item, folder))
         return rows
 
@@ -6156,13 +6156,9 @@ class XlefViewer:
             if not start - 8 <= event.x <= start + tkfont.nametofont("TkDefaultFont").measure(self.tree.item(item, "text")) + 8:
                 self._hide_tree_tip()
                 return
-            changed = self._unsaved_names(item)
-            note = (f"Unsaved changes: {', '.join(changed[:5])}{' and more' if len(changed) > 5 else ''}" if changed
-                    else "No unsaved changes")
             if self.tree_tip is None:
                 self.tree_tip = PointerTip(self.tree)
-            self.tree_tip.show(f"{os.path.normpath(self.projects[item]['path'])}\n{note}\n{self._speed_note(self.projects[item]['path'])}",
-                               event.x_root, event.y_root)
+            self.tree_tip.show(self._project_tip_text(item), event.x_root, event.y_root)
             return
         if item not in self.entries or not self.tree.bbox(item):
             self._hide_tree_tip()
@@ -6178,6 +6174,39 @@ class XlefViewer:
             self.tree_tip = PointerTip(self.tree)
         self.tree_tip.show(self._section_tip_text(item), event.x_root, event.y_root)
 
+    def _size_note(self, item):
+        """The size column of an image, folder or project (its full resolution, as _show_sizes put it there), as a line of a note."""
+        size = self.tree.set(item, "size")
+        return f"{size} at full resolution" if size else None
+
+    def _project_tip_text(self, pid):
+        """The note on a project's name: its full path, how many images and how big, unsaved changes, how fast its drive is."""
+        path = self.projects[pid]["path"]
+        n = len(self._entries_of(pid))
+        changed = self._unsaved_names(pid)
+        lines = [os.path.normpath(path), ", ".join(filter(None, [f"{n} image{'s' * (n != 1)}", self._size_note(pid)])),
+                 f"Unsaved changes: {', '.join(changed[:5])}{' and more' if len(changed) > 5 else ''}" if changed else "No unsaved changes",
+                 self._speed_note(path)]
+        return "\n".join(line for line in lines if line)
+
+    def _grid_tip_text(self, item):
+        """The thumbnail grid's note on an image, or on a project's or folder's heading: the list's (whose size column it doesn't show)."""
+        if item in self.entries:
+            return self._section_tip_text(item)
+        if item in self.projects:
+            return self._project_tip_text(item)
+        if self.tree.exists(item):
+            n = sum(1 for _ in self._images_under(item))
+            return self.tree.item(item, "text") + "\n" + ", ".join(filter(None, [f"{n} image{'s' * (n != 1)}", self._size_note(item)]))
+        return None
+
+    def _images_under(self, node):
+        for child in self.tree.get_children(node):
+            if child in self.entries:
+                yield child
+            else:
+                yield from self._images_under(child)
+
     def _section_tip_text(self, item):
         """The note on an image's name in the list: its name, its size and resolution (and layers, for a z-stack), whether it has unsaved
         changes, and (online-only) what its cloud means."""
@@ -6187,6 +6216,8 @@ class XlefViewer:
             lines.append(e.problem)
         elif e.width:
             lines.append(f"{e.width} x {e.height} px" + (f", {e.pixel_um:.3f} µm/px" if e.pixel_um else ""))
+            if self._size_note(item):
+                lines.append(self._size_note(item))
             if e.nz > 1:
                 lines.append(f"z-stack of {e.nz} layers, shown one at a time: the \"Z plane\" slider (above the channels) picks which\n"
                              f"(it opens on the first, or on the layer last shown of another z-stack)")

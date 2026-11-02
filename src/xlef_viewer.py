@@ -18,6 +18,7 @@ import sys
 import json
 import time
 import collections
+import weakref
 import functools
 import shutil
 import hashlib
@@ -52,6 +53,7 @@ logging.getLogger("tifffile").addFilter(_LeicaZeroTagFilter())
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "FileConverters"))
 from open_file_dialog import ask_open_file
 import leica_luts           # (LAS X's colour maps, sampled: see lut_table)
+import app_update          # (Update on the File menu)
 import xlef_pyramids        # (pyramids for an experiment that has none: see XlefViewer.make_pyramids)
 from color_button import ColorButton
 from tooltip import Tooltip, place_on_monitor, monitor_area
@@ -2389,6 +2391,79 @@ def nice_length(um):
 
 # ---------------------------------------------------------------------------------------------------------------------- the window
 
+HIST_BINS = 4096              # (a channel's counts are kept in this many bins over 0..its largest value: fine enough for a dim 16-bit image)
+HIST_SAMPLE = 1_000_000      # (pixels: an overview larger than this is sampled evenly for its histogram)
+HIST_HEIGHT = 120
+
+
+class HistogramView(tk.Canvas):
+    """The histogram of the channels switched on, each in its own color, translucent so that they show through one another; counts are
+    drawn on a log scale (the background is most of an image). A channel's black and white levels are vertical bars in its color, and
+    its histogram is darker outside them. The axis runs from 0 to the largest of the white levels and the brightest pixels (its end is
+    written under the right corner). show() is given the channels: dicts {bins, width (of a bin, in pixel values), color (r, g, b: 0-1),
+    black, white}; bins None while the image is not read yet."""
+
+    FILL = 0.6          # (how opaque a histogram is)
+    OUTSIDE = 0.3       # (its brightness outside the black/white levels)
+
+    def __init__(self, parent):
+        super().__init__(parent, highlightthickness=0, background=PAL["bg"], width=170, height=HIST_HEIGHT)
+        self.channels, self.picture = [], None
+        self.bind("<Configure>", lambda e: self._draw())
+
+    def show(self, channels):
+        self.channels = channels
+        self._draw()
+
+    @staticmethod
+    def span(channels):
+        """The top of the axis: the white levels, or where 99.9% of the pixels are below, whichever is higher (+3%)."""
+        top = 1.0
+        for c in channels:
+            top = max(top, c["white"])
+            if c["bins"] is not None:
+                cum = np.cumsum(c["bins"])
+                if cum[-1] > 0:
+                    top = max(top, (np.searchsorted(cum, 0.999 * cum[-1]) + 1) * c["width"])
+        return top * 1.03
+
+    def _draw(self):
+        self.delete("all")
+        self.picture = None
+        W, H = self.winfo_width(), self.winfo_height()
+        if W < 8 or H < 30 or not self.channels:
+            return
+        top = self.span(self.channels)
+        plot = H - 14                                       # (the rest: the axis' end values)
+        bg = np.array([k / 257 for k in self.winfo_rgb(PAL["bg"])])
+        img = np.empty((plot, W, 3))
+        img[:] = bg
+        edges = np.linspace(0, top, W + 1)
+        rows = np.arange(plot)[::-1, None]                  # (distance from the bottom)
+        bars = []
+        for c in self.channels:
+            rgb = np.array(c["color"]) * 255
+            x_lo, x_hi = (min(max(c[k] / top * W, 0), W - 1) for k in ("black", "white"))
+            if c["bins"] is not None:
+                cum = np.concatenate(([0.0], np.cumsum(c["bins"])))
+                counts = np.diff(np.interp(edges / c["width"], np.arange(len(cum)), cum))
+                logs = np.log1p(np.maximum(counts, 0))
+                if logs.max() > 0:
+                    height = np.where(counts > 0, np.maximum(logs / logs.max() * plot, 1), 0)
+                    fill = rows < height[None, :]
+                    x = np.arange(W)
+                    color = np.where(((x >= x_lo) & (x <= x_hi))[:, None], rgb, rgb * self.OUTSIDE)
+                    img = np.where(fill[:, :, None], img * (1 - self.FILL) + color[None, :, :] * self.FILL, img)
+            bars.append((x_lo, x_hi, "#%02x%02x%02x" % tuple(int(k) for k in rgb)))
+        self.picture = ImageTk.PhotoImage(Image.fromarray(np.clip(img, 0, 255).astype(np.uint8)))
+        self.create_image(0, 0, anchor=tk.NW, image=self.picture)
+        for x_lo, x_hi, color in bars:
+            for x in (x_lo, x_hi):
+                self.create_line(x, 0, x, plot, fill=color, width=2)
+        self.create_text(1, H - 1, anchor=tk.SW, text="0", fill=PAL["muted"], font=("Segoe UI", 8))
+        self.create_text(W - 1, H - 1, anchor=tk.SE, text=str(int(top)), fill=PAL["muted"], font=("Segoe UI", 8))
+
+
 class RangeSlider(tk.Canvas):
     """One slider with two handles: black level and white level (left/right, or bottom/top when vertical). Drag a handle to move it,
     drag the bar between them to shift both, click elsewhere on the track to bring the nearer handle there. Shift while dragging moves
@@ -3214,6 +3289,7 @@ class XlefViewer:
         fm.add_command(label=PYRAMID_MENU, command=self.make_pyramids_command)
         self.pyramid_menu_index = fm.index("end")
         fm.add_separator()
+        fm.add_command(label="Update from GitHub...", command=self.update_app)
         fm.add_command(label="Quit", command=self.quit)
         menu.add_cascade(label="File", menu=fm)
         vm = tk.Menu(menu, tearoff=0)
@@ -3381,6 +3457,12 @@ class XlefViewer:
         btns.pack(fill=tk.X, pady=(4, 0))
         ttk.Button(btns, text="Auto contrast", command=self.auto_all).pack(side=tk.LEFT, expand=True, fill=tk.X)
         ttk.Button(btns, text="LAS X contrast", command=self.lasx_all).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(4, 0))
+        self.hist = HistogramView(side)
+        self.hist.pack(fill=tk.X, pady=(4, 0))
+        self.hist_key, self.hist_cache = None, collections.OrderedDict()
+        Tooltip(self.hist, "Histogram of the plane shown (all of it, not just the part in view), for each channel switched on, in its "
+                           "color and on a log scale. The vertical bars are its black and white levels; it is darker outside them. "
+                           "Pixels of value 0 (e.g. outside a stitched scan) are left out.")
 
         self.canvas = self.main_canvas = tk.Canvas(view_row, background="black", highlightthickness=0, cursor="fleur")
         self.canvas.keep_colors = True        # (black in both themes)
@@ -3726,6 +3808,74 @@ class XlefViewer:
         position from before: restored as a normal window that would hang off the screen)."""
         if event.widget is self.root and self.root.state() == "normal":
             self.normal_geometry = self.root.geometry()
+
+    def update_app(self):
+        """File > Update from GitHub: looks for newer commits (in a thread: the network), says what is new, and on a yes pulls them and
+        offers to restart the viewer."""
+        if getattr(self, "updating", False):
+            return
+        self.updating = True
+        done = queue.Queue()
+
+        def work(job, *args):
+            try:
+                done.put((True, job(*args)))
+            except app_update.UpdateError as e:
+                done.put((False, str(e)))
+            except Exception as e:                      # (anything unforeseen: still reported, not a frozen "Checking ...")
+                done.put((False, f"{type(e).__name__}: {e}"))
+
+        def run(job, *args, then):
+            threading.Thread(target=work, args=(job,) + args, daemon=True).start()
+
+            def poll():
+                try:
+                    ok, value = done.get_nowait()
+                except queue.Empty:
+                    self.root.after(100, poll)
+                    return
+                then(ok, value)
+            poll()
+
+        def finish(text=None, error=False):
+            self.updating = False
+            self.root.config(cursor="")
+            if text:
+                (messagebox.showerror if error else messagebox.showinfo)("Update", text, parent=self.root)
+
+        def checked(ok, value):
+            if not ok:
+                return finish(value, True)
+            if not value:
+                return finish("You have the newest version.")
+            shown = "\n".join("  • " + line for line in value[:12]) + (f"\n  ... and {len(value) - 12} more" if len(value) > 12 else "")
+            self.root.config(cursor="")
+            if not messagebox.askyesno("Update", f"{len(value)} new change{'s' if len(value) != 1 else ''} on GitHub:\n\n{shown}\n\n"
+                                       "Download them now?", parent=self.root):
+                return finish()
+            self.status.config(text="Updating ...")
+            self.root.config(cursor="watch")
+            run(app_update.pull, root, then=pulled)
+
+        def pulled(ok, value):
+            self.status.config(text="")
+            if not ok:
+                return finish(value, True)
+            finish()
+            if messagebox.askyesno("Update", "Updated. The new version runs after the viewer restarts.\n\nRestart it now?", parent=self.root):
+                self.quit()
+                try:
+                    self.root.winfo_exists()            # (still there: closing was cancelled, e.g. unsaved changes)
+                except tk.TclError:
+                    app_update.relaunch()
+
+        try:
+            root = app_update.repo_root()
+        except app_update.UpdateError as e:
+            return finish(str(e), True)
+        self.status.config(text="Checking GitHub for updates ...")
+        self.root.config(cursor="watch")
+        run(app_update.check, root, then=lambda ok, value: (self.status.config(text=""), checked(ok, value)))
 
     def quit(self):
         if not self.unsaved_ok("Closing the viewer", "Close anyway?"):
@@ -5386,10 +5536,47 @@ class XlefViewer:
             w, h = max(1, round((i1 - i0) * step * self.scale)), max(1, round((j1 - j0) * step * self.scale))
         return (i0, j0, i1, j1), (left, top, w, h)
 
+    def _hist_bins(self, array, max_value):
+        """Counts of `array`'s pixel values, not 0, in HIST_BINS bins over 0..max_value (kept for as long as the array is: a plane gone back
+        to is not counted again)."""
+        hit = self.hist_cache.get(id(array))
+        if hit is not None and hit[0]() is array:
+            self.hist_cache.move_to_end(id(array))
+            return hit[1]
+        stride = max(1, int(np.ceil(np.sqrt(array.size / HIST_SAMPLE))))
+        v = array[::stride, ::stride].ravel()
+        v = v[v > 0]
+        nb = min(HIST_BINS, max_value + 1)
+        bins = np.bincount((v.astype(np.int64) * nb) // (max_value + 1), minlength=nb)[:nb]
+        self.hist_cache[id(array)] = (weakref.ref(array), bins)
+        while len(self.hist_cache) > 256:
+            self.hist_cache.popitem(last=False)
+        return bins
+
+    def _hist_refresh(self):
+        """The histogram below the sliders: of the shown plane's overview, whole, for each channel switched on. Cheap when nothing it
+        shows has changed (every redraw asks)."""
+        img = self.img
+        chans = []
+        if img is not None and len(self.ch_settings) == len(img.entry.channels):
+            for i, (ch, st) in enumerate(zip(img.entry.channels, self.ch_settings)):
+                if st["on"]:
+                    chans.append((i, ch, st, img.overviews.get((self.z, i))))
+        key = (id(img), self.z, PAL["bg"], PAL["muted"],
+               tuple((i, id(a), st["lo"], st["hi"], tuple(ch.color)) for i, ch, st, a in chans))
+        if key == self.hist_key:
+            return
+        self.hist_key = key
+        self.hist.show([{"bins": None if a is None else self._hist_bins(a, ch.max_value),
+                         "width": (ch.max_value + 1) / min(HIST_BINS, ch.max_value + 1), "color": ch.color,
+                         "black": st["lo"], "white": st["hi"]} for i, ch, st, a in chans])
+
     def redraw(self, preview_only=False):
         """Draw at once from the overview; if the view needs more detail than the overview has, read it from the files in the background."""
         if not self.img:
+            self._hist_refresh()
             return
+        self._hist_refresh()
         n = len(self.img.entry.channels)
         luts = make_luts(self.img.entry.channels, self.ch_settings)
         s = self.img.ov_step

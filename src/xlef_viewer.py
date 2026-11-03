@@ -53,7 +53,7 @@ logging.getLogger("tifffile").addFilter(_LeicaZeroTagFilter())
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "FileConverters"))
 from open_file_dialog import ask_open_file
 import leica_luts           # (LAS X's colour maps, sampled: see lut_table)
-import app_update          # (Update on the File menu)
+import app_update          # (the Update menu)
 import xlef_pyramids        # (pyramids for an experiment that has none: see XlefViewer.make_pyramids)
 from color_button import ColorButton
 from tooltip import Tooltip, place_on_monitor, monitor_area
@@ -3393,13 +3393,16 @@ class XlefViewer:
         fm.add_command(label=PYRAMID_MENU, command=self.make_pyramids_command)
         self.pyramid_menu_index = fm.index("end")
         fm.add_separator()
-        fm.add_command(label="Update from GitHub...", command=self.update_app)
         fm.add_command(label="Quit", command=self.quit)
         menu.add_cascade(label="File", menu=fm)
         vm = tk.Menu(menu, tearoff=0)
         vm.add_command(label="Fit to window", accelerator="Home", command=self.fit)
         vm.add_command(label="Actual pixels (1:1)", command=lambda: self.zoom_to(1.0))
         menu.add_cascade(label="View", menu=vm)
+        # (a menu of its own, to be found easily; a command straight on the menu bar would not show on macOS, whose menu bar has only menus)
+        um = tk.Menu(menu, tearoff=0)
+        um.add_command(label="Update from GitHub...", command=self.update_app)
+        menu.add_cascade(label="Update", menu=um)
         self.root.config(menu=menu)
 
         panes = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
@@ -3918,7 +3921,7 @@ class XlefViewer:
             self.normal_geometry = self.root.geometry()
 
     def update_app(self):
-        """File > Update from GitHub: looks for newer commits (in a thread: the network), says what is new, and on a yes pulls them and
+        """Update > Update from GitHub: looks for newer commits (in a thread: the network), says what is new, and on a yes pulls them and
         offers to restart the viewer."""
         if getattr(self, "updating", False):
             return

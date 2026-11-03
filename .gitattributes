@@ -4,3 +4,6 @@
 # and the macOS scripts must keep Unix (LF) line endings, or bash misreads them
 *.command text eol=lf
 *.sh text eol=lf
+# GitHub writes the commit (and its date) into src/version.txt in its ZIP downloads, so that a folder unzipped from one knows its
+# version (see app_update.py)
+src/version.txt export-subst

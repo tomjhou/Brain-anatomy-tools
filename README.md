@@ -2,17 +2,24 @@
 
 This repository has several tools for analyzing brain anatomy data.
 
-Although written in Python, you do NOT need to install anything yourself. Just run the .exe or .bat files according to the
-instructions below, and the computer sets up what it needs on its own. The .exe has Python and every library inside it. Currently
-the section assembler (section 1) and the ABC atlas browser (section 2) have .exe releases; the other tools need to be run from .bat
-files. The first time you run a .bat file, it finds Python (installing Python 3.13 if there is none), builds a private `.venv` folder next
-to it (in this top folder), and installs the libraries it needs into that; this needs an internet connection, and it leaves any Python you already
-have untouched. All the .bat files share the one `.venv`. Everything you run is in this top folder; the programs themselves, and
-the scripts and files they use, are in `src/`.
+The fastest way to get started is to click the green "CODE" button above, then click "Download ZIP".
 
-Windows won't pin a .bat file to the taskbar, so double click `INSTALL_APPS.bat` once: it makes shortcuts, each with its own icon, for
-the xlef viewer, CCF browser and ABC atlas browser, on the desktop and in the Start menu (under "Brain anatomy tools"). Drag them onto
-the taskbar (or right-click, Pin to taskbar). Run it again if you move this folder, or after an icon changes (Windows otherwise keeps showing the old one; this updates pinned shortcuts too). A pinned shortcut and its running program share one taskbar button with the
+<p align="center"><img src="src/readme_images/download_zip.png" alt="The green Code button on GitHub, and Download ZIP in the menu it opens"></p>
+
+Unzip the download, then double click `INSTALL_APPS.bat` on Windows (red arrow below), or `INSTALL_APPS.command` on Mac (orange arrow).
+
+<p align="center"><img src="src/readme_images/Install.png" alt="Double click the installer"></p>
+
+You should see 3 new apps in the Windows Start Menu (or Mac Applications folder):
+
+<p align="center"><img src="src/readme_images/start_menu.png" alt="The &quot;Brain anatomy tools&quot; folder in the Windows Start menu, with the three apps"></p>
+
+Run the apps like you would any normal Windows or Mac app.
+
+
+### Installation details (most users don't need to read all this)
+
+A pinned shortcut and its running program share one taskbar button with the
 program's own icon (the programs declare the same app ID as their shortcuts: see `src/app_identity.py`). The xlef viewer and CCF browser close
 their console window once they have started; their output then goes to `%LOCALAPPDATA%\JhouLab\logs`, and an error is shown in a message box.
 The icons are in `src/icons/` (`make_icons.py` draws them).
@@ -22,7 +29,7 @@ the shortcuts, icons, logs and thumbnails, then asks about each of the `.venv`, 
 settings and the ABC atlas download (Enter keeps it). It never touches projects or outputs; unpin taskbar buttons and delete this folder
 by hand.
 
-**On a Mac** (not yet tried on one: please report what doesn't work), each `run-….bat` has a `run-….command` twin, double-clicked in
+**On a Mac**, each `run-….bat` has a `run-….command` twin, double-clicked in
 Finder (the first time, right-click it and choose Open: macOS asks before running a script it hasn't seen). It finds Python 3.10 to 3.13,
 with tkinter, but can't install it: if there is none, it says to install Python 3.13 from python.org. Its private environment is
 `.venv-macos`, so that a folder shared with Windows keeps both. `INSTALL_APPS.command` makes an app for each of the xlef viewer, CCF browser and
@@ -34,9 +41,12 @@ running program shows its own icon in the Dock, but is named "Python" there and 
 
 ## 1. Section alignment program for Windows
 
-The section assembler and aligner (in `src/FileConverters/`; run from the source with `run-assembler.bat`) can read NeuroInfo reconstructions (.xml or .jpx) or raw image
-files (Zeiss .czi, or jp2 images), detect sections, sort them in order, and adjust alignment and section outlines to
-create serial-section stacks.
+This program is intended to augment the "Serial Section Assembler" of MBF's NeuroInfo program. Unlike
+that program, this app allows image stacks to be re-adjusted and re-edited afterwards. It also has much
+better auto-detection of tissue versus background, and is generally faster, friendlier, and less buggy.
+
+It can work with Zeiss .czi or jp2 input images, detect sections, sort them in order, and adjust
+alignment and section outlines to create serial-section stacks.
 
 This program is available as a Windows .exe program with everything inside it, so nothing has to be installed:
 

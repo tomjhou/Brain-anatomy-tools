@@ -1,5 +1,5 @@
 #!/bin/bash
-# macOS: makes an app, with its own icon, for the xlef viewer, CCF browser and ABC atlas browser, in your Applications folder
+# macOS: makes an app, with its own icon, for the xlef viewer, CCF browser, ABC atlas browser and section assembler, in your Applications folder
 # (~/Applications), to start them from Launchpad, Spotlight or the Dock. Double-click it in Finder (the first time, right-click it and
 # choose Open). Run it again after moving this folder, or when an icon has changed. UNINSTALL_APPS.command removes them.
 #
@@ -72,12 +72,14 @@ make_app "Leica xlef viewer" run-xlef-viewer.command xlef_viewer org.jhoulab.bra
 make_app "CCF browser" run-ccf-browser.command ccf_browser org.jhoulab.brainanatomytools.ccfbrowser CCF_browser.py "numpy, pandas, PIL"
 make_app "ABC atlas browser" run-abc-atlas-browser.command abc_atlas_browser org.jhoulab.brainanatomytools.abcatlasbrowser \
     ABC_atlas_browser.py ""
+make_app "Section assembler" run-assembler.command section_assembler org.jhoulab.brainanatomytools.sectionassembler \
+    FileConverters/SerialAssembler.py ""
 chmod +x "$REPO"/run-*.command "$REPO/UNINSTALL_APPS.command" 2>/dev/null
 
 # Let Launchpad and Spotlight know about them (and their icons) now rather than later
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 if [ -x "$LSREGISTER" ]; then
-    for app in "$APPS_DIR"/{"Leica xlef viewer","CCF browser","ABC atlas browser"}.app; do "$LSREGISTER" -f "$app" >/dev/null 2>&1; done
+    for app in "$APPS_DIR"/{"Leica xlef viewer","CCF browser","ABC atlas browser","Section assembler"}.app; do "$LSREGISTER" -f "$app" >/dev/null 2>&1; done
 fi
 
 echo

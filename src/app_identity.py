@@ -20,6 +20,7 @@ APPS = {   # program: (app ID, icon files' name: .ico for Windows, .png for macO
     "xlef_viewer": ("JhouLab.BrainAnatomyTools.XlefViewer", "xlef_viewer"),
     "ccf_browser": ("JhouLab.BrainAnatomyTools.CCFBrowser", "ccf_browser"),
     "abc_atlas_browser": ("JhouLab.BrainAnatomyTools.ABCAtlasBrowser", "abc_atlas_browser"),
+    "section_assembler": ("JhouLab.BrainAnatomyTools.SectionAssembler", "section_assembler"),
 }
 
 

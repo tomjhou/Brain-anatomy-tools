@@ -139,4 +139,10 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    try:      # (its own icon and taskbar button: app_identity.py is in src, above this folder; not in the packaged .exe)
+        sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))     # (after this folder: its modules come first)
+        from app_identity import use_app_identity
+        use_app_identity("section_assembler")
+    except ImportError:
+        pass
     main()

@@ -38,7 +38,7 @@ if pgrep -f "$REPO/.venv-macos/" >/dev/null 2>&1; then
 fi
 
 echo "Removing the apps, logs and thumbnails:"
-for name in "Leica xlef viewer" "CCF browser" "ABC atlas browser"; do      # (only ours: made by INSTALL_APPS.command)
+for name in "Leica xlef viewer" "CCF browser" "ABC atlas browser" "Section assembler"; do      # (only ours: made by INSTALL_APPS.command)
     app="$APPS_DIR/$name.app"
     if grep -q "org.jhoulab.brainanatomytools" "$app/Contents/Info.plist" 2>/dev/null; then remove "$app" "$app"; fi
 done

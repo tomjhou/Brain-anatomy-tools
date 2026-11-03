@@ -1,4 +1,4 @@
-"""Draws the launcher icons (xlef_viewer.ico, ccf_browser.ico, abc_atlas_browser.ico) that INSTALL_APPS.bat gives the shortcuts.
+"""Draws the launcher icons (xlef_viewer.ico, ccf_browser.ico, abc_atlas_browser.ico, section_assembler.ico) that INSTALL_APPS.bat gives the shortcuts.
 The .ico files are kept in the repository, so this only needs running again to change a design:  python icons/make_icons.py"""
 import os
 import random
@@ -72,6 +72,32 @@ def xlef_viewer():
     return im
 
 
+def section_assembler():
+    """A serial-section stack: four coronal sections one behind another (the back ones dimmer), each outlined in yellow as the assembler
+    outlines sections. The section's shape is traced from the same photo as the xlef viewer's icon. Needs numpy and scipy."""
+    import numpy as np
+    from scipy import ndimage
+
+    photo = np.asarray(Image.open(os.path.join(HERE, "xlef_section.webp")).convert("RGB"))
+    labels, _ = ndimage.label(ndimage.binary_opening(photo.max(axis=2) > 22, iterations=4))
+    section = ndimage.binary_fill_holes(ndimage.binary_closing(labels == np.bincount(labels.ravel())[1:].argmax() + 1, iterations=6))
+    ys, xs = np.nonzero(section)
+    shape = Image.fromarray((section * 255).astype(np.uint8)).crop((xs.min(), ys.min(), xs.max() + 1, ys.max() + 1))
+    w = 520
+    h = int(w * shape.height / shape.width * 1.12)              # (a little taller than the photo, as in the xlef viewer's icon)
+    pad = w // 12                                               # (room for the outline)
+    mask = Image.new("L", (w + 2 * pad, h + 2 * pad), 0)
+    mask.paste(shape.resize((w, h), Image.LANCZOS).filter(ImageFilter.GaussianBlur(w / 90)).point(lambda v: 255 if v > 128 else 0), (pad, pad))
+    edge = Image.fromarray((np.asarray(mask.filter(ImageFilter.MaxFilter(15))) > 128) & ~(np.asarray(mask.filter(ImageFilter.MinFilter(15))) > 128))
+    im = tile((22, 22, 26, 255))
+    for k in reversed(range(4)):                               # (k = 0 in front, bottom left)
+        x, y = 60 + k * 80, 330 - k * 85
+        grey = 150 - k * 30
+        im.paste(Image.new("RGBA", mask.size, (grey, grey, grey, 255)), (x, y), mask)
+        im.paste(Image.new("RGBA", mask.size, tuple(int(v * (1 - k * 0.2)) for v in (240, 200, 40)) + (255,)), (x, y), edge.convert("L"))
+    return clip(im, tile((0, 0, 0, 255)).getchannel("A"))
+
+
 def mouse_brain_mask():
     """A sagittal mouse brain outline (nose to the left): olfactory bulb, cortex dome, cerebellum, brainstem."""
     m = Image.new("L", (BIG, BIG), 0)
@@ -122,7 +148,8 @@ def abc_atlas_browser():
 
 
 if __name__ == "__main__":
-    for name, draw in (("xlef_viewer", xlef_viewer), ("ccf_browser", ccf_browser), ("abc_atlas_browser", abc_atlas_browser)):
+    for name, draw in (("xlef_viewer", xlef_viewer), ("ccf_browser", ccf_browser), ("abc_atlas_browser", abc_atlas_browser),
+                       ("section_assembler", section_assembler)):
         big = draw()
         big.resize((256, 256), Image.LANCZOS).save(os.path.join(HERE, name + ".ico"), sizes=SIZES)
         # macOS: icons sit within a margin of the square (Apple's grid: 824 of 1024 pixels), as an .icns for the app made by

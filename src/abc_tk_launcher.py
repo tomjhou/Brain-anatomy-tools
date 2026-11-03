@@ -23,6 +23,19 @@ SUBSAMPLE_CAPS = (("200,000 cells (recommended)", 200_000), ("No limit: every ce
 LARGE_PROJECT_CELLS = 200_000            # a selection of more cells than this is a "large project": the dialog asks how to handle it
 
 
+def bring_to_front(root):
+    """Puts a window that is just opening in front of the others, with the keyboard focus. Windows won't let a program take the foreground
+    unless the user's last click or key was in it, and the browser takes a while to start (time enough to click somewhere else), so
+    without this its first window can open behind the others, with only its taskbar button flashing. Being "always on top" is allowed
+    anyway: on for a moment brings the window in front, then off again (else it would stay above everything, even its own file dialogs)."""
+    def front():
+        root.attributes("-topmost", True)
+        root.lift()
+        root.focus_force()
+        root.after(400, lambda: root.winfo_exists() and root.attributes("-topmost", False))
+    root.after(50, front)                  # (once the window is on screen)
+
+
 def choose_run_options(current="Neurons", counts=None, folder_for=None, whole_brain=False, count_state=None):
     """The one window between confirming the sections and ROIs and the long analysis that follows, so that the analysis then runs without
     asking anything more: which cells to analyze, how to handle a large project (a selection of more than LARGE_PROJECT_CELLS cells: use a
@@ -544,6 +557,7 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
     root.update_idletasks()
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
     root.geometry(f"+{(sw - root.winfo_width()) // 2}+{(sh - root.winfo_height()) // 3}")
+    bring_to_front(root)
     root.mainloop()
     return result["outcome"]
 

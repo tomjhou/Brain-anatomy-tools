@@ -1,5 +1,6 @@
 @echo off
-REM Makes desktop and Start menu shortcuts, each with its own icon, for the xlef viewer, CCF browser and ABC atlas browser
+REM Makes desktop and Start menu shortcuts, each with its own icon, for the xlef viewer, CCF browser, ABC atlas browser
+REM and section assembler
 REM (double-click this file in Windows Explorer). Unlike the run-*.bat files, the shortcuts can be pinned to the taskbar.
 REM Run it again after moving this folder, or when an icon has changed (it updates pinned shortcuts too). See src\install_shortcuts.ps1.
 setlocal

@@ -17,7 +17,8 @@ $top = Split-Path -Parent $here        # the repository's top folder, with the .
 $apps = @(   # AppId and Icon as in APPS in app_identity.py
     @{ Name = "Leica xlef viewer"; Bat = "run-xlef-viewer.bat";       Icon = "xlef_viewer.ico";       AppId = "JhouLab.BrainAnatomyTools.XlefViewer" },
     @{ Name = "CCF browser";       Bat = "run-ccf-browser.bat";       Icon = "ccf_browser.ico";       AppId = "JhouLab.BrainAnatomyTools.CCFBrowser" },
-    @{ Name = "ABC atlas browser"; Bat = "run-abc-atlas-browser.bat"; Icon = "abc_atlas_browser.ico"; AppId = "JhouLab.BrainAnatomyTools.ABCAtlasBrowser" }
+    @{ Name = "ABC atlas browser"; Bat = "run-abc-atlas-browser.bat"; Icon = "abc_atlas_browser.ico"; AppId = "JhouLab.BrainAnatomyTools.ABCAtlasBrowser" },
+    @{ Name = "Section assembler"; Bat = "run-assembler.bat";         Icon = "section_assembler.ico"; AppId = "JhouLab.BrainAnatomyTools.SectionAssembler" }
 )
 
 # WScript.Shell can't set a shortcut's app ID (the System.AppUserModel.ID property), so that is done through the shell's property store.

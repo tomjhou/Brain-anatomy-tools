@@ -13,7 +13,7 @@ param([string]$Repo,                                   # the repository's top fo
 
 $ErrorActionPreference = "Stop"
 if ($Repo) { $Repo = [IO.Path]::GetFullPath($Repo).TrimEnd('\') }   # (UNINSTALL_APPS.bat passes "...\Brain-anatomy-tools\.")
-$Shortcuts =@("Leica xlef viewer", "CCF browser", "ABC atlas browser")     # as in install_shortcuts.ps1
+$Shortcuts =@("Leica xlef viewer", "CCF browser", "ABC atlas browser", "Section assembler")     # as in install_shortcuts.ps1
 $asked = 0
 
 function Size-Of($path) {

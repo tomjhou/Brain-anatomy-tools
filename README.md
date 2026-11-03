@@ -4,160 +4,135 @@ This repository has several tools for analyzing brain anatomy data.
 
 The fastest way to get started is to click the green "CODE" button above, then click "Download ZIP".
 
-<p align="center"><img src="src/readme_images/download_zip.png" alt="The green Code button on GitHub, and Download ZIP in the menu it opens"></p>
+<p align="center"><img src="src/readme_images/download_zip.png" width="361" alt="The green Code button on GitHub, and Download ZIP in the menu it opens"></p>
 
 Unzip the download, then double click `INSTALL_APPS.bat` on Windows (red arrow below), or `INSTALL_APPS.command` on Mac (orange arrow).
 
-<p align="center"><img src="src/readme_images/Install.png" alt="Double click the installer"></p>
+<p align="center"><img src="src/readme_images/Install.png" width="471" alt="Double click the installer"></p>
 
-You should see 3 new apps in the Windows Start Menu (or Mac Applications folder):
+You should see 4 new apps in the Windows Start Menu (or Mac Applications folder):
 
-<p align="center"><img src="src/readme_images/start_menu.png" alt="The &quot;Brain anatomy tools&quot; folder in the Windows Start menu, with the three apps"></p>
+<p align="center"><img src="src/readme_images/start_menu.png" width="452" alt="The &quot;Brain anatomy tools&quot; folder in the Windows Start menu, with the three apps"></p>
 
 Run the apps like you would any normal Windows or Mac app.
 
+The first time each app starts, it sets itself up: it installs Python if the computer has none, and downloads the libraries it needs into
+this folder. This takes a few minutes and needs an internet connection, and it leaves any Python you already have alone. Later starts are quick.
 
-### Installation details (most users don't need to read all this)
+**On a Mac**, install Python 3.13 from [python.org](https://www.python.org/downloads/) first. The first time you open
+`INSTALL_APPS.command`, right-click it and choose Open: macOS asks before running a script it hasn't seen before.
 
-A pinned shortcut and its running program share one taskbar button with the
-program's own icon (the programs declare the same app ID as their shortcuts: see `src/app_identity.py`). The xlef viewer and CCF browser close
-their console window once they have started; their output then goes to `%LOCALAPPDATA%\JhouLab\logs`, and an error is shown in a message box.
-The icons are in `src/icons/` (`make_icons.py` draws them).
+**Windows may warn** "Windows protected your PC" the first time you run one of the stand-alone `.exe` programs below, because they are not code-signed: choose More info, then Run anyway.
 
-`INSTALL_APPS.bat` also lists the tools in Windows' Settings > Apps, as "Brain anatomy tools". Uninstall there, or `UNINSTALL_APPS.bat`, removes
-the shortcuts, icons, logs and thumbnails, then asks about each of the `.venv`, the browsers' caches and settings, the xlef viewer's
-settings and the ABC atlas download (Enter keeps it). It never touches projects or outputs; unpin taskbar buttons and delete this folder
-by hand.
+### Updating and uninstalling
 
-**On a Mac**, each `run-….bat` has a `run-….command` twin, double-clicked in
-Finder (the first time, right-click it and choose Open: macOS asks before running a script it hasn't seen). It finds Python 3.10 to 3.13,
-with tkinter, but can't install it: if there is none, it says to install Python 3.13 from python.org. Its private environment is
-`.venv-macos`, so that a folder shared with Windows keeps both. `INSTALL_APPS.command` makes an app for each of the xlef viewer, CCF browser and
-ABC atlas browser in `~/Applications`, with its own icon, to drag to the Dock; the first start opens Terminal to set things up, later ones
-(except the ABC browser's, which talks in its Terminal window) start the program directly, logging to `~/Library/Logs/JhouLab`. A
-running program shows its own icon in the Dock, but is named "Python" there and in the menu bar, and appears beside, not on, its app.
-`UNINSTALL_APPS.command` removes the apps and asks about the rest, as on Windows.
+- **Update:** in the xlef viewer, choose Update > Update from GitHub. It shows what's new and updates all tools at once.
+- **Uninstall:** Windows Settings > Apps > "Brain anatomy tools", or double-click `UNINSTALL_APPS.bat` (`UNINSTALL_APPS.command` on a
+  Mac). It asks before removing anything large, and never touches your images, projects or results.
+
+Most buttons and controls explain themselves when you hover the mouse over them.
 
 
-## 1. Section alignment program for Windows
+## 1. XLEF viewer
 
-This program is intended to augment the "Serial Section Assembler" of MBF's NeuroInfo program. Unlike
-that program, this app allows image stacks to be re-adjusted and re-edited afterwards. It also has much
-better auto-detection of tissue versus background, and is generally faster, friendlier, and less buggy.
+A fast viewer and organizer for Leica LAS X experiments (`.xlef` projects, and `.lif` files):
 
-It can work with Zeiss .czi or jp2 input images, detect sections, sort them in order, and adjust
-alignment and section outlines to create serial-section stacks.
+- **Open experiments quickly**, even large ones on a network drive or in OneDrive: it reads only what is needed for the current view.
+  It uses LAS X's reduced-size copies of the images (pyramids) when there are some, and can make them for experiments that have none.
+- **See every image** in the experiment as a list or as thumbnails, and zoom from the whole slide down to single pixels.
+- **View the channels** overlaid in their LAS X colors, or side by side. Adjust each channel's brightness and contrast (with
+  a histogram) and its color.
+- **Annotate**: see the measuring lines, arrows, shapes and text added in LAS X, and add or edit your own.
+- **Organize**: rename images and folders, put them in a different order, move them to another experiment, or delete them.
+- **Save back into LAS X's own files**, so LAS X shows the same changes. A backup of each changed file is kept. Close the experiment in
+  LAS X before saving. (`.lif` files are read only.)
 
-This program is available as a Windows .exe program with everything inside it, so nothing has to be installed:
+To open an experiment, use File > Open, or drag its `.xlef` file onto the window.
 
-1. Download [SectionAssembler-windows.zip](https://github.com/tomjhou/Brain-anatomy-tools/releases/latest/download/SectionAssembler-windows.zip)
-   (always the newest version; older ones and their notes are on the [Releases](https://github.com/tomjhou/Brain-anatomy-tools/releases) page).
-2. Unzip it anywhere and run `SectionAssembler\SectionAssembler.exe`.
-
-Windows may warn "Windows protected your PC" the first time, because the program is not code-signed: choose More info, then Run anyway.
-To update, download the zip again. How it is built: `src/packaging/README.md`.
-
+<p align="center"><img src="src/readme_images/xlef_viewer.webp" width="800" alt="The XLEF viewer: an experiment's sections as thumbnails, a coronal section with three channels, their sliders and histogram"></p>
 
 ## 2. Allen ABC atlas browser
 
-Interactive browser for the Allen Brain Cell (ABC) atlas MERFISH dataset
-(C57BL6J-638850): pick brain sections and regions of interest, compute a UMAP
-of the selected cells, and explore it alongside spatial section maps, colored by
-taxonomy level or gene expression (including the imputed gene dataset).
+Explore the Allen Brain Cell (ABC) atlas, a map of millions of individually identified cells in the mouse brain (the MERFISH dataset
+C57BL6J-638850):
 
-### Windows standalone .exe program (easiest way to run)
+- Pick brain sections and regions of interest.
+- Compute a UMAP of the selected cells, and see it beside maps of the sections.
+- Color the cells by cell type (at any level of the atlas' taxonomy) or by the expression of any gene, including the imputed genes.
+- Export the cells' coordinates, e.g. to plot them in the CCF browser.
 
-1. Download [ABCAtlasBrowser-1.0.0-windows.zip](https://github.com/tomjhou/Brain-anatomy-tools/releases/download/atlas-v1.0.0/ABCAtlasBrowser-1.0.0-windows.zip)
-   (about 290 MB; the [release page](https://github.com/tomjhou/Brain-anatomy-tools/releases/tag/atlas-v1.0.0) has its notes;
-   newer versions will be on the [Releases](https://github.com/tomjhou/Brain-anatomy-tools/releases) page, as `atlas-v...`).
-2. Unzip it anywhere and run `ABCAtlasBrowser\ABCAtlasBrowser.exe`. A console window opens and stays open: the program prints its progress
-   there and occasionally asks a yes/no question there (for example, to confirm a run with no sections selected), so keep it visible.
+The first time, it asks where to keep the atlas download. Choose a drive with plenty of room: the download can reach about 100 GB.
+The browser shows its progress, and now and then asks a question, in a text window beside its own: keep that window visible.
 
-Windows may warn "Windows protected your PC" the first time, because the program is not code-signed: choose More info, then Run anyway.
-The first time, it asks where to keep the atlas download and suggests a drive with enough free space.
-Since the atlas cache can reach about 100 GB, make sure the drive you choose has room.
+There is also a stand-alone Windows version, with nothing to install:
+[ABCAtlasBrowser-1.0.0-windows.zip](https://github.com/tomjhou/Brain-anatomy-tools/releases/download/atlas-v1.0.0/ABCAtlasBrowser-1.0.0-windows.zip)
+(about 290 MB; newer versions will be on the [Releases](https://github.com/tomjhou/Brain-anatomy-tools/releases) page). Unzip it
+anywhere and run `ABCAtlasBrowser\ABCAtlasBrowser.exe`.
 
-
-### Running from the source
-
-If you plan to edit or debug code, you'll need to run from source. The easiest way on Windows is to
-double click run-abc-atlas-browser.bat. The first time you run it, it creates and installs a
-shared `.venv` (see above), which takes about 30 seconds for the section assembler, and longer for the
-ABC browser. The `.venv` will be about 300MB with the assembler, and grow to about 1.1 GB with the ABC
-browser. This only happens once, and it does not alter existing Python environments.
-
-On other systems, or to use your own Python environment, install Python and run `python src/ABC_atlas_browser.py` from that
-environment (e.g. after `conda activate <env>`): at startup it checks for missing libraries and pip-installs them into it.
-
-
-### Data locations
-
-- **ABC atlas download:** The packaged Windows ABC browser program keeps the
-  ABC atlas cache in locations described under "Windows standalone .exe program" above.
-  When run from source (using `.bat` files or `python src/ABC_atlas_browser.py`)
-  for the first time, the app looks for a folder abc_atlas_cache in the PARENT
-  folder of the repository. If not found, the app lists your local drives and their
-  free space, and asks once where to put it (or where an existing download is),
-  suggesting a drive with enough room. The choice is saved in
-  `cache_local/abc_atlas_cache_location.json`; delete that file to be asked again.
-  Atlas files are downloaded on first use.
-- **Local cache:** `src/cache_local` inside this repository (git-ignored; the Settings file is `src/viewer_settings.json`). Section
-  images and processed files are regenerated as needed. The packaged Windows program has no repository
-  folder of its own to write in (a new version replaces its files), so its `cache_local` is
-  `%LOCALAPPDATA%\JhouLab\ABCAtlasBrowser\program\cache_local`, and the Settings file
-  `viewer_settings.json` is in the `program` folder beside it.
-
-These default locations are relative to the script itself, so the app can be launched
-from any working directory. If you choose your own cache location, this may not apply.
+<p align="center"><img src="src/readme_images/abc_atlas_browser.webp" width="800" alt="The ABC atlas browser: maps of the selected sections on the left, a UMAP of their cells colored by subclass in the middle, and the list of subclasses on the right"></p>
 
 
 ## 3. CCF browser
 
-Scroll through the Allen CCF annotation volume (coronal, sagittal or horizontal slices) and plot cells from CSV files on it:
-the coordinates exported by the ABC browser's "Export coordinates" button, or a marker export from NeuroInfo. On Windows, double
-click run-ccf-browser.bat (it uses the same `.venv`; if that lacks pandas or Pillow they are installed first, and the Allen Institute's
-`abc_atlas_access` library, which brings about 300 MB of dependencies, is installed the first time the atlas is needed; neither needs git). The
-25 um annotation volume (3.6 MB) comes from the ABC atlas cache, and is downloaded on first use, after asking, if it is not there yet. Making surface meshes of regions needs the `vtk` library, which the
-program offers to install the first time (a download of about 100 MB).
+Browse the Allen Common Coordinate Framework (CCF), the standard 3D atlas of the mouse brain, in coronal, sagittal or horizontal
+slices, and plot cells on it:
 
-## 4. XLEF viewer
+- cells exported from the ABC atlas browser, or markers exported from NeuroInfo (as CSV files);
+- 3D surfaces of brain regions.
 
-A quick viewer for Leica LAS X experiments (`.xlef`): on Windows, double click run-xlef-viewer.bat, or drop an `.xlef` file on it
-(it uses the same `.venv`, and installs numpy, tifffile and Pillow into it if they are missing). File > Open (Ctrl+O) lists the
-experiments opened recently (with a Pyramid column: whether LAS X made reduced copies of its images, which open much faster; "Yes", "No", or e.g. "5 of 29"), or lets you browse for one or drag it in; an `.xlef` can also be dragged onto the window. A `.lif` (LAS X's single-file format) opens the same way, with LAS X's pyramid from the `.lifext` next to it, but read only: its images can't be renamed, deleted or moved, and changes made in the view (annotations, contrast, colors) aren't saved. The left panel lists the experiment's
-images in LAS X's order, with each image's size at full resolution (and the totals of folders and experiments); click one to see its channels overlaid in their LAS X colors, starting with LAS X's contrast settings. Mouse wheel zooms,
-dragging pans, Home (or double click) fits the image to the window, and keys 1-9 switch channels on and off. At the largest zoom, one more turn of the wheel draws a line along the edge of every pixel, with each pixel a square of one color (not smoothed); one turn back removes the lines and smooths the pixels again, at the same zoom. If a sharper view takes more than half a second to read, "Loading full resolution..." shows over the image, with how far it has got, until it is in (meanwhile the background loading of other sections pauses, so as not to share the connection with it). The sharper view is read in bands and drawn as each comes in, so it sharpens from the top down; a plain (uncompressed) TIFF is read several rows at a time, which on a network drive is several times faster than reading it in order. How eagerly sharper pictures are read depends on how fast the files can be read, measured for each drive or network share (a few small reads from random places in a large image file, so that Windows' cache doesn't flatter it, kept up to date by the viewer's own reads), not by the kind of drive: it is measured as a project opens. A section opens with only its small preview. Where reading would take more than a moment (e.g. a network drive over wifi), that preview is shown enlarged up to 2.5 times before anything sharper is read; then only the part in view is read, from LAS X's sharper (1/4 size) copy, with "Loading a sharper view..." over the image if it takes a while, and full resolution once that copy too would be enlarged more than 2.5 times. Where reading is quick, the sharper view is read as soon as you zoom in past the preview's detail, likewise only the part in view (of the 1/4 size copy, or at full resolution). Settings ("Reading sharper pictures") shows the speeds measured, and can also make it always the sharpest, or always save reading. Each channel switched on is shown in a panel of its own, labeled with its name (the default); zooming or panning in any panel moves them all. "Merge channels" (above the channels) overlays them in one picture instead, and "Separate channels" goes back; the choice is remembered. "Flip all sections" (top right, by Settings) shows every image mirrored, with its annotations; "Flip this section" (above the channels) mirrors just the one shown, e.g. a section mounted the other way up (with both ticked, that section is shown unflipped). Only the view is flipped, not the image. "Flip all sections" is remembered on this computer; "Flip this section" is saved by Save into the section's .xlif (in an attachment of the viewer's own, JhouXlefViewer, which LAS X keeps when it saves the file again), so it goes with the files to any computer, and until then the section is marked with the red *. (Sections flipped with an earlier version, which kept this on the computer, are picked up when each is first shown, and written by the next Save.) LAS X keeping such a field is what it does today (tried with LAS X 6.2), not a promise for future versions, so Settings has "Save it in a custom field of LAS X's files" (on by default): off, "Flip this section" is kept on this computer only and LAS X's files are left alone (a flip already saved in a file is still shown). Under the image, the pointer's position is shown, and when zoomed in to full resolution each channel's value there, in the channel's color. "Show annotations" (at the left of the toolbar above the image, on by default) draws the measuring lines (with their lengths), lines, arrows, rectangles,
-circles/ellipses and text added to an image in LAS X. The toolbar above the image edits them: Select (drag to move, corners to resize,
-the round handle to rotate, double-click a text to change its words or color), drawing tools (a tool stays chosen for one annotation after another; Select or Escape to go back. With any tool, moving the mouse over a shape or line shows its handles (hollow squares; an ellipse's are the corners of its box), the pointer turns to a hand over a handle, and dragging it resizes, rotates or moves an end instead of drawing; over an outline (a rectangle's edge, an ellipse's circumference, a line, a text) it turns to move arrows, and dragging moves the whole annotation), color (shapes and lines start red, text white, each time the viewer starts), Delete and Undo. Changes are written into the
-image's LAS X file (`.xlif`) only when you click Save; only the annotations in it are changed, and a copy of the file as it was is kept
-next to it (the file's name plus `.bak`; one from an earlier version, ending in `.before_xlef_viewer.bak`, is kept as it is). Close the experiment in LAS X before saving. "⚙ Settings" (top right) switches between
-the dark (default) and light color themes, and sets how pixels look when zoomed in past them (Mitchell-Netravali smoothing by
-default; also bicubic, Gaussian, bilinear, or hard-edged true pixels). It also sets the memory for previews (50% of the computer's memory by default, at most 80%): the pictures of recently viewed images, and of the ones loaded in the background so that they open at once, and, in what those leave free, the full-resolution views zoomed into before (going back to one needs no reading; they make room for the pictures, never the other way round); when it fills up, the status bar says so. To rename an image or folder, click its name in the list once it is selected (as in
-Windows Explorer); Save writes the new name into its `.xlif`/`.xlcf`. With "Also rename the files and folders on disk" (Settings,
-off by default) the image's `.xlif` and channel TIFFs, or the folder, are renamed too, and the references to them updated. Each channel has
-a swatch (click to switch it on/off) and a black/white slider. Right-click a channel's swatch or slider (or double-click the slider) to choose its color map, as in
-LAS X: its list of maps (Gray, Red, ..., Glow (O&U), Spectrum, Rainbow), or any color from the picker. The choice shows on the image at
-once; apply it to This section or to All sections (the same channel in every image of the experiment), or Cancel. Undo (Ctrl+Z) takes
-it back, and Save writes it into the images' `.xlif` files, where LAS X reads it.
-The black/white sliders work the same way: a section keeps the contrast set for it (sliders, Auto contrast) when you come back to it, marked with a red * in the list (hover over it to see what is unsaved; hovering over a section's name shows its name, size and resolution, the number of layers of a z-stack, and its unsaved changes too) until Save writes it into its `.xlif` (LAS X then shows the same contrast); Undo takes back a whole drag at once, and "LAS X contrast" goes back to the contrast in the file.
+It downloads the atlas it needs on first use, after asking.
 
-To change the order of the images, drag their names in the list (or their thumbnails): onto the middle of a folder's name to put
-them in it, or into another open experiment, which moves the image's files (its `.xlif`, channel TIFFs and reduced copies) into that
-experiment's folder when you Save. Folders can be dragged within their experiment. Right-click an image > Delete section takes it out
-of the list; Save removes it from LAS X's files and moves its files to the Windows Recycle Bin (a network drive has no Recycle Bin, so
-there they go into a "Deleted by XLEF viewer" folder in the experiment's folder instead). Both can be undone (Ctrl+Z) until Save, and
-Save asks first whenever it moves or deletes files.
+<p align="center"><img src="src/readme_images/ccf_browser.webp" width="800" alt="The CCF browser: a horizontal slice of the atlas colored by region, with cells from two CSV files plotted on it, and its info window"></p>
 
-The viewer only reads what it needs: listing the images reads only the small `.xlif` metadata files, and an image's TIFFs (one per channel, or one OME-TIFF holding all channels as its pages, or, in a project saved with LAS X's LOF option, one `.lof` file holding all channels, read the same way as a plain TIFF) are
-opened only when you select it (and then only the rows the current view needs). When the experiment has LAS X's reduced copies
-(a `Pyramid` folder), the zoomed-out picture comes from those, and full resolution is read only as you zoom in. Several experiments
-can be open at once: each one opened is added to the list as a branch of its own (right-click its name to close it); hovering over its name shows its path and any unsaved changes, and the slide
-overview shows the selected image's experiment. The List / Thumbnails buttons switch the left panel
-to a grid of thumbnails; these are made from an image's preview when it is already in memory (nothing is read), else from LAS X's
-small reduced copies (the `Pyramid` folder) when an experiment has them; an image without those gets its thumbnail from the preview
-the background loader reads for it, so its files are read once, not twice. Settings shows how many thumbnails are saved, and
-"Clear saved thumbnails" deletes them (they are made again as they are needed). Thumbnails are kept in `%LOCALAPPDATA%\JhouLab\xlef_viewer_thumbs`. Images whose files are online-only in OneDrive are marked with a cloud. Reading
-any part of an online-only file makes OneDrive download all of it, so the viewer downloads online-only files of up to 50 MB (such as
-the reduced copies) as needed, but asks before any bigger one: when opening an image without reduced copies, or when zooming in far
-enough to need full resolution ("Download for this section", "Download for all sections", or Cancel, which keeps the view at
-the reduced copies' sharpness).
+
+## 4. Brain section assembler
+
+This program augments the "Serial Section Assembler" of MBF's NeuroInfo program by allowing you to
+re-edit image stacks after they are made. It can replace NeuroInfo's entire workflow (detection, ordering,
+and aligning) for Zeiss .czi or jp2 input images. It is also faster, friendlier, and less buggy.
+
+It is in the Start menu (or Applications folder) with the other apps. There is also a stand-alone Windows version, with nothing to
+install: download
+[SectionAssembler-windows.zip](https://github.com/tomjhou/Brain-anatomy-tools/releases/latest/download/SectionAssembler-windows.zip)
+(always the newest version), unzip it anywhere, and run `SectionAssembler\SectionAssembler.exe`. To update the stand-alone version,
+download it again.
+
+<p align="center"><img src="src/readme_images/section_assembler.webp" width="800" alt="The section assembler: two dozen slides, each with its sections outlined and numbered in order"></p>
+
+
+
+<details>
+<summary><b>Technical details</b> (for developers; most users don't need any of this)</summary>
+
+### What is where
+
+- The `.bat` files (and their Mac `.command` twins) at the top start the tools. The programs themselves, and everything they use, are in `src/`.
+- The first `.bat` run finds Python (installing Python 3.13 for this user if there is none) and builds a private environment, `.venv`,
+  in this folder (`.venv-macos` on a Mac, so that a folder shared with Windows can keep both). All the tools share it. It is about 300 MB,
+  and grows to about 1.1 GB once the ABC browser has installed its libraries.
+- `INSTALL_APPS` makes the shortcuts (Windows: desktop and Start menu, and an entry in Settings > Apps; Mac: apps in `~/Applications`).
+  Run it again after moving this folder. The icons are drawn by `src/icons/make_icons.py`.
+- The xlef viewer and CCF browser run without a console window; their output goes to `%LOCALAPPDATA%\JhouLab\logs`
+  (`~/Library/Logs/JhouLab` on a Mac), and errors are shown in a message box.
+- Updating: a git clone updates with git. A folder unzipped from GitHub knows its version from `src/version.txt`, which GitHub fills in
+  when it makes the ZIP; see `src/app_update.py`.
+
+### Running from the source in your own Python
+
+Install Python and run, e.g., `python src/ABC_atlas_browser.py` from your environment (e.g. after `conda activate <env>`): at startup
+it checks for missing libraries and installs them into that environment.
+
+### Data locations
+
+- **ABC atlas download:** from the source, the browser first looks for `abc_atlas_cache` beside this folder; if there is none, it asks
+  where to put it (or where an existing download is). The choice is saved in `src/cache_local/abc_atlas_cache_location.json`; delete
+  that file to be asked again.
+- **Caches and settings:** `src/cache_local` and `src/viewer_settings.json` (regenerated as needed). The stand-alone ABC browser keeps
+  them in `%LOCALAPPDATA%\JhouLab\ABCAtlasBrowser\program`. The xlef viewer's settings are in `~/.xlef_viewer_settings.json`, and its
+  thumbnails in `%LOCALAPPDATA%\JhouLab\xlef_viewer_thumbs`.
+
+### Building the stand-alone programs
+
+See `src/packaging/README.md`.
+
+</details>

@@ -12,7 +12,7 @@ Unzip the download, then double click `INSTALL_APPS.bat` on Windows (red arrow b
 
 You should see 4 new apps in the Windows Start Menu (or Mac Applications folder):
 
-<p align="center"><img src="src/readme_images/start_menu.png" width="452" alt="The &quot;Brain anatomy tools&quot; folder in the Windows Start menu, with the three apps"></p>
+<p align="center"><img src="src/readme_images/start_menu.png" width="464" alt="The &quot;Brain anatomy tools&quot; folder in the Windows Start menu, with the four apps"></p>
 
 Run the apps like you would any normal Windows or Mac app.
 

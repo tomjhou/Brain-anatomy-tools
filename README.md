@@ -8,7 +8,7 @@ The fastest way to get started is to click the green "CODE" button above, then c
 
 Unzip the download, then double click `INSTALL_APPS_WINDOWS.bat` on Windows (red arrow below), or `INSTALL_APPS_MAC.command` on Mac (orange arrow).
 
-<p align="center"><img src="src/readme_images/Install.png" width="471" alt="Double click the installer"></p>
+<p align="center"><img src="src/readme_images/install_apps.png" width="471" alt="Double click the installer"></p>
 
 You should see 4 new apps in the Windows Start Menu (or Mac Applications folder):
 

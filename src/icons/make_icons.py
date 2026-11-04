@@ -1,4 +1,4 @@
-"""Draws the launcher icons (xlef_viewer.ico, ccf_browser.ico, abc_atlas_browser.ico, section_assembler.ico) that INSTALL_APPS.bat gives the shortcuts.
+"""Draws the launcher icons (xlef_viewer.ico, ccf_browser.ico, abc_atlas_browser.ico, section_assembler.ico) that INSTALL_APPS_WINDOWS.bat gives the shortcuts.
 The .ico files are kept in the repository, so this only needs running again to change a design:  python icons/make_icons.py"""
 import os
 import random
@@ -153,7 +153,7 @@ if __name__ == "__main__":
         big = draw()
         big.resize((256, 256), Image.LANCZOS).save(os.path.join(HERE, name + ".ico"), sizes=SIZES)
         # macOS: icons sit within a margin of the square (Apple's grid: 824 of 1024 pixels), as an .icns for the app made by
-        # INSTALL_APPS.command, and a .png that the program sets as its Dock icon when it starts (see app_identity.py)
+        # INSTALL_APPS_MAC.command, and a .png that the program sets as its Dock icon when it starts (see app_identity.py)
         mac = Image.new("RGBA", (BIG, BIG), (0, 0, 0, 0))
         mac.alpha_composite(big.resize((824, 824), Image.LANCZOS), (100, 100))
         mac.save(os.path.join(HERE, name + ".icns"))

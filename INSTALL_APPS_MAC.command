@@ -1,7 +1,7 @@
 #!/bin/bash
 # macOS: makes an app, with its own icon, for the xlef viewer, CCF browser, ABC atlas browser and section assembler, in your Applications folder
 # (~/Applications), to start them from Launchpad, Spotlight or the Dock. Double-click it in Finder (the first time, right-click it and
-# choose Open). Run it again after moving this folder, or when an icon has changed. UNINSTALL_APPS.command removes them.
+# choose Open). Run it again after moving this folder, or when an icon has changed. UNINSTALL_APPS_MAC.command removes them.
 #
 # Each app runs this folder's run-*.command file in Terminal the first time (to set up Python and the libraries, which shows its
 # progress there); after that it starts the program directly, with no Terminal window, its output in ~/Library/Logs/JhouLab (the ABC
@@ -37,11 +37,11 @@ make_app() {   # name, run-*.command, icon (src/icons/<icon>.icns), bundle id, p
 PLIST
     {
         echo '#!/bin/bash'
-        echo "# Made by INSTALL_APPS.command: starts $name from $REPO (run INSTALL_APPS.command again if that folder moves)."
+        echo "# Made by INSTALL_APPS_MAC.command: starts $name from $REPO (run INSTALL_APPS_MAC.command again if that folder moves)."
         printf 'REPO=%q\n' "$REPO"
         printf 'COMMAND="$REPO/%s"\n' "$command"
         echo 'if [ ! -f "$COMMAND" ]; then'
-        echo "    osascript -e 'display alert \"$name\" message \"Its folder has moved or is gone. Run INSTALL_APPS.command in the folder where it is now.\"'"
+        echo "    osascript -e 'display alert \"$name\" message \"Its folder has moved or is gone. Run INSTALL_APPS_MAC.command in the folder where it is now.\"'"
         echo '    exit 1'
         echo 'fi'
         if [ -n "$libs" ]; then
@@ -74,7 +74,7 @@ make_app "ABC atlas browser" run-abc-atlas-browser.command abc_atlas_browser org
     ABC_atlas_browser.py ""
 make_app "Section assembler" run-assembler.command section_assembler org.jhoulab.brainanatomytools.sectionassembler \
     FileConverters/SerialAssembler.py ""
-chmod +x "$REPO"/run-*.command "$REPO/UNINSTALL_APPS.command" 2>/dev/null
+chmod +x "$REPO"/run-*.command "$REPO/UNINSTALL_APPS_MAC.command" 2>/dev/null
 
 # Let Launchpad and Spotlight know about them (and their icons) now rather than later
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister

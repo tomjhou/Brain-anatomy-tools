@@ -1,5 +1,5 @@
 @echo off
-REM Removes what INSTALL_APPS.bat made (shortcuts, icons, the entry in Settings > Apps), and offers to remove the .venv, caches,
+REM Removes what INSTALL_APPS_WINDOWS.bat made (shortcuts, icons, the entry in Settings > Apps), and offers to remove the .venv, caches,
 REM settings and the ABC atlas download. Projects and outputs are never touched. Also run by Uninstall in Settings > Apps.
 REM See src\uninstall_apps.ps1.
 setlocal

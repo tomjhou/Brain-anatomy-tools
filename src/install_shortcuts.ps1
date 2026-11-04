@@ -1,5 +1,5 @@
 # Makes shortcuts, each with its own icon, for the .bat launchers: on the desktop and in the Start menu (folder "Brain anatomy tools").
-# Run by INSTALL_APPS.bat. A shortcut runs cmd.exe with the .bat, which (unlike the .bat itself) Windows lets you pin to the taskbar.
+# Run by INSTALL_APPS_WINDOWS.bat. A shortcut runs cmd.exe with the .bat, which (unlike the .bat itself) Windows lets you pin to the taskbar.
 # Each shortcut also gets its program's app ID, the one the program declares when it starts (app_identity.py), so that Windows shows
 # the running program on the pinned button instead of as a separate Python button.
 # Running it again replaces the shortcuts, so after moving this folder, or when an icon has changed, just run it again.
@@ -130,7 +130,7 @@ $entry = @{
 foreach ($name in $entry.Keys) { New-ItemProperty -Path $RegistryKey -Name $name -Value $entry[$name] -PropertyType String -Force | Out-Null }
 foreach ($name in @("NoModify", "NoRepair")) { New-ItemProperty -Path $RegistryKey -Name $name -Value 1 -PropertyType DWord -Force | Out-Null }
 New-ItemProperty -Path $RegistryKey -Name EstimatedSize -Value ([int]($size / 1KB)) -PropertyType DWord -Force | Out-Null   # (KB)
-Write-Host "Listed in Settings > Apps as ""Brain anatomy tools"" (uninstall from there, or with UNINSTALL_APPS.bat)"
+Write-Host "Listed in Settings > Apps as ""Brain anatomy tools"" (uninstall from there, or with UNINSTALL_APPS_WINDOWS.bat)"
 
 # The Start menu keeps icons in a cache of its own, read when its process starts, so after a new icon it shows the old one until the next
 # sign-in. Restarting that process (Windows starts it again at once; a Start menu open just then closes) makes it read them now.

@@ -1,5 +1,5 @@
 #!/bin/bash
-# macOS counterpart of UNINSTALL_APPS.bat: removes the apps INSTALL_APPS.command made, and the programs' logs and thumbnails; then asks
+# macOS counterpart of UNINSTALL_APPS_WINDOWS.bat: removes the apps INSTALL_APPS_MAC.command made, and the programs' logs and thumbnails; then asks
 # (Enter = no) about the private Python environment (.venv-macos), the ABC atlas download, the browsers' caches and settings, and the
 # xlef viewer's settings. Never touched: projects, images, the ABC browser's output folders, this folder's own files, Python itself.
 # Apps kept in the Dock stay there as question marks: drag them out of the Dock.
@@ -38,7 +38,7 @@ if pgrep -f "$REPO/.venv-macos/" >/dev/null 2>&1; then
 fi
 
 echo "Removing the apps, logs and thumbnails:"
-for name in "Leica xlef viewer" "CCF browser" "ABC atlas browser" "Section assembler"; do      # (only ours: made by INSTALL_APPS.command)
+for name in "Leica xlef viewer" "CCF browser" "ABC atlas browser" "Section assembler"; do      # (only ours: made by INSTALL_APPS_MAC.command)
     app="$APPS_DIR/$name.app"
     if grep -q "org.jhoulab.brainanatomytools" "$app/Contents/Info.plist" 2>/dev/null; then remove "$app" "$app"; fi
 done

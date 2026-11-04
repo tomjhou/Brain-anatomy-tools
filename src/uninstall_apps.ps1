@@ -1,4 +1,4 @@
-# Undoes INSTALL_APPS.bat, and offers to remove what the programs made: run by UNINSTALL_APPS.bat, or by Uninstall in Windows' Settings >
+# Undoes INSTALL_APPS_WINDOWS.bat, and offers to remove what the programs made: run by UNINSTALL_APPS_WINDOWS.bat, or by Uninstall in Windows' Settings >
 # Apps (which runs a copy of this file kept in %LOCALAPPDATA%\JhouLab\uninstall, so that it works even after the repository folder was deleted).
 # Removed without asking: the desktop and Start menu shortcuts, the icon copies, the logs, the xlef viewer's thumbnails and the Settings entry.
 # Asked one by one (Enter = no): the .venv, the browsers' caches and settings in src, the xlef viewer's settings, the ABC atlas download.
@@ -12,7 +12,7 @@ param([string]$Repo,                                   # the repository's top fo
       [string]$Answers)                                # (for tests: the answers to the questions, e.g. "ynyn", instead of asking)
 
 $ErrorActionPreference = "Stop"
-if ($Repo) { $Repo = [IO.Path]::GetFullPath($Repo).TrimEnd('\') }   # (UNINSTALL_APPS.bat passes "...\Brain-anatomy-tools\.")
+if ($Repo) { $Repo = [IO.Path]::GetFullPath($Repo).TrimEnd('\') }   # (UNINSTALL_APPS_WINDOWS.bat passes "...\Brain-anatomy-tools\.")
 $Shortcuts =@("Leica xlef viewer", "CCF browser", "ABC atlas browser", "Section assembler")     # as in install_shortcuts.ps1
 $asked = 0
 
@@ -67,7 +67,7 @@ if ($haveRepo) {
     }
 }
 
-# --- Removed without asking: what INSTALL_APPS.bat and the programs made outside the repository, all small or rebuilt as needed
+# --- Removed without asking: what INSTALL_APPS_WINDOWS.bat and the programs made outside the repository, all small or rebuilt as needed
 Write-Host "Removing the shortcuts, icons, logs and thumbnails:"
 foreach ($name in $Shortcuts) {
     $path = Join-Path $Desktop "$name.lnk"

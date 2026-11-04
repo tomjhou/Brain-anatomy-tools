@@ -4,7 +4,7 @@
 # "Press Enter to close this window" only printed "logout ... [Process completed]". close_window_and_exit closes the window once the
 # shell Terminal started for the script has ended too; a window the script was typed into still has its shell, so it stays open.
 #
-# hand_off_to_app: an app made by INSTALL_APPS.command runs its run-*.command in Terminal the first time, to set up Python and the
+# hand_off_to_app: an app made by INSTALL_APPS_MAC.command runs its run-*.command in Terminal the first time, to set up Python and the
 # libraries. Had the program then run from Terminal too, macOS would have counted its files as Terminal's: on a network folder it could
 # list them (the file dialog is macOS's own) but not read them, with no question asked, until the app itself asked the next time. So
 # once the setup is done, the run-*.command starts the app again, and the program runs as the app from the very first time.
@@ -29,7 +29,7 @@ press_enter_to_close() {   # [exit code]
     close_window_and_exit "${1:-0}"
 }
 
-hand_off_to_app() {   # the libraries the app checks for, as an import list (as in INSTALL_APPS.command)
+hand_off_to_app() {   # the libraries the app checks for, as an import list (as in INSTALL_APPS_MAC.command)
     # The app leaves its path in this file just before it opens the run-*.command in Terminal (an hour or two is ample for the setup).
     local note app fresh
     note="$HOME/Library/Caches/JhouLab/$(basename "$0" .command).handoff"

@@ -6,7 +6,7 @@ The fastest way to get started is to click the green "CODE" button above, then c
 
 <p align="center"><img src="src/readme_images/download_zip.png" width="361" alt="The green Code button on GitHub, and Download ZIP in the menu it opens"></p>
 
-Unzip the download, then double click `INSTALL_APPS.bat` on Windows (red arrow below), or `INSTALL_APPS.command` on Mac (orange arrow).
+Unzip the download, then double click `INSTALL_APPS_WINDOWS.bat` on Windows (red arrow below), or `INSTALL_APPS_MAC.command` on Mac (orange arrow).
 
 <p align="center"><img src="src/readme_images/Install.png" width="471" alt="Double click the installer"></p>
 
@@ -20,14 +20,14 @@ The first time each app starts, it sets itself up: it installs Python if the com
 this folder. This takes a few minutes and needs an internet connection, and it leaves any Python you already have alone. Later starts are quick.
 
 **On a Mac**, install Python 3.13 from [python.org](https://www.python.org/downloads/) first. The first time you open
-`INSTALL_APPS.command`, right-click it and choose Open: macOS asks before running a script it hasn't seen before.
+`INSTALL_APPS_MAC.command`, right-click it and choose Open: macOS asks before running a script it hasn't seen before.
 
 **Windows may warn** "Windows protected your PC" the first time you run one of the stand-alone `.exe` programs below, because they are not code-signed: choose More info, then Run anyway.
 
 ### Updating and uninstalling
 
 - **Update:** in the xlef viewer, choose Update > Update from GitHub. It shows what's new and updates all tools at once.
-- **Uninstall:** Windows Settings > Apps > "Brain anatomy tools", or double-click `UNINSTALL_APPS.bat` (`UNINSTALL_APPS.command` on a
+- **Uninstall:** Windows Settings > Apps > "Brain anatomy tools", or double-click `UNINSTALL_APPS_WINDOWS.bat` (`UNINSTALL_APPS_MAC.command` on a
   Mac). It asks before removing anything large, and never touches your images, projects or results.
 
 Most buttons and controls explain themselves when you hover the mouse over them.
@@ -110,7 +110,7 @@ download it again.
 - The first `.bat` run finds Python (installing Python 3.13 for this user if there is none) and builds a private environment, `.venv`,
   in this folder (`.venv-macos` on a Mac, so that a folder shared with Windows can keep both). All the tools share it. It is about 300 MB,
   and grows to about 1.1 GB once the ABC browser has installed its libraries.
-- `INSTALL_APPS` makes the shortcuts (Windows: desktop and Start menu, and an entry in Settings > Apps; Mac: apps in `~/Applications`).
+- `INSTALL_APPS_WINDOWS.bat` and `INSTALL_APPS_MAC.command` make the shortcuts (Windows: desktop and Start menu, and an entry in Settings > Apps; Mac: apps in `~/Applications`).
   Run it again after moving this folder. The icons are drawn by `src/icons/make_icons.py`.
 - The xlef viewer and CCF browser run without a console window; their output goes to `%LOCALAPPDATA%\JhouLab\logs`
   (`~/Library/Logs/JhouLab` on a Mac), and errors are shown in a message box.

@@ -9,7 +9,7 @@ program's icon from the icons folder.
 On macOS there is no such ID: the Dock shows a running program as the app it belongs to, here Python. Each program only sets the Dock
 icon to its own (from the .png in the icons folder), so the running program looks right, though still named "Python".
 
-For a program started with pythonw.exe (no console window), or on macOS from its app made by INSTALL_APPS.command (which sets
+For a program started with pythonw.exe (no console window), or on macOS from its app made by INSTALL_APPS_MAC.command (which sets
 JHOULAB_WINDOWLESS=1), output and errors would vanish: use_windowless_log sends them to a log file and shows errors in a message box."""
 import os
 import sys

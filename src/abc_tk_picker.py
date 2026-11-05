@@ -490,6 +490,7 @@ class SectionWindow:
     MARK_COLOR = (255, 0, 0)
     SCALE_UNITS = {("standard", "log"): "log2(1 + expr)", ("standard", "linear"): "expr (raw counts)",
                    ("imputed", "log"): "log2 (imputed)", ("imputed", "linear"): "linear (imputed)"}
+    MAX_KEPT_RENDERS = 24          # gene pictures kept (about 6 MB each) so that going back to a section shows its gene view at once
     CHANNEL_COLORS = ("#e53935", "#43a047", "#4a6cff")        # the red, green and blue of a multi-gene overlay
 
     def __init__(self, data, abc_cache, spatial=None, section_series=None, adata=None, root=None, on_close=None, existing_rois=(),
@@ -513,10 +514,17 @@ class SectionWindow:
         self.level = "class"           # the Group level
         self.busy = False
         self.pictures = data.pictures  # (groups level -> picture)
-        self.renders = {}              # gene views already made: key -> result
+        self.renders = {}              # gene views already made, of this and the sections shown before: (section, genes, scale, dataset) -> result
         self.cell_expr = {}            # (gene, dataset) -> expression of each cell of this section (for the hover), or None while it is being read
         self.finds = {}                # (level, number) -> (picture, cells, name)
         self.shown_genes = []          # the genes the picture shows (canonical names), and which dataset
+        self.session_view_settings = None   # the session's {"mode", "gene"}, shared with every window: a gene entered here becomes the default
+        self.overlay = None            # the label that says, over the picture, what is being made (show_overlay)
+        self.shown_key = None          # the key (in self.renders) of the gene view on screen, and the color range(s) it was first made with
+        self.base_ranges = None
+        self.levels_memory = {}        # (gene, dataset) -> (low, high): its black and white levels, kept across scales, sections and other genes
+        self.hidden = set()            # the genes (as in a key of self.renders) switched off in an overlay: kept the same way
+        self.multi_sliders, self.multi_windows = [], []
         self.shown_dataset = "standard"
         self.hover_job = self.mark_job = None
         self.hover_pos = None
@@ -581,8 +589,8 @@ class SectionWindow:
         lv = ttk.LabelFrame(f, text="Group level", padding=6)
         lv.pack(fill=tk.X, pady=(6, 0))
         self.var_level = tk.StringVar(f, "class")
-        for k, name in enumerate(LEVELS):
-            ttk.Radiobutton(lv, text=name.capitalize(), value=name, variable=self.var_level, command=self.on_level).grid(row=k // 2, column=k % 2, sticky="w", padx=(0, 14))
+        for name in LEVELS:                                 # (one column, coarse to fine, top to bottom)
+            ttk.Radiobutton(lv, text=name.capitalize(), value=name, variable=self.var_level, command=self.on_level).pack(anchor="w")
 
         self.mode_box = ttk.Frame(f)
         self.mode_box.pack(fill=tk.X, pady=(6, 0))
@@ -634,6 +642,13 @@ class SectionWindow:
         self.cbar = tk.Canvas(f, width=310, height=86, highlightthickness=0)
         self.cbar.pack(fill=tk.X, pady=(6, 0))
         self.cbar_photo = None
+        self.cbar.bind("<Button-1>", self.on_legend_click)
+        # In linear scale the black and white levels of one gene can be moved (as in the UMAP viewer): they cut the range the colors cover.
+        from abc_tk_umap import HoverTip, RangeSlider              # (imported here: that module is large, and this one can be run on its own)
+        self.levels_job = None
+        self.cbar_slider = RangeSlider(f, self.on_gene_levels)
+        HoverTip(self.cbar_slider, lambda: "Drag the black and white handles to set the lowest and the highest value of the color scale. The track is by the square root of "
+                                           "the value: most of it is for the low values. Double-click to reset.")
 
     def build_find_controls(self, parent):
         f = self.find_frame = ttk.LabelFrame(parent, text="Find group", padding=6)
@@ -668,12 +683,14 @@ class SectionWindow:
 
     # ---- background work (one job at a time: the controls wait, the picture can still be moved)
 
-    def job(self, text, work, done):
+    def job(self, text, work, done, overlay=None):
+        """Run `work` on a thread, then `done(result)` here. `overlay`: large text over the picture while it runs (what is being made)."""
         if self.busy:
             return False
         self.busy = True
         self.var_status.set(text)
         self.root.config(cursor="watch")
+        self.show_overlay(overlay)
 
         def target():
             try:
@@ -685,6 +702,25 @@ class SectionWindow:
         threading.Thread(target=target, daemon=True).start()
         return True
 
+    def show_overlay(self, text):
+        """Large text in the middle of the picture (the old one is still there while a new one is made), or none with None."""
+        if text is None:
+            if self.overlay is not None:
+                self.overlay.place_forget()
+            return
+        if self.overlay is None:
+            self.overlay = tk.Label(self.view.canvas, font=("Segoe UI", 22, "bold"), fg="white", bg="#202020", padx=24, pady=14,
+                                    wraplength=900, justify=tk.CENTER)
+        self.overlay.configure(text=text)
+        self.overlay.place(relx=0.5, rely=0.5, anchor="center")
+        self.overlay.lift()
+        self.root.update_idletasks()
+
+    @staticmethod
+    def and_list(names):
+        names = list(names)
+        return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
     def poll(self):
         try:
             while True:
@@ -693,12 +729,15 @@ class SectionWindow:
                     done, res = payload
                     self.busy = False
                     self.root.config(cursor="")
+                    self.show_overlay(None)
                     done(res)
                 elif kind == "expr":
                     key, values, generation = payload
                     if generation != self.generation:
                         continue                                 # (read for a section that is no longer shown)
                     self.cell_expr[key] = values
+                    if key[0] in self.shown_genes:                   # (the percentages of cells below the levels can now be told)
+                        self.draw_legend()
                     if self.hover_idx is not None:
                         self.update_hover()
         except queue.Empty:
@@ -746,6 +785,11 @@ class SectionWindow:
         if self.mode in ("gene", "imputed") and self.var_gene.get().strip():
             self.apply_gene()
 
+    def wanted_gene_key(self):
+        """(genes, scale, dataset) as in the keys of self.renders, for the genes now in the box (as shown by an earlier Enter), or None."""
+        names = tuple(n.strip().casefold() for n in self.var_gene.get().split(",") if n.strip())
+        return (names, self.color_scale["mode"], "imputed" if self.mode == "imputed" else "standard") if names else None
+
     def refresh_picture(self):
         """Show what the current choice calls for."""
         self.var_status.set("")
@@ -790,7 +834,7 @@ class SectionWindow:
             if self.mode == "groups" and self.level == level:
                 self.show_picture(res)
 
-        self.job(f"Coloring by {level}...", work, done)
+        self.job(f"Coloring by {level}...", work, done, overlay=f"Coloring the cells by {level}")
 
     # ---- Gene and Imputed Gene
 
@@ -874,11 +918,14 @@ class SectionWindow:
             return
         self.gene_entry.config(foreground="")
         self.var_gene.set(", ".join(resolved))
+        if self.session_view_settings is not None:         # (the genes of the next section's window, and of this one's other sections)
+            self.session_view_settings["gene"] = ", ".join(resolved)
         dataset = "imputed" if use_imputed else "standard"
         scale = self.color_scale["mode"]
         key = (tuple(r.casefold() for r in resolved), scale, dataset)
-        if key in self.renders:
-            self.show_gene_result(key, resolved, dataset, self.renders[key])
+        stored = (self.data.label,) + key
+        if stored in self.renders:
+            self.show_gene_result(key, resolved, dataset, self.renders[stored])
             return
         d, spatial, series, adata = self.data, self.spatial, self.section_series, self.adata
         expr_adata = self.imputed_state["adata"] if use_imputed else None
@@ -895,23 +942,30 @@ class SectionWindow:
             if isinstance(res, BaseException):
                 self.var_status.set(f"Could not show {', '.join(resolved)}: {res}")
                 return
-            self.renders[key] = res
-            self.show_gene_result(key, resolved, dataset, res)
+            self.keep_render(stored, res)
+            if d is self.data:                                  # (not if another section was moved to meanwhile)
+                self.show_gene_result(key, resolved, dataset, res)
 
-        self.job(f"Rendering {', '.join(resolved)}...", work, done)
+        self.job(f"Rendering {', '.join(resolved)}...", work, done, overlay=f"Generating expression view for {self.and_list(resolved)}")
 
     def show_gene_result(self, key, resolved, dataset, res):
         if self.mode not in ("gene", "imputed") or (self.mode == "imputed") != (dataset == "imputed"):
             return                                       # (the choice changed while it was being made)
         self.show_picture(res[0])
         self.shown_genes, self.shown_dataset = list(resolved), dataset
+        self.shown_key = key
+        self.base_ranges = list(zip(res[3], res[4])) if len(resolved) >= 2 else [(res[3], res[4])]
         scale = key[1]
+        self.show_levels_slider(len(resolved) == 1 and scale == "linear")
+        if len(resolved) == 1:
+            self.cbar_slider.set(*self.levels_of(0))
         if len(resolved) >= 2:
-            self.draw_colorbar_multi(res[1], res[3], res[4], scale, dataset)
             self.var_status.set(f"Showing {', '.join(resolved)} (red / green / blue).")
         else:
-            self.draw_colorbar(res[3], res[4], scale, dataset)
             self.var_status.set(f"Showing {resolved[0]} (highest expression {res[2]:.2f}).")
+        self.draw_legend()
+        if self.custom_state():                           # (the same view shown again: with its levels, and its genes off)
+            self.schedule_levels()
         self.load_cell_expr(resolved, dataset)
         if self.hover_idx is not None:
             self.update_hover()
@@ -920,30 +974,242 @@ class SectionWindow:
 
     def clear_colorbar(self):
         self.cbar.delete("all")
+        self.clear_multi_sliders()
         self.shown_genes = []
+        self.shown_key = self.base_ranges = None
+        self.show_levels_slider(False)
 
-    def draw_colorbar(self, vmin, vmax, scale, dataset):
+    def show_levels_slider(self, on):
+        if on:
+            self.cbar_slider.pack(fill=tk.X, after=self.cbar)
+        else:
+            self.cbar_slider.pack_forget()
+
+    def clear_multi_sliders(self):
+        for slider in self.multi_sliders:
+            slider.destroy()
+        self.multi_sliders, self.multi_windows = [], []
+
+    def keep_render(self, stored, res):
+        if len(stored) > 4:                                       # (a picture with levels: only the latest of a view is kept, as a drag makes many)
+            for old in [k for k in self.renders if len(k) > 4 and k[:4] == stored[:4]]:
+                del self.renders[old]
+        self.renders[stored] = res
+        while len(self.renders) > self.MAX_KEPT_RENDERS:          # (the oldest go first: a dict keeps the order they were made in)
+            self.renders.pop(next(iter(self.renders)))
+
+    def render_variant(self, names, dataset, scale):
+        """What, beyond the gene view's own key, a picture depends on: the black and white levels (linear scale) and the genes switched off
+        (an overlay), as they are now for these genes. () while all are at the start: the first picture made is the one."""
+        levels = tuple(self.levels_memory.get((n, dataset), (0.0, 1.0)) if scale == "linear" else (0.0, 1.0) for n in names)
+        off = tuple(len(names) >= 2 and n in self.hidden for n in names)
+        return () if not any(off) and all(v == (0.0, 1.0) for v in levels) else (levels, off)
+
+    def levels_of(self, i):
+        """The black and white levels (as fractions of the range) of the i-th gene shown: what was set for that gene before, else the ends."""
+        return self.levels_memory.get((self.shown_genes[i].casefold(), self.shown_dataset), (0.0, 1.0))
+
+    def is_off(self, i):
+        return self.shown_genes[i].casefold() in self.hidden
+
+    def custom_state(self):
+        """Whether the picture shown differs from the first one made of this view: a level moved (linear scale), or a gene switched off."""
+        if self.shown_key is None:
+            return False
+        linear = self.shown_key[1] == "linear"
+        if len(self.shown_genes) == 1:
+            return linear and self.levels_of(0) != (0.0, 1.0)
+        n = range(len(self.shown_genes))
+        return any(self.is_off(i) for i in n) or (linear and any(self.levels_of(i) != (0.0, 1.0) for i in n))
+
+    def effective_ranges(self):
+        """[(vmin, vmax)] of each gene shown: the range of its colors, cut by the black and white levels (linear scale)."""
+        out = []
+        linear = self.shown_key[1] == "linear"
+        for i, (lo, hi) in enumerate(self.base_ranges):
+            low, high = self.levels_of(i) if linear else (0.0, 1.0)
+            out.append((lo + low * (hi - lo), lo + high * (hi - lo)))
+        return out
+
+    def transformed_values(self, gene):
+        """The expression of every cell of this section for `gene`, in the units of the color bar, or None while it is being read."""
+        values = self.cell_expr.get((gene, self.shown_dataset))
+        if values is None or values is False:
+            return None
+        log = self.shown_key[1] == "log"
+        if self.shown_dataset == "imputed":
+            return values if log else 2.0 ** values - 1.0
+        return core.log2p1(values) if log else values
+
+    def readouts(self, ranges):
+        """Linear scale: for each gene, ((all, expressing) percentages of cells below the black level, the same for the white level); None
+        where they cannot be told yet (the cells' values are still being read) or are not about every cell (a cell type was chosen)."""
+        from abc_tk_umap import percent_below
+        if self.shown_key[1] != "linear" or self.cell_type_selection != "All":
+            return [None] * len(ranges)
+        out = []
+        for gene, (lo, hi) in zip(self.shown_genes, ranges):
+            values = self.transformed_values(gene)
+            out.append(None if values is None else (percent_below(values, lo), percent_below(values, hi)))
+        return out
+
+    def draw_legend(self):
+        """The color bar (one gene) or the legend (several) for what is shown, with the levels' readouts."""
+        if self.shown_key is None or self.base_ranges is None:
+            return
+        ranges = self.effective_ranges()
+        scale, dataset = self.shown_key[1], self.shown_dataset
+        readouts = self.readouts(ranges)
+        if len(self.shown_genes) == 1:
+            self.draw_colorbar(ranges[0][0], ranges[0][1], scale, dataset, readouts[0])
+        else:
+            self.draw_colorbar_multi(self.shown_genes, ranges, scale, dataset, readouts)
+
+    def on_gene_levels(self, low, high):
+        """The levels slider moved: the picture is made again with the colors cut there (about once a second while it is dragged)."""
+        if self.shown_key is not None and self.shown_genes:
+            self.levels_memory[(self.shown_genes[0].casefold(), self.shown_dataset)] = (low, high)
+        self.schedule_levels()
+
+    def on_multi_levels(self, index, low, high):
+        if index < len(self.shown_genes):
+            self.levels_memory[(self.shown_genes[index].casefold(), self.shown_dataset)] = (low, high)
+        self.schedule_levels()
+
+    def on_legend_click(self, e):
+        """A click on a gene's colored square (or its name) in the overlay's legend switches that gene off or on."""
+        if self.busy or self.shown_key is None or len(self.shown_genes) < 2:
+            return
+        for tag in self.cbar.gettags("current"):
+            if tag.startswith("gene") and tag[4:].isdigit():
+                i = int(tag[4:])
+                if i < len(self.shown_genes):
+                    self.hidden.symmetric_difference_update({self.shown_genes[i].casefold()})
+                self.schedule_levels()
+                return
+
+    def schedule_levels(self):
+        if self.levels_job is None:
+            self.levels_job = self.root.after(60, self.apply_levels)
+
+    def apply_levels(self):
+        """Make the picture again with the black and white levels and the genes that are on, as they are now (the first picture, if they are
+        back at the start)."""
+        self.levels_job = None
+        if self.shown_key is None or self.mode not in ("gene", "imputed") or self.base_ranges is None:
+            return
+        if self.busy:                                          # (something else is being made: try again shortly)
+            self.levels_job = self.root.after(200, self.apply_levels)
+            return
+        key, genes, dataset = self.shown_key, list(self.shown_genes), self.shown_dataset
+        state = (dict(self.levels_memory), set(self.hidden))
+        d, spatial, series, adata = self.data, self.spatial, self.section_series, self.adata
+        variant = self.render_variant(key[0], dataset, key[1])
+        made = self.renders.get((d.label,) + key + variant)          # (the picture with these levels, or the first one: if made before)
+        if made is not None:
+            self.show_picture(made[0])
+            self.draw_legend()
+            return
+        if not variant:
+            return
+        ranges, hidden = self.effective_ranges(), {i for i in range(len(genes)) if self.is_off(i)}
+        expr_adata = self.imputed_state["adata"] if dataset == "imputed" else None
+        selection, scale = self.cell_type_selection, key[1]
+
+        def work():
+            kw = dict(cell_type_selection=selection, color_scale=scale, expr_adata=expr_adata, dataset=dataset)
+            if len(genes) >= 2:
+                return core.render_multi_gene_expression_array(adata, series, d.label, lambda: spatial, genes, d.layout, d.img_w, d.img_h,
+                                                               color_ranges=ranges, hidden=hidden, **kw)
+            return core.render_gene_expression_array(adata, series, d.label, lambda: spatial, genes[0], d.layout, d.img_w, d.img_h,
+                                                     color_range=ranges[0], **kw)
+
+        def done(res):
+            self.var_status.set(status)
+            if isinstance(res, BaseException):
+                self.var_status.set(f"Could not change the picture: {res}")
+                return
+            self.keep_render((d.label,) + key + variant, res)
+            if self.shown_key == key and d is self.data:        # (still the same view)
+                self.show_picture(res[0])
+                self.draw_legend()
+                if (self.levels_memory, self.hidden) != state:       # (changed again while this was being made)
+                    self.schedule_levels()
+        status = self.var_status.get()
+        if not self.job(status, work, done):
+            self.levels_job = self.root.after(200, self.apply_levels)
+
+    def line_height(self, size, bold=False):
+        import tkinter.font as tkfont
+        return tkfont.Font(root=self.root, font=("Segoe UI", size, "bold" if bold else "normal")).metrics("linespace")
+
+    def draw_colorbar(self, vmin, vmax, scale, dataset, readout=None):
+        """`readout` (linear scale): ((all, expressing) percent below the black level, the same for the white level)."""
         from matplotlib import colormaps
         c = self.cbar
         c.delete("all")
+        h8, h9 = self.line_height(8), self.line_height(9)
         w = max(c.winfo_width(), 200)
         ramp = (colormaps["viridis"](np.linspace(0, 1, 256))[:, :3] * 255).astype(np.uint8)[None, :, :]
         img = cv2.resize(np.repeat(ramp, 16, axis=0), (w - 20, 16), interpolation=cv2.INTER_LINEAR)
         self.cbar_photo = ImageTk.PhotoImage(Image.fromarray(img), master=c)
         c.create_image(10, 8, anchor="nw", image=self.cbar_photo)
-        c.create_text(10, 30, anchor="nw", text=f"{vmin:.2f}", font=("Segoe UI", 9))
-        c.create_text(w - 10, 30, anchor="ne", text=f"{vmax:.2f}", font=("Segoe UI", 9))
-        c.create_text(w / 2, 50, text=self.SCALE_UNITS[(dataset, scale)], font=("Segoe UI", 9), fill="gray30")
+        c.create_text(10, 28, anchor="nw", text=f"{vmin:.2f}", font=("Segoe UI", 9))
+        c.create_text(w - 10, 28, anchor="ne", text=f"{vmax:.2f}", font=("Segoe UI", 9))
+        y = 28 + h9 + 2
+        if readout is not None:
+            for (a, e), x, anchor in ((readout[0], 10, "nw"), (readout[1], w - 10, "ne")):
+                c.create_text(x, y, anchor=anchor, text=f"{a:.1f}% of cells below", font=("Segoe UI", 8), fill="gray30")
+                c.create_text(x, y + h8, anchor=anchor, text=f"{e:.1f}% of expressing", font=("Segoe UI", 8), fill="gray30")
+            y += 2 * h8 + 4
+        c.create_text(w / 2, y + h9 / 2, text=self.SCALE_UNITS[(dataset, scale)], font=("Segoe UI", 9), fill="gray30")
+        c.config(height=int(y + h9 + 8))
 
-    def draw_colorbar_multi(self, genes, vmins, vmaxs, scale, dataset):
+    def draw_colorbar_multi(self, genes, ranges, scale, dataset, readouts=None):
+        """The legend of an overlay: for each gene its colored square (click: switch the gene off or on), name and range; in linear scale also
+        the percentages of cells below its black and white levels, and the slider of those levels."""
         c = self.cbar
-        c.delete("all")
         self.cbar_photo = None
-        for k, (g, lo, hi) in enumerate(zip(genes, vmins, vmaxs)):
-            y = 8 + 18 * k
-            c.create_rectangle(10, y, 24, y + 12, fill=self.CHANNEL_COLORS[k], outline="")
-            c.create_text(32, y - 1, anchor="nw", text=f"{g}   {lo:.1f}–{hi:.1f}", font=("Segoe UI", 9))
-        c.create_text(10, 8 + 18 * len(genes), anchor="nw", text=self.SCALE_UNITS[(dataset, scale)], font=("Segoe UI", 9), fill="gray30")
+        linear = scale == "linear"
+        h8, h9 = self.line_height(8), self.line_height(9, bold=True)
+        row = h9 + h8 + 8 + ((2 * h8 + 4 + 26 + 6) if linear else 0)
+        if len(self.multi_sliders) != (len(genes) if linear else 0):
+            c.delete("all")
+            self.clear_multi_sliders()                         # (the sliders are kept while they are dragged: only made again for other genes)
+            if linear:
+                self.multi_sliders = [self.new_multi_slider(i) for i in range(len(genes))]
+                self.multi_windows = [c.create_window(0, 0, anchor="nw", window=sl, height=26) for sl in self.multi_sliders]
+        else:
+            c.delete("legend")                                 # (only the texts and squares: a drag in progress goes on)
+        w = max(c.winfo_width(), 200)
+        for i, (g, (lo, hi)) in enumerate(zip(genes, ranges)):
+            y = 8 + row * i
+            off = self.is_off(i)
+            color = "#999999" if off else self.CHANNEL_COLORS[i]
+            tags = ("legend", f"gene{i}")
+            c.create_rectangle(10, y + 1, 10 + h9 - 2, y + h9 - 1, fill="" if off else color, outline=color, width=2, tags=tags)
+            c.create_text(10 + h9 + 4, y, anchor="nw", text=g, fill=color, font=("Segoe UI", 10, "bold"), tags=tags)
+            c.create_text(10 + h9 + 4, y + h9 + 2, anchor="nw", text="off" if off else f"{lo:.1f}–{hi:.1f}", fill="#666666", font=("Segoe UI", 8), tags="legend")
+            if linear:
+                readout = None if off or readouts is None else readouts[i]
+                if readout is not None:
+                    ty = y + h9 + h8 + 6
+                    for (a, e), x, anchor in ((readout[0], 10, "nw"), (readout[1], w - 10, "ne")):
+                        c.create_text(x, ty, anchor=anchor, text=f"{a:.1f}% of cells below", font=("Segoe UI", 8), fill="gray30", tags="legend")
+                        c.create_text(x, ty + h8, anchor=anchor, text=f"{e:.1f}% of expressing", font=("Segoe UI", 8), fill="gray30", tags="legend")
+                self.multi_sliders[i].set(*self.levels_of(i))
+                c.coords(self.multi_windows[i], 0, y + h9 + h8 + 6 + 2 * h8 + 4)
+                c.itemconfig(self.multi_windows[i], width=w)
+        end = 8 + row * len(genes)
+        c.create_text(10, end, anchor="nw", text=self.SCALE_UNITS[(dataset, scale)], font=("Segoe UI", 9), fill="gray30", tags="legend")
+        hint = c.create_text(10, end + h8 + 6, anchor="nw", width=w - 20, text="click a square to switch a gene off or on"
+                             + ("; drag the handles for its black and white levels" if linear else ""),
+                             fill="#888888", font=("Segoe UI", 8, "italic"), tags="legend")
+        c.config(height=c.bbox(hint)[3] + 6)
+
+    def new_multi_slider(self, index):
+        from abc_tk_umap import RangeSlider
+        return RangeSlider(self.cbar, lambda lo, hi, i=index: self.on_multi_levels(i, lo, hi))
 
     # ---- the expression of each cell (for the hover), read in the background after a gene is shown
 
@@ -1035,7 +1301,7 @@ class SectionWindow:
             self.finds[key] = res
             self.show_find(key, res)
 
-        self.job(f"Finding {level} {', '.join(map(str, numbers))}...", work, done)
+        self.job(f"Finding {level} {', '.join(map(str, numbers))}...", work, done, overlay=f"Finding {level} {self.and_list(map(str, numbers))}")
 
     def show_find(self, key, res):
         if self.mode != "find":
@@ -1215,8 +1481,10 @@ class SectionWindow:
         self.generation += 1
         self.data = data
         self.pictures = data.pictures
-        self.renders, self.cell_expr, self.finds = {}, {}, {}
+        self.cell_expr, self.finds = {}, {}
         self.shown_genes, self.shown_dataset = [], "standard"
+        self.shown_key = self.base_ranges = None
+        self.show_levels_slider(False)
         self.clear_hover()
         self.hide_marks()
         self.clear_colorbar()
@@ -1229,7 +1497,10 @@ class SectionWindow:
         self.tree = cKDTree(np.column_stack([data.xs, data.ys]))
         pb, dx = data.layout["pixel_bbox"], data.layout["data_xlim"]
         self.px_per_mm = abs(pb[1] - pb[0]) / abs(dx[1] - dx[0]) if dx[1] != dx[0] else 1.0
-        self.view.set_image(data.rgba, keep_view=False)
+        # A gene view of this section that was made before is shown at once: the section's own (Groups) picture is not put up first.
+        wanted = self.wanted_gene_key() if self.mode in ("gene", "imputed") else None
+        made = self.renders.get((data.label,) + wanted + self.render_variant(wanted[0], wanted[2], wanted[1])) if wanted is not None else None
+        self.view.set_image(made[0] if made is not None else data.rgba, keep_view=False)
         self.roi.reset(existing_rois)
         self.update_nav_buttons()
         self.refresh_picture()
@@ -1275,6 +1546,9 @@ def prompt_subregion_selection_tk(adata, abc_cache, section_series, section_labe
     win = SectionWindow(data, abc_cache, spatial=spatial, section_series=section_series, adata=adata, root=parent, existing_rois=existing_rois or (),
                         imputed_state=imputed_state, ensure_imputed=ensure_imputed, session_color_scale=session_color_scale,
                         cell_type_selection=cell_type_selection, navigator=navigator)
+    win.session_view_settings = session_view_settings
+    if initial_view and initial_view.get("gene") and not win.var_gene.get():
+        win.var_gene.set(initial_view["gene"])           # (the session's gene is in the box from the start, also in Groups: Gene then shows it)
     if on_window:
         on_window(win)                  # (the grid shows its waits over this window when it moves to another section)
     try:

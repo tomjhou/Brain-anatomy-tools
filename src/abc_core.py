@@ -1541,10 +1541,13 @@ def gene_symbol_list(adata, imputed_state, use_imputed):
     return adata.var['gene_symbol'].tolist()
 
 
+_gene_render_inputs = {}     # (section, gene, cell type selection, dataset) -> (xs, ys, expression, grey mask) of the last renders (see color_range)
+
+
 def render_gene_expression_array(adata, section_series, section_label, get_spatial, gene_name,
                                   cached_layout, img_w, img_h, dpi=150, on_progress=None,
                                   cell_type_selection='All', color_scale='log',
-                                  expr_adata=None, dataset='standard'):
+                                  expr_adata=None, dataset='standard', color_range=None):
     """Render `gene_name`'s expression across `section_label`'s cells as an
     RGBA array, transparently cached to disk per section+gene+cell-type
     +color-scale (see gene_expression_cache_paths()) so re-showing one
@@ -1617,6 +1620,13 @@ def render_gene_expression_array(adata, section_series, section_label, get_spati
     entry. Omit both (the defaults) to look up and plot straight from
     `adata`, as before.
 
+    `color_range`, if given, is (vmin, vmax) in the units of the color bar
+    (after the color_scale transform): the colormap is scaled to that instead
+    of to the cells' own range (the black and white levels of the section
+    window's slider). Such a picture is neither read from nor written to the
+    disk cache, and the cells' positions and values, kept in memory by the
+    first render of this section and gene, are reused so that it is quick.
+
     Raises ValueError if the gene isn't found, spatial coordinates aren't
     available, or there's no data to plot."""
     def report(frac):
@@ -1634,7 +1644,7 @@ def render_gene_expression_array(adata, section_series, section_label, get_spati
     cache_png, cache_json = gene_expression_cache_paths(
         section_label, resolved_gene, cell_type_selection, color_scale, dataset,
     )
-    if cache_png.exists() and cache_json.exists():
+    if color_range is None and cache_png.exists() and cache_json.exists():
         try:
             rgba = np.asarray(Image.open(cache_png).convert('RGBA'), dtype=np.uint8)
             with open(cache_json) as f:
@@ -1645,58 +1655,65 @@ def render_gene_expression_array(adata, section_series, section_label, get_spati
         except Exception:
             pass  # corrupt/partial cache — fall through and regenerate
 
-    mask = (section_series == section_label).to_numpy()
-    if not mask.any():
-        raise ValueError(f"no cells found for section {section_label}")
+    memo_key = (section_label, resolved_gene, cell_type_selection, dataset)
+    inputs = _gene_render_inputs.get(memo_key)
+    if inputs is None:
+        mask = (section_series == section_label).to_numpy()
+        if not mask.any():
+            raise ValueError(f"no cells found for section {section_label}")
 
-    report(0.15)
-    spatial = get_spatial()
-    if spatial is None:
-        raise ValueError("spatial coordinates not available")
-    xs = pd.to_numeric(spatial['x'], errors='coerce').to_numpy()[mask]
-    ys = pd.to_numeric(spatial['y'], errors='coerce').to_numpy()[mask]
-    valid = ~(np.isnan(xs) | np.isnan(ys))
-    xs, ys = xs[valid], ys[valid]
-    if len(xs) == 0:
-        raise ValueError(f"no spatial coordinates for section {section_label}")
+        report(0.15)
+        spatial = get_spatial()
+        if spatial is None:
+            raise ValueError("spatial coordinates not available")
+        xs = pd.to_numeric(spatial['x'], errors='coerce').to_numpy()[mask]
+        ys = pd.to_numeric(spatial['y'], errors='coerce').to_numpy()[mask]
+        valid = ~(np.isnan(xs) | np.isnan(ys))
+        xs, ys = xs[valid], ys[valid]
+        if len(xs) == 0:
+            raise ValueError(f"no spatial coordinates for section {section_label}")
 
-    row_indices = np.where(mask)[0][valid]
-    report(0.3)
-    if expr_adata is None:
-        expr = adata[row_indices, gene_col].X  # slowest step for backed data — a disk read
-        if hasattr(expr, 'toarray'):
-            expr = expr.toarray()
-        expr = np.asarray(expr).ravel().astype(float)
-    else:
-        # expr_adata doesn't necessarily share adata's cell order/set (see
-        # this function's own docstring) — matched here by cell ID rather
-        # than by position. Cells adata has but expr_adata doesn't get NaN
-        # expression rather than raising.
-        cell_ids = adata.obs_names[row_indices]
-        expr_positions = expr_adata.obs_names.get_indexer(cell_ids)
-        found = expr_positions >= 0
-        expr = np.full(len(cell_ids), np.nan, dtype=float)
-        if found.any():
-            # See _get_full_gene_column's own docstring: this reads (and
-            # caches) the whole gene's column once, up front, instead of
-            # the scattered per-cell backed reads that made this line
-            # extremely slow — expr_positions[found] then just indexes an
-            # in-memory numpy array.
-            expr[found] = _get_full_gene_column(expr_adata, gene_col)[expr_positions[found]]
-    report(0.6)
+        row_indices = np.where(mask)[0][valid]
+        report(0.3)
+        if expr_adata is None:
+            expr = adata[row_indices, gene_col].X  # slowest step for backed data — a disk read
+            if hasattr(expr, 'toarray'):
+                expr = expr.toarray()
+            expr = np.asarray(expr).ravel().astype(float)
+        else:
+            # expr_adata doesn't necessarily share adata's cell order/set (see
+            # this function's own docstring) — matched here by cell ID rather
+            # than by position. Cells adata has but expr_adata doesn't get NaN
+            # expression rather than raising.
+            cell_ids = adata.obs_names[row_indices]
+            expr_positions = expr_adata.obs_names.get_indexer(cell_ids)
+            found = expr_positions >= 0
+            expr = np.full(len(cell_ids), np.nan, dtype=float)
+            if found.any():
+                # See _get_full_gene_column's own docstring: this reads (and
+                # caches) the whole gene's column once, up front, instead of
+                # the scattered per-cell backed reads that made this line
+                # extremely slow — expr_positions[found] then just indexes an
+                # in-memory numpy array.
+                expr[found] = _get_full_gene_column(expr_adata, gene_col)[expr_positions[found]]
+        report(0.6)
 
-    # See this function's own docstring: the picker still has every cell
-    # type at this point, so 'Neurons'/'NonNeurons' don't exclude anything
-    # here — they grey out the *other* type instead, ignoring its actual
-    # expression, while leaving it in place (as opposed to actually
-    # excluding it, which was the original ask — but non-neurons are what
-    # keep section outlines filled in where neurons alone leave gaps, so
-    # dropping them here would have undone that).
-    grey_mask = np.zeros(len(xs), dtype=bool)
-    if cell_type_selection in ('Neurons', 'NonNeurons') and 'class' in spatial.columns:
-        class_ids = extract_leading_numeric_id(spatial['class']).to_numpy()[row_indices]
-        is_non_neuron = np.isin(class_ids, list(NON_NEURON_CLASS_IDS))
-        grey_mask = is_non_neuron if cell_type_selection == 'Neurons' else ~is_non_neuron
+        # See this function's own docstring: the picker still has every cell
+        # type at this point, so 'Neurons'/'NonNeurons' don't exclude anything
+        # here — they grey out the *other* type instead, ignoring its actual
+        # expression, while leaving it in place (as opposed to actually
+        # excluding it, which was the original ask — but non-neurons are what
+        # keep section outlines filled in where neurons alone leave gaps, so
+        # dropping them here would have undone that).
+        grey_mask = np.zeros(len(xs), dtype=bool)
+        if cell_type_selection in ('Neurons', 'NonNeurons') and 'class' in spatial.columns:
+            class_ids = extract_leading_numeric_id(spatial['class']).to_numpy()[row_indices]
+            is_non_neuron = np.isin(class_ids, list(NON_NEURON_CLASS_IDS))
+            grey_mask = is_non_neuron if cell_type_selection == 'Neurons' else ~is_non_neuron
+        inputs = _gene_render_inputs[memo_key] = (xs, ys, expr, grey_mask)
+        while len(_gene_render_inputs) > 6:                    # (a few sections' worth: each is a section's cells, not the atlas)
+            _gene_render_inputs.pop(next(iter(_gene_render_inputs)))
+    xs, ys, expr, grey_mask = inputs
 
     fig = Figure(figsize=(img_w / dpi, img_h / dpi), dpi=dpi)
     FigureCanvasAgg(fig)
@@ -1732,6 +1749,8 @@ def render_gene_expression_array(adata, section_series, section_label, get_spati
     order = np.argsort(color_values)  # plot highest-expressing cells last/on top
     color_vmin = float(np.nanmin(color_values)) if len(color_values) else 0.0
     color_vmax = float(np.nanmax(color_values)) if len(color_values) else 1.0
+    if color_range is not None:
+        color_vmin, color_vmax = color_range
     ax.scatter(xs[colored][order], ys[colored][order], c=color_values[order],
                s=6, cmap='viridis', vmin=color_vmin, vmax=color_vmax, linewidths=0)
     ax.set_xlim(cached_layout['data_xlim'])
@@ -1746,20 +1765,24 @@ def render_gene_expression_array(adata, section_series, section_label, get_spati
     max_expr = float(np.nanmax(expr)) if len(expr) else 0.0
     report(1.0)
 
-    try:
-        Image.fromarray(rgba, mode='RGBA').save(cache_png)
-        with open(cache_json, 'w') as f:
-            json.dump({'max_expr': max_expr, 'color_vmin': color_vmin, 'color_vmax': color_vmax}, f)
-    except Exception as e:
-        print(f"Warning: could not cache gene expression image for '{resolved_gene}': {e}")
+    if color_range is None:
+        try:
+            Image.fromarray(rgba, mode='RGBA').save(cache_png)
+            with open(cache_json, 'w') as f:
+                json.dump({'max_expr': max_expr, 'color_vmin': color_vmin, 'color_vmax': color_vmax}, f)
+        except Exception as e:
+            print(f"Warning: could not cache gene expression image for '{resolved_gene}': {e}")
 
     return rgba, resolved_gene, max_expr, color_vmin, color_vmax
+
+
+_multi_gene_render_inputs = {}     # as _gene_render_inputs, for the overlays: (section, genes joined by '+', cell type selection, dataset) -> (xs, ys, [expression], grey mask)
 
 
 def render_multi_gene_expression_array(adata, section_series, section_label, get_spatial, gene_names,
                                         cached_layout, img_w, img_h, dpi=150, on_progress=None,
                                         cell_type_selection='All', color_scale='log',
-                                        expr_adata=None, dataset='standard'):
+                                        expr_adata=None, dataset='standard', color_ranges=None, hidden=()):
     """Multi-gene (2 or 3) overlay variant of render_gene_expression_array:
     gene_names[0] drives red, [1] green, [2] (if given) blue, blended via
     multi_gene_rgb (module-level, shared with the interactive UMAP viewer's
@@ -1778,8 +1801,20 @@ def render_multi_gene_expression_array(adata, section_series, section_label, get
     actual data range each channel was scaled from — same meaning as
     normalize_expression's own return in the interactive UMAP viewer).
 
+    `color_ranges`, if given, is one (vmin, vmax) per gene, in the units of
+    the legend (after the color_scale transform): each channel is scaled
+    from that range instead of from its genes's own (the black and white
+    levels of the section window's sliders). As for render_gene_expression_
+    array's `color_range`, such a picture bypasses the disk cache and reuses
+    the cells' positions and values kept in memory by an earlier render.
+
+    `hidden`: the numbers (0, 1, 2) of genes whose channel is left out (the
+    legend's colored squares switch a gene off and on); such a picture also
+    bypasses the disk cache.
+
     Raises ValueError if any gene isn't found, spatial coordinates aren't
     available, or there's no data to plot."""
+    custom = color_ranges is not None or bool(hidden)
     def report(frac):
         if on_progress is not None:
             on_progress(frac)
@@ -1793,9 +1828,9 @@ def render_multi_gene_expression_array(adata, section_series, section_label, get
     resolved_genes = [str(gene_source.var['gene_symbol'].iloc[c]) for c in gene_cols]
 
     cache_png, cache_json = gene_expression_cache_paths(
-        section_label, '+'.join(resolved_genes), cell_type_selection, color_scale, dataset,
+        section_label, '+'.join(resolved_genes) + '+grey', cell_type_selection, color_scale, dataset,      # ('+grey': pictures made on the old black background are not reused)
     )
-    if cache_png.exists() and cache_json.exists():
+    if not custom and cache_png.exists() and cache_json.exists():
         try:
             rgba = np.asarray(Image.open(cache_png).convert('RGBA'), dtype=np.uint8)
             with open(cache_json) as f:
@@ -1806,48 +1841,55 @@ def render_multi_gene_expression_array(adata, section_series, section_label, get
         except Exception:
             pass  # corrupt/partial cache — fall through and regenerate
 
-    mask = (section_series == section_label).to_numpy()
-    if not mask.any():
-        raise ValueError(f"no cells found for section {section_label}")
+    memo_key = (section_label, '+'.join(resolved_genes), cell_type_selection, dataset)
+    inputs = _multi_gene_render_inputs.get(memo_key)
+    if inputs is None:
+        mask = (section_series == section_label).to_numpy()
+        if not mask.any():
+            raise ValueError(f"no cells found for section {section_label}")
 
-    report(0.15)
-    spatial = get_spatial()
-    if spatial is None:
-        raise ValueError("spatial coordinates not available")
-    xs = pd.to_numeric(spatial['x'], errors='coerce').to_numpy()[mask]
-    ys = pd.to_numeric(spatial['y'], errors='coerce').to_numpy()[mask]
-    valid = ~(np.isnan(xs) | np.isnan(ys))
-    xs, ys = xs[valid], ys[valid]
-    if len(xs) == 0:
-        raise ValueError(f"no spatial coordinates for section {section_label}")
+        report(0.15)
+        spatial = get_spatial()
+        if spatial is None:
+            raise ValueError("spatial coordinates not available")
+        xs = pd.to_numeric(spatial['x'], errors='coerce').to_numpy()[mask]
+        ys = pd.to_numeric(spatial['y'], errors='coerce').to_numpy()[mask]
+        valid = ~(np.isnan(xs) | np.isnan(ys))
+        xs, ys = xs[valid], ys[valid]
+        if len(xs) == 0:
+            raise ValueError(f"no spatial coordinates for section {section_label}")
 
-    row_indices = np.where(mask)[0][valid]
-    report(0.3)
+        row_indices = np.where(mask)[0][valid]
+        report(0.3)
 
-    def gene_expr(gene_col):
-        # Same per-gene extraction as render_gene_expression_array's own
-        # single-gene branch, just factored out so it can run once per gene.
-        if expr_adata is None:
-            e = adata[row_indices, gene_col].X
-            if hasattr(e, 'toarray'):
-                e = e.toarray()
-            return np.asarray(e).ravel().astype(float)
-        cell_ids = adata.obs_names[row_indices]
-        expr_positions = expr_adata.obs_names.get_indexer(cell_ids)
-        found = expr_positions >= 0
-        e = np.full(len(cell_ids), np.nan, dtype=float)
-        if found.any():
-            e[found] = _get_full_gene_column(expr_adata, gene_col)[expr_positions[found]]
-        return e
+        def gene_expr(gene_col):
+            # Same per-gene extraction as render_gene_expression_array's own
+            # single-gene branch, just factored out so it can run once per gene.
+            if expr_adata is None:
+                e = adata[row_indices, gene_col].X
+                if hasattr(e, 'toarray'):
+                    e = e.toarray()
+                return np.asarray(e).ravel().astype(float)
+            cell_ids = adata.obs_names[row_indices]
+            expr_positions = expr_adata.obs_names.get_indexer(cell_ids)
+            found = expr_positions >= 0
+            e = np.full(len(cell_ids), np.nan, dtype=float)
+            if found.any():
+                e[found] = _get_full_gene_column(expr_adata, gene_col)[expr_positions[found]]
+            return e
 
-    exprs = [gene_expr(c) for c in gene_cols]
-    report(0.5)
+        exprs = [gene_expr(c) for c in gene_cols]
+        report(0.5)
 
-    grey_mask = np.zeros(len(xs), dtype=bool)
-    if cell_type_selection in ('Neurons', 'NonNeurons') and 'class' in spatial.columns:
-        class_ids = extract_leading_numeric_id(spatial['class']).to_numpy()[row_indices]
-        is_non_neuron = np.isin(class_ids, list(NON_NEURON_CLASS_IDS))
-        grey_mask = is_non_neuron if cell_type_selection == 'Neurons' else ~is_non_neuron
+        grey_mask = np.zeros(len(xs), dtype=bool)
+        if cell_type_selection in ('Neurons', 'NonNeurons') and 'class' in spatial.columns:
+            class_ids = extract_leading_numeric_id(spatial['class']).to_numpy()[row_indices]
+            is_non_neuron = np.isin(class_ids, list(NON_NEURON_CLASS_IDS))
+            grey_mask = is_non_neuron if cell_type_selection == 'Neurons' else ~is_non_neuron
+        inputs = _multi_gene_render_inputs[memo_key] = (xs, ys, exprs, grey_mask)
+        while len(_multi_gene_render_inputs) > 6:
+            _multi_gene_render_inputs.pop(next(iter(_multi_gene_render_inputs)))
+    xs, ys, exprs, grey_mask = inputs
     colored = ~grey_mask
 
     def transform(values):
@@ -1867,8 +1909,14 @@ def render_multi_gene_expression_array(adata, section_series, section_label, get
             return (values - vmin) / (vmax - vmin), vmin, vmax
         return np.zeros_like(values), vmin, vmax
 
-    normalized = [normalize(transform(e[colored])) for e in exprs]
-    norms = [n[0] for n in normalized]
+    def normalize_to(values, vmin, vmax):
+        return (np.clip((values - vmin) / (vmax - vmin), 0.0, 1.0) if vmax > vmin else np.zeros_like(values)), vmin, vmax
+
+    if color_ranges is None:
+        normalized = [normalize(transform(e[colored])) for e in exprs]
+    else:
+        normalized = [normalize_to(transform(e[colored]), lo, hi) for e, (lo, hi) in zip(exprs, color_ranges)]
+    norms = [np.zeros_like(n[0]) if i in hidden else n[0] for i, n in enumerate(normalized)]
     color_vmins = [n[1] for n in normalized]
     color_vmaxes = [n[2] for n in normalized]
     report(0.65)
@@ -1877,14 +1925,13 @@ def render_multi_gene_expression_array(adata, section_series, section_label, get
 
     fig = Figure(figsize=(img_w / dpi, img_h / dpi), dpi=dpi)
     FigureCanvasAgg(fig)
-    # Black, same reasoning as render_gene_expression_array's own — and the
-    # same baseline multi_gene_rgb was given above, so a genuinely
-    # zero-expression cell (all three channels at their baseline) actually
-    # disappears into it rather than reading as a dim but visible dot.
-    fig.patch.set_facecolor('black')
+    # Dark grey, as the interactive UMAP viewer's multi-gene plots (its MULTI_BG): a zero-expression cell is black (the baseline multi_gene_rgb
+    # was given above), so on a black background it would melt into it; on this grey it shows.
+    background = (26 / 255, 26 / 255, 26 / 255)
+    fig.patch.set_facecolor(background)
     px_x0, px_x1, px_y0, px_y1 = cached_layout['pixel_bbox']
     ax = fig.add_axes([px_x0 / img_w, px_y0 / img_h, (px_x1 - px_x0) / img_w, (px_y1 - px_y0) / img_h])
-    ax.set_facecolor('black')
+    ax.set_facecolor(background)
     if grey_mask.any():
         ax.scatter(xs[grey_mask], ys[grey_mask], c=[[0.15, 0.15, 0.15]], s=6, linewidths=0)
     # Brightest-overall-last/on-top (sum of channels), same "don't let a dim
@@ -1905,12 +1952,13 @@ def render_multi_gene_expression_array(adata, section_series, section_label, get
     max_exprs = [float(np.nanmax(e)) if len(e) else 0.0 for e in exprs]
     report(1.0)
 
-    try:
-        Image.fromarray(rgba, mode='RGBA').save(cache_png)
-        with open(cache_json, 'w') as f:
-            json.dump({'max_exprs': max_exprs, 'color_vmins': color_vmins, 'color_vmaxes': color_vmaxes}, f)
-    except Exception as e:
-        print(f"Warning: could not cache multi-gene expression image for {resolved_genes}: {e}")
+    if not custom:
+        try:
+            Image.fromarray(rgba, mode='RGBA').save(cache_png)
+            with open(cache_json, 'w') as f:
+                json.dump({'max_exprs': max_exprs, 'color_vmins': color_vmins, 'color_vmaxes': color_vmaxes}, f)
+        except Exception as e:
+            print(f"Warning: could not cache multi-gene expression image for {resolved_genes}: {e}")
 
     return rgba, resolved_genes, max_exprs, color_vmins, color_vmaxes
 

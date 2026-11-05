@@ -1205,10 +1205,14 @@ class UmapWindow(ExportsMixin):
         self.color_label = ttk.Label(f, text="Color by", font=("Segoe UI", 13, "bold"))
         self.color_label.pack(anchor="w")
         self.var_mode = tk.StringVar(f, "all")
-        for value, text in (("all", "All groups"), ("single", "Specific group(s)"), ("gene", "Gene"), ("imputed", "Imputed Gene")):
-            if value == "imputed" and self.own is not None:
-                continue                                                  # (there is no imputed dataset behind a dataset of the user's own)
-            ttk.Radiobutton(f, text=text, value=value, variable=self.var_mode, command=self.on_mode).pack(anchor="w")
+        modes = ttk.Frame(f)                                              # (two to a row, in two columns of equal width: they line up)
+        modes.pack(fill=tk.X)
+        modes.columnconfigure(0, weight=1, uniform="mode")
+        modes.columnconfigure(1, weight=1, uniform="mode")
+        shown = [(value, text) for value, text in (("all", "All groups"), ("single", "Specific group(s)"), ("gene", "Gene"), ("imputed", "Imputed Gene"))
+                 if not (value == "imputed" and self.own is not None)]     # (there is no imputed dataset behind a dataset of the user's own)
+        for k, (value, text) in enumerate(shown):
+            ttk.Radiobutton(modes, text=text, value=value, variable=self.var_mode, command=self.on_mode).grid(row=k // 2, column=k % 2, sticky="w")
         opacity_row = ttk.Frame(f)
         opacity_row.pack(fill=tk.X, pady=(8, 0))
         self.var_opacity = tk.IntVar(opacity_row, DEFAULT_OPACITY_INDEX)
@@ -1331,7 +1335,7 @@ class UmapWindow(ExportsMixin):
             w.destroy()
         for k, name in enumerate(self.levels):
             rb = ttk.Radiobutton(self.level_frame, text=self.level_names[name], value=name, variable=self.var_level, command=self.on_level)
-            rb.grid(row=k // 2, column=k % 2, sticky="w", padx=(0, 14))
+            rb.grid(row=k, column=0, sticky="w")                       # (one column, coarse to fine, top to bottom)
             HoverTip(rb, self.level_tip)
 
     def level_tip(self):

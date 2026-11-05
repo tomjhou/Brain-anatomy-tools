@@ -881,9 +881,8 @@ def offer_atlas_release_update(cache):
         f"    in use:  {current}",
         f"    newest:  {latest}",
         "",
-        "Switching may re-download any data files that changed between releases",
-        "(already-downloaded files are kept), and results saved from the older",
-        "release may no longer match new runs.",
+        "Switching may re-download any data files that changed between releases (already-downloaded files are kept), "
+        "and results saved from the older release may no longer match new runs.",
         "",
         "Switch to the newest release?",
     ])

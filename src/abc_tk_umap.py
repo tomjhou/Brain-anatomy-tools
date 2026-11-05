@@ -18,6 +18,7 @@ import re
 from pathlib import Path
 import threading
 import time
+import types
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk
@@ -462,6 +463,8 @@ class PointCanvas:
         self.on_view = None                         # fn() after a redraw
         self.on_change = None                       # fn(zoom, dx, dy) after the user zoomed or panned (the view, relative to the whole view)
         self.pan_from = None
+        self.panel_hook = None                      # when set (the whole-panel zoom of the section maps): its wheel, drag and double-click act on the panel, not on this view
+        self.panel_zoom = 1.0                       # how much the whole panel is enlarged: the dots grow with it
         self.opacity = 1.0                          # of one cell's dot, below 1 overlapping dots add up (the Opacity slider)
         self.kernels = {}                           # dot diameter -> the disc used to spread dots when they are blended
         self.marker_factor = 1.0                    # times the size of the hover ring and of the + marks
@@ -489,7 +492,7 @@ class PointCanvas:
             c.bind(release, self.pan_end)
         c.bind("<Motion>", lambda e: self.on_motion and self.on_motion(e.x, e.y), add="+")
         c.bind("<Leave>", lambda e: self.on_motion and self.on_motion(None, None))
-        c.bind("<Double-Button-1>", lambda e: (self.fit(), self.announce()))
+        c.bind("<Double-Button-1>", lambda e: self.panel_hook.reset() if self.panel_hook else (self.fit(), self.announce()))
 
     # ---- geometry
 
@@ -566,6 +569,9 @@ class PointCanvas:
         return x, self.cy + (-dy if self.flip_y else dy)
 
     def zoom_at(self, px, py, factor):
+        if self.panel_hook is not None:
+            self.panel_hook.zoom(self.canvas, px, py, factor)
+            return
         x, y = self.to_data(px, py)
         before = self.scale
         fs = self.fit_scale()
@@ -583,9 +589,15 @@ class PointCanvas:
         self.announce()
 
     def pan_start(self, e):
+        if self.panel_hook is not None:
+            self.panel_hook.pan_start(e)
+            return
         self.pan_from = (e.x, e.y, self.cx, self.cy)
 
     def pan_move(self, e):
+        if self.panel_hook is not None:
+            self.panel_hook.pan_move(e)
+            return
         if self.pan_from is None:
             return
         x0, y0, cx, cy = self.pan_from
@@ -631,7 +643,7 @@ class PointCanvas:
             if "size_mm" in lay:                                              # (a size on the tissue: the same at any window size)
                 d = int(max(round(lay["size_mm"] * self.dot_factor * self.scale), 1))
             else:
-                d = int(max(round(lay["size"] * zoom ** 0.7), 1))          # (the dots grow as the view is zoomed in)
+                d = int(max(round(lay["size"] * (zoom * self.panel_zoom) ** 0.7), 1))          # (the dots grow as the view, or the whole panel, is zoomed in)
             x, y = lay["x"], lay["y"]
             pm = d / self.scale
             m = (x >= self.cx - hw - pm) & (x <= self.cx + hw + pm) & (y >= self.cy - hh - pm) & (y <= self.cy + hh + pm)
@@ -1140,10 +1152,20 @@ class UmapWindow(ExportsMixin):
         HoverTip(self.ccf_scale, lambda: "How opaque the cells are while the CCF atlas is shown: lower it to see the outlines better. "
                                          "The outlines stay fully opaque.")
         self.ccf_outlines = None
+        self.panel_zoom = 1.0                                                                  # (the whole-panel zoom: see set_panel_zoom)
+        self.panel_hook = types.SimpleNamespace(zoom=self.panel_zoom_at, pan_start=self.panel_pan_start, pan_move=self.panel_pan_move, reset=lambda: self.set_panel_zoom(1.0))
+        self.var_panel_zoom = tk.BooleanVar(bars, False)
+        panel_zoom_box = ttk.Checkbutton(bars, text="Zoom whole panel", variable=self.var_panel_zoom, command=self.apply_panel_zoom_mode)
+        panel_zoom_box.grid(row=2, column=4, sticky="w", padx=(12, 6))
+        HoverTip(panel_zoom_box, lambda: "Off: the wheel zooms into each section map, which stays in its panel (clipped by its border). "
+                                         "On: the wheel zooms the whole panel, the borders and the sections together, and a drag moves the pane; "
+                                         "sections scrolled out of view are not drawn. Double-click puts the panel back.")
         bars.columnconfigure(3, weight=1)
         self.tile_scroll = tk.Canvas(left, highlightthickness=0, bg="#f4f4f4")
         sb = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.tile_scroll.yview)
-        self.tile_scroll.configure(yscrollcommand=lambda a, b: (sb.set(a, b), self.root.after_idle(self.refresh_visible)))
+        self.hsb = ttk.Scrollbar(left, orient=tk.HORIZONTAL, command=self.tile_scroll.xview)        # (shown only while the panel is zoomed in)
+        self.tile_scroll.configure(yscrollcommand=lambda a, b: (sb.set(a, b), self.root.after_idle(self.refresh_visible)),
+                                   xscrollcommand=lambda a, b: (self.hsb.set(a, b), self.root.after_idle(self.refresh_visible)))
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         sb.bind("<MouseWheel>", lambda e: self.tile_scroll.yview_scroll(-1 if e.delta > 0 else 1, "units"))
         self.tile_scroll.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -1432,6 +1454,8 @@ class UmapWindow(ExportsMixin):
             pc.opacity = OPACITIES[self.var_opacity.get()]
             pc.marker_factor = MARKER_SIZES[self.var_marker.get()]
             pc.visible_fn = lambda fr=fr: self.frame_visible(fr)
+            pc.panel_zoom = self.panel_zoom
+            pc.panel_hook = self.panel_hook if self.var_panel_zoom.get() else None
             if not self.tiles:
                 pc.enable_scalebar()                       # (the first section's panel carries the scale bar)
             tile = {"item": item, "label": s, "frame": fr, "pc": pc, "title": title, "token": token, "tree": None}
@@ -1548,6 +1572,11 @@ class UmapWindow(ExportsMixin):
         """A slider of `parent` with `n` stops (0 .. n-1), not yet placed: it jumps from stop to stop, shows `value_text(stop)` in the label `shown`, and
         calls `command()` when the stop changes. The same width wherever it is."""
         scale = ttk.Scale(parent, from_=0, to=n - 1, orient=tk.HORIZONTAL, length=130)
+        pending = []
+
+        def run():
+            pending.clear()
+            command()
 
         def moved(v):
             i = int(round(float(v)))
@@ -1557,7 +1586,11 @@ class UmapWindow(ExportsMixin):
             shown.config(text=value_text(i))
             if var.get() != i:
                 var.set(i)
-                command()
+                # The command (laying out and drawing all the section maps again, say) is slow: run inside the drag it held up the mouse events,
+                # which the slider then went on working through after the button was let go. So the thumb moves at once, and the work follows.
+                if pending:
+                    scale.after_cancel(pending[0])
+                pending[:] = [scale.after(30, run)]
 
         scale.config(command=moved)
         scale.set(var.get())
@@ -1617,7 +1650,7 @@ class UmapWindow(ExportsMixin):
             return
         cols = TILE_COLUMNS[self.var_tile.get()]
         w = max(self.tile_scroll.winfo_width(), 100)
-        px = int(max((w - 4) // cols - 8 - 2, MIN_TILE_PX))          # (8: the gaps either side of a panel; 2: its canvas border)
+        px = int(max((w - 4) // cols - 8 - 2, MIN_TILE_PX) * self.panel_zoom)          # (8: the gaps either side of a panel; 2: its canvas border)
         if cols == self.tile_cols and px == self.tile_px:
             return
         self.tile_cols, self.tile_px = cols, px
@@ -1629,10 +1662,67 @@ class UmapWindow(ExportsMixin):
         fh = max(t["frame"].winfo_reqheight() for t in self.tiles)
         for k, t in enumerate(self.tiles):                            # (8 across and 6 down between panels, as the grid had)
             x, y = 4 + (k % cols) * (fw + 8), 3 + (k // cols) * (fh + 6)
-            t["frame"].tile_y = y                                     # (where it is in the scrolled canvas: see frame_visible)
+            t["frame"].tile_x, t["frame"].tile_y = x, y               # (where it is in the scrolled canvas: see frame_visible)
             self.tile_scroll.coords(t["item"], x, y)
         rows = -(-len(self.tiles) // cols)
         self.tile_scroll.configure(scrollregion=(0, 0, 4 + cols * (fw + 8), 3 + rows * (fh + 6)))
+        self.root.after_idle(self.refresh_visible)
+
+    # ---- zooming the whole panel (the borders and the sections together)
+
+    MAX_PANEL_ZOOM = 8.0
+
+    def apply_panel_zoom_mode(self):
+        """The Zoom whole panel checkbox. On: every section map is put back to its whole view and the wheel then zooms the panel. Off: the panel is
+        put back to its size, and the wheel zooms into each section again."""
+        on = self.var_panel_zoom.get()
+        for t in self.tiles:
+            t["pc"].panel_hook = self.panel_hook if on else None
+            if on:
+                t["pc"].fit()
+        if on:
+            self.tile_stop_before_zoom = self.var_tile.get()          # (the section maps start at their smallest, 1/6 of the width: to zoom into)
+            self.sliders[0].set(TILE_COLUMNS.index(max(TILE_COLUMNS)))
+        else:
+            self.set_panel_zoom(1.0)
+            if getattr(self, "tile_stop_before_zoom", None) is not None:
+                self.sliders[0].set(self.tile_stop_before_zoom)       # (and back to what they were)
+                self.tile_stop_before_zoom = None
+
+    def set_panel_zoom(self, zoom, anchor=None):
+        """Enlarge the whole panel to `zoom` times its size (1 to MAX_PANEL_ZOOM): the panels are laid out again, bigger, so that borders, gaps and
+        sections grow together, and only those in view are drawn. `anchor` = (x, y in the scrolled pane, x, y in the window): the point that stays
+        under the pointer."""
+        zoom = min(max(zoom, 1.0), self.MAX_PANEL_ZOOM)
+        if abs(zoom - self.panel_zoom) < 1e-9 or not self.tiles:
+            return
+        old = [float(v) for v in self.tile_scroll.cget("scrollregion").split()] or [0, 0, 1, 1]
+        self.panel_zoom = zoom
+        for t in self.tiles:
+            t["pc"].panel_zoom = zoom
+        self.layout_tiles()
+        if zoom > 1.0:
+            self.hsb.pack(side=tk.BOTTOM, fill=tk.X, before=self.tile_scroll)
+        else:
+            self.hsb.pack_forget()
+        new = [float(v) for v in self.tile_scroll.cget("scrollregion").split()]
+        if anchor is not None and old[2] > 0 and old[3] > 0 and new[2] > 0 and new[3] > 0:
+            ax, ay, wx, wy = anchor
+            self.tile_scroll.xview_moveto(min(max((ax * new[2] / old[2] - wx) / new[2], 0.0), 1.0))
+            self.tile_scroll.yview_moveto(min(max((ay * new[3] / old[3] - wy) / new[3], 0.0), 1.0))
+        self.root.after_idle(self.refresh_visible)
+
+    def panel_zoom_at(self, canvas, px, py, factor):
+        """The wheel over a section map (px, py in that map) while the whole panel is zoomed: about the pointer."""
+        wx = canvas.winfo_rootx() + px - self.tile_scroll.winfo_rootx()
+        wy = canvas.winfo_rooty() + py - self.tile_scroll.winfo_rooty()
+        self.set_panel_zoom(self.panel_zoom * factor, (self.tile_scroll.canvasx(wx), self.tile_scroll.canvasy(wy), wx, wy))
+
+    def panel_pan_start(self, e):
+        self.tile_scroll.scan_mark(e.x_root - self.tile_scroll.winfo_rootx(), e.y_root - self.tile_scroll.winfo_rooty())
+
+    def panel_pan_move(self, e):
+        self.tile_scroll.scan_dragto(e.x_root - self.tile_scroll.winfo_rootx(), e.y_root - self.tile_scroll.winfo_rooty(), gain=1)
         self.root.after_idle(self.refresh_visible)
 
     def apply_dot_size(self):
@@ -1806,7 +1896,13 @@ class UmapWindow(ExportsMixin):
         """Whether a section panel is (at least partly) in the scrolled pane."""
         top, h = getattr(fr, "tile_y", fr.winfo_y()), fr.winfo_reqheight()
         vt, vh = self.tile_scroll.canvasy(0), self.tile_scroll.winfo_height()
-        return top + h > vt and top < vt + vh
+        if not (top + h > vt and top < vt + vh):
+            return False
+        left = getattr(fr, "tile_x", None)                          # (sideways too, while the whole panel is zoomed in)
+        if left is None:
+            return True
+        vl, vw = self.tile_scroll.canvasx(0), self.tile_scroll.winfo_width()
+        return left + fr.winfo_reqwidth() > vl and left < vl + vw
 
     def refresh_visible(self):
         """Panels that were off screen when they were recolored or moved are made now that they are on screen."""

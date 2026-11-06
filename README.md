@@ -61,7 +61,7 @@ C57BL6J-638850):
 - Color the cells by cell type (at any level of the atlas' taxonomy) or by the expression of any gene, including the imputed genes.
 - Export the cells' coordinates, e.g. to plot them in the CCF browser.
 
-The first time, it asks where to keep the atlas download. Choose a drive with plenty of room: the download can reach about 100 GB.
+The first time, it asks where to keep the atlas download. Choose a drive with plenty of room: the download can reach about 80 GB (9 GB for the core atlas, 50 GB for the imputed gene dataset, and room for newer atlas releases).
 The browser shows its progress, and now and then asks a question, in a text window beside its own: keep that window visible.
 
 There is also a stand-alone Windows version, with nothing to install:

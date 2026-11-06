@@ -618,9 +618,9 @@ def show_coordinate_settings_dialog(abc_cache):
 # choose_atlas_cache_location) and the choice is remembered in this file.
 DEFAULT_ATLAS_CACHE_DIR = DEFAULTS_DIR / 'abc_atlas_cache'
 ATLAS_CACHE_LOCATION_FILE = CACHE_DIR / 'abc_atlas_cache_location.json'
-# Free space a drive should have to hold the atlas download. A typical cache for
-# this app, including the imputed gene dataset, is around 75 GB.
-ATLAS_CACHE_SPACE_NEEDED_GB = 100
+# Free space a drive should have to hold the atlas download. Everything this app downloads, the imputed gene dataset included, is about
+# 60 GB; the rest is room for a newer atlas release (a revised file is downloaded beside the old one, up to about 9 GB) and to spare.
+ATLAS_CACHE_SPACE_NEEDED_GB = 80
 ATLAS_CORE_GB = 9                  # ...of which the core atlas (the cell table and the raw expression data) every session needs
 ATLAS_IMPUTED_GB = 50              # ...and the imputed gene dataset, only when imputed genes are asked for
 

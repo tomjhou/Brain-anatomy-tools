@@ -1496,8 +1496,12 @@ class UmapWindow(ExportsMixin):
             self.add_slider(bars, 2, "Marker size:", self.var_marker, len(MARKER_SIZES), self.apply_marker_size, lambda i: marker_names[i], None,
                             label_tip="The size of the marks on the highlighted cells only (the ring under the pointer and the red + marks), "
                                       "not of the other cells' dots.")]
-        ttk.Style(self.root).configure("Stacked.TButton", justify="center", padding=(10, 4))       # (room round the text)
-        ttk.Button(bars, text="Reset\nslider\ndefault", width=0, style="Stacked.TButton",          # (on three lines: narrow, as tall as the sliders)
+        # The buttons on three lines (narrow, as tall as the sliders). On macOS an ordinary button's bezel is drawn at the system's one height,
+        # a line of text, whatever the button's own: the three lines were cut to one. A Toolbutton's bevel there takes the button's height.
+        aqua = self.root.tk.call("tk", "windowingsystem") == "aqua"
+        self.stacked_style = "Stacked.Toolbutton" if aqua else "Stacked.TButton"
+        ttk.Style(self.root).configure(self.stacked_style, justify="center", padding=(10, 4), anchor="center")       # (room round the text)
+        ttk.Button(bars, text="Reset\nslider\ndefault", width=0, style=self.stacked_style,
                    command=self.reset_sliders).grid(row=0, column=0, rowspan=3, sticky="nsw")
         # the checkboxes, in two columns: Hover highlight, ROI only, Zoom whole panel; then CCF atlas overlay, with its slider under it
         self.var_roi_only = tk.BooleanVar(bars, False)
@@ -1579,7 +1583,7 @@ class UmapWindow(ExportsMixin):
                             label_tip="The size of the cells' dots in the UMAP (the same setting as UMAP circle size in Settings)."),
             self.add_slider(umap_bar, 1, "Label size:", self.var_label, len(LABEL_SIZES), self.apply_label_size,
                             lambda i: LABEL_SIZE_NAMES[i], None)]
-        ttk.Button(umap_bar, text="Reset\nslider\ndefault", width=0, style="Stacked.TButton",
+        ttk.Button(umap_bar, text="Reset\nslider\ndefault", width=0, style=self.stacked_style,
                    command=self.reset_umap_sliders).grid(row=0, column=0, rowspan=2, sticky="nsw")
         umap_bar.columnconfigure(4, weight=1)      # (the spare width goes to an empty column on the right: the controls stay where they are)
         c = self.coords

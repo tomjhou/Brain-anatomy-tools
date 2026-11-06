@@ -11,6 +11,10 @@ the "All neurons" dataset: Neurons, every section, a random ALL_NEURONS_CAP of t
 the window was closed or Exit was clicked. The cell type is None for a new run (not chosen yet) and unused for an existing one (the run says which it is).
 """
 import os
+import queue
+import sys
+import subprocess
+import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -456,6 +460,79 @@ class RunPicker:
         return self.result
 
 
+def check_for_update(root, button):
+    """The launch screen's Update… button: looks on GitHub for newer commits (in a thread: the network), says what is new, and on a yes
+    brings the apps' folder up to date (git pull for a clone, else GitHub's ZIP: see app_update.py) and offers to restart the browser."""
+    import app_update
+    done = queue.Queue()
+
+    def work(job, *args):
+        try:
+            done.put((True, job(*args)))
+        except app_update.UpdateError as e:
+            done.put((False, str(e)))
+        except Exception as e:                      # (anything unforeseen: still reported, not a button stuck on "Checking…")
+            done.put((False, f"{type(e).__name__}: {e}"))
+
+    def run(job, *args, then, label):
+        button.config(text=label, state=tk.DISABLED)
+        root.config(cursor="watch")
+        threading.Thread(target=work, args=(job,) + args, daemon=True).start()
+
+        def poll():
+            try:
+                ok, value = done.get_nowait()
+            except queue.Empty:
+                root.after(100, poll)
+                return
+            then(ok, value)
+        poll()
+
+    def finish(text=None, error=False):
+        button.config(text="Update…", state=tk.NORMAL)
+        root.config(cursor="")
+        if text:
+            (messagebox.showerror if error else messagebox.showinfo)("Update", text, parent=root)
+
+    def checked(ok, value):
+        if not ok:
+            return finish(value, True)
+        if not value:
+            return finish("You have the newest version.")
+        shown = "\n".join("  • " + line for line in value[:12]) + (f"\n  ... and {len(value) - 12} more" if len(value) > 12 else "")
+        root.config(cursor="")
+        if not messagebox.askyesno("Update", f"{len(value)} new change{'s' if len(value) != 1 else ''} on GitHub:\n\n{shown}\n\n"
+                                   "Download them now?", parent=root):
+            return finish()
+        run(app_update.pull, folder, then=pulled, label="Updating…")
+
+    def pulled(ok, value):
+        if not ok:
+            return finish(value, True)
+        finish()
+        if messagebox.askyesno("Update", "Updated. The new version runs after the browser restarts.\n\nRestart it now?", parent=root):
+            root.destroy()
+            restart()
+
+    try:
+        folder = app_update.repo_root()
+    except app_update.UpdateError as e:
+        return finish(str(e), True)
+    run(app_update.check, folder, then=checked, label="Checking…")
+
+
+def restart():
+    """Starts the browser again in the same console window (app_update.relaunch() would start it with none, hiding its progress output),
+    and ends this one."""
+    args = [sys.executable, os.path.abspath(sys.argv[0])] + sys.argv[1:]
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if os.name == "nt":
+        subprocess.Popen(args, close_fds=True)
+        os._exit(0)                                  # (not sys.exit: background loading threads would hold it open)
+    os.execv(sys.executable, args)                  # (macOS / Linux: the same process, so the same Terminal window)
+
+
 def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
     """`helpers`: load_recent_output_folders(), remember_recent_output_folder(folder), required_cached_run_files(folder) ->
     {label: Path}, open_3d_viewer(abc_cache), settings_dialog(abc_cache)."""
@@ -470,6 +547,9 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
     top.pack(fill=tk.X)
     ttk.Label(top, text="AllenABC UMAP Explorer", font=("Segoe UI", 20, "bold")).pack(side=tk.LEFT)
     ttk.Button(top, text="Settings…", command=lambda: helpers["settings_dialog"](abc_cache)).pack(side=tk.RIGHT, anchor="n")
+    if not getattr(sys, "frozen", False):                   # (the packaged .exe is not a folder from GitHub: nothing to update)
+        update_button = ttk.Button(top, text="Update…", command=lambda: check_for_update(root, update_button))
+        update_button.pack(side=tk.RIGHT, anchor="n", padx=(0, 6))
 
     ttk.Label(outer, text="Output folder (where runs are saved and loaded from):", font=("Segoe UI", 11)).pack(anchor="w", pady=(18, 4))
     row = ttk.Frame(outer)

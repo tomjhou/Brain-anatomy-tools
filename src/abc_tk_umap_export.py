@@ -48,7 +48,7 @@ def section_map_columns(n, panel_w_in, panel_h_in, choice, screen_cols):
     that makes the figure closest to a square, and if it cannot be square, taller than wide is preferred to wider than tall (a small extra cost
     for wider: it decides between layouts about as far from a square, but never picks a tall thin strip over a wide one that is much closer to a
     square); a layout that leaves few empty places is preferred to one that leaves many. Only the panels count in the shape: the legend band under
-    them goes as far past the square as it needs to. The panels' size is set by the Section map size slider, so the figure is as big as that makes it."""
+    them goes as far past the square as it needs to. The panels' size is set by the Section size slider, so the figure is as big as that makes it."""
     pad, title = PANEL_PAD_IN, PANEL_TITLE_IN
     if choice == "screen":
         return max(1, screen_cols)
@@ -343,7 +343,7 @@ class ExportsMixin:
 
     def section_map_plan(self, choice):
         """What a saved section map will be for this choice of panels across ('auto', 'screen' or a number): the layout, and the size of the picture.
-        A panel's size in the picture follows the Section map size slider and nothing else (not the window or the screen): at full width it is
+        A panel's size in the picture follows the Section size slider and nothing else (not the window or the screen): at full width it is
         SECTION_MAPS_FULL_WIDTH_PX pixels wide, at one half of the width half of that, and so on; its shape is the shape of the panels on the screen."""
         dpi = self.host["SECTION_MAPS_SAVE_DPI"]
         n = len(self.tiles)
@@ -366,12 +366,12 @@ class ExportsMixin:
         w_px, h_px = plan["px"]
         mp = w_px * h_px / 1e6
         png = (f"{plan['cols']} panel{'s' if plan['cols'] > 1 else ''} across and {plan['rows']} down" + (", the legend under them" if plan["band_h"] else "") + ". "
-               f"Each panel is {plan['panel_px'][0]:,} x {plan['panel_px'][1]:,} pixels (set by the Section map size slider, not by the window). "
+               f"Each panel is {plan['panel_px'][0]:,} x {plan['panel_px'][1]:,} pixels (set by the Section size slider, not by the window). "
                f"The picture is {w_px:,} x {h_px:,} pixels ({mp:.0f} megapixels, about {w_px * h_px * 4 / 1e6:,.0f} MB of memory to make).")
         if mp > 250:
-            png += " That is very large: use more panels across, or a smaller Section map size."
+            png += " That is very large: use more panels across, or a smaller Section size."
         svg = f"The page is {plan['width']:.1f} x {plan['height']:.1f} inches."
-        jpg = (f" This one is too big for a JPG, which can be at most {JPG_MAX_SIDE_PX:,} pixels on a side: use more panels across, or a smaller Section map size."
+        jpg = (f" This one is too big for a JPG, which can be at most {JPG_MAX_SIDE_PX:,} pixels on a side: use more panels across, or a smaller Section size."
                if max(w_px, h_px) > JPG_MAX_SIDE_PX else "")
         return png, svg, jpg
 
@@ -527,7 +527,7 @@ class ExportsMixin:
             big = max(self.section_map_plan(parse_panels_across(getattr(self, "export_panels_across", "")))["px"])
             if big > JPG_MAX_SIDE_PX:
                 self.var_status.set(f"A JPG can be at most {JPG_MAX_SIDE_PX:,} pixels on a side and this picture would be {big:,}: use more panels across, "
-                                    "a smaller Section map size, or a PNG.")
+                                    "a smaller Section size, or a PNG.")
                 return
         roi_only = "_ROI_only" if self.var_roi_only.get() else ""        # (the ROI only box above the panels: the name says what the maps show)
         ccf = "_CCF-overlay" if any(t["pc"].outlines for t in self.tiles) else ""        # (and the CCF atlas box)
@@ -1015,24 +1015,6 @@ class ExportsMixin:
         return {"groups": groups, "shell_xyz": shell_xyz, "outline": outline, "axis_labels": axis_labels, "structures": structures,
                 "title": f"3D view: {level_name.lower()} {', '.join(str(t) for t in targets)} ({scope})", "have_ccf": have_ccf, "level": level,
                 "targets": targets}
-
-    def show_3d(self):
-        if self.busy:
-            return
-        self.root.config(cursor="watch")
-        self.var_status.set("Preparing the 3D view...")
-        self.root.update()
-        try:
-            p = self.prepare_3d("opening the 3D view")
-            if p is not None:
-                self.view3d = getattr(self, "view3d", [])
-                self.view3d.append(self.host["open_3d_group_view"](p["groups"], p["shell_xyz"], p["outline"], p["axis_labels"], p["title"]))
-                self.var_status.set("3D view opened: drag to rotate, click legend entries to hide/show a group."
-                                    + ("" if p["have_ccf"] else " (CCF unavailable: section coordinates, so the sections look stacked.)"))
-        except Exception as e:
-            self.var_status.set(f"Could not open the 3D view: {e}")
-            print(f"Could not open the 3D view: {e}", flush=True)
-        self.root.config(cursor="")
 
     def show_3d_browser(self):
         if self.busy:

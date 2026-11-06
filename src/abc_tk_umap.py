@@ -51,7 +51,7 @@ LEVEL_NAMES = {"class": "Class", "subclass": "Subclass", "supertype": "Supertype
 NOT_IN_TAXONOMY = ("leiden", "neurotransmitter")        # the levels that are not a step down from the one above (so a group's table is just its own row)
 TILE_PX = 230
 MIN_TILE_PX = 50
-TILE_COLUMNS = (6, 5, 4, 3, 2, 1)         # the Section map size slider's stops: how many panels fit across the pane (1/6 of its width ... all of it)
+TILE_COLUMNS = (6, 5, 4, 3, 2, 1)         # the Section size slider's stops: how many panels fit across the pane (1/6 of its width ... all of it)
 OUTLINE_PX_LARGEST = 2                    # the CCF outlines' width (pixels) at the largest section map size (one pixel at the others)
 DEFAULT_TILE_INDEX = 4                    # (two across)
 CELL_SIZES_UM = (20, 30, 40, 50, 60, 70, 80, 90, 100)       # the Cell size slider's stops: the width of a cell's dot in the section panels, in microns
@@ -230,6 +230,9 @@ def blend_dots(img, px, py, rgb, d, opacity, kernel_cache, kernel=None):
     piled on each other show it: where n dots overlap, the pixel is their average color covering the background with 1 - (1 - opacity) ** n."""
     h, w = img.shape[:2]
     W, H = w + 2 * d, h + 2 * d
+    keep = (px >= 0) & (px < W) & (py >= 0) & (py < H)       # (a point just past the margin would land on the wrong row, or past the end)
+    if not keep.all():
+        px, py, rgb = px[keep], py[keep], rgb[keep]
     flat = py * W + px
     size = H * W
     st = np.empty((H, W, 4), np.float32)
@@ -944,6 +947,9 @@ class PointCanvas:
         """Dots of different shapes: `marks` is a marker code for each point. Later points are on top of earlier ones, whatever their shape (each
         point writes its number at its pixel; each shape grows those numbers with its own kernel; the biggest number wins where they meet)."""
         h, w = img.shape[:2]
+        keep = (px >= -d) & (px < w + d) & (py >= -d) & (py < h + d)       # (the caller's margin is d, inclusive, and rounding can put a point
+        if not keep.all():                                               # exactly on its far edge: outside the margin of d the arrays below have)
+            px, py, rgb, marks = px[keep], py[keep], rgb[keep], marks[keep]
         if d > BIG_DOT_PX:                                               # (very big dots, so few on screen: one by one)
             for X, Y, c, code in zip(px.tolist(), py.tolist(), rgb.tolist(), marks.tolist()):
                 draw_big_marker(img, X, Y, c, d, int(code))
@@ -1192,7 +1198,7 @@ class UmapWindow(ExportsMixin):
         except tk.TclError:
             pass
         loading =ttk.Label(self.root, text="Preparing the UMAP viewer...", font=("Segoe UI", 14), padding=40)
-        loading.pack()
+        loading.place(relx=0.5, rely=0.5, anchor="center")     # (in the middle of the window, which already fills the screen)
         self.root.update()
         self.msgs = queue.Queue()
         self.busy = False
@@ -1350,6 +1356,7 @@ class UmapWindow(ExportsMixin):
     # ---- the window
 
     def build(self):
+        self.tiles = []                    # (made by build_tiles; empty until then, for the scroll callbacks that can come first)
         self.pw = pw = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         pw.pack(fill=tk.BOTH, expand=True)
         # the section panels
@@ -1364,29 +1371,38 @@ class UmapWindow(ExportsMixin):
         self.dot_factors = [um / (DOT_MM * 1000) for um in CELL_SIZES_UM]          # (times DOT_MM)
         marker_names = ("Small", "Medium", "Large")
         self.sliders = [
-            self.add_slider(bars, 0, "Section map size:", self.var_tile, len(TILE_COLUMNS), self.layout_tiles,
+            self.add_slider(bars, 0, "Section size:", self.var_tile, len(TILE_COLUMNS), self.layout_tiles,
                             lambda i: "full width" if TILE_COLUMNS[i] == 1 else f"1/{TILE_COLUMNS[i]} width", None),
             self.add_slider(bars, 1, "Cell size:", self.var_dot, len(CELL_SIZES_UM), self.apply_dot_size,
-                            lambda i: f"{CELL_SIZES_UM[i]} \u00b5m", None),
-            self.add_slider(bars, 2, "Marker size:", self.var_marker, len(MARKER_SIZES), self.apply_marker_size, lambda i: marker_names[i], None)]
+                            lambda i: f"{CELL_SIZES_UM[i]} \u00b5m", None,
+                            label_tip="The size of every cell's dot in the section maps: all the neurons or glia shown, not only the highlighted ones."),
+            self.add_slider(bars, 2, "Marker size:", self.var_marker, len(MARKER_SIZES), self.apply_marker_size, lambda i: marker_names[i], None,
+                            label_tip="The size of the marks on the highlighted cells only (the ring under the pointer and the red + marks), "
+                                      "not of the other cells' dots.")]
         ttk.Button(bars, text="Reset to default", command=self.reset_sliders).grid(row=0, column=0, rowspan=3, sticky="nsw")
+        # the checkboxes, in two columns: Hover highlight, ROI only, Zoom whole panel; then CCF atlas overlay, with its slider under it
         self.var_roi_only = tk.BooleanVar(bars, False)
         roi_only_box = ttk.Checkbutton(bars, text="ROI only", variable=self.var_roi_only, command=self.apply_roi_only)
-        roi_only_box.grid(row=0, column=4, sticky="w", padx=(12, 6))
-        HoverTip(roi_only_box, lambda: "The cells outside the ROIs go gray, on a white background: only the ROIs are colored. Saved section maps "
-                                       "have the same look (and, as an SVG, the gray cells are pictures, so the file stays small).")
+        roi_only_box.grid(row=1, column=4, sticky="w", padx=(12, 6))
+        if self.rois:
+            HoverTip(roi_only_box, lambda: "The cells outside the ROIs go gray, on a white background: only the ROIs are colored. Saved section maps "
+                                           "have the same look (and, as an SVG, the gray cells are pictures, so the file stays small).")
+        else:
+            roi_only_box.state(["disabled"])
+            HoverTip(roi_only_box, lambda: "This project has no ROIs.")
         self.var_ccf = tk.BooleanVar(bars, False)
-        ccf_row = ttk.Frame(bars)
-        ccf_row.grid(row=1, column=4, sticky="w", padx=(12, 6))
-        ccf_box = ttk.Checkbutton(ccf_row, text="CCF atlas", variable=self.var_ccf, command=self.apply_ccf)
-        ccf_box.pack(side=tk.LEFT)
-        HoverTip(ccf_box, lambda: "Draw the outlines of the Allen CCF (2020) regions over the section maps. Placed by the cells' reconstructed "
-                                  "coordinates, they are the atlas's own; otherwise fitted to each section from the CCF position of its cells "
-                                  "(the first time reads the CCF coordinates of the cells: a minute or so).")
+        ccf_box = ttk.Checkbutton(bars, text="CCF atlas overlay", variable=self.var_ccf, command=self.apply_ccf)
+        ccf_box.grid(row=1, column=5, sticky="w", padx=(6, 6))
+        HoverTip(ccf_box, lambda: "Draw the outlines of the regions of the Allen Mouse Brain Common Coordinate Framework (CCF, 2020 version) "
+                                  "over the section maps. Placed by the cells' reconstructed coordinates, they are the atlas's own; otherwise "
+                                  "fitted to each section from the CCF position of its cells (the first time reads the CCF coordinates of the "
+                                  "cells: a minute or so).")
+        ccf_row = ttk.Frame(bars)                                                              # (its slider, under it)
+        ccf_row.grid(row=2, column=5, sticky="w", padx=(26, 6))
         self.var_ccf_opacity = tk.IntVar(bars, DEFAULT_OPACITY_INDEX)                          # (full: the cells as they are)
         ccf_shown = ttk.Label(ccf_row, width=5)
         self.ccf_scale = self.stop_slider(ccf_row, ccf_shown, self.var_ccf_opacity, len(OPACITIES), self.apply_ccf_opacity, lambda i: f"{OPACITIES[i] * 100:g}%")
-        self.ccf_scale.pack(side=tk.LEFT, padx=(12, 0))
+        self.ccf_scale.pack(side=tk.LEFT)
         ccf_shown.pack(side=tk.LEFT, padx=(6, 0))
         self.ccf_scale.state(["disabled"])                                                      # (until the atlas is shown)
         HoverTip(self.ccf_scale, lambda: "How opaque the cells are while the CCF atlas is shown: lower it to see the outlines better. "
@@ -1401,10 +1417,13 @@ class UmapWindow(ExportsMixin):
         HoverTip(panel_zoom_box, lambda: "Off: the wheel zooms into each section map, which stays in its panel (clipped by its border). "
                                          "On: the wheel zooms the whole panel, the borders and the sections together, and a drag moves the pane; "
                                          "sections scrolled out of view are not drawn. Double-click puts the panel back.")
-        self.var_hover = tk.BooleanVar(bars, bool(self.viewer_settings.get("hover_enabled", True)))          # (the same setting as in the Settings window)
-        hover_box = ttk.Checkbutton(bars, text="Enable hover highlighting", variable=self.var_hover, command=self.apply_hover_enabled)
-        hover_box.grid(row=0, column=5, sticky="nw", padx=(6, 6))
-        HoverTip(hover_box, lambda: "Highlight the cell under the pointer, and its group, in the plots (the same setting as in Settings).")
+        # (the same setting as in the Settings window; but off to begin with for "Browse All Neurons", whose many small maps make it distracting,
+        # and there the box is for this window alone: see apply_hover_enabled)
+        self.var_hover = tk.BooleanVar(bars, False if self.start_panel_zoom else bool(self.viewer_settings.get("hover_enabled", True)))
+        hover_box = ttk.Checkbutton(bars, text="Hover highlight", variable=self.var_hover, command=self.apply_hover_enabled)
+        hover_box.grid(row=0, column=4, sticky="w", padx=(12, 6))
+        HoverTip(hover_box, lambda: "When the pointer rests on a cell, dim the plots and mark every cell of its group with a red +. Off: no "
+                                    "marking, but the cell is still ringed and described in the cell info panel (the same setting as in Settings).")
         bars.columnconfigure(3, weight=1)
         self.tile_scroll = tk.Canvas(left, highlightthickness=0, bg="#f4f4f4")
         sb = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.tile_scroll.yview)
@@ -1633,9 +1652,8 @@ class UmapWindow(ExportsMixin):
         rows = ((("Settings...", self.open_settings, False), ("Open data folder", self.open_data_folder, False)),
                 (("Save section maps", self.save_section_maps, False), ("Save UMAP", self.save_umap, False)),
                 (("Export DEGs", self.export_degs, True), ("Export expression", self.export_expression, True)),
-                (("Export coordinates", self.export_coordinates, True), ("3D view", self.show_3d, True)),
-                (("3D in browser", self.show_3d_browser, True), ("Analyze...", self.open_analyze, False)),
-                (("Create subproject", self.analyze_subset, False),),
+                (("Export coordinates", self.export_coordinates, True), ("3D in browser", self.show_3d_browser, True)),
+                (("Analyze...", self.open_analyze, False), ("Create subproject", self.analyze_subset, False)),
                 (("Close", self.close, False),))
         for r, pair in enumerate(rows):
             for c, (text, cmd, grouped) in enumerate(pair):
@@ -1645,8 +1663,6 @@ class UmapWindow(ExportsMixin):
                     self.group_buttons.append(b)
                 if self.own is not None and text == "Save section maps":
                     b.state(["disabled"])                                 # (no section maps)
-                if text == "3D view":
-                    HoverTip(b, lambda: "Deprecated: 3D in browser does this much better.")
                 if text == "Create subproject":
                     HoverTip(b, lambda: "Analyze only the groups switched on in the legend: a project of its own, in a subfolder of this one, with its own "
                                         "PCA and UMAP, opened in a second window.")
@@ -1858,10 +1874,14 @@ class UmapWindow(ExportsMixin):
         shown.config(text=value_text(var.get()))
         return scale
 
-    def add_slider(self, parent, row, text, var, n, command, value_text, tip_text):
+    def add_slider(self, parent, row, text, var, n, command, value_text, tip_text, label_tip=None):
         """A slider with `n` stops (0 .. n-1): it jumps from stop to stop, shows `value_text(stop)` beside it, and calls `command()` when the
-        stop changes. `tip_text(stop)`, if given, is shown in a tip while the pointer is over the slider. Returns the slider."""
-        ttk.Label(parent, text=text).grid(row=row, column=1, sticky="w", padx=(12, 6))
+        stop changes. `tip_text(stop)`, if given, is shown in a tip while the pointer is over the slider, and `label_tip` (a string) over
+        its label. Returns the slider."""
+        label = ttk.Label(parent, text=text)
+        label.grid(row=row, column=1, sticky="w", padx=(12, 6))
+        if label_tip is not None:
+            HoverTip(label, lambda: label_tip)
         shown = ttk.Label(parent, width=19)
         shown.grid(row=row, column=3, sticky="w", padx=(6, 0))
         scale = self.stop_slider(parent, shown, var, n, command, value_text)
@@ -1905,7 +1925,7 @@ class UmapWindow(ExportsMixin):
         self.layout_tiles()
 
     def layout_tiles(self):
-        """The panels are a third, a half or all of the pane's width (the Section map size buttons), as many to a row as that gives; the
+        """The panels are a third, a half or all of the pane's width (the Section size slider), as many to a row as that gives; the
         pane scrolls to the rest. While the whole panel is zoomed they are bigger than the pane, by up to 100 times: each is then a virtual
         canvas (PointCanvas.set_virtual), of which the widget is only the part in view (place_tiles)."""
         if not getattr(self, "tiles", None):
@@ -3606,7 +3626,7 @@ class UmapWindow(ExportsMixin):
 
     def hover(self, info):
         """The pointer is on a cell (info) or on none (None). The ring and description are immediate; once it rests, the plots dim and, a
-        little later, the cell's group is marked with red '+' signs."""
+        little later, the cell's group is marked with red '+' signs (only those two are turned off by the Hover highlight box)."""
         if info is None:
             self.cancel_hover_jobs()
             self.hover_key = None
@@ -3614,6 +3634,9 @@ class UmapWindow(ExportsMixin):
             self.clear_highlights()
             return
         self.show_info(info)
+        if not self.var_hover.get():
+            self.hover_key = None                    # (so that ticking the box again marks the next cell pointed at)
+            return
         if info["key"] == self.hover_key:
             return
         self.cancel_hover_jobs()
@@ -3693,14 +3716,14 @@ class UmapWindow(ExportsMixin):
         return True
 
     def umap_motion(self, px, py):
-        if px is None or not self.viewer_settings.get("hover_enabled", True):
+        if px is None:
             self.hover(None)
             return
         i = self.umap.nearest(self.umap_tree, px, py)
         self.hover(None if i is None else self.cell_info(i, "umap"))
 
     def tile_motion(self, tile, px, py):
-        if px is None or not self.viewer_settings.get("hover_enabled", True):
+        if px is None:
             self.hover(None)
             return
         if tile["tree"] is None:
@@ -3731,12 +3754,21 @@ class UmapWindow(ExportsMixin):
     # ---- Settings and the UMAP parameters
 
     def apply_hover_enabled(self):
-        """The Enable hover highlighting box above the section maps: the setting of the same name in Settings, saved as it is when that is."""
-        self.viewer_settings["hover_enabled"] = bool(self.var_hover.get())
-        if "save_viewer_settings" in self.host:
-            self.host["save_viewer_settings"](self.viewer_settings)
+        """The Hover highlight box above the section maps: the setting of the same name in Settings, saved as it is when that is. Off: no
+        dimming and no red '+' signs; the hovered cell's ring and its description in the cell info panel stay. In "Browse All Neurons" (which
+        starts with it off) it is for this window only, so the saved setting, for the other projects, is not changed."""
+        if not self.start_panel_zoom:
+            self.viewer_settings["hover_enabled"] = bool(self.var_hover.get())
+            if "save_viewer_settings" in self.host:
+                self.host["save_viewer_settings"](self.viewer_settings)
         if not self.var_hover.get():
-            self.hover(None)
+            self.drop_highlights()
+
+    def drop_highlights(self):
+        """Hover highlight was turned off: the dimming and '+' signs of the cell under the pointer go (its ring and description stay)."""
+        self.cancel_hover_jobs()
+        self.hover_key = None
+        self.clear_highlights()
 
     def open_settings(self):
         dialog = self.host.get("settings_dialog")
@@ -3748,11 +3780,13 @@ class UmapWindow(ExportsMixin):
         new_params = new.pop("umap_params", None)        # (belong to this run, not to the user's preferences)
         shape_changed = new.get("gene456_shape") != self.viewer_settings.get("gene456_shape")
         size_changed = new.get("umap_circle_size") != self.viewer_settings.get("umap_circle_size")
+        hover_changed = bool(new.get("hover_enabled", True)) != bool(self.viewer_settings.get("hover_enabled", True))
         self.viewer_settings.update(new)
         self.host["save_viewer_settings"](self.viewer_settings)
-        self.var_hover.set(bool(self.viewer_settings.get("hover_enabled", True)))
-        if not self.viewer_settings.get("hover_enabled", True):
-            self.hover(None)
+        if hover_changed or not self.start_panel_zoom:          # (Browse All Neurons: the box keeps its own state unless the setting itself changed)
+            self.var_hover.set(bool(self.viewer_settings.get("hover_enabled", True)))
+        if not self.var_hover.get():
+            self.drop_highlights()
         if (size_changed or (shape_changed and self.mode in ("gene", "imputed"))) and not self.busy:
             self.recolor()
         if new_params is not None and self.params is not None:

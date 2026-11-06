@@ -5668,7 +5668,7 @@ def prompt_viewer_settings_dialog(parent_window, current_settings, umap_params=N
     dialog.resizable(False, False)
 
     hover_var = tk.BooleanVar(value=current_settings['hover_enabled'])
-    tk.Checkbutton(dialog, text="Enable hover highlighting", variable=hover_var, anchor='w').pack(
+    tk.Checkbutton(dialog, text="Hover highlight", variable=hover_var, anchor='w').pack(
         fill='x', padx=12, pady=(12, 6))
 
     size_frame = tk.Frame(dialog)

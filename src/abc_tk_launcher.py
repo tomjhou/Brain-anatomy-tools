@@ -6,8 +6,9 @@ viewer launcher, the settings window), so this file has no start-up side effects
 
     outcome = prompt_startup_panel_tk(out_folder, abc_cache, helpers)
 
-`outcome` is (action, cell_type_selection, load_folder, out_folder) with action 'new_run' or 'load_existing', or None if the window was closed
-or Exit was clicked. The cell type is None for a new run (not chosen yet) and unused for an existing one (the run says which it is).
+`outcome` is (action, cell_type_selection, load_folder, out_folder) with action 'new_run', 'load_existing', 'own_dataset' or 'all_neurons' (make
+the "All neurons" dataset: Neurons, every section, a random ALL_NEURONS_CAP of them; an existing one comes back with its folder as load_folder), or None if
+the window was closed or Exit was clicked. The cell type is None for a new run (not chosen yet) and unused for an existing one (the run says which it is).
 """
 import os
 import tkinter as tk
@@ -20,7 +21,11 @@ RECOVERABLE = {"ROI coordinates", "Processed AnnData"}      # (cached files of a
 
 
 SUBSAMPLE_CAPS = (("200,000 cells (recommended)", 200_000), ("No limit: every cell", None))
-LARGE_PROJECT_CELLS = 200_000            # a selection of more cells than this is a "large project": the dialog asks how to handle it
+ALL_NEURONS_CAP = 500_000                # "Browse All Neurons": a random this many neurons from every section, saved as ALL_NEURONS_FOLDER
+ALL_NEURONS_LABEL = "All neurons"
+ALL_NEURONS_FOLDER = f"umap_neurons_allsections_All-neurons_sub{ALL_NEURONS_CAP}"       # (the name a run of Neurons / all sections / this label / this cap gets)
+ALL_NEURONS_FOLDER_UNNAMED = f"umap_neurons_allsections_sub{ALL_NEURONS_CAP}"           # (the same run made through the ordinary route, with no project name)
+LARGE_PROJECT_CELLS = 200_000          # a selection of more cells than this is a "large project": the dialog asks how to handle it
 
 
 def bring_to_front(root):
@@ -543,15 +548,50 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
     def viewer3d():
         helpers["open_3d_viewer"](abc_cache)                # (returns when that window is closed; this one is still here)
 
+    def all_neurons():
+        folder = committed_folder()
+        if folder is None:
+            return
+        # made on an earlier day, as "All neurons" or as the same run with no project name: simply opened, like any saved run
+        existing = next((folder / n for n in (ALL_NEURONS_FOLDER, ALL_NEURONS_FOLDER_UNNAMED) if (folder / n / "umap_coords.csv").exists()), None)
+        if existing is not None:
+            required = helpers["required_cached_run_files"](existing)
+            missing = [f"{label}: {path}" for label, path in required.items() if label not in RECOVERABLE and not path.exists()]
+            if missing:
+                messagebox.showerror("Missing cached files", "The saved \"All neurons\" dataset is missing required cached file(s):\n\n" + "\n".join(missing), parent=root)
+                return
+            helpers["remember_recent_output_folder"](folder)
+            result["outcome"] = ("all_neurons", None, existing, folder)           # (with the folder: opened, not made)
+            root.destroy()
+            return
+        if not messagebox.askokcancel(
+                "Browse all neurons",
+                f"There is no \"All neurons\" dataset in this output folder yet, so one will be made now.\n\n"
+                f"It takes a random {ALL_NEURONS_CAP:,} of the neurons from every section of the brain atlas (the whole atlas has millions), "
+                "and computes a UMAP of them, with clusters.\n\n"
+                "This can take a while (tens of minutes, or longer the first time, if the atlas is still downloading). "
+                "It is saved in the output folder, so from then on this button opens it straight away.\n\n"
+                "Proceed?", parent=root):
+            return
+        helpers["remember_recent_output_folder"](folder)
+        result["outcome"] = ("all_neurons", None, None, folder)
+        root.destroy()
+
     ttk.Separator(outer).pack(fill=tk.X, pady=(20, 14))
     style = ttk.Style(root)
     style.configure("Big.TButton", font=("Segoe UI", 12), padding=(10, 9))
-    # the one most used button (a saved run) is by itself at the top, with a gap under it before the others
-    ttk.Button(outer, text="Load Existing ROI Dataset…", style="Big.TButton", command=load_existing).pack(fill=tk.X, pady=(4, 0))
-    ttk.Frame(outer, height=26).pack(fill=tk.X)
-    for text, command in (("Open Brain Browser/ROI Chooser", new_run), ("Open Your Own Dataset (.h5ad)…", own_dataset),
-                          ("Open 3D Viewer…", viewer3d), ("Exit", root.destroy)):
-        ttk.Button(outer, text=text, style="Big.TButton", command=command).pack(fill=tk.X, pady=4)
+    ttk.Button(outer, text="Browse All Neurons", style="Big.TButton", command=all_neurons).pack(fill=tk.X, pady=4)
+    ttk.Button(outer, text="Open Brain Browser/ROI Chooser", style="Big.TButton", command=new_run).pack(fill=tk.X, pady=4)
+    pair = ttk.Frame(outer)                                         # (the two less used ones share a row)
+    pair.pack(fill=tk.X, pady=4)
+    pair.columnconfigure((0, 1), weight=1, uniform="pair")
+    ttk.Button(pair, text="Open Your Own Dataset…", style="Big.TButton", command=own_dataset).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+    ttk.Button(pair, text="Open 3D Viewer…", style="Big.TButton", command=viewer3d).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+    # a saved run, set apart so that it stands out: space above and below it
+    ttk.Frame(outer, height=22).pack(fill=tk.X)
+    ttk.Button(outer, text="Load Existing ROI Dataset…", style="Big.TButton", command=load_existing).pack(fill=tk.X, pady=4)
+    ttk.Frame(outer, height=22).pack(fill=tk.X)
+    ttk.Button(outer, text="Exit", style="Big.TButton", command=root.destroy).pack(fill=tk.X, pady=4)
 
     root.protocol("WM_DELETE_WINDOW", root.destroy)
     root.update_idletasks()

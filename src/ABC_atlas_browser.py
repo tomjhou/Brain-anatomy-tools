@@ -6295,7 +6295,8 @@ def prompt_startup_panel(out_folder):
     (the full pipeline, Step 0 onward), load a previously computed run's cached files directly into the interactive UMAP viewer, or open
     the 3D viewer. (The matplotlib version of this screen was removed: the cell type is no longer asked here at all.)
 
-    Returns (action, cell_type_selection, load_folder, chosen_out_folder): action is 'new_run' or 'load_existing'; cell_type_selection is
+    Returns (action, cell_type_selection, load_folder, chosen_out_folder): action is 'new_run', 'load_existing', 'own_dataset' or
+    'all_neurons' (make the "All neurons" dataset: see abc_tk_launcher.ALL_NEURONS_CAP); cell_type_selection is
     None for a new run (asked after the sections and ROIs are confirmed) and unused for 'load_existing'; load_folder is the chosen run
     folder (a Path) when action is 'load_existing', else None; chosen_out_folder is the output folder the user settled on (a Path, already
     created) — the caller should adopt it as the working directory for this session.
@@ -11052,7 +11053,7 @@ def show_own_dataset_window(own, abc_cache, project_folder=None):
 
 
 def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_backed=None, rois=None,
-                                  run_folder=None):
+                                  run_folder=None, panel_zoom=False):
     """Interactive UMAP viewer, opened once the embedding (adata.obsm[
     'X_umap']) is computed. A vertical hand-rolled radio on the right picks
     what colors the scatter:
@@ -11164,7 +11165,8 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         host['preload_imputed'] = preload_imputed_gene_dataset
         host['umap_circle_sizes'] = UMAP_CIRCLE_SIZE_REGISTRY
         show_umap_window_tk(adata, abc_cache, imputed_state=imputed_state, adata_backed=adata_backed, rois=rois, run_folder=run_folder,
-                            ensure_imputed=ensure_imputed_gene_dataset_loaded, title=tk_title, host=host, params=tk_params)
+                            ensure_imputed=ensure_imputed_gene_dataset_loaded, title=tk_title, host=host, params=tk_params,
+                            panel_zoom=panel_zoom)
         return
 
     # This window builds one Axes (plus its own scatter/text/spine
@@ -18521,6 +18523,11 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         cell_type_selection = prompt_cell_type_selection()
         startup_action, load_existing_folder = 'new_run', None
 
+    # "Browse All Neurons" opens the viewer with Zoom whole panel ticked; an All neurons dataset already made is opened like any saved run.
+    browse_all_neurons = startup_action == 'all_neurons'
+    if browse_all_neurons and load_existing_folder is not None:
+        startup_action = 'load_existing'
+
     # The Tk launch screen doesn't ask for the cell type: it is asked once the sections and ROIs are confirmed (below), and the picker
     # shows every cell until then.
     if cell_type_selection is not None:
@@ -18646,7 +18653,7 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
             show_interactive_umap_window(
                 adata, abc_cache,
                 imputed_state=imputed_state,
-                adata_backed=adata_backed, rois=rois, run_folder=Path(load_existing_folder),
+                adata_backed=adata_backed, rois=rois, run_folder=Path(load_existing_folder), panel_zoom=browse_all_neurons,
             )
         except Exception as e:
             log_status(f"Step 9: Could not open the interactive UMAP viewer: {e}")
@@ -18680,20 +18687,25 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
     # ---------------------------------------------------------------------------
     # Section subset selection
     # ---------------------------------------------------------------------------
-    try:
-        print("Attempting to open the clickable section-thumbnail picker...")
-        selected_sections, sections_suffix, rois, imputed_adata_from_picker = prompt_section_selection_gui(
-            adata, abc_cache, section_series, out_folder=out_folder, cell_type_selection=cell_type_selection or 'All',
-            imputed_state=imputed_state,
-        )
-    except UserCancelledSelection:
-        print("Section/ROI selection cancelled; returning to the startup panel.")
-        return
-    except Exception as e:
-        print(f"GUI section picker unavailable ({e}); falling back to console prompt.")
-        selected_sections, sections_suffix = prompt_section_selection(section_series)
-        rois = []
-        imputed_adata_from_picker = None
+    all_neurons_run = startup_action == 'all_neurons'
+    if all_neurons_run:
+        # "Browse All Neurons" (abc_tk_launcher): every section, no ROIs, so there is nothing to pick.
+        selected_sections, sections_suffix, rois, imputed_adata_from_picker = None, 'allsections', [], None
+    else:
+        try:
+            print("Attempting to open the clickable section-thumbnail picker...")
+            selected_sections, sections_suffix, rois, imputed_adata_from_picker = prompt_section_selection_gui(
+                adata, abc_cache, section_series, out_folder=out_folder, cell_type_selection=cell_type_selection or 'All',
+                imputed_state=imputed_state,
+            )
+        except UserCancelledSelection:
+            print("Section/ROI selection cancelled; returning to the startup panel.")
+            return
+        except Exception as e:
+            print(f"GUI section picker unavailable ({e}); falling back to console prompt.")
+            selected_sections, sections_suffix = prompt_section_selection(section_series)
+            rois = []
+            imputed_adata_from_picker = None
     # One window now settles everything the analysis would otherwise stop to ask (cell type, the most cells in the UMAP, the ROI run's
     # label, the optional plots), so that it can then run unattended. Without a window (no display), the questions come one by one at the
     # console as they always did (run_options stays None).
@@ -18712,32 +18724,39 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         finally:
             count_state['done'] = True
 
-    threading.Thread(target=count_in_background, daemon=True).start()
-    try:
-        from abc_tk_launcher import choose_run_options
-        def folder_for(cell_type, project_name, cap):
-            """The folder a project with these choices is saved in (as the analysis below will name it), for the options window to show."""
-            sections_part, region_part, _roi_sections = region_naming(sections_suffix, rois)
-            name = f'umap_{CELL_TYPE_SUFFIXES[cell_type]}_{sections_part}{region_part}'
-            if sanitize_run_label(project_name):
-                name += f'_{sanitize_run_label(project_name)}'
-            counted = count_state['counts']
-            n = counted.get(cell_type) if counted else None
-            if cap is not None and n is not None and n > cap:
-                name += f'_sub{cap}'
-            return Path(out_folder) / name
+    if all_neurons_run:
+        # Neurons from every section, a random ALL_NEURONS_CAP of them, named "All neurons": nothing to ask, and no need to count (far more than the cap).
+        from abc_tk_launcher import ALL_NEURONS_CAP, ALL_NEURONS_LABEL
+        run_options = {'cell_type': 'Neurons', 'cap': ALL_NEURONS_CAP, 'label': ALL_NEURONS_LABEL, 'optional_plots': False}
+        count_state['done'] = True
+    else:
+        threading.Thread(target=count_in_background, daemon=True).start()
+    if not all_neurons_run:
+        try:
+            from abc_tk_launcher import choose_run_options
+            def folder_for(cell_type, project_name, cap):
+                """The folder a project with these choices is saved in (as the analysis below will name it), for the options window to show."""
+                sections_part, region_part, _roi_sections = region_naming(sections_suffix, rois)
+                name = f'umap_{CELL_TYPE_SUFFIXES[cell_type]}_{sections_part}{region_part}'
+                if sanitize_run_label(project_name):
+                    name += f'_{sanitize_run_label(project_name)}'
+                counted = count_state['counts']
+                n = counted.get(cell_type) if counted else None
+                if cap is not None and n is not None and n > cap:
+                    name += f'_sub{cap}'
+                return Path(out_folder) / name
 
-        run_options = choose_run_options(cell_type_selection or 'Neurons', folder_for=folder_for, whole_brain=whole_brain, count_state=count_state)
-        if run_options is None:
-            print("Analysis options cancelled; returning to the startup panel.")
-            return
-    except Exception as e:
-        print(f"Analysis options window unavailable ({e}); the questions will be asked here instead.")
-        if whole_brain and not confirm_whole_brain():
-            print("Whole-brain run not confirmed; returning to the startup panel.")
-            return
-        if cell_type_selection is None:
-            cell_type_selection = prompt_cell_type_selection()
+            run_options = choose_run_options(cell_type_selection or 'Neurons', folder_for=folder_for, whole_brain=whole_brain, count_state=count_state)
+            if run_options is None:
+                print("Analysis options cancelled; returning to the startup panel.")
+                return
+        except Exception as e:
+            print(f"Analysis options window unavailable ({e}); the questions will be asked here instead.")
+            if whole_brain and not confirm_whole_brain():
+                print("Whole-brain run not confirmed; returning to the startup panel.")
+                return
+            if cell_type_selection is None:
+                cell_type_selection = prompt_cell_type_selection()
     if run_options is not None:
         cell_type_selection = run_options['cell_type']
         print(f"Analysis options: {run_options}")
@@ -19271,7 +19290,7 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
             # The shared state already holds whatever the picker loaded
             # (imputed_adata_from_picker is that same object, when set).
             imputed_state=imputed_state,
-            adata_backed=adata_backed, rois=rois, run_folder=run_folder,
+            adata_backed=adata_backed, rois=rois, run_folder=run_folder, panel_zoom=browse_all_neurons,
         )
     except Exception as e:
         log_status(f"Step 9: Could not open the interactive UMAP viewer: {e}")

@@ -178,17 +178,30 @@ def shows_working(method):
     return wrapper
 
 
+def target_list(target):
+    """The group (or groups, combined) Selectivity looks at, as a list of indexes: `target` may be one index, a list of them, or None."""
+    if target is None:
+        return []
+    return [int(t) for t in np.atleast_1d(target)]
+
+
 def other_group_sizes(counts, target, min_cells=MIN_GROUP_CELLS):
-    """The cell counts of the groups other than `target` that have at least `min_cells` cells, largest first (the order Selectivity takes them in)."""
-    return [int(counts[g]) for g in np.argsort(-counts, kind="stable") if g != target and counts[g] >= min_cells]
+    """The cell counts of the groups other than `target` (one group or several) that have at least `min_cells` cells, largest first (the order Selectivity takes them in)."""
+    own = set(target_list(target))
+    return [int(counts[g]) for g in np.argsort(-counts, kind="stable") if int(g) not in own and counts[g] >= min_cells]
 
 
 def selectivity_values(means, counts, target, k, floor=SELECTIVITY_FLOOR, min_cells=MIN_GROUP_CELLS):
     """(x, y, how many other groups were used) for every gene: x is the gene's mean in the `target` group, y the ratio of that to the highest
     mean among the `k` largest other groups with at least `min_cells` cells (`floor` is added to both, so that a gene the others do not express at
     all has a large ratio, not an infinite one). `means`: genes x groups; `counts`: the cells of each group."""
-    others = [int(g) for g in np.argsort(-counts, kind="stable") if g != target and counts[g] >= min_cells][:k]
-    x = means[:, target].astype(float)
+    own = target_list(target)
+    others = [int(g) for g in np.argsort(-counts, kind="stable") if int(g) not in own and counts[g] >= min_cells][:k]
+    if len(own) == 1:
+        x = means[:, own[0]].astype(float)
+    else:                                                     # several groups, combined: the mean of all their cells (each group's mean weighted by its cells)
+        weights = counts[own].astype(float)
+        x = (means[:, own].astype(float) * weights).sum(axis=1) / max(weights.sum(), 1.0)
     top = means[:, others].max(axis=1).astype(float) if others else np.zeros(len(x))
     return x, (x + floor) / (top + floor), len(others)
 
@@ -303,13 +316,8 @@ class AnalyzeWindow:
         combo.pack(fill=tk.X)
         combo.bind("<<ComboboxSelected>>", lambda ev: self.level_changed())
 
-        box = ttk.LabelFrame(side, text="Plot", padding=6)
-        box.pack(fill=tk.X, pady=(6, 0))
-        self.var_per = tk.StringVar(top, "cell")
-        ttk.Radiobutton(box, text="Per cell", value="cell", variable=self.var_per, command=self.per_changed).pack(anchor="w")
-        ttk.Radiobutton(box, text="Per group", value="group", variable=self.var_per, command=self.per_changed).pack(anchor="w")
+        self.var_per = tk.StringVar(top, "cell")                  # (Per cell / Per group: in the Expression tab, which is the only plot it is about)
         self.var_exclude_small = tk.BooleanVar(top, True)
-        self.chk_exclude = ttk.Checkbutton(box, text=f"Exclude groups with <{MIN_PLOTTED_GROUP_CELLS} cells", variable=self.var_exclude_small, command=self.redraw)
         self.var_jitter = tk.BooleanVar(top, True)
         self.var_density = tk.BooleanVar(top, False)
 
@@ -336,15 +344,23 @@ class AnalyzeWindow:
         self.genes_entry.pack(fill=tk.X, pady=(2, 0))
         self.var_genes_hint = tk.StringVar(top, "")
         self.genes_hint = ttk.Label(page, textvariable=self.var_genes_hint, foreground="#b3261e", wraplength=250, justify=tk.LEFT)     # (under the box, where it is seen; the status is at the foot of the window)
+        self.var_main_only = tk.BooleanVar(top, False)
+        self.chk_main_only = ttk.Checkbutton(page, text="Only the groups in the main window", variable=self.var_main_only, command=self.update_labels)
+        self.chk_main_only.pack(anchor="w", pady=(8, 0))
         self.var_cells_of = tk.StringVar(top, "")
         self.cells_of_label = ttk.Label(page, textvariable=self.var_cells_of, foreground="gray30", wraplength=250, justify=tk.LEFT)
-        self.cells_of_label.pack(anchor="w", pady=(8, 0))
+        self.cells_of_label.pack(anchor="w")
         # (the scale, and the two boxes about the dots of the Expression plot: Selectivity has no use for them)
         scale_row = ttk.Frame(page)
         scale_row.pack(anchor="w", pady=(10, 0))
         ttk.Label(scale_row, text="Scale:", foreground="gray30").pack(side=tk.LEFT, padx=(0, 8))
         for value, text in (("linear", "Linear"), ("log", "Log")):
             ttk.Radiobutton(scale_row, text=text, value=value, variable=self.var_scale, command=self.scale_changed).pack(side=tk.LEFT, padx=(0, 12))
+        plot_box = ttk.LabelFrame(page, text="Plot", padding=(6, 2))
+        plot_box.pack(fill=tk.X, pady=(8, 0))
+        ttk.Radiobutton(plot_box, text="Per cell", value="cell", variable=self.var_per, command=self.per_changed).pack(anchor="w")
+        ttk.Radiobutton(plot_box, text="Per group", value="group", variable=self.var_per, command=self.per_changed).pack(anchor="w")
+        self.chk_exclude = ttk.Checkbutton(plot_box, text=f"Exclude groups with <{MIN_PLOTTED_GROUP_CELLS} cells", variable=self.var_exclude_small, command=self.redraw)
         self.chk_jitter = ttk.Checkbutton(page, text="Jitter counts", variable=self.var_jitter, command=self.redraw)
         self.chk_jitter.pack(anchor="w", pady=(6, 0))
         from abc_tk_umap import HoverTip                  # (the viewer's own tip; imported here, as that module imports this one)
@@ -355,11 +371,14 @@ class AnalyzeWindow:
         page = ttk.Frame(self.tabs, padding=6)
         self.tabs.add(page, text="Selectivity")
         self.source_radios(page, "selectivity")
-        ttk.Label(page, text="Group number or name (only the first is used):", foreground="gray30", wraplength=250).pack(anchor="w")
+        ttk.Label(page, text="Group number or name (several are combined):", foreground="gray30", wraplength=250).pack(anchor="w")
         self.var_groups = tk.StringVar(top, viewer.var_ids.get())
         self.groups_entry = ttk.Entry(page, textvariable=self.var_groups)
         self.groups_entry.pack(fill=tk.X, pady=(2, 0))
-        ttk.Label(page, text="Genes to mark in red, separated by commas:", foreground="gray30", wraplength=250, justify=tk.LEFT).pack(anchor="w", pady=(8, 0))
+        self.var_groups_hint = tk.StringVar(top, "")
+        self.groups_hint = ttk.Label(page, textvariable=self.var_groups_hint, foreground="#b3261e", wraplength=250, justify=tk.LEFT)     # (under the box: why it is red)
+        self.mark_label = ttk.Label(page, text="Genes to mark in red, separated by commas:", foreground="gray30", wraplength=250, justify=tk.LEFT)
+        self.mark_label.pack(anchor="w", pady=(8, 0))
         self.var_sel_genes = tk.StringVar(top, viewer.var_gene.get())
         self.sel_genes_entry = ttk.Entry(page, textvariable=self.var_sel_genes)
         self.sel_genes_entry.pack(fill=tk.X, pady=(2, 0))
@@ -523,6 +542,14 @@ class AnalyzeWindow:
         else:
             self.genes_hint.pack_forget()
 
+    def show_groups_hint(self, text):
+        """The note under the Selectivity group box, saying why it is red (cleared when the box is edited)."""
+        self.var_groups_hint.set(text)
+        if text:
+            self.groups_hint.pack(anchor="w", pady=(4, 0), before=self.mark_label)
+        else:
+            self.groups_hint.pack_forget()
+
     def scale_changed(self):
         """Log / Linear: the plot on the screen is read and drawn again on the new scale."""
         if self.last_plot is not None:
@@ -531,16 +558,18 @@ class AnalyzeWindow:
     def update_labels(self):
         """The small texts that follow the boxes: which groups the Expression tab plots, and how many other groups the slider compares with."""
         n_genes = len(core.parse_gene_names(self.var_genes.get()))
+        if self.var_groups_hint.get() and self.groups_entry.cget("foreground") != "red":
+            self.show_groups_hint("")
         self.show_genes_hint("Two genes are needed: add a second after a comma." if n_genes == 1 else "")
         entries = split_entries(self.var_groups.get())
-        self.var_cells_of.set("Cells of the groups on the Selectivity tab: " + (", ".join(entries) if entries else "every group") + ".")
+        self.var_cells_of.set("Cells of the groups colored in the main window." if self.var_main_only.get() else "Cells of every group.")
         try:
             codes, uniques = self.v.category_codes(self.level())
         except Exception:
             return
         counts = np.bincount(codes[codes >= 0], minlength=len(uniques))
-        chosen = match_groups(entries[:1], uniques)[0] if entries else []
-        sizes = other_group_sizes(counts, chosen[0] if chosen else None)
+        chosen = match_groups(entries, uniques)[0] if entries else []
+        sizes = other_group_sizes(counts, chosen)
         n_others = max(len(sizes), 1)
         if not self.slider_touched:
             self.var_slider.set(slider_for_groups(DEFAULT_OTHER_GROUPS, n_others))
@@ -589,19 +618,40 @@ class AnalyzeWindow:
         return names[self.var_level.get()]
 
     def groups(self, level):
-        """(codes of each run cell at the level, the groups' indexes in `uniques`, uniques, how they were asked: typed or every group) or None
-        (the status says why)."""
+        """(codes of each run cell at the level, the groups' indexes in `uniques`, uniques, whether they are only some of the groups) or None (the status
+        says why). Every group with cells, or with the box ticked, those colored in the main window."""
         codes, uniques = self.v.category_codes(level)
-        entries = split_entries(self.var_groups.get())
-        if not entries:
-            counts = np.bincount(codes[codes >= 0], minlength=len(uniques))
-            return codes, [int(i) for i in np.argsort(-counts, kind="stable") if counts[i] > 0], uniques, False
-        chosen, bad = match_groups(entries, uniques)
-        if bad:
-            self.groups_entry.configure(foreground="red")
-            self.var_status.set(f"No {self.v.level_names[level].lower()} named {', '.join(bad)} in this run.")
+        counts = np.bincount(codes[codes >= 0], minlength=len(uniques))
+        everyone = [int(i) for i in np.argsort(-counts, kind="stable") if counts[i] > 0]
+        if not self.var_main_only.get():
+            return codes, everyone, uniques, False
+        chosen = self.main_window_groups(level, uniques, counts, everyone)
+        if chosen is None:
             return None
         return codes, chosen, uniques, True
+
+    def main_window_groups(self, level, uniques, counts, everyone):
+        """The indexes (in `uniques`) of the groups the main window colors now: those of Specific group(s) that are not grayed, or of All groups the
+        colored ones (not grayed by a click in the list, and within the largest MAX_COLORED_CATEGORIES). None, with the status saying why, when the
+        window shows genes, or another group type than this one."""
+        from abc_tk_umap import MAX_COLORED_CATEGORIES            # (imported here: that module imports this one)
+        v = self.v
+        if v.mode not in ("all", "single"):
+            self.var_status.set("The main window is showing genes, not groups: untick the box to use every group.")
+            return None
+        if level != v.level:
+            self.var_status.set(f"The main window shows {plural(v.level_names[v.level].lower())}: set Group type to {v.level_names[v.level]}, or untick the box.")
+            return None
+        if v.mode == "single":
+            ids, _bad = v.parse_ids()
+            uid = core.extract_leading_numeric_id(pd.Series(uniques)).to_numpy()
+            chosen = [int(i) for t in ids if t not in v.off_groups for i in np.flatnonzero(uid == t)[:1]]
+        else:
+            chosen = [i for i in everyone[:MAX_COLORED_CATEGORIES] if str(uniques[i]) not in v.off_groups]
+        if not chosen:
+            self.var_status.set("No group is colored in the main window.")
+            return None
+        return chosen
 
     def genes(self):
         """The two genes to plot, as spelled in the dataset, or None (the status says why)."""
@@ -770,12 +820,15 @@ class AnalyzeWindow:
         entries = split_entries(self.var_groups.get())
         if not entries:
             self.groups_entry.configure(foreground="red")
+            self.show_groups_hint("Enter a group number or name.")
             self.var_status.set("Enter a group on this tab: Selectivity compares it with the others.")
             return
-        chosen, bad = match_groups(entries[:1], uniques)
+        chosen, bad = match_groups(entries, uniques)
         if bad or not chosen:
+            missing = ", ".join(str(b) for b in bad) if bad else entries[0]
             self.groups_entry.configure(foreground="red")
-            self.var_status.set(f"No {self.v.level_names[level].lower()} named {entries[0]} in this run.")
+            self.show_groups_hint(f"There is no {self.v.level_names[level].lower()} {missing} in this run. Check the Group type, or the number.")
+            self.var_status.set(f"No {self.v.level_names[level].lower()} named {missing} in this run.")
             return
         note_source = ""
         if not self.ensure_source("selectivity"):
@@ -784,14 +837,17 @@ class AnalyzeWindow:
         if not imputed and not v.has_counts:
             self.var_status.set("No raw counts on this dataset (layers['counts'] missing).")
             return
-        target = chosen[0]
+        target = list(dict.fromkeys(int(c) for c in chosen))          # (a group named twice counts once)
         counts = np.bincount(codes[codes >= 0], minlength=len(uniques))
-        if counts[target] < MIN_GROUP_CELLS:
+        total = int(counts[target].sum())
+        if total < MIN_GROUP_CELLS:
+            what = "This group has" if len(target) == 1 else "These groups have"
             self.groups_entry.configure(foreground="red")
-            self.var_status.set(f"{str(uniques[target]).strip()} has only {int(counts[target])} cells in this run: a group needs at least {MIN_GROUP_CELLS}.")
+            self.show_groups_hint(f"{what} only {total} cells in this run; at least {MIN_GROUP_CELLS} are needed.")
+            self.var_status.set(f"{what} only {total} cells in this run: at least {MIN_GROUP_CELLS} are needed.")
             return
         meta = dict(level=level, target=target, uniques=uniques, imputed=imputed,
-                    note=(f" (only the first, {entries[0]}, is used)" if len(entries) > 1 else "") + note_source)
+                    note=(f" ({len(target)} groups combined)" if len(target) > 1 else "") + note_source)
         data = self.ensure_means(imputed, meta)
         if data is not None:
             self.finish_means(data, meta)
@@ -899,7 +955,7 @@ class AnalyzeWindow:
         self.home_view = None
         self.hover = None
         self.hover_group = None
-        label = str(uniques[target]).strip()
+        label = " + ".join(str(uniques[t]).strip() for t in target_list(target))
         ax.scatter(x, y, s=SELECTIVITY_DOT_AREA[bool(imputed)], c="#3b6ea8", alpha=0.7, linewidths=0, rasterized=True)
         ax.axhline(1.0, color="gray", linestyle="--", linewidth=0.8)
         ax.set_xscale("log")
@@ -930,7 +986,7 @@ class AnalyzeWindow:
                 else "mean count per cell")
         ax.set_xlabel(f"{unit} in {label}")
         ax.set_ylabel(textwrap.fill(f"ratio to the highest of the {used} largest other {plural(self.v.level_names[level])}", 42))
-        ax.set_title(f"{len(x):,} genes: {label}")
+        ax.set_title(textwrap.fill(f"{len(x):,} genes: {label}", 70))
         ax.grid(True, alpha=0.25, which="both")
         self.hover = {"kind": "genes", "x": x, "y": y, "names": names}
         self.table = pd.DataFrame({"gene": names, ax.get_xlabel().replace("\n", " "): x, ax.get_ylabel().replace("\n", " "): y})

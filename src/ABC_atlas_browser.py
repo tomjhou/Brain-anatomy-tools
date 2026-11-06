@@ -400,6 +400,15 @@ def _has_internet_connection(host='allen-brain-cell-atlas.s3.amazonaws.com', por
 
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+# A crash that ends the program outright (a native abort, as when Tk is used from the wrong thread) leaves its Python traceback here, since the console
+# window closes with the program.
+try:
+    import faulthandler
+    _crash_log = open(CACHE_DIR / 'crash_log.txt', 'a', buffering=1)
+    faulthandler.enable(_crash_log, all_threads=True)
+except Exception:
+    pass
+
 
 # Defaults for the interactive UMAP viewer's own Settings dialog. Gene456_
 # shape is validated against GENE456_SHAPE_REGISTRY (defined further down,
@@ -4836,17 +4845,39 @@ class StepWindow:
                 outcome['value'] = work()
             except BaseException as e:
                 outcome['error'] = e
-        thread = threading.Thread(target=runner, daemon=True)
-        thread.start()
-        while thread.is_alive():
-            if self.ui:
+        # While the work runs on its thread: matplotlib draws with the Agg backend (TkAgg made a window for each figure, on the wrong thread: the program
+        # died), and garbage collection waits (a collection run on this thread that frees a Tk object ends the program the same way).
+        previous_backend = matplotlib.get_backend()
+        gc_was_on = gc.isenabled()
+        try:
+            plt.switch_backend('agg')
+        except Exception:
+            previous_backend = None
+        # The leftover Tk objects of the windows closed so far (the section grid, the options window) are freed here, on the Tk thread: pynndescent
+        # (the neighbor graph of Step 6) calls gc.collect() itself, which would otherwise free them on the worker thread, and Tcl ends the program
+        # ("Tcl_AsyncDelete: async handler deleted by the wrong thread"). Garbage collection being off does not stop that call.
+        gc.collect()
+        gc.disable()
+        try:
+            thread = threading.Thread(target=runner, daemon=True)
+            thread.start()
+            while thread.is_alive():
+                if self.ui:
+                    try:
+                        self.ui[3].config(text=f"{int(time.perf_counter() - self.started)} s")
+                        self.ui[0].update()
+                    except Exception:
+                        self.ui = False
+                time.sleep(0.03)
+            thread.join()
+        finally:
+            if gc_was_on:
+                gc.enable()
+            if previous_backend and previous_backend.lower() != 'agg':
                 try:
-                    self.ui[3].config(text=f"{int(time.perf_counter() - self.started)} s")
-                    self.ui[0].update()
+                    plt.switch_backend(previous_backend)
                 except Exception:
-                    self.ui = False
-            time.sleep(0.03)
-        thread.join()
+                    pass
         if 'error' in outcome:
             raise outcome['error']
         return outcome.get('value')
@@ -7363,7 +7394,7 @@ def prompt_section_selection_gui(adata, abc_cache, section_series, out_folder=No
     clear_rois_button.on_clicked(on_clear_rois)
 
     cancel_ax = fig.add_axes([x4, ROW1_Y, button_width, button_height])
-    cancel_button = Button(cancel_ax, 'Exit')
+    cancel_button = Button(cancel_ax, 'Close')
     cancel_button.label.set_fontsize(button_fontsize)
     cancel_button.on_clicked(on_cancel)
 
@@ -10425,7 +10456,11 @@ def save_roi_map(adata, abc_cache, section_series, rois, output_path):
 
     ncols = max(1, math.ceil(math.sqrt(n)))
     nrows = math.ceil(n / ncols)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4, nrows * 4), squeeze=False)
+    # (a plain Agg figure, not pyplot's: this runs on the "Computing" window's worker thread, where a pyplot figure made a Tk window and the program
+    # died with "main thread is not in main loop" while saving the map)
+    fig = Figure(figsize=(ncols * 4, nrows * 4))
+    FigureCanvasAgg(fig)
+    axes = fig.subplots(nrows, ncols, squeeze=False)
     axes_flat = axes.ravel()
 
     section_values = section_series.to_numpy()
@@ -10476,7 +10511,6 @@ def save_roi_map(adata, abc_cache, section_series, rois, output_path):
     fig.tight_layout()
     fig.savefig(output_path, dpi=200)
     fig.savefig(output_path.with_suffix('.svg'))
-    plt.close(fig)
     print(f" Done saving")
 
 
@@ -10815,6 +10849,27 @@ def prompt_roi_run_label():
     a fresh run. Reusing a labeled run on purpose is what the startup
     panel's 'Load existing run' picker is for."""
     return sanitize_run_label(input("Optional label for this ROI run's folder name (blank to skip): "))
+
+
+def parse_unfinished_run(folder):
+    """What a run folder's name says about how it was made, for finishing a run that stopped before its UMAP was made: {'cell_type', 'label', 'cap'}
+    (the cells' kind, the project name or '', and the limit of cells or None), or None if the name is not one a run makes."""
+    name = Path(folder).name
+    m = re.match(r'^umap_(neurons|nonneurons|all-cells)_(.*)$', name)
+    if m is None:
+        return None
+    cell_type = {v: k for k, v in CELL_TYPE_SUFFIXES.items()}[m.group(1)]
+    rest = m.group(2)
+    cap = None
+    capped = re.search(r'_sub(\d+)$', rest)
+    if capped:
+        cap = int(capped.group(1))
+        rest = rest[:capped.start()]
+    # (the part after the sections, and after the ROIs' count and hash if there are ROIs: the project name)
+    label = re.match(r'^(?:allsections|sections-[0-9-]+)(?:_rois\d+-[0-9a-f]{8})?(?:_(.+))?$', rest)
+    if label is None:
+        return None
+    return {'cell_type': cell_type, 'label': label.group(1) or '', 'cap': cap}
 
 
 def sanitize_run_label(raw):
@@ -18700,8 +18755,28 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
             log_status("UMAP viewer closed.")
         return
 
+    resume_info = resume_selection = None
+    if startup_action == 'resume':
+        # A run that stopped before its UMAP was made: its ROIs are in its folder, and its name says the rest. Made again as a new run would be.
+        resume_info = parse_unfinished_run(load_existing_folder)
+        try:
+            resume_rois, resume_whole = load_rois_csv(Path(load_existing_folder) / 'roi_coords.csv')
+        except Exception as e:
+            show_error_dialog("Could not finish the project", f"Its ROIs could not be read: {e}")
+            return
+        if resume_info is None:
+            show_error_dialog("Could not finish the project", f"The folder's name ({Path(load_existing_folder).name}) is not one that a run makes, so how it was made is not known.")
+            return
+        if resume_whole:
+            resume_selection = (resume_whole, 'sections-' + '-'.join(sanitize_section_token(s) for s in resume_whole), resume_rois, None)
+        else:
+            resume_selection = (None, 'allsections', resume_rois, None)
     FRAME_STATE['override'] = None
     prepare_coordinate_frame(abc_cache)
+    if startup_action == 'resume' and resume_selection[2] and read_run_frame(load_existing_folder) != coordinate_frame_name():
+        # (the ROIs were drawn on the other coordinates: they select the cells by those)
+        FRAME_STATE['override'] = read_run_frame(load_existing_folder)
+        prepare_coordinate_frame(abc_cache)
     if startup_action == 'load_existing':
         # Skips section/ROI selection and UMAP computation (Steps 1-8) entirely
         # — the chosen folder's own cached files (verified by prompt_startup_
@@ -18814,9 +18889,13 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
     # Section subset selection
     # ---------------------------------------------------------------------------
     all_neurons_run = startup_action == 'all_neurons'
+    resume_run = startup_action == 'resume'
     if all_neurons_run:
         # "Browse All Neurons" (abc_tk_launcher): every section, no ROIs, so there is nothing to pick.
         selected_sections, sections_suffix, rois, imputed_adata_from_picker = None, 'allsections', [], None
+    elif resume_run:
+        selected_sections, sections_suffix, rois, imputed_adata_from_picker = resume_selection
+        print(f"Finishing {Path(load_existing_folder).name} from its {len(rois)} saved ROI(s).")
     else:
         try:
             print("Attempting to open the clickable section-thumbnail picker...")
@@ -18855,9 +18934,13 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         from abc_tk_launcher import ALL_NEURONS_CAP, ALL_NEURONS_LABEL
         run_options = {'cell_type': 'Neurons', 'cap': ALL_NEURONS_CAP, 'label': ALL_NEURONS_LABEL, 'optional_plots': False}
         count_state['done'] = True
+    elif resume_run:
+        # The cells, the project name and the limit are in the folder's name: nothing to ask.
+        run_options = {'cell_type': resume_info['cell_type'], 'cap': resume_info['cap'], 'label': resume_info['label'], 'optional_plots': False}
+        count_state['done'] = True
     else:
         threading.Thread(target=count_in_background, daemon=True).start()
-    if not all_neurons_run:
+    if not (all_neurons_run or resume_run):
         try:
             from abc_tk_launcher import choose_run_options
             def folder_for(cell_type, project_name, cap):

@@ -146,7 +146,7 @@ class GridWindow:
         ttk.Label(f, textvariable=self.var_perf, foreground="gray50", font=("Segoe UI", 8)).pack(anchor="w", side=tk.BOTTOM)
         self.var_status = tk.StringVar(f, "")
         ttk.Label(f, textvariable=self.var_status, foreground="gray30", wraplength=310, justify=tk.LEFT).pack(anchor="w", side=tk.BOTTOM, pady=(8, 0))
-        for text, command in (("Exit", self.exit), ("Clear ROIs", self.clear_rois), ("Load ROIs", self.load_rois), ("Confirm Selection", self.confirm)):
+        for text, command in (("Close", self.exit), ("Clear ROIs", self.clear_rois), ("Load ROIs", self.load_rois), ("Confirm Selection", self.confirm)):
             ttk.Button(f, text=text, command=command).pack(side=tk.BOTTOM, fill=tk.X, pady=3)
         self.update_summary()
 

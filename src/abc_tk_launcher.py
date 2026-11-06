@@ -1,5 +1,5 @@
-"""A Tk version of the atlas browser's launch screen: the output folder, then one of "Open Brain Browser / ROI Chooser", "Load
-Existing ROI Dataset" or "Open 3D Viewer". Which cells to analyze (Neurons, Non-neurons or All cells) is asked later, by
+"""A Tk version of the atlas browser's launch screen: the output folder, then one of "Choose ROI(s) for project", "Load
+saved ROI project" or "Open 3D Viewer". Which cells to analyze (Neurons, Non-neurons or All cells) is asked later, by
 choose_run_options(), once the sections and ROIs are confirmed. It is a function of the same shape as the matplotlib one (prompt_startup_panel in
 ABC_atlas_browser.py): the browser passes in the few of its own functions it needs (recent folders, the check of a run folder, the 3D
 viewer launcher, the settings window), so this file has no start-up side effects of its own.
@@ -242,6 +242,7 @@ def choose_run_options(current="Neurons", counts=None, folder_for=None, whole_br
 
 SUBSET_PREFIX = "subset_"          # the subfolders Analyze subset makes in a run (abc_tk_subset.py), each a run of its own
 MAX_SUBSET_DEPTH = 8               # how many levels of subsets inside subsets the list follows
+ROI_FILE = "roi_coords.csv"          # the ROIs a run was made from: a folder with this but no RUN_FILE is a run that stopped before its UMAP was made
 RUN_FILE = "umap_coords.csv"        # the one file a run needs (see required_cached_run_files in ABC_atlas_browser.py): a folder with it is a run
 
 
@@ -260,8 +261,14 @@ def scan_runs(folder):
         try:
             saved = os.stat(os.path.join(e.path, RUN_FILE)).st_mtime
         except OSError:
+            # No UMAP: a run that stopped before it was made. If it saved its ROIs it is listed, as unfinished, to be finished from them.
+            try:
+                if e.name.startswith("umap_"):
+                    runs.append((e.name, Path(e.path), os.stat(os.path.join(e.path, ROI_FILE)).st_mtime, 0, None, False))
+            except OSError:
+                pass
             continue
-        runs.append((e.name, Path(e.path), max(saved, opened.get(abc_core._run_key(e.path), 0.0)), 0, None))
+        runs.append((e.name, Path(e.path), max(saved, opened.get(abc_core._run_key(e.path), 0.0)), 0, None, True))
         _add_subsets(e.path, 1, runs, opened, abc_core)
     runs.sort(key=lambda r: r[2], reverse=True)
     return runs
@@ -281,7 +288,7 @@ def _add_subsets(path, depth, runs, opened, abc_core):
             saved = os.stat(os.path.join(e.path, RUN_FILE)).st_mtime
         except OSError:
             continue
-        runs.append((e.name, Path(e.path), max(saved, opened.get(abc_core._run_key(e.path), 0.0)), depth, Path(path)))
+        runs.append((e.name, Path(e.path), max(saved, opened.get(abc_core._run_key(e.path), 0.0)), depth, Path(path), True))
         _add_subsets(e.path, depth + 1, runs, opened, abc_core)
 
 
@@ -291,11 +298,12 @@ class RunPicker:
     to go back. Browse... picks a run folder from anywhere else with the system's dialog. A box above the list
     narrows it to the names that hold what is typed. `result` is the chosen folder (a Path), or None."""
 
-    def __init__(self, parent, folder):
+    def __init__(self, parent, folder, helpers=None):
         import queue
         import threading
         self.result = None
         self.folder = folder
+        self.helpers = helpers or {}
         self.scanned = False                  # the folders have been looked into
         self.runs = []
         self.shown = []                       # the runs in the list now (the ones that match the filter)
@@ -329,7 +337,12 @@ class RunPicker:
         self.tree.configure(yscrollcommand=scroll.set)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.tree.tag_configure("incomplete", foreground="#a05000")
         self.tree.bind("<Double-Button-1>", self.double_clicked)
+        self.menu = tk.Menu(top, tearoff=False)
+        self.menu.add_command(label="Delete project folder and files…", command=self.delete_project)
+        for press in (("<Button-3>", "<Button-2>", "<Control-Button-1>") if top.tk.call("tk", "windowingsystem") == "aqua" else ("<Button-3>",)):
+            self.tree.bind(press, self.right_clicked)
         self.var_status = tk.StringVar(top, "Looking for runs...")
         ttk.Label(body, textvariable=self.var_status, foreground="gray30").pack(anchor="w", pady=(6, 0))
         buttons = ttk.Frame(body)
@@ -411,9 +424,12 @@ class RunPicker:
         emit(None)
         self.tree.delete(*self.tree.get_children())
         import time
-        for i, (name, _path, saved, depth, _parent) in enumerate(self.shown):
+        for i, (name, _path, saved, depth, _parent, complete) in enumerate(self.shown):
             shown_name = "      " * depth + "\u21b3 " + name if depth else name           # (a subset: under its project, indented)
-            self.tree.insert("", tk.END, iid=str(i), values=(shown_name, time.strftime("%Y-%m-%d %H:%M", time.localtime(saved))))
+            if not complete:
+                shown_name += "     (incomplete: no UMAP yet; OK finishes it from its saved ROIs)"
+            self.tree.insert("", tk.END, iid=str(i), values=(shown_name, time.strftime("%Y-%m-%d %H:%M", time.localtime(saved))),
+                             tags=() if complete else ("incomplete",))
         if self.shown:
             paths = [r[1] for r in self.shown]
             at = paths.index(keep) if keep in paths else max(range(len(self.shown)), key=lambda i: self.shown[i][2])
@@ -431,6 +447,69 @@ class RunPicker:
             return None
         self.ok()
         return "break"                  # (the window is gone: the tree's own double-click handler, which runs after this one, would fail on it)
+
+    def right_clicked(self, event):
+        """A right click on a project: it is highlighted, and the menu with Delete is offered."""
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return None
+        self.tree.selection_set(row)
+        self.tree.focus(row)
+        try:
+            self.menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.menu.grab_release()
+        return "break"
+
+    def delete_project(self):
+        """Delete the highlighted project's folder (with the subsets kept inside it) and the processed data file saved for it in the cache, after a
+        second question that says exactly what goes."""
+        picked = self.tree.selection()
+        if not picked or not self.shown:
+            return
+        name, path = self.shown[int(picked[0])][:2]
+        path = Path(path)
+        inside = [r for r in self.runs if r[1] != path and path in Path(r[1]).parents]
+        files = []                                              # (the processed data saved in the cache for the project and for each subset)
+        find = self.helpers.get("required_cached_run_files")
+        if find is not None:
+            for r in [self.shown[int(picked[0])]] + inside:
+                try:
+                    f = find(r[1]).get("Processed AnnData")
+                except Exception:
+                    f = None
+                if f is not None and Path(f).exists():
+                    files.append(Path(f))
+        text = f"Permanently delete the project \"{name}\"?\n\nThe folder, with everything in it:\n    {path}\n"
+        if inside:
+            text += f"\nincluding its {len(inside)} subset{'s' if len(inside) != 1 else ''}:\n" + "\n".join("    " + r[0] for r in inside[:8]) + (
+                f"\n    … and {len(inside) - 8} more" if len(inside) > 8 else "") + "\n"
+        if files:
+            text += "\nand the saved processed data in the cache:\n" + "\n".join("    " + f.name for f in files[:8]) + (
+                f"\n    … and {len(files) - 8} more" if len(files) > 8 else "") + "\n"
+        text += "\nThis cannot be undone."
+        if not messagebox.askyesno("Delete project folder and files", text, icon="warning", default="no", parent=self.top):
+            return
+        import shutil
+        self.top.config(cursor="watch")
+        self.var_status.set(f"Deleting {name}...")
+        self.top.update_idletasks()
+        problems = []
+        try:
+            shutil.rmtree(path)
+        except OSError as e:
+            problems.append(f"{path}: {e}")
+        for f in files:
+            try:
+                f.unlink()
+            except OSError as e:
+                problems.append(f"{f}: {e}")
+        self.top.config(cursor="")
+        if problems:
+            messagebox.showerror("Could not delete everything", "These could not be deleted:\n\n" + "\n".join(problems), parent=self.top)
+        gone = {r[1] for r in self.runs if (r[1] == path or path in Path(r[1]).parents) and not Path(r[1]).exists()}
+        self.runs = [r for r in self.runs if r[1] not in gone]
+        self.fill()
 
     def ok(self):
         picked = self.tree.selection()
@@ -604,8 +683,21 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
         folder = committed_folder()
         if folder is None:
             return
-        chosen_path = RunPicker(root, folder).show()
+        chosen_path = RunPicker(root, folder, helpers).show()
         if chosen_path is None:
+            return
+        chosen_path = Path(chosen_path)
+        if not (chosen_path / RUN_FILE).exists() and (chosen_path / ROI_FILE).exists():
+            # a run that stopped before its UMAP was made: finished from the ROIs it saved (the cells, the project name and the size limit are in its name)
+            if not messagebox.askyesno(
+                    "Finish this project?",
+                    f"{chosen_path.name}\n\nThis project was never finished: its ROIs were saved, but the UMAP was not made.\n\n"
+                    "Make it now, from the saved ROIs? It takes as long as a new project (the cells, the project name and the size limit "
+                    "are taken from the folder's name).", parent=root):
+                return
+            helpers["remember_recent_output_folder"](folder)
+            result["outcome"] = ("resume", None, chosen_path, folder)
+            root.destroy()
             return
         required = helpers["required_cached_run_files"](chosen_path)
         missing = [f"{label}: {path}" for label, path in required.items() if label not in RECOVERABLE and not path.exists()]
@@ -699,16 +791,16 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
     big = "Big.Toolbutton" if aqua else "Big.TButton"
     style.configure(big, font=("Segoe UI", 12), padding=(10, 9), anchor="center")
     ttk.Button(outer, text="Browse All Neurons", style=big, command=all_neurons).pack(fill=tk.X, pady=4)
-    ttk.Button(outer, text="Open Brain Browser/ROI Chooser", style=big, command=new_run).pack(fill=tk.X, pady=4)
+    # choosing ROIs and loading a saved ROI project go together: set apart by space above and below the two
+    ttk.Frame(outer, height=22).pack(fill=tk.X)
+    ttk.Button(outer, text="Choose ROI(s) for project", style=big, command=new_run).pack(fill=tk.X, pady=4)
+    ttk.Button(outer, text="Load saved ROI project…", style=big, command=load_existing).pack(fill=tk.X, pady=4)
+    ttk.Frame(outer, height=22).pack(fill=tk.X)
     pair = ttk.Frame(outer)                                         # (the two less used ones share a row)
     pair.pack(fill=tk.X, pady=4)
     pair.columnconfigure((0, 1), weight=1, uniform="pair")
-    ttk.Button(pair, text="Open Your Own Dataset…", style=big, command=own_dataset).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+    ttk.Button(pair, text="Open .h5ad dataset…", style=big, command=own_dataset).grid(row=0, column=0, sticky="ew", padx=(0, 4))
     ttk.Button(pair, text="Open 3D Viewer…", style=big, command=viewer3d).grid(row=0, column=1, sticky="ew", padx=(4, 0))
-    # a saved run, set apart so that it stands out: space above and below it
-    ttk.Frame(outer, height=22).pack(fill=tk.X)
-    ttk.Button(outer, text="Load Existing ROI Dataset…", style=big, command=load_existing).pack(fill=tk.X, pady=4)
-    ttk.Frame(outer, height=22).pack(fill=tk.X)
     def exit_app():
         """Exit (or the window closed): while the atlas is still downloading, warn first, since closing the program stops the download."""
         running = helpers.get("atlas_download_running", lambda: None)()

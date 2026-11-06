@@ -15,6 +15,7 @@ import gc
 import queue
 import math
 import re
+import sys
 from pathlib import Path
 import threading
 import time
@@ -51,6 +52,7 @@ LEVEL_NAMES = {"class": "Class", "subclass": "Subclass", "supertype": "Supertype
 NOT_IN_TAXONOMY = ("leiden", "neurotransmitter")        # the levels that are not a step down from the one above (so a group's table is just its own row)
 TILE_PX = 230
 MIN_TILE_PX = 50
+ROI_LINE_PX = {6: 2, 5: 3, 4: 4, 3: 5, 2: 6, 1: 8}        # the ROI outline's line width at each Section size stop (panels across): thicker as the sections grow
 TILE_COLUMNS = (6, 5, 4, 3, 2, 1)         # the Section size slider's stops: how many panels fit across the pane (1/6 of its width ... all of it)
 OUTLINE_PX_LARGEST = 2                    # the CCF outlines' width (pixels) at the largest section map size (one pixel at the others)
 DEFAULT_TILE_INDEX = 4                    # (two across)
@@ -339,7 +341,7 @@ class RangeSlider(tk.Canvas):
     `command(low, high)` as a handle is dragged, and a double-click puts both back at the ends. `low` and `high` are the fractions of the range
     the levels are at; the track is drawn by their square root (a position is the square root of its value), so that the low end, where most of a
     gene's expression is, has most of the track."""
-    MIN_GAP = 0.02            # the handles keep at least this much of the track between them
+    MIN_GAP = 0.005           # the handles keep at least this much of the track between them
 
     def __init__(self, parent, command, margin=10, height=26):
         super().__init__(parent, height=height, highlightthickness=0)
@@ -498,12 +500,12 @@ class CellTip:
             rgb, code, back = swatch
             hexc = "#%02x%02x%02x" % tuple(int(c) for c in rgb[:3])
             top = tk.Frame(box, bg=bg)
-            top.pack(anchor="w", padx=6, pady=(5, 0))
+            top.pack(anchor="e", padx=6, pady=(5, 0))               # (at the right: the tip opens with its top left corner at the pointer, so the symbol was under it)
+            tk.Label(top, text="this cell, as drawn", bg=bg, fg="gray35", font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(0, 6))
             mark = tk.Canvas(top, width=22, height=22, bg="#%02x%02x%02x" % tuple(int(c) for c in back[:3]),
                              highlightthickness=1, highlightbackground="gray60")
             mark.pack(side=tk.LEFT)
             draw_marker(mark, 12, 12, int(code), hexc, size=14)
-            tk.Label(top, text="this cell, as drawn", bg=bg, fg="gray35", font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(6, 0))
         # in columns: what (gray), the number (bold, to the right), the name
         grid = tk.Frame(box, bg=bg)
         grid.pack(anchor="w", padx=6, pady=(4, 2))
@@ -602,6 +604,8 @@ class PointCanvas:
         self.item = self.canvas.create_image(0, 0, anchor="nw")
         self.markers = {}                           # name -> [item, x, y] (x None: hidden)
         self.rects = []                             # [item, x0, y0, x1, y1]
+        self.rect_line = None                       # the width the ROI outlines have been given (see rect_width)
+        self.rect_px = 2                            # the width they should have
         self.labels = []                            # [item, x, y]
         self.label_text = {}                        # item -> its text (the group's number)
         self.label_weight = {}                      # item -> its size factor, by the group's cell count
@@ -1190,8 +1194,12 @@ class PointCanvas:
         self.canvas.tag_raise(m[0])
 
     def add_rect(self, x0, y0, x1, y1):
-        item = self.canvas.create_rectangle(0, 0, 0, 0, outline="#ff8c00", width=2, dash=(6, 3))
+        item = self.canvas.create_rectangle(0, 0, 0, 0, outline="black", width=2, dash=(6, 3))
         self.rects.append([item, x0, y0, x1, y1])
+
+    def rect_width(self):
+        """The ROI outline's line width: set by the Section size slider (see ROI_LINE_PX), thicker as the sections are bigger."""
+        return self.rect_px
 
     def enable_scalebar(self):
         self.scalebar = (self.canvas.create_line(0, 0, 0, 0, fill="black", width=3), self.canvas.create_text(0, 0, anchor="s", font=("Segoe UI", 9, "bold"), fill="black"))
@@ -1271,11 +1279,15 @@ class PointCanvas:
             self.place_scalebar()
         for m in self.markers.values():
             self.place_marker(m)
+        wd = self.rect_width() if self.rects else 2
         for it, x0, y0, x1, y1 in self.rects:
             a, b = self.to_canvas(x0, y0)
             c, d = self.to_canvas(x1, y1)
             self.canvas.coords(it, a, b, c, d)
+            if self.rect_line != wd:
+                self.canvas.itemconfig(it, width=wd, dash=(3 * wd, 2 * wd) if wd > 2 else (6, 3))
             self.canvas.tag_raise(it)
+        self.rect_line = wd
         w, h = self.view_size()
         for it, x, y in ([] if light else self.labels):
             px, py = self.to_canvas(x, y)
@@ -1355,6 +1367,7 @@ class UmapWindow(ExportsMixin):
         self.label_info = []
         self.view_kind, self.view_token, self.view_title = "all", "all", ""
         self.hover_key = None
+        self.ccf_started = False           # start_ccf_lookup has been called (by the first cell tip)
         self.ccf_run = self.ccf_bg = None  # the cells' CCF coordinates (AP, DV, ML), for the Paxinos ML and DV of the cell tip: see start_ccf_lookup
         self.ccf_state = "none"
         self.variants = {}                 # UMAP parameter key -> (coordinates, Leiden labels), the ones already shown
@@ -1367,8 +1380,8 @@ class UmapWindow(ExportsMixin):
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.bind("<Escape>", lambda e: self.close())
         self.poll()
-        self.root.after(1500, self.preload_imputed)         # (once the window has been drawn)
-        self.root.after(2500, self.start_ccf_lookup)
+        # (No background loads here: they held Python's one running thread for seconds at a time, just when the section maps were being zoomed. The imputed
+        # dataset is loaded when Imputed Gene is chosen, the CCF coordinates when the first cell tip needs them: see coord_rows.)
 
     def preload_imputed(self):
         """Start loading the imputed gene dataset in the background, if it is already on this computer: the choice "Imputed Gene" is common."""
@@ -1493,9 +1506,11 @@ class UmapWindow(ExportsMixin):
         left = ttk.Frame(pw)
         bars = ttk.Frame(left, padding=(6, 4))
         bars.pack(side=tk.TOP, fill=tk.X)
-        # Zoom whole panel from the start ("Browse All Neurons"): the section maps start at their smallest, so that they are made once, not made and then again
-        self.var_tile = tk.IntVar(bars, TILE_COLUMNS.index(max(TILE_COLUMNS)) if self.start_panel_zoom else DEFAULT_TILE_INDEX)
-        self.tile_stop_before_zoom = DEFAULT_TILE_INDEX if self.start_panel_zoom else None
+        # Zoom whole panel from the start, in every project that has section maps: they start at the size it chooses (panel_zoom_tile_index), so that they
+        # are made once, not made and then again
+        self.zoom_from_start = bool(self.sections)
+        self.var_tile = tk.IntVar(bars, self.panel_zoom_tile_index() if self.zoom_from_start else DEFAULT_TILE_INDEX)
+        self.tile_stop_before_zoom = DEFAULT_TILE_INDEX if self.zoom_from_start else None
         self.var_dot = tk.IntVar(bars, DEFAULT_DOT_INDEX)
         self.var_marker = tk.IntVar(bars, DEFAULT_MARKER_INDEX)
         self.dot_factors = [um / (DOT_MM * 1000) for um in CELL_SIZES_UM]          # (times DOT_MM)
@@ -1548,7 +1563,7 @@ class UmapWindow(ExportsMixin):
         self.panel_zoom = 1.0                                                                  # (the whole-panel zoom: see set_panel_zoom)
         self.zoom_burst = None                                                                 # (a run of wheel steps being shown on a snapshot: see zoom_step)
         self.panel_hook = types.SimpleNamespace(zoom=self.panel_zoom_at, pan_start=self.panel_pan_start, pan_move=self.panel_pan_move, reset=self.panel_zoom_reset)
-        self.var_panel_zoom = tk.BooleanVar(bars, self.start_panel_zoom)
+        self.var_panel_zoom = tk.BooleanVar(bars, self.zoom_from_start)
         panel_zoom_box = ttk.Checkbutton(bars, text="Zoom whole panel", variable=self.var_panel_zoom, command=self.apply_panel_zoom_mode)
         panel_zoom_box.grid(row=2, column=4, sticky="w", padx=(6, 6))
         HoverTip(panel_zoom_box, lambda: "Off: the wheel zooms into each section map, which stays in its panel (clipped by its border). "
@@ -1617,6 +1632,7 @@ class UmapWindow(ExportsMixin):
         self.side_pane = side
         self.root.update_idletasks()
         self.fit_left_pane(False)                                        # (the panes at their final widths before the section maps are made: they are laid out once)
+        self.root.update_idletasks()                                     # (so that the section pane has its new width when the maps are sized from it: until the divider's move is carried out, it still reports the old one, the maps came out 1/5 of the old pane and then 1/6 of the new)
         self.build_tiles()
         self.root.after(400, self.fit_left_pane)                         # (and looked at again once the window has settled: a no-op if all is as it should be)
 
@@ -1669,6 +1685,7 @@ class UmapWindow(ExportsMixin):
         self.id_frame = ttk.LabelFrame(self.box, text="Group number(s)", padding=6)
         ttk.Label(self.id_frame, text="One or more, separated by commas (Enter):", foreground="gray30", wraplength=300).pack(anchor="w")
         self.var_ids = tk.StringVar(f, "")
+        self.ids_by_level = {}                              # level -> the group numbers last typed for it (see on_level)
         e = ttk.Entry(self.id_frame, textvariable=self.var_ids)
         e.pack(fill=tk.X, pady=(2, 0))
         e.bind("<Return>", lambda ev: self.recolor())
@@ -2094,6 +2111,9 @@ class UmapWindow(ExportsMixin):
         for t in self.tiles:
             pc = t["pc"]
             pc.outline_px = OUTLINE_PX_LARGEST if cols == min(TILE_COLUMNS) else 1            # (the CCF outlines: wider at the largest size)
+            pc.rect_px = ROI_LINE_PX[cols]
+            if pc.rects and pc.rect_line != pc.rect_px:
+                pc.reposition()                                                         # (the ROI outlines take the new line width)
             if big:
                 pc.set_virtual((px, ph))
             else:
@@ -2177,10 +2197,17 @@ class UmapWindow(ExportsMixin):
 
     # ---- zooming the whole panel (the borders and the sections together)
 
-    MAX_PANEL_ZOOM = 100.0
+    MAX_PANEL_ZOOM = 200.0
 
     def max_panel_zoom(self):
         return self.MAX_PANEL_ZOOM
+
+    def panel_zoom_tile_index(self):
+        """The Section size stop the whole-panel zoom starts at: 1 over the square root of the number of sections across (rounded down, and kept within
+        the slider's stops), so that a few sections are not left small in a big pane."""
+        across = int(math.isqrt(max(len(self.sections), 1)))
+        across = min(max(across, min(TILE_COLUMNS)), max(TILE_COLUMNS))
+        return TILE_COLUMNS.index(across)
 
     def apply_panel_zoom_mode(self):
         """The Zoom whole panel checkbox. On: every section map is put back to its whole view and the wheel then zooms the panel. Off: the panel is
@@ -2192,8 +2219,8 @@ class UmapWindow(ExportsMixin):
                 t["pc"].fit()
         self.cancel_zoom_burst()
         if on:
-            self.tile_stop_before_zoom = self.var_tile.get()          # (the section maps start at their smallest, 1/6 of the width: to zoom into)
-            self.sliders[0].set(TILE_COLUMNS.index(max(TILE_COLUMNS)))
+            self.tile_stop_before_zoom = self.var_tile.get()          # (the section maps start at a size that fits them all: see panel_zoom_tile_index)
+            self.sliders[0].set(self.panel_zoom_tile_index())
         else:
             self.set_panel_zoom(1.0)
             if getattr(self, "tile_stop_before_zoom", None) is not None:
@@ -2249,13 +2276,45 @@ class UmapWindow(ExportsMixin):
         else:
             self.hsb.pack_forget()
         new = [float(v) for v in self.tile_scroll.cget("scrollregion").split()]
+        if anchor is not None and (spot is None or not (new[2] > 0 and new[3] > 0)):
+            self.zoom_note("no spot to keep under the pointer", spot=spot, scrollregion=new, anchor=anchor)
         if spot is not None and new[2] > 0 and new[3] > 0:
             nx, ny = self.spot_now(spot)
             wx, wy = anchor[2], anchor[3]
             self.tile_scroll.xview_moveto(min(max((nx - wx) / new[2], 0.0), 1.0))
             self.tile_scroll.yview_moveto(min(max((ny - wy) / new[3], 0.0), 1.0))
+            self.root.update_idletasks()
+            # (the view should now be where the spot is under the pointer, unless that is past an edge: if not, say so in zoom_debug.log, and put it right once)
+            want_x = min(max(nx - wx, 0.0), max(new[2] - self.tile_scroll.winfo_width(), 0.0))
+            want_y = min(max(ny - wy, 0.0), max(new[3] - self.tile_scroll.winfo_height(), 0.0))
+            got_x, got_y = self.tile_scroll.canvasx(0), self.tile_scroll.canvasy(0)
+            if abs(got_x - want_x) > 8 or abs(got_y - want_y) > 8:               # (a few pixels is the canvas's own border: moveto is off by it. More is not.)
+                self.zoom_note("the view is not where the zoom put it", want=(want_x, want_y), got=(got_x, got_y), spot=spot, spot_now=(nx, ny), anchor=anchor,
+                               scrollregion=new, pane=(self.tile_scroll.winfo_width(), self.tile_scroll.winfo_height()), zoom=(self.panel_zoom, zoom))
+                self.tile_scroll.xview_moveto(want_x / new[2])
+                self.tile_scroll.yview_moveto(want_y / new[3])
+            self.zoom_view = (self.tile_scroll.canvasx(0), self.tile_scroll.canvasy(0))
+            self.root.after(400, self.check_zoom_view)
         self.place_tiles()
         self.root.after_idle(self.refresh_visible)
+
+    def check_zoom_view(self):
+        """Some time after a zoom: has the view moved since, with no drag or wheel? (The sudden jump to the top left: see zoom_debug.log.)"""
+        if self.zoom_burst is not None or getattr(self, "panning", False) or getattr(self, "zoom_view", None) is None:
+            return
+        now = (self.tile_scroll.canvasx(0), self.tile_scroll.canvasy(0))
+        if abs(now[0] - self.zoom_view[0]) > 3 or abs(now[1] - self.zoom_view[1]) > 3:
+            self.zoom_note("the view moved by itself after a zoom", was=self.zoom_view, now=now, zoom=self.panel_zoom,
+                           scrollregion=self.tile_scroll.cget("scrollregion"), pane=(self.tile_scroll.winfo_width(), self.tile_scroll.winfo_height()))
+        self.zoom_view = None
+
+    def zoom_note(self, what, **state):
+        """A line in zoom_debug.log (next to the cache) for a zoom that did not go as it should: for finding what makes the view jump."""
+        try:
+            with open(core.CACHE_DIR / "zoom_debug.log", "a", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S") + " " + what + " " + repr(state) + chr(10))
+        except Exception:
+            pass
 
     ZOOM_SETTLE_MS = 180
 
@@ -2303,14 +2362,65 @@ class UmapWindow(ExportsMixin):
             widest = min(self.pane_cache, key=lambda e: e["z"])
             self.pane_cache = [widest] + [e for e in self.pane_cache if e is not widest][-3:]
 
+    def print_window_region(self, x, y, w, h):
+        """A part of this window's own picture of itself (Windows PrintWindow), x, y from the window's top left: right on any monitor, whatever its scaling.
+        (A screen grab is not: it comes out black, or the wrong place, for a window on a monitor other than the main one.) None if it cannot be had."""
+        if sys.platform != "win32":
+            return None
+        try:
+            import ctypes
+            from ctypes import wintypes as wt
+            u, g = ctypes.windll.user32, ctypes.windll.gdi32
+            u.GetDC.restype = ctypes.c_void_p
+            g.CreateCompatibleDC.restype = ctypes.c_void_p
+            g.CreateCompatibleBitmap.restype = ctypes.c_void_p
+            hwnd = wt.HWND(self.root.winfo_id())
+            rect = wt.RECT()
+            u.GetClientRect(hwnd, ctypes.byref(rect))
+            W, H = rect.right, rect.bottom
+            if W <= 0 or H <= 0:
+                return None
+            screen = u.GetDC(None)
+            mem = g.CreateCompatibleDC(ctypes.c_void_p(screen))
+            bmp = g.CreateCompatibleBitmap(ctypes.c_void_p(screen), W, H)
+            g.SelectObject(ctypes.c_void_p(mem), ctypes.c_void_p(bmp))
+            try:
+                if not u.PrintWindow(hwnd, ctypes.c_void_p(mem), 2):                  # (2: the full content, the windows inside it too)
+                    return None
+
+                class Header(ctypes.Structure):
+                    _fields_ = [("size", wt.DWORD), ("w", wt.LONG), ("h", wt.LONG), ("planes", wt.WORD), ("bits", wt.WORD), ("compression", wt.DWORD),
+                                ("image", wt.DWORD), ("xppm", wt.LONG), ("yppm", wt.LONG), ("used", wt.DWORD), ("important", wt.DWORD)]
+                header = Header(40, W, -H, 1, 32, 0, 0, 0, 0, 0, 0)
+                buf = ctypes.create_string_buffer(W * H * 4)
+                g.GetDIBits(ctypes.c_void_p(mem), ctypes.c_void_p(bmp), 0, H, buf, ctypes.byref(header), 0)
+            finally:
+                g.DeleteObject(ctypes.c_void_p(bmp))
+                g.DeleteDC(ctypes.c_void_p(mem))
+                u.ReleaseDC(None, ctypes.c_void_p(screen))
+            whole = Image.frombuffer("RGBA", (W, H), buf, "raw", "BGRA", 0, 1).convert("RGB")
+            part = whole.crop((x, y, x + w, y + h))
+            if part.size != (w, h) or part.getextrema() == ((0, 0), (0, 0), (0, 0)):         # (nothing in it: not to be trusted)
+                return None
+            return part
+        except Exception:
+            return None
+
     def snapshot_pane(self):
         """A picture of the section pane as it is on screen now (PIL Image), or None if it cannot be taken."""
         try:
-            from PIL import ImageGrab
             self.root.update_idletasks()
             c = self.tile_scroll
             x, y, w, h = c.winfo_rootx(), c.winfo_rooty(), c.winfo_width(), c.winfo_height()
-            image = ImageGrab.grab(bbox=(x, y, x + w, y + h)).convert("RGB")
+            image = self.print_window_region(x - self.root.winfo_rootx(), y - self.root.winfo_rooty(), w, h)
+            if image is not None:
+                return image
+            from PIL import ImageGrab
+            try:
+                image = ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True)         # (all screens: without it only the primary monitor is captured, and a window on another is black)
+            except TypeError:
+                image = ImageGrab.grab(bbox=(x, y, x + w, y + h))
+            image = image.convert("RGB")
             return image if image.size == (w, h) else image.resize((w, h))
         except Exception:
             return None
@@ -2550,7 +2660,11 @@ class UmapWindow(ExportsMixin):
         if self.busy:
             self.var_level.set(self.level)
             return
+        old = self.level
         self.level = self.var_level.get()
+        if self.level != old:                                          # (each level keeps its own group numbers: those last typed for it, else none)
+            self.ids_by_level[old] = self.var_ids.get()
+            self.var_ids.set(self.ids_by_level.get(self.level, ""))
         if self.mode in ("all", "single"):
             self.recolor()
 
@@ -3707,6 +3821,8 @@ class UmapWindow(ExportsMixin):
         core.start_section_coordinate_load(self.abc_cache)
         z, section_ap = core.section_coords(sec)
         rows = [("Atlas z", f"{z:.2f}", "mm (the section's)")] if z is not None else []
+        if not self.ccf_started:
+            self.start_ccf_lookup()                                  # (the first cell tip: not before, so that nothing reads it while the maps are being drawn and zoomed)
         ccf = None
         if info["umap_idx"] is not None and self.ccf_run is not None:
             ccf = self.ccf_run[info["umap_idx"]]
@@ -3762,6 +3878,7 @@ class UmapWindow(ExportsMixin):
         first time (the table of every cell of the atlas: a minute or so), seconds after. Only if they are on this computer: see ccf_action."""
         self.ccf_run = self.ccf_bg = None
         self.ccf_state = "none"
+        self.ccf_started = True
         h = self.host
         if self.own is not None or self.abc_cache is None or "load_ccf_for_cells" not in h:
             return
@@ -3769,15 +3886,34 @@ class UmapWindow(ExportsMixin):
             self.ccf_state = "missing"
             return
         self.ccf_state = "reading"
-        run_ids = list(self.adata.obs_names)
-        bg_ids = list(self.bg["ids"]) if self.bg is not None and self.bg.get("ids") is not None else []
+        names, bg = self.adata.obs_names, (self.bg["ids"] if self.bg is not None and self.bg.get("ids") is not None else [])
+        # (the cells' coordinates are kept in the run's folder, the first time: the table behind them is the whole atlas. Which cells they are for is
+        # told by their number and the first and last of them.)
+        signature = f"{len(names)}|{names[0] if len(names) else ''}|{names[-1] if len(names) else ''}|{len(bg)}|{bg[0] if len(bg) else ''}|{bg[-1] if len(bg) else ''}"
+        saved = Path(self.run_folder) / "ccf_cells.npz" if self.run_folder is not None else None
 
         def work():
             try:
+                if saved is not None and saved.exists():
+                    try:
+                        with np.load(saved, allow_pickle=False) as z:
+                            if str(z["signature"]) == signature:
+                                self.ccf_run, self.ccf_bg = z["run"], (z["bg"] if z["bg"].size else None)
+                                self.ccf_state = "ready"
+                                return
+                    except Exception:
+                        pass                                            # (unreadable or not for these cells: read again)
+                run_ids = list(self.adata.obs_names)                     # (here and not before the thread: for 500,000 cells and every cell of the sections that took 6 seconds with the window frozen)
+                bg_ids = list(self.bg["ids"]) if self.bg is not None and self.bg.get("ids") is not None else []
                 table, _shell = h["load_ccf_for_cells"](self.abc_cache, run_ids + bg_ids)
                 xyz = table[["x_ccf", "y_ccf", "z_ccf"]].to_numpy(dtype=np.float32)       # (AP, DV, ML)
                 self.ccf_run, self.ccf_bg = xyz[:len(run_ids)], (xyz[len(run_ids):] if bg_ids else None)
                 self.ccf_state = "ready"
+                if saved is not None:
+                    try:
+                        np.savez(saved, run=self.ccf_run, bg=self.ccf_bg if self.ccf_bg is not None else np.zeros((0, 3), np.float32), signature=np.array(signature))
+                    except Exception:
+                        pass                                            # (a folder that cannot be written to: it is read again next time)
             except Exception as e:
                 self.ccf_state = "failed"
                 print(f"Could not read the cells' CCF coordinates (for their Paxinos ML and DV): {e}", flush=True)

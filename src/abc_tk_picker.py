@@ -1512,6 +1512,10 @@ class SectionWindow:
             self.root.after_cancel(self.poll_id)
         except Exception:
             pass
+        try:
+            self.final_gene = self.var_gene.get().strip()       # (kept for the caller: release_tk_variables takes the variables away)
+        except (tk.TclError, AttributeError):
+            self.final_gene = ""
         if self.own_root:
             try:
                 self.root.quit()        # (the loop ends even while other windows, matplotlib's, are alive in the same process)
@@ -1570,7 +1574,7 @@ def prompt_subregion_selection_tk(adata, abc_cache, section_series, section_labe
     win.run()
     if session_view_settings is not None:         # (the next section opens on the same view)
         session_view_settings["mode"] = {"groups": "standard", "find": "standard", "gene": "gene", "imputed": "imputed_gene"}[win.mode]
-        session_view_settings["gene"] = win.var_gene.get().strip()
+        session_view_settings["gene"] = getattr(win, "final_gene", "")          # (read as the window closed: its variables are gone by now)
     return win.result or []
 
 

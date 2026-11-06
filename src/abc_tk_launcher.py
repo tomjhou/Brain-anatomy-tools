@@ -643,6 +643,10 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
         raw = folder_var.get().strip().strip('"')
         if not raw or existing_all_neurons(Path(os.path.expanduser(raw))) is not None:
             return
+        # (the atlas still downloading, the first time: making the dataset waits for it, so say so, or a yes looks like it starts now)
+        running = helpers.get("atlas_download_running", lambda: None)()
+        waiting = (f"The atlas is still downloading ({running}). If you say yes, making the dataset starts as soon as the download "
+                   "finishes, so keep the program open.\n\n") if running else ""
         if messagebox.askyesno(
                 "Make the \"All neurons\" dataset?",
                 "This output folder has no \"All neurons\" dataset yet. It is well worth making once:\n\n"
@@ -653,6 +657,7 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
                 "  •  a quick way to find where to draw ROIs for a project of your own.\n\n"
                 "Making it takes a while (tens of minutes, or longer if the atlas is still downloading), once: it is saved in the output "
                 "folder, and from then on the \"Browse All Neurons\" button opens it straight away.\n\n"
+                f"{waiting}"
                 "Make it now?", parent=root):
             folder = committed_folder()
             if folder is not None:

@@ -5806,8 +5806,14 @@ class XlefViewer:
                 self.detail_pending = False
                 self._update_cursor()
             return
-        if not self._full_res_allowed():
-            return
+        if level is None and not self._full_res_allowed():
+            # The full resolution isn't here (online-only: being downloaded, or not wanted): the pyramid's sharpest copy stands in, if
+            # it is sharper than the preview and not in already. The sharp view follows when the download is in (see _downloaded).
+            fin = self.img.usable_level(max(self.img.entry.width, self.img.entry.height) / 2 - 2)
+            if fin is None or not step < fin[1] < s or self._covered_at(fin[1], need):
+                return
+            level, step = fin
+            self.sharp_level = level
         self.generation += 1
         self.detail_pending = True           # (an hourglass until the sharper view is in)
         self.hires_progress = None
@@ -5913,9 +5919,12 @@ class XlefViewer:
     def _interim_level(self, level, step, need):
         """(level, its step) of the pyramid's finest level when a view at `step` from the full-resolution files (level None) would have
         to decode compressed planes whole (seconds), and that level is sharper than the preview, so that it can be shown meanwhile;
-        else None."""
+        else None. Not for online-only files: finding out whether they are compressed means reading their header, and OneDrive answers
+        a read of any part of a file only once it has downloaded all of it (minutes, for a large one, with the window frozen)."""
         img, z = self.img, self.z
-        if level is not None or not any((z, c) not in img.planes and img.is_compressed(z, c) for c in need):
+        if level is not None or any((f := img.entry.files.get((z, c))) and is_online_only(f) for c in need):
+            return None
+        if not any((z, c) not in img.planes and img.is_compressed(z, c) for c in need):
             return None
         if any(img.raw_layout(z, c) is not None for c in need):
             return None
@@ -6638,7 +6647,8 @@ class XlefViewer:
             size = size_text(sum(os.path.getsize(f) for f in ask))
             cloud = [i for i in self._entries_of(self._project_of(item)) if i in self.item_cloud and i not in self.download_progress]
             choice = ask_download(self.root, "Download from OneDrive?",
-                                  f"Zooming further needs high-resolution files ({size} for this section) that are online-only.",
+                                  f"Highest resolution views require downloading files ({size} for this section) that are currently "
+                                  "online-only.",
                                   all_label=f"Download for all sections ({size_text(self._cloud_bytes(cloud))})")
         finally:
             self.asking_download = False

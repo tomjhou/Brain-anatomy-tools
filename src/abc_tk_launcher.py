@@ -151,7 +151,7 @@ def choose_run_options(current="Neurons", counts=None, folder_for=None, whole_br
         elif is_large():
             n = count_of_kind()
             large_text.set((f"This selection has {n:,} cells. " if n is not None else "") +
-                           "A UMAP of that many cells takes a very long time. Use a random subset of this size, or all of them:")
+                           "A UMAP of that many cells takes a very long time. Use a pseudorandom subset of this size (the same cells each time), or all of them:")
         else:
             large_text.set(f"This selection has {count_of_kind():,} cells, so there is no need to limit it (that is asked for more than "
                            f"{LARGE_PROJECT_CELLS:,}).")
@@ -682,7 +682,7 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
         if not messagebox.askokcancel(
                 "Browse all neurons",
                 f"There is no \"All neurons\" dataset in this output folder yet, so one will be made now.\n\n"
-                f"It takes a random {ALL_NEURONS_CAP:,} of the neurons from every section of the brain atlas (the whole atlas has millions), "
+                f"It takes a pseudorandom {ALL_NEURONS_CAP:,} of the neurons (the same ones each time) from every section of the brain atlas (the whole atlas has millions), "
                 "and computes a UMAP of them, with clusters.\n\n"
                 "This can take a while (tens of minutes, or longer the first time, if the atlas is still downloading). "
                 "It is saved in the output folder, so from then on this button opens it straight away.\n\n"

@@ -977,7 +977,11 @@ serialize_downloads(abc_cache)
 # waits for the download rather than starting another (see serialize_downloads).
 ATLAS_CORE_FILES = (("the cell metadata table", 'MERFISH-C57BL6J-638850', 'cell_metadata_with_cluster_annotation', 'metadata'),
                     ("the raw MERFISH expression data", 'MERFISH-C57BL6J-638850', 'C57BL6J-638850/raw', 'data'))
-atlas_prefetch = {'thread': None, 'total_gb': 0.0, 'files': []}
+# ...and, first, the reconstructed coordinates and their atlas, when the setting asks for them (it does unless changed): a quarter of a GB, that
+# the browser needs as soon as it opens. Asked for separately (prepare_coordinate_frame) they were a second download beside the big one,
+# and the two progress bars in the console wrote over each other.
+ATLAS_RECON_LABELS = ("the reconstructed cell coordinates", "the atlas regions that go with them")
+atlas_prefetch = {'thread': None, 'total_gb': 0.0, 'files': [], 'keys': set()}
 
 
 def atlas_download_running():
@@ -1003,22 +1007,34 @@ def start_atlas_prefetch(cache):
     for label, directory, file_name, kind in ATLAS_CORE_FILES:
         path, size, present = metadata_file_status(cache, directory, file_name)
         if present is False:
-            missing.append((label, directory, file_name, kind, size))
-            atlas_prefetch['files'].append((path, size))
+            missing.append((label, directory, file_name, kind, size, path))
     if not missing:
-        return
+        return                     # (the reconstructed coordinates alone, a setting changed later, are asked for when needed, as before)
+    if COORD_SETTINGS['reconstructed_coords']:
+        recon = []
+        for label, (directory, file_name, kind) in zip(ATLAS_RECON_LABELS, RECON_FILES):
+            path, size, present = metadata_file_status(cache, directory, file_name)
+            if present is False:
+                recon.append((label, directory, file_name, kind, size, path))
+        missing = recon + missing                       # (first: small, and needed as soon as the browser opens)
+    for _label, directory, file_name, _kind, size, path in missing:
+        atlas_prefetch['files'].append((path, size))
+        atlas_prefetch['keys'].add((directory, file_name))
     total_gb = sum(m[4] or 0 for m in missing) / 1e9
     atlas_prefetch['total_gb'] = total_gb
 
     def work():
-        for _label, directory, file_name, kind, _size in missing:
+        for _label, directory, file_name, kind, _size, _path in missing:          # (one after another: one progress bar in the console)
             try:
                 (cache.get_data_path if kind == 'data' else cache.get_metadata_path)(directory=directory, file_name=file_name)
             except Exception as e:
                 print(f"Could not download {file_name} ({type(e).__name__}: {e}); it will be tried again when it is needed.")
     atlas_prefetch['thread'] = threading.Thread(target=work, daemon=True)
     atlas_prefetch['thread'].start()
-    parts = "\n".join(f"    {m[0]}: {m[4] / 1e9:.1f} GB" if m[4] else f"    {m[0]}" for m in missing)
+
+    def size_text(n):
+        return f"{n / 1e9:.1f} GB" if n >= 1e8 else f"{max(n / 1e6, 1):.0f} MB"
+    parts = "\n".join(f"    {m[0]}: {size_text(m[4])}" if m[4] else f"    {m[0]}" for m in missing)
     message = (f"The atlas data is not on this computer yet, so it is being downloaded now (one time only):\n\n{parts}\n\n"
                f"That is about {total_gb:.0f} GB and can take 10 minutes or much longer, depending on the connection. Progress is shown in "
                "the console window. You can carry on to the launch screen; opening the browser will wait for the download to finish. "
@@ -2486,16 +2502,24 @@ def ensure_ccf_downloaded(abc_cache, parent=None, files=CCF_FILES, what="CCF coo
     kinds = {(entry[0], entry[1]): (entry[2] if len(entry) > 2 else 'metadata') for entry in files}
     total_bytes = sum(size or 0 for _d, _f, size, _p in missing)
     size_text = f"{total_bytes / 1e6:.0f} MB" if total_bytes else "a large file"
-    try:
-        from tkinter import messagebox
-        if not messagebox.askyesno(
-                "Download CCF coordinates?",
-                f"This needs the Allen {what}, a one-time download of "
-                f"{size_text} into your atlas cache folder. Download it now?", parent=parent):
+    # Already on their way in the atlas download at start-up (start_atlas_prefetch): not asked about, and not downloaded a second time beside it
+    # (the per-file lock of serialize_downloads makes the download below wait for that one, and then find the files there).
+    queued = atlas_download_running() is not None and all((d, f) in atlas_prefetch['keys'] for d, f, _s, _p in missing)
+    if not queued:
+        question = (f"This needs the Allen {what}, a one-time download of "
+                    f"{size_text} into your atlas cache folder. Download it now?")
+        try:
+            if parent is None:                          # (no window to put it over: in the middle of the screen, see centered_dialog.py)
+                import centered_dialog
+                answer = centered_dialog.ask_yes_no("Download CCF coordinates?", question)
+            else:
+                from tkinter import messagebox
+                answer = messagebox.askyesno("Download CCF coordinates?", question, parent=parent)
+            if not answer:
+                return False
+        except Exception as e:
+            print(f"Could not ask about the CCF download ({e}); not downloading.")
             return False
-    except Exception as e:
-        print(f"Could not ask about the CCF download ({e}); not downloading.")
-        return False
 
     outcome = {'error': None, 'done': False}
 
@@ -2540,7 +2564,7 @@ def ensure_ccf_downloaded(abc_cache, parent=None, files=CCF_FILES, what="CCF coo
     if outcome['error'] is not None:
         print(f"The {what} download failed: {outcome['error']}")
         return False
-    return not ccf_files_missing(abc_cache)
+    return not ccf_files_missing(abc_cache, files)        # (the files asked for: not the default CCF ones, which a download of others never fetches)
 
 
 def load_ccf_for_cells(abc_cache, cell_labels, shell_points=0):
@@ -4737,12 +4761,109 @@ def run_with_loading_window(message, work, show_after_s=0.4):
     if ui:
         try:
             ui[2].stop()                       # (its pending step would otherwise run on the destroyed window and print an error)
+            # Hidden, and the screen brought up to date, before it is destroyed: on macOS a window destroyed with no event handled after it
+            # stays on the screen, and the step that follows (minutes of PCA and UMAP) handles none, so "Waiting for the atlas" stayed up.
+            ui[0].withdraw()
+            ui[0].update()
             ui[0].destroy()
         except Exception:
             pass
     if 'error' in outcome:
         raise outcome['error']
     return outcome.get('value')
+
+
+class StepWindow:
+    """One "Computing" window for the whole of a new run's computation (Steps 2-8: annotations, filtering, preprocessing, PCA, UMAP,
+    clustering, plots, saving), showing the step under way and its time. The long calls run on a background thread through run(), this
+    thread repainting the window meanwhile (unrepainted, it would freeze, "Not Responding" on Windows); log_status shows each step's
+    message in it too. Opened by the first run(), closed by close() (before the viewer opens, or when the launch screen comes back).
+    Not "always on top": the questions a run can ask on the way (how many cells to use, a failed step) must not be hidden behind it."""
+
+    def __init__(self):
+        self.ui = None
+        self.started = None
+
+    def _ensure(self):
+        if self.ui is not None:
+            return self.ui
+        try:
+            import tkinter as tk
+            from tkinter import ttk
+            root = tk.Tk()
+            root.title("Computing")
+            root.protocol("WM_DELETE_WINDOW", lambda: None)            # (nothing to cancel)
+            tk.Label(root, text="Computing the new run. This can take a while; the console shows the details.",
+                     justify='left', padx=18, pady=(14), wraplength=460).pack(anchor='w')
+            step = tk.Label(root, text="", justify='left', padx=18, wraplength=460, font=('TkDefaultFont', 10, 'bold'))
+            step.pack(anchor='w')
+            bar = ttk.Progressbar(root, mode='indeterminate', length=420)
+            bar.pack(padx=18, pady=(8, 0))
+            bar.start(12)
+            elapsed = tk.Label(root, text="", fg='gray35', pady=10)
+            elapsed.pack()
+            root.update_idletasks()
+            w, h = root.winfo_reqwidth(), root.winfo_reqheight()
+            root.geometry(f"+{(root.winfo_screenwidth() - w) // 2}+{(root.winfo_screenheight() - h) // 3}")
+            root.lift()
+            self.ui = (root, step, bar, elapsed)
+        except Exception:
+            self.ui = False                                                 # (no usable Tk: the console alone)
+        return self.ui
+
+    def set(self, message):
+        """Show `message` as the step under way (and repaint). Only from the main thread: Tk is not to be touched from another."""
+        if threading.current_thread() is not threading.main_thread() or not self.ui:
+            return
+        try:
+            self.ui[1].config(text=message)
+            self.started = time.perf_counter()
+            self.ui[3].config(text="")
+            self.ui[0].update()
+        except Exception:
+            self.ui = False
+
+    def run(self, message, work):
+        """`work()` on a background thread, the window showing `message` and the time it has taken; returns its result (re-raising what it
+        raised). `work` must not touch any GUI object."""
+        ui = self._ensure()
+        if ui:
+            self.set(message)
+        outcome = {}
+
+        def runner():
+            try:
+                outcome['value'] = work()
+            except BaseException as e:
+                outcome['error'] = e
+        thread = threading.Thread(target=runner, daemon=True)
+        thread.start()
+        while thread.is_alive():
+            if self.ui:
+                try:
+                    self.ui[3].config(text=f"{int(time.perf_counter() - self.started)} s")
+                    self.ui[0].update()
+                except Exception:
+                    self.ui = False
+            time.sleep(0.03)
+        thread.join()
+        if 'error' in outcome:
+            raise outcome['error']
+        return outcome.get('value')
+
+    def close(self):
+        if self.ui:
+            try:
+                self.ui[2].stop()
+                self.ui[0].withdraw()
+                self.ui[0].update()                    # (gone from the screen now, also on macOS: see run_with_loading_window)
+                self.ui[0].destroy()
+            except Exception:
+                pass
+        self.ui = None
+
+
+compute_window = StepWindow()
 
 
 
@@ -6303,6 +6424,7 @@ def prompt_startup_panel(out_folder):
     Exits the process if the window is closed without choosing an action. Raises if the Tk launch screen can't be loaded (the caller
     falls back to a console prompt)."""
     start_section_coordinate_load(abc_cache)   # (the table of sections' z values, read in the background for the windows to come)
+    compute_window.close()                     # (a run that stopped partway, with an error, may have left its "Computing" window up)
     from abc_tk_launcher import prompt_startup_panel_tk
     outcome = prompt_startup_panel_tk(out_folder, abc_cache, {
         'load_recent_output_folders': load_recent_output_folders,
@@ -10719,6 +10841,9 @@ def confirm_overwrite(path):
     return prompt_yes_no(f"File '{path}' already exists. Overwrite? (y/n): ")
 
 
+PIPELINE_STEPS = 9          # a run's steps, as log_status numbers them: 1 the sections and ROIs, 2-8 the computing (see StepWindow), 9 the viewer
+
+
 def log_status(message):
     """print() prefixed with the elapsed time, in seconds (3 decimals, i.e.
     millisecond resolution), since `selection_confirmed_at` (a
@@ -10728,7 +10853,13 @@ def log_status(message):
     status updates printed after that point; earlier messages (data
     loading, the picker itself) use plain print()."""
     elapsed_s = time.perf_counter() - selection_confirmed_at
+    # "Step 6:" -> "Step 6/9:" (and "Steps 4-7:" -> "Steps 4-7/9:"), so that how far along a run is reads at a glance
+    message = re.sub(r'^(Steps? \d+(?:-\d+)?):', rf'\1/{PIPELINE_STEPS}:', message)
     print(f"[+{elapsed_s:9.3f} s] {message}")
+    if message.startswith("Step 9"):
+        compute_window.close()                         # (the computing is done: the viewer opens next)
+    else:
+        compute_window.set(message)
 
 
 def open_with_default_viewer(path):
@@ -18859,7 +18990,8 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         try:
             # The table is read from the CSV only the first time (a gigabyte; the better part of a minute): after that from a cache that
             # is already in the order of adata.obs, so the columns are simply added (see load_annotations_aligned).
-            annotations = load_annotations_aligned(adata.obs.index, abc_cache)
+            annotations = compute_window.run(f"Step 2/{PIPELINE_STEPS}: Reading the cell types of the atlas...",
+                                             lambda: load_annotations_aligned(adata.obs.index, abc_cache))
             metadata_cols = [c for c in annotations.columns if c not in adata.obs.columns]
             # Adding columns to adata.obs (rather than subsetting adata to the
             # intersection first) keeps adata backed — subsetting a backed AnnData
@@ -18895,10 +19027,14 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
     else:
         section_desc = 'all sections' if selected_sections is None else f'{len(selected_sections)} selected section(s)'
         log_status(f"Step 3: Filtering to cell type subset '{cell_type_selection}' and {section_desc}...")
-        adata = filter_by_cell_type(adata, cell_type_selection)
-        adata = filter_by_sections(adata, section_series, selected_sections)
-        if rois:
-            adata = filter_by_rois(adata, abc_cache, rois)
+
+        def filter_cells(adata=adata):
+            adata = filter_by_cell_type(adata, cell_type_selection)
+            adata = filter_by_sections(adata, section_series, selected_sections)
+            if rois:
+                adata = filter_by_rois(adata, abc_cache, rois)
+            return adata
+        adata = compute_window.run(f"Step 3/{PIPELINE_STEPS}: Picking out the cells ({cell_type_selection}, {section_desc})...", filter_cells)
         log_status(f"Step 3: {adata.n_obs} cells remain after filtering.")
         cells_after_filter = int(adata.n_obs)           # (before a random subset, if one is taken: it goes into statistics.txt)
 
@@ -18924,7 +19060,7 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
             cap = run_options['cap']
             if cap is not None and adata.n_obs > cap:
                 subsample_target = cap
-                log_status(f"Step 4: {adata.n_obs} cells exceed the limit of {cap}: using a random subset of {cap}.")
+                log_status(f"Step 4: {adata.n_obs} cells exceed the limit of {cap}: using a pseudorandom subset of {cap} (fixed seed: the same cells each time).")
         elif adata.n_obs > N_SUBSAMPLE_DEFAULT:
             subsample_target = prompt_subsample_choice(adata.n_obs, N_SUBSAMPLE_DEFAULT)
 
@@ -19064,11 +19200,12 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
             # is still backed here, so this is where the actual disk read
             # happens — and it only reads the subsampled cells, not the full
             # unfiltered dataset first.
-            adata = materialize_subset(adata, keep_mask)
+            adata = compute_window.run(f"Step 4/{PIPELINE_STEPS}: Reading {subsample_target:,} cells' expression from the atlas...",
+                                       lambda: materialize_subset(adata, keep_mask))
             log_status(f"Step 4: Subsampled to {adata.n_obs} cells.")
         elif adata.isbacked:
             log_status(f"Step 4: Using all {adata.n_obs} filtered cells (no subsampling); loading into memory...")
-            adata = adata.to_memory()
+            adata = compute_window.run(f"Step 4/{PIPELINE_STEPS}: Reading {adata.n_obs:,} cells' expression from the atlas...", adata.to_memory)
         else:
             log_status(f"Step 4: Using all {adata.n_obs} filtered cells (no subsampling).")
 
@@ -19077,27 +19214,31 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         # ---------------------------------------------------------------------------
         # Basic QC filtering
         log_status("Step 5: Filtering cells (min_counts=20) and genes (min_cells=5)...")
-        sc.pp.filter_cells(adata, min_counts=20)
-        sc.pp.filter_genes(adata, min_cells=5)
-        log_status(f"Step 5: After filtering, {adata.n_obs} cells x {adata.n_vars} genes remain.")
 
-        # Save raw counts
-        adata.layers['counts'] = adata.X.copy()
+        def qc_filter():
+            sc.pp.filter_cells(adata, min_counts=20)
+            sc.pp.filter_genes(adata, min_cells=5)
+        compute_window.run(f"Step 5/{PIPELINE_STEPS}: Filtering cells and genes...", qc_filter)
+        log_status(f"Step 5: After filtering, {adata.n_obs} cells x {adata.n_vars} genes remain.")
 
         # Normalize + log-transform (MERFISH panels are small, ~500 genes,
         # so we skip highly-variable-gene selection and use all genes for PCA)
         log_status("Step 5: Normalizing, log-transforming, and scaling...")
-        sc.pp.normalize_total(adata)
-        sc.pp.log1p(adata)
-        # sc.pp.scale zero-centers the data, which densifies the sparse matrix.
-        # Harmless here since the MERFISH panel is small (~500 genes vs. tens of
-        # thousands for full transcriptome data), so just silence the warning.
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                'ignore', message='zero-centering a sparse array/matrix densifies it',
-                category=UserWarning,
-            )
-            sc.pp.scale(adata, max_value=10)
+
+        def normalize():
+            adata.layers['counts'] = adata.X.copy()          # (the raw counts, kept)
+            sc.pp.normalize_total(adata)
+            sc.pp.log1p(adata)
+            # sc.pp.scale zero-centers the data, which densifies the sparse matrix.
+            # Harmless here since the MERFISH panel is small (~500 genes vs. tens of
+            # thousands for full transcriptome data), so just silence the warning.
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    'ignore', message='zero-centering a sparse array/matrix densifies it',
+                    category=UserWarning,
+                )
+                sc.pp.scale(adata, max_value=10)
+        compute_window.run(f"Step 5/{PIPELINE_STEPS}: Normalizing, log-transforming and scaling...", normalize)
         log_status("Step 5: Preprocessing complete.")
 
         # ---------------------------------------------------------------------------
@@ -19105,13 +19246,13 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         # ---------------------------------------------------------------------------
         log_status("Step 6: Running PCA (n_comps=50)...")
         pca_start = time.perf_counter()
-        sc.tl.pca(adata, n_comps=50, svd_solver='arpack')
+        compute_window.run(f"Step 6/{PIPELINE_STEPS}: Running PCA...", lambda: sc.tl.pca(adata, n_comps=50, svd_solver='arpack'))
         log_status(f"Step 6: PCA complete in {format_duration(time.perf_counter() - pca_start)}.")
         log_status("Step 6: Computing neighbor graph (n_neighbors=15, n_pcs=50)...")
-        sc.pp.neighbors(adata, n_neighbors=15, n_pcs=50)
-        log_status("Step 6: Running UMAP...")
+        compute_window.run(f"Step 6/{PIPELINE_STEPS}: Computing the neighbor graph...", lambda: sc.pp.neighbors(adata, n_neighbors=15, n_pcs=50))
+        log_status("Step 6: Running UMAP (this is usually the longest step)...")
         umap_start = time.perf_counter()
-        sc.tl.umap(adata)
+        compute_window.run(f"Step 6/{PIPELINE_STEPS}: Running UMAP (this is usually the longest step)...", lambda: sc.tl.umap(adata))
         log_status(f"Step 6: UMAP complete in {format_duration(time.perf_counter() - umap_start)}.")
 
         # Leiden clustering — scanpy's own de-novo grouping of these cells,
@@ -19132,8 +19273,9 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
             # emits a FutureWarning in scanpy 1.12 about the default
             # changing, and 'igraph' with n_iterations=2 is what that
             # warning steers callers toward.
-            sc.tl.leiden(adata, key_added=LEIDEN_KEY, flavor='igraph', n_iterations=2,
-                         resolution=LEIDEN_RESOLUTION)
+            compute_window.run(f"Step 6/{PIPELINE_STEPS}: Finding clusters (Leiden)...",
+                               lambda: sc.tl.leiden(adata, key_added=LEIDEN_KEY, flavor='igraph', n_iterations=2,
+                                                    resolution=LEIDEN_RESOLUTION))
             log_status(f"Step 6: Leiden found {adata.obs[LEIDEN_KEY].nunique()} clusters in "
                        f"{format_duration(time.perf_counter() - leiden_start)}.")
         except Exception as e:
@@ -19265,7 +19407,7 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
     # Optionally save the processed AnnData for reuse (kept in the local cache dir, not out_folder)
     h5ad_out_path = CACHE_DIR / f'{session_prefix}_processed.h5ad'
     log_status(f"Step 8: Writing processed AnnData to {h5ad_out_path}...")
-    adata.write_h5ad(h5ad_out_path)
+    compute_window.run(f"Step 8/{PIPELINE_STEPS}: Saving the run...", lambda: adata.write_h5ad(h5ad_out_path))
 
     log_status(f"Done. UMAP computed for {adata.n_obs} cells ({cell_type_selection}, {sections_suffix}).")
     log_status(f"Saved: {main_plot_path}, "
@@ -19275,9 +19417,9 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
     # ---------------------------------------------------------------------------
     # 9. Interactive UMAP viewer (subclass highlight / gene / imputed gene)
     # ---------------------------------------------------------------------------
-    run_with_loading_window("Writing this run's statistics.txt.",
-                            lambda: write_run_statistics(run_folder, adata, abc_cache, rois=rois, whole_sections=whole_only_sections if rois else None,
-                                                         cells_selected=cells_after_filter, overwrite=True, note="made with this run"))
+    compute_window.run(f"Step 8/{PIPELINE_STEPS}: Writing this run's statistics.txt...",          # (in the same window, not one of its own)
+                       lambda: write_run_statistics(run_folder, adata, abc_cache, rois=rois, whole_sections=whole_only_sections if rois else None,
+                                                    cells_selected=cells_after_filter, overwrite=True, note="made with this run"))
     log_status("Step 9: Opening the interactive UMAP viewer...")
     try:
         show_interactive_umap_window(

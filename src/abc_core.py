@@ -2152,7 +2152,7 @@ def run_statistics_text(run_folder, adata, abc_cache, rois=None, whole_sections=
 
     out += ["Cells", "-----", f"Cells in this run:                 {n:,}"]
     if sub:
-        out.append(f"Random subset:                     limited to {int(sub.group(1)):,} cells (the limit set for this run)"
+        out.append(f"Pseudorandom subset:               limited to {int(sub.group(1)):,} cells (the limit set for this run)"
                    + (f"; the selection had {cells_selected:,} cells" if cells_selected else ""))
     elif cells_selected and cells_selected != n:
         out.append(f"Cells in the selection:            {cells_selected:,}")

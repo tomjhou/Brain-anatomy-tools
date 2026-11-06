@@ -329,10 +329,9 @@ class ExportsMixin:
                         ax.scatter(coords[m, 0], coords[m, 1], c=color, marker=marker, s=size, alpha=POINT_ALPHA, linewidths=0)
                 entries = cat
             from abc_tk_umap import ink_for
-            by_count = self.var_label_scale.get()                 # (the "Label font size scales with cell count" checkbox: the saved UMAP follows it)
-            for text, x, y, color, weight in getattr(self, "label_info", []):
+            for text, x, y, color, weight in getattr(self, "label_info", []):          # (sized by their group's cell count, as on the screen)
                 if xlim[0] <= x <= xlim[1] and ylim[0] <= y <= ylim[1]:
-                    ax.text(x, y, text, fontsize=EXPORT_FONTSIZE * 0.6 * (weight if by_count else 1.0), color=ink_for(color, self.umap.bgcolor), fontweight="bold", ha="center", va="center", clip_on=True)
+                    ax.text(x, y, text, fontsize=EXPORT_FONTSIZE * 0.6 * weight, color=ink_for(color, self.umap.bgcolor), fontweight="bold", ha="center", va="center", clip_on=True)
             if entries is not None:
                 handles = self.legend_handles(entries, sort="id")
                 ncol = max(1, math.ceil(len(handles) / EXPORT_LEGEND_MAX_ROWS))

@@ -535,7 +535,8 @@ def restart():
 
 def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
     """`helpers`: load_recent_output_folders(), remember_recent_output_folder(folder), required_cached_run_files(folder) ->
-    {label: Path}, open_3d_viewer(abc_cache), settings_dialog(abc_cache)."""
+    {label: Path}, open_3d_viewer(abc_cache), settings_dialog(abc_cache), and (optional) atlas_download_running() -> how far the atlas
+    download has got, as text, while it runs (else None)."""
     root = tk.Tk()
     root.title("AllenABC UMAP Explorer")
     root.resizable(False, False)
@@ -628,12 +629,41 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
     def viewer3d():
         helpers["open_3d_viewer"](abc_cache)                # (returns when that window is closed; this one is still here)
 
+    def existing_all_neurons(folder):
+        """The "All neurons" dataset in `folder`, made on an earlier day (as "All neurons" or as the same run with no project name), or None."""
+        return next((folder / n for n in (ALL_NEURONS_FOLDER, ALL_NEURONS_FOLDER_UNNAMED) if (folder / n / "umap_coords.csv").exists()), None)
+
+    def make_all_neurons(folder):
+        helpers["remember_recent_output_folder"](folder)
+        result["outcome"] = ("all_neurons", None, None, folder)
+        root.destroy()
+
+    def offer_all_neurons():
+        """At start: if the output folder has no "All neurons" dataset yet, say what it is good for and offer to make it now."""
+        raw = folder_var.get().strip().strip('"')
+        if not raw or existing_all_neurons(Path(os.path.expanduser(raw))) is not None:
+            return
+        if messagebox.askyesno(
+                "Make the \"All neurons\" dataset?",
+                "This output folder has no \"All neurons\" dataset yet. It is well worth making once:\n\n"
+                f"  •  a UMAP of {ALL_NEURONS_CAP:,} neurons from every section of the brain atlas, with clusters, so that every neuron "
+                "type is there to browse at once;\n"
+                "  •  point at a cell, on the UMAP or on the section maps, to see what it is and where it is; pick a group to see "
+                "everywhere it lies in the brain;\n"
+                "  •  a quick way to find where to draw ROIs for a project of your own.\n\n"
+                "Making it takes a while (tens of minutes, or longer if the atlas is still downloading), once: it is saved in the output "
+                "folder, and from then on the \"Browse All Neurons\" button opens it straight away.\n\n"
+                "Make it now?", parent=root):
+            folder = committed_folder()
+            if folder is not None:
+                make_all_neurons(folder)
+
     def all_neurons():
         folder = committed_folder()
         if folder is None:
             return
-        # made on an earlier day, as "All neurons" or as the same run with no project name: simply opened, like any saved run
-        existing = next((folder / n for n in (ALL_NEURONS_FOLDER, ALL_NEURONS_FOLDER_UNNAMED) if (folder / n / "umap_coords.csv").exists()), None)
+        # made on an earlier day: simply opened, like any saved run
+        existing = existing_all_neurons(folder)
         if existing is not None:
             required = helpers["required_cached_run_files"](existing)
             missing = [f"{label}: {path}" for label, path in required.items() if label not in RECOVERABLE and not path.exists()]
@@ -653,13 +683,14 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
                 "It is saved in the output folder, so from then on this button opens it straight away.\n\n"
                 "Proceed?", parent=root):
             return
-        helpers["remember_recent_output_folder"](folder)
-        result["outcome"] = ("all_neurons", None, None, folder)
-        root.destroy()
+        make_all_neurons(folder)
 
     ttk.Separator(outer).pack(fill=tk.X, pady=(20, 14))
     style = ttk.Style(root)
-    style.configure("Big.TButton", font=("Segoe UI", 12), padding=(10, 9))
+    # On macOS a button's bezel is drawn at the system's own height, whatever the padding: the padding only made each button's widget taller
+    # than the bezel in it, a band of empty space above and below every button (the window nearly twice as tall as it needed to be).
+    aqua = root.tk.call("tk", "windowingsystem") == "aqua"
+    style.configure("Big.TButton", font=("Segoe UI", 12), padding=(10, 2) if aqua else (10, 9))
     ttk.Button(outer, text="Browse All Neurons", style="Big.TButton", command=all_neurons).pack(fill=tk.X, pady=4)
     ttk.Button(outer, text="Open Brain Browser/ROI Chooser", style="Big.TButton", command=new_run).pack(fill=tk.X, pady=4)
     pair = ttk.Frame(outer)                                         # (the two less used ones share a row)
@@ -671,13 +702,25 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
     ttk.Frame(outer, height=22).pack(fill=tk.X)
     ttk.Button(outer, text="Load Existing ROI Dataset…", style="Big.TButton", command=load_existing).pack(fill=tk.X, pady=4)
     ttk.Frame(outer, height=22).pack(fill=tk.X)
-    ttk.Button(outer, text="Exit", style="Big.TButton", command=root.destroy).pack(fill=tk.X, pady=4)
+    def exit_app():
+        """Exit (or the window closed): while the atlas is still downloading, warn first, since closing the program stops the download."""
+        running = helpers.get("atlas_download_running", lambda: None)()
+        if running and not messagebox.askyesno(
+                "The atlas is still downloading",
+                f"The atlas data is still downloading ({running}).\n\n"
+                "Exiting now stops the download, and the file it was on starts again from the beginning next time.\n\n"
+                "Exit anyway?", icon="warning", default="no", parent=root):
+            return
+        root.destroy()
 
-    root.protocol("WM_DELETE_WINDOW", root.destroy)
+    ttk.Button(outer, text="Exit", style="Big.TButton", command=exit_app).pack(fill=tk.X, pady=4)
+
+    root.protocol("WM_DELETE_WINDOW", exit_app)
     root.update_idletasks()
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
     root.geometry(f"+{(sw - root.winfo_width()) // 2}+{(sh - root.winfo_height()) // 3}")
     bring_to_front(root)
+    root.after(600, offer_all_neurons)                      # (once the window is in front: the question goes over it)
     root.mainloop()
     return result["outcome"]
 

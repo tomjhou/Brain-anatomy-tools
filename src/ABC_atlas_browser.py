@@ -284,17 +284,12 @@ def check_libraries_or_exit():
 
     title = "Missing Python libraries"
     try:
-        import tkinter as tk
-        from tkinter import messagebox
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
+        import centered_dialog                                  # (in the middle of the screen: see centered_dialog.py)
         if missing_required:
-            messagebox.showerror(title, message, parent=root)
+            centered_dialog.info(title, message)
             proceed = False
         else:
-            proceed = messagebox.askyesno(title, message, parent=root)
-        root.destroy()
+            proceed = centered_dialog.ask_yes_no(title, message)
     except Exception:
         # No GUI available: fall back to the console.
         if missing_required:
@@ -348,7 +343,7 @@ from abc_atlas_access.abc_atlas_cache.cloud_cache import OutdatedManifestWarning
 from abc_core import (
     CACHE_DIR, CCF_COORDS_FILE_NAME, CCF_DIRECTORY, CCF_FILES, CCF_PARCELLATION_DIRECTORY, CCF_PARCELLATION_FILE_NAME,
     COORD_SETTINGS, DATASET_NAME, DEFAULT_BREGMA_CCF_AP_MM, DEFAULT_GREY_RGBA, FRAME_STATE, GRID_CACHE_DPI, RECON_FILES,
-    coordinate_frame_name, dataset_prefix, grid_cache_layout, grid_cache_png, reconstructed_in_use,
+    coordinate_frame_name, dataset_prefix, file_complete, grid_cache_layout, grid_cache_png, reconstructed_in_use,
     record_run_opened as core_record_run_opened,
     IMPUTED_DATASET_DIRECTORY, IMPUTED_DATASET_FILE_NAME, MULTI_GENE_BRIGHT_BLUE, NON_NEURON_CLASS_IDS, DEFAULTS_DIR, SECTION_COL,
     SECTION_COORDS_CACHE_VERSION, SETTINGS_FILE, SPATIAL_CSV_CACHE_VERSION, SPATIAL_CSV_CHUNK_SIZE, ZOOM_DEBUG_DIAGNOSTICS,
@@ -626,6 +621,8 @@ ATLAS_CACHE_LOCATION_FILE = CACHE_DIR / 'abc_atlas_cache_location.json'
 # Free space a drive should have to hold the atlas download. A typical cache for
 # this app, including the imputed gene dataset, is around 75 GB.
 ATLAS_CACHE_SPACE_NEEDED_GB = 100
+ATLAS_CORE_GB = 9                  # ...of which the core atlas (the cell table and the raw expression data) every session needs
+ATLAS_IMPUTED_GB = 50              # ...and the imputed gene dataset, only when imputed genes are asked for
 
 
 def format_gb(n_bytes):
@@ -673,15 +670,16 @@ def free_bytes_at(path):
 
 
 def suggest_atlas_cache_dir(drives):
-    """The default location if its drive has room, otherwise abc_atlas_cache at
-    the root of the local drive with the most free space."""
+    """The default location if its drive has room; otherwise abc_atlas_cache at the root of the roomiest local drive that does have room; and
+    if none has, the default location after all. (Moving to another drive that is short of room too gains little, and on macOS and Linux the
+    only drive listed is the filesystem root, /, where a folder cannot be made: the suggestion was one that failed.)"""
     needed = ATLAS_CACHE_SPACE_NEEDED_GB * 1e9
     free_default = free_bytes_at(DEFAULT_ATLAS_CACHE_DIR)
     if free_default is not None and free_default >= needed:
         return DEFAULT_ATLAS_CACHE_DIR
-    if drives:
-        roomiest_root = max(drives, key=lambda d: d[1])[0]
-        return Path(roomiest_root) / 'abc_atlas_cache'
+    roomy = [d for d in drives if d[1] >= needed]
+    if roomy:
+        return Path(max(roomy, key=lambda d: d[1])[0]) / 'abc_atlas_cache'
     return DEFAULT_ATLAS_CACHE_DIR
 
 
@@ -731,14 +729,22 @@ def prompt_atlas_cache_location(suggested, drives):
     frame = tk.Frame(root, padx=16, pady=12)
     frame.pack(fill='both', expand=True)
 
+    # (no drive with the room for all of it: say what does fit, so that taking the default is still sound advice)
+    short = not any(free >= needed for _root, free, _total in drives)
+    shortfall = (f"No drive on this computer has {ATLAS_CACHE_SPACE_NEEDED_GB} GB free. That is fine for most use: the core atlas "
+                 f"needs about {ATLAS_CORE_GB} GB. The imputed gene dataset (about {ATLAS_IMPUTED_GB} GB) may not fit.\n\n") if short else ""
     tk.Label(frame, justify='left', wraplength=620, text=(
         "No ABC atlas download was found at the default location:\n"
         f"    {DEFAULT_ATLAS_CACHE_DIR}\n\n"
         "Choose where it should go. If this is a new location, the atlas files are "
-        f"downloaded there as needed, which can take about {ATLAS_CACHE_SPACE_NEEDED_GB} GB, "
+        f"downloaded there as needed, which can take about {ATLAS_CACHE_SPACE_NEEDED_GB} GB "
+        f"({ATLAS_CORE_GB} GB for the core atlas, {ATLAS_IMPUTED_GB} GB for the imputed gene dataset), "
         "so pick a drive with plenty of free space. If you already have a download "
         "elsewhere, choose that folder instead. This is asked only once. The local "
-        "drives and their free space are also listed in the console."
+        "drives and their free space are also listed in the console. (The program's own "
+        "working files, a few GB, are kept next to the program, not here.)\n\n"
+        f"{shortfall}"
+        "If you are unsure, accepting the default is likely the best option."
     )).pack(anchor='w')
 
     path_var = tk.StringVar(value=str(suggested))
@@ -888,13 +894,8 @@ def offer_atlas_release_update(cache):
     ])
     print("\n" + message + "\n")
     try:
-        import tkinter as tk
-        from tkinter import messagebox
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
-        switch = messagebox.askyesno("Newer ABC atlas release", message, parent=root)
-        root.destroy()
+        import centered_dialog
+        switch = centered_dialog.ask_yes_no("Newer ABC atlas release", message)
     except Exception:
         # No GUI available: fall back to the console.
         try:
@@ -942,14 +943,9 @@ else:
     # instead of a silent freeze.
     abc_cache = AbcProjectCache.from_local_cache(download_base)
     try:
-        import tkinter as tk
-        from tkinter import messagebox
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
-        messagebox.showwarning("Offline", offline_reason + "\n\nThe browser is working offline, with the atlas data already downloaded to this "
-                               "computer. Anything not downloaded yet cannot be loaded, and newer atlas releases are not checked for.", parent=root)
-        root.destroy()
+        import centered_dialog
+        centered_dialog.info("Offline", offline_reason + "\n\nThe browser is working offline, with the atlas data already downloaded to this "
+                             "computer. Anything not downloaded yet cannot be loaded, and newer atlas releases are not checked for.")
     except Exception:
         pass                                              # (no GUI: the console line above is the notice)
 
@@ -981,7 +977,23 @@ serialize_downloads(abc_cache)
 # waits for the download rather than starting another (see serialize_downloads).
 ATLAS_CORE_FILES = (("the cell metadata table", 'MERFISH-C57BL6J-638850', 'cell_metadata_with_cluster_annotation', 'metadata'),
                     ("the raw MERFISH expression data", 'MERFISH-C57BL6J-638850', 'C57BL6J-638850/raw', 'data'))
-atlas_prefetch = {'thread': None, 'total_gb': 0.0}
+atlas_prefetch = {'thread': None, 'total_gb': 0.0, 'files': []}
+
+
+def atlas_download_running():
+    """While the download started by start_atlas_prefetch is still going: how far it has got, as text ("3.1 of 9.1 GB"); else None. (For the
+    launch screen's Exit: closing the program stops the download, and a file cut short is downloaded again from the start.)"""
+    thread = atlas_prefetch['thread']
+    if thread is None or not thread.is_alive():
+        return None
+    got = 0
+    for path, _size in atlas_prefetch['files']:
+        try:
+            got += path.stat().st_size if path is not None else 0
+        except OSError:
+            pass
+    total = atlas_prefetch['total_gb']
+    return f"{got / 1e9:.1f} of {total:.1f} GB" if total else "under way"
 
 
 def start_atlas_prefetch(cache):
@@ -989,9 +1001,10 @@ def start_atlas_prefetch(cache):
     Fills atlas_prefetch with the thread and the size, and tells the user once what is going on."""
     missing = []
     for label, directory, file_name, kind in ATLAS_CORE_FILES:
-        _path, size, present = metadata_file_status(cache, directory, file_name)
+        path, size, present = metadata_file_status(cache, directory, file_name)
         if present is False:
             missing.append((label, directory, file_name, kind, size))
+            atlas_prefetch['files'].append((path, size))
     if not missing:
         return
     total_gb = sum(m[4] or 0 for m in missing) / 1e9
@@ -1012,13 +1025,8 @@ def start_atlas_prefetch(cache):
                "Keep this program open until then: an interrupted file starts again from the beginning.")
     print("\n" + message + "\n")
     try:
-        import tkinter as tk
-        from tkinter import messagebox
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
-        messagebox.showinfo("Downloading the atlas", message, parent=root)
-        root.destroy()
+        import centered_dialog                                  # (in the middle of the screen: a native box over a hidden window was partly off it on macOS)
+        centered_dialog.info("Downloading the atlas", message)
     except Exception:
         pass                                              # (no GUI: the console text above is the notice)
 
@@ -1189,6 +1197,7 @@ GENE456_SHAPE_DEFAULT = 'small circle'
 # (bump it up so individual cells are easier to see/click) or a very dense
 # one (shrink it so points overlap less).
 UMAP_CIRCLE_SIZE_REGISTRY = {
+    'Extra small': 0.5,
     'Small': 0.7,
     'Default': 1.0,
     'Large': 1.4,
@@ -3342,7 +3351,7 @@ def is_data_file_cached(abc_cache, directory, file_name):
         file_attributes = abc_cache.cache._manifest.get_file_attributes(
             directory=directory, file_name=file_name,
         )
-        return abc_cache.cache._file_exists(file_attributes)
+        return file_complete(abc_cache, file_attributes)          # (a download cut short is there but not whole: see file_complete)
     except Exception:
         return None
 
@@ -3504,19 +3513,14 @@ def ensure_imputed_gene_dataset_loaded(imputed_state, abc_cache):
         )
         if already_cached is not True:
             try:
-                import tkinter as tk
-                from tkinter import messagebox
-                root = tk.Tk()
-                root.withdraw()
-                root.attributes('-topmost', True)
-                confirmed = messagebox.askyesno(
+                import centered_dialog
+                confirmed = centered_dialog.ask_yes_no(
                     "Load imputed gene dataset?",
                     "The imputed gene dataset covers far more genes than the standard "
                     "500-gene MERFISH panel, but is much larger. The first time it's "
                     "loaded this session (and cached to disk, if not already), this can "
                     "take a long time. Continue?",
                 )
-                root.destroy()
             except Exception as e:
                 print(f"Could not show confirmation dialog ({e}); not loading the imputed dataset.")
                 return False
@@ -5833,13 +5837,8 @@ def offer_leiden_backfill(adata, csv_path, processed_h5ad_path=None):
         f"Choosing No just leaves the Leiden level unavailable for this run."
     )
     try:
-        import tkinter as tk
-        from tkinter import messagebox
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
-        confirmed = messagebox.askyesno("Compute Leiden clustering?", message)
-        root.destroy()
+        import centered_dialog
+        confirmed = centered_dialog.ask_yes_no("Compute Leiden clustering?", message)
     except Exception as e:
         print(f"Could not show the Leiden prompt ({e}); asking on the console instead.")
         confirmed = prompt_yes_no("Compute Leiden clustering for this cached run? (y/n): ")
@@ -6311,6 +6310,7 @@ def prompt_startup_panel(out_folder):
         'required_cached_run_files': required_cached_run_files,
         'open_3d_viewer': open_3d_viewer_launcher,
         'settings_dialog': show_coordinate_settings_dialog,
+        'atlas_download_running': atlas_download_running,
     })
     if outcome is None:
         print("No selection made; exiting.")
@@ -7188,17 +7188,12 @@ def prompt_section_selection_gui(adata, abc_cache, section_series, out_folder=No
         # only sensible place, and confirming this specific irreversible
         # action deserves a bit more visual weight than a console prompt.
         try:
-            import tkinter as tk
-            from tkinter import messagebox
-            root = tk.Tk()
-            root.withdraw()
-            root.attributes('-topmost', True)
-            confirmed = messagebox.askyesno(
+            import centered_dialog
+            confirmed = centered_dialog.ask_yes_no(
                 "Clear all ROIs?",
                 f"Clear {n_rois} ROI(s) and {n_whole} whole-section pick(s)? "
                 "This cannot be undone.",
             )
-            root.destroy()
         except Exception as e:
             print(f"Could not show confirmation dialog ({e}); not clearing.")
             return

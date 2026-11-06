@@ -71,6 +71,10 @@ Z_MODE_OPTIONS = (
 
 
 DEFAULT_BREGMA_CCF_AP_MM = 5.40
+# ...and its other two coordinates, for a cell's Paxinos ML and DV (paxinos_coords): the IBL's position of bregma in the CCF (ML 5.739, AP 5.400,
+# DV 0.332 mm), whose AP is the default above. No scaling between the two brains, so the values are approximate, more so far from bregma.
+BREGMA_CCF_ML_MM = 5.739
+BREGMA_CCF_DV_MM = 0.332
 
 
 # (these settings are always kept in viewer_settings.json, whether or not the viewer's own settings persist; 'tk_section_window':
@@ -216,6 +220,25 @@ def section_z_text(section_label, abc_cache=None, wait=False, short=False):
     if mode == 'ccf_ap':
         return f"CCF AP {value:.2f}{unit}" if short else f"CCF AP = {value:.2f} mm"
     return f"AP {value:+.2f}{unit}" if short else f"Paxinos AP = {value:+.2f} mm (approx.)"
+
+
+def section_coords(section_label):
+    """(the section's own z, its CCF AP), in mm, whichever coordinate Settings labels sections with; None for one not known (or the table not
+    yet read: see start_section_coordinate_load)."""
+    table = section_coords_state['table']
+    if not table:
+        return None, None
+    label = str(section_label)
+    return table['z'].get(label), table['ccf_ap'].get(label)
+
+
+def paxinos_coords(ccf_ap, ccf_dv=None, ccf_ml=None):
+    """Approximate Paxinos coordinates (AP, ML, DV in mm from bregma) of a CCF position: AP positive toward the front, ML the distance from the
+    midline (either side), DV negative below bregma. ML and DV are None when their CCF coordinates are not given."""
+    ap = COORD_SETTINGS['bregma_ap_mm'] - ccf_ap
+    ml = abs(ccf_ml - BREGMA_CCF_ML_MM) if ccf_ml is not None else None
+    dv = BREGMA_CCF_DV_MM - ccf_dv if ccf_dv is not None else None
+    return ap, ml, dv
 
 
 # ---------------------------------------------------------------------------
@@ -839,9 +862,24 @@ def metadata_file_status(abc_cache, directory, file_name):
     reach as is_data_file_cached)."""
     try:
         attributes = abc_cache.cache._manifest.get_file_attributes(directory=directory, file_name=file_name)
-        return Path(attributes.local_path), int(attributes.file_size), bool(abc_cache.cache._file_exists(attributes))
+        return Path(attributes.local_path), int(attributes.file_size), file_complete(abc_cache, attributes)
     except Exception:
         return None, None, None
+
+
+def file_complete(abc_cache, attributes):
+    """Whether an atlas file is in the local cache whole. abc_atlas_access writes a download straight to its final name, so a download cut
+    short (the program closed partway) leaves a file that is there but not whole; it records the ones that finished, and when the file is next
+    asked for it downloads a file not on that record again, from the start. Here too, then, a file not on the record is not there: otherwise it
+    looked downloaded, the download at start-up (start_atlas_prefetch) was not started again, and the file was fetched later, unannounced.
+    (Working offline the record is not consulted: there is nothing to download it again from.)"""
+    cache = abc_cache.cache
+    if not cache._file_exists(attributes):
+        return False
+    check = getattr(cache, "_check_successful_download", None)
+    if check is None or type(cache).__name__ != "S3CloudCache":
+        return True
+    return bool(check(attributes))
 
 
 def ccf_files_missing(abc_cache, files=CCF_FILES):

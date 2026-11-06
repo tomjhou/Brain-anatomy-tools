@@ -68,18 +68,22 @@ OPACITIES = (0.15, 0.25, 0.35, 0.5, 0.75, 1.0)      # the Opacity slider's stops
 DEFAULT_OPACITY_INDEX = 5                          # (fully opaque: the dots on top hide the ones below)
 LABEL_ZOOM_CAP = 5.0               # the group numbers grow with the zoom up to this, then stay the same size
 LAYOUT_SETTLE_MS = 150             # dragging the divider (or the window's edge) changes the section pane's width many times a second: the panels are laid out and drawn again this long after it stops
-HOVER_LABEL_PX = 110               # the hover table: its first column wraps here, and the names beside it never get less than HOVER_NAME_MIN_PX
-HOVER_NAME_MIN_PX = 140
-HOVER_GAP_PX = 8                   # the space between the hover table's columns
-HOVER_SETTLE_MS = 120              # the hover box is measured this long after its text is set (once the names have wrapped)
+HOVER_LABEL_PX = 110               # the cell tip's table (CellTip): its first column wraps here
+HOVER_GAP_PX = 8                   # the space between the cell tip's columns
 PREVIEW_ZOOM = True                # a wheel step on a plot shows the last picture scaled, and draws the view for real once the wheel is still
 ZOOM_DRAW_MS = 120
 PAN_DRAW_MS = 45                   # while a plot is dragged it is drawn again this often (in between, what is on the canvas is moved as it is)
+PAN_FILL_GAP_MS = 10               # while the zoomed panel is dragged, its maps are drawn one at a time, this far apart (for the mouse's moves between)
+PANEL_PAN_SETTLE_MS = 150          # ...and all of them once the drag has been still this long
 SHAPE_SETTLE_MS = 250              # while the view is being zoomed or panned the cells are drawn as plain discs; their shapes come back this long after it stops
 LABEL_WEIGHT_RANGE = (0.6, 2.0)    # the size factor of the smallest and the largest group's number, when sized by cell count
 LABEL_HIGHLIGHT_FACTOR = 2.0       # the number of the group being marked with '+' signs is drawn this much bigger, for as long as it is marked
 HOVER_HOLD_MS = 250                # the pointer must rest this long before the plots dim
 GROUP_HOLD_MS = 500                # ...and this long before the cell's group is marked
+CELL_TIP_MS = 1000                 # ...and this long before its description comes up in a tip too (CellTip), with a Copy button
+CELL_TIP_GRACE_PX = 40             # the tip stays while the pointer is this close to where it came (on its way onto the tip)
+GROUP_TIP_MS = 400                 # a row of the group list (or of the Single group(s) legend) is described in a tip after this long
+DENSE_UMAP_CELLS = 100_000         # a UMAP of more cells than this starts with Small dots (its Cell size slider's default)
 DOT_MM = 0.04                      # a cell's dot in the section panels: 40 um across on the tissue
 BIG_DOT_PX = 40                    # dots wider than this are drawn one by one as circles (the maximum filter gets slow)
 SCALEBAR_UM = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000)
@@ -419,6 +423,120 @@ class HoverTip:
         if self.tip is not None:
             self.tip.destroy()
             self.tip = self.label = None
+
+
+class CellTip:
+    """The hovered cell's description in a tip of its own, once the pointer has rested on one cell for
+    CELL_TIP_MS, with a button that copies it. Unlike a HoverTip it stays while the pointer goes onto it (to reach the button): it goes when
+    the pointer is on another cell more than CELL_TIP_GRACE_PX from where the tip came, or leaves the tip itself."""
+
+    def __init__(self, root, delay_ms=None):
+        self.root, self.tip, self.job, self.key, self.anchor = root, None, None, None, None
+        self.delay_ms = CELL_TIP_MS if delay_ms is None else delay_ms
+
+    def pointer_on(self, key, rows_fn, action_fn=None):
+        """The pointer is on a new cell (`key`); `rows_fn()` gives its description, as rows (what, number, name), asked when the tip is shown.
+        `action_fn()`, if given, is asked then too: None, or (text, command) for a button beside Copy."""
+        if key == self.key:
+            return
+        self.key = key
+        self.cancel()
+        if self.tip is not None and not self.pointer_in_tip() and not self.near_anchor():
+            self.hide()
+        self.job = self.root.after(self.delay_ms, lambda: self.show(rows_fn, action_fn))
+
+    def pointer_off(self):
+        """The pointer is on no cell (or left the plot): the tip goes, unless the pointer went onto it."""
+        self.key = None
+        self.cancel()
+        if self.tip is not None:
+            self.root.after(300, self.hide_unless_pointer_in)
+
+    def cancel(self):
+        if self.job is not None:
+            self.root.after_cancel(self.job)
+            self.job = None
+
+    def pointer_in_tip(self):
+        if self.tip is None:
+            return False
+        try:
+            x, y = self.root.winfo_pointerxy()
+            tx, ty = self.tip.winfo_rootx(), self.tip.winfo_rooty()
+            return tx <= x < tx + self.tip.winfo_width() and ty <= y < ty + self.tip.winfo_height()
+        except tk.TclError:
+            return False
+
+    def near_anchor(self):
+        if self.anchor is None:
+            return False
+        x, y = self.root.winfo_pointerxy()
+        return abs(x - self.anchor[0]) <= CELL_TIP_GRACE_PX and abs(y - self.anchor[1]) <= CELL_TIP_GRACE_PX
+
+    def hide_unless_pointer_in(self):
+        if not self.pointer_in_tip():
+            self.hide()
+
+    def show(self, rows_fn, action_fn=None):
+        self.job = None
+        if self.pointer_in_tip():                       # (on its way to the Copy button: the tip it is going to stays as it is)
+            return
+        rows = rows_fn()
+        if not rows:
+            return
+        self.hide()
+        self.tip = tk.Toplevel(self.root)
+        self.tip.wm_overrideredirect(True)
+        self.tip.attributes("-topmost", True)
+        bg = "#ffffe0"
+        box = tk.Frame(self.tip, bg=bg, relief="solid", borderwidth=1)
+        box.pack()
+        # in columns: what (gray), the number (bold, to the right), the name
+        grid = tk.Frame(box, bg=bg)
+        grid.pack(anchor="w", padx=6, pady=(4, 2))
+        for r, (what, num, name) in enumerate(rows):
+            tk.Label(grid, text=what, bg=bg, fg="gray35", font=("Segoe UI", 9, "bold"), anchor="w", justify=tk.LEFT,
+                     wraplength=HOVER_LABEL_PX).grid(row=r, column=0, sticky="nw", padx=(0, HOVER_GAP_PX))
+            tk.Label(grid, text=num, bg=bg, font=("Segoe UI", 9, "bold"), anchor="e").grid(row=r, column=1, sticky="ne", padx=(0, HOVER_GAP_PX))
+            tk.Label(grid, text=name, bg=bg, font=("Segoe UI", 9), anchor="w", justify=tk.LEFT, wraplength=300).grid(row=r, column=2, sticky="nw")
+        # copied with a tab between the columns: pasted into a spreadsheet, they stay columns
+        text = "\n".join("\t".join(row) for row in rows)
+        buttons = tk.Frame(box, bg=bg)
+        buttons.pack(anchor="e", padx=6, pady=(0, 6))
+        action = action_fn() if action_fn is not None else None
+        if action is not None:
+            label, command = action
+            ttk.Button(buttons, text=label, command=lambda: (self.hide(), command())).pack(side=tk.LEFT, padx=(0, 6))
+        copy = ttk.Button(buttons, text="Copy to clipboard")
+        copy.config(command=lambda: self.copy(text, copy))
+        copy.pack(side=tk.LEFT)
+        self.tip.bind("<Leave>", lambda e: self.root.after(100, self.hide_unless_pointer_in))
+        # just beside the pointer (close, so that it is quickly reached), but kept on the screen
+        x0, y0 = self.root.winfo_pointerxy()
+        self.anchor = (x0, y0)
+        self.tip.update_idletasks()
+        w, h = self.tip.winfo_reqwidth(), self.tip.winfo_reqheight()
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        x, y = x0 + 6, y0 + 6
+        if x + w > sw:
+            x = max(x0 - w - 6, 0)
+        if y + h > sh:
+            y = max(y0 - h - 6, 0)
+        self.tip.wm_geometry(f"+{x}+{y}")
+
+    def copy(self, text, button):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        button.config(text="Copied")
+        self.root.after(1200, lambda: button.winfo_exists() and button.config(text="Copy to clipboard"))
+
+    def hide(self):
+        if self.tip is not None:
+            try:
+                self.tip.destroy()
+            except tk.TclError:
+                pass
+            self.tip = self.anchor = None
 
 
 class LazyLevels(dict):
@@ -1089,7 +1207,7 @@ class PointCanvas:
         self.boosted = None
 
     def add_label(self, text, x, y, color="black", weight=1.0):
-        """`weight`: times the font size when the labels are sized by their group's cell count (see set_label_scaling)."""
+        """`weight`: times the font size (the labels are sized by their group's cell count)."""
         item = self.canvas.create_text(0, 0, text=text, font=("Segoe UI", self.label_size, "bold"), fill=ink_for(color, self.bgcolor) if color.startswith("#") else color)
         self.label_color[item] = color if color.startswith("#") else "#000000"
         self.labels.append([item, x, y])
@@ -1110,10 +1228,6 @@ class PointCanvas:
         self.label_factor = factor
         self.label_size = None                      # (so the next update applies the new size)
         self.update_label_size()
-
-    def set_label_scaling(self, on):
-        self.scale_labels = on
-        self.update_label_size(force=True)
 
     def label_font_size(self, item, size):
         if self.scale_labels:
@@ -1216,7 +1330,6 @@ class UmapWindow(ExportsMixin):
         self.values = None                 # the shown gene's value for each cell (as coloured), or None
         self.tree = None
         self.hover_job = self.group_job = None
-        self.floor_job = None              # (the job that measures the 'Under the pointer' box: apart from hover_job, which dims the plots)
         self.gene_cache = None             # ((genes, imputed, scale), values read) of the genes shown, so a legend click re-uses them
         self.hidden = set()                # the genes switched off by a legend click
         self.multi_rows = None
@@ -1229,6 +1342,8 @@ class UmapWindow(ExportsMixin):
         self.label_info = []
         self.view_kind, self.view_token, self.view_title = "all", "all", ""
         self.hover_key = None
+        self.ccf_run = self.ccf_bg = None  # the cells' CCF coordinates (AP, DV, ML), for the Paxinos ML and DV of the cell tip: see start_ccf_lookup
+        self.ccf_state = "none"
         self.variants = {}                 # UMAP parameter key -> (coordinates, Leiden labels), the ones already shown
         self.load_data(adata_backed, rois)
         if self.host and self.params is not None:
@@ -1240,6 +1355,7 @@ class UmapWindow(ExportsMixin):
         self.root.bind("<Escape>", lambda e: self.close())
         self.poll()
         self.root.after(1500, self.preload_imputed)         # (once the window has been drawn)
+        self.root.after(2500, self.start_ccf_lookup)
 
     def preload_imputed(self):
         """Start loading the imputed gene dataset in the background, if it is already on this computer: the choice "Imputed Gene" is common."""
@@ -1357,6 +1473,7 @@ class UmapWindow(ExportsMixin):
 
     def build(self):
         self.tiles = []                    # (made by build_tiles; empty until then, for the scroll callbacks that can come first)
+        self.cell_tip = CellTip(self.root)
         self.pw = pw = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         pw.pack(fill=tk.BOTH, expand=True)
         # the section panels
@@ -1379,7 +1496,9 @@ class UmapWindow(ExportsMixin):
             self.add_slider(bars, 2, "Marker size:", self.var_marker, len(MARKER_SIZES), self.apply_marker_size, lambda i: marker_names[i], None,
                             label_tip="The size of the marks on the highlighted cells only (the ring under the pointer and the red + marks), "
                                       "not of the other cells' dots.")]
-        ttk.Button(bars, text="Reset to default", command=self.reset_sliders).grid(row=0, column=0, rowspan=3, sticky="nsw")
+        ttk.Style(self.root).configure("Stacked.TButton", justify="center", padding=(10, 4))       # (room round the text)
+        ttk.Button(bars, text="Reset\nslider\ndefault", width=0, style="Stacked.TButton",          # (on three lines: narrow, as tall as the sliders)
+                   command=self.reset_sliders).grid(row=0, column=0, rowspan=3, sticky="nsw")
         # the checkboxes, in two columns: Hover highlight, ROI only, Zoom whole panel; then CCF atlas overlay, with its slider under it
         self.var_roi_only = tk.BooleanVar(bars, False)
         roi_only_box = ttk.Checkbutton(bars, text="ROI only", variable=self.var_roi_only, command=self.apply_roi_only)
@@ -1398,12 +1517,13 @@ class UmapWindow(ExportsMixin):
                                   "fitted to each section from the CCF position of its cells (the first time reads the CCF coordinates of the "
                                   "cells: a minute or so).")
         ccf_row = ttk.Frame(bars)                                                              # (its slider, under it)
-        ccf_row.grid(row=2, column=5, sticky="w", padx=(26, 6))
+        ccf_row.grid(row=2, column=5, sticky="w", padx=(22, 6))
         self.var_ccf_opacity = tk.IntVar(bars, DEFAULT_OPACITY_INDEX)                          # (full: the cells as they are)
         ccf_shown = ttk.Label(ccf_row, width=5)
-        self.ccf_scale = self.stop_slider(ccf_row, ccf_shown, self.var_ccf_opacity, len(OPACITIES), self.apply_ccf_opacity, lambda i: f"{OPACITIES[i] * 100:g}%")
+        self.ccf_scale = self.stop_slider(ccf_row, ccf_shown, self.var_ccf_opacity, len(OPACITIES), self.apply_ccf_opacity, lambda i: f"{OPACITIES[i] * 100:g}%",
+                                          length=90)            # (shorter than the others, so that the values of the sliders on the left have room)
         self.ccf_scale.pack(side=tk.LEFT)
-        ccf_shown.pack(side=tk.LEFT, padx=(6, 0))
+        ccf_shown.pack(side=tk.LEFT, padx=(4, 0))
         self.ccf_scale.state(["disabled"])                                                      # (until the atlas is shown)
         HoverTip(self.ccf_scale, lambda: "How opaque the cells are while the CCF atlas is shown: lower it to see the outlines better. "
                                          "The outlines stay fully opaque.")
@@ -1423,8 +1543,9 @@ class UmapWindow(ExportsMixin):
         hover_box = ttk.Checkbutton(bars, text="Hover highlight", variable=self.var_hover, command=self.apply_hover_enabled)
         hover_box.grid(row=0, column=4, sticky="w", padx=(12, 6))
         HoverTip(hover_box, lambda: "When the pointer rests on a cell, dim the plots and mark every cell of its group with a red +. Off: no "
-                                    "marking, but the cell is still ringed and described in the cell info panel (the same setting as in Settings).")
-        bars.columnconfigure(3, weight=1)
+                                    "marking, but the cell is still ringed and described in its tip (the same setting as in Settings).")
+        self.update_marker_slider()
+        bars.columnconfigure(6, weight=1)          # (the spare width goes to an empty column on the right: the controls stay where they are)
         self.tile_scroll = tk.Canvas(left, highlightthickness=0, bg="#f4f4f4")
         sb = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.tile_scroll.yview)
         self.hsb = ttk.Scrollbar(left, orient=tk.HORIZONTAL, command=self.tile_scroll.xview)        # (shown only while the panel is zoomed in)
@@ -1444,16 +1565,23 @@ class UmapWindow(ExportsMixin):
         mid = ttk.Frame(pw)
         umap_bar = ttk.Frame(mid, padding=(6, 4))
         umap_bar.pack(side=tk.TOP, fill=tk.X)
+        # Cell size: the UMAP circle size of Settings (the same setting, so either changes the other). A dense UMAP starts at Small, unless
+        # the size is remembered from an earlier session (Settings' "Remember these settings"): then that.
+        self.umap_size_names = list(self.host.get("umap_circle_sizes", {}) or {"Default": 1.0})
+        self.umap_default_size = "Small" if self.n > DENSE_UMAP_CELLS and "Small" in self.umap_size_names else "Default"
+        if not self.viewer_settings.get("persist_settings", False):
+            self.viewer_settings["umap_circle_size"] = self.umap_default_size
+        self.var_umap_dot = tk.IntVar(umap_bar, self.umap_size_index(self.viewer_settings.get("umap_circle_size", "Default")))
         self.var_label = tk.IntVar(umap_bar, DEFAULT_LABEL_INDEX)
-        self.umap_sliders = [self.add_slider(umap_bar, 0, "Label size:", self.var_label, len(LABEL_SIZES), self.apply_label_size,
-                                             lambda i: LABEL_SIZE_NAMES[i], None)]
-        ttk.Button(umap_bar, text="Reset to default", command=self.reset_umap_sliders).grid(row=0, column=0, sticky="w")
-        self.var_label_scale = tk.BooleanVar(umap_bar, True)
-        label_scale_box = ttk.Checkbutton(umap_bar, text="Label font size scales with cell count", variable=self.var_label_scale, command=self.apply_label_scaling)
-        label_scale_box.grid(row=0, column=4, sticky="w", padx=(12, 0))
-        HoverTip(label_scale_box, lambda: "The group numbers on the UMAP are bigger for the groups with more cells (from 0.6 to 2 times the Label size, "
-                                          "by the logarithm of the count), so that the major groups stand out. Off: all the same size. Saved UMAPs follow it.")
-        umap_bar.columnconfigure(3, weight=1)
+        self.umap_sliders = [
+            self.add_slider(umap_bar, 0, "Cell size:", self.var_umap_dot, len(self.umap_size_names), self.apply_umap_dot_size,
+                            lambda i: self.umap_size_names[i], None,
+                            label_tip="The size of the cells' dots in the UMAP (the same setting as UMAP circle size in Settings)."),
+            self.add_slider(umap_bar, 1, "Label size:", self.var_label, len(LABEL_SIZES), self.apply_label_size,
+                            lambda i: LABEL_SIZE_NAMES[i], None)]
+        ttk.Button(umap_bar, text="Reset\nslider\ndefault", width=0, style="Stacked.TButton",
+                   command=self.reset_umap_sliders).grid(row=0, column=0, rowspan=2, sticky="nsw")
+        umap_bar.columnconfigure(4, weight=1)      # (the spare width goes to an empty column on the right: the controls stay where they are)
         c = self.coords
         padx = (c[:, 0].max() - c[:, 0].min()) * 0.05 or 1.0
         pady = (c[:, 1].max() - c[:, 1].min()) * 0.05 or 1.0
@@ -1599,30 +1727,9 @@ class UmapWindow(ExportsMixin):
         self.legend.config(cursor="hand2")
         self.group_canvas.bind("<MouseWheel>", lambda e: self.group_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
         self.build_buttons(f)
-        hov = ttk.LabelFrame(f, text="Under the pointer", padding=6)
-        hov.pack(fill=tk.X, side=tk.BOTTOM, pady=(6, 0))
-        self.var_cell = tk.StringVar(f, "Hover over a cell in the UMAP or a section.")
-        self.hover_floor = 0                         # the box grows to fit the longest description shown so far and does not shrink again: the controls
-        self.hover_spacer = tk.Frame(hov, width=1, height=1)         # below it (the legend) stay where they are while the pointer moves between cells
-        self.hover_spacer.pack(side=tk.LEFT)
-        self.cell_hint = ttk.Label(hov, textvariable=self.var_cell, wraplength=320, justify=tk.LEFT)
-        self.cell_hint.pack(anchor="w")
-        # the hovered cell as a table: what it is / its number / its name, each in a column of its own
-        self.cell_grid = ttk.Frame(hov)
-        self.cell_grid.columnconfigure(2, weight=1)
-        self.cell_grid.bind("<Configure>", lambda e: self.fit_cell_names())
-        self.hover_width = 0
+        # (No "Under the pointer" box: the hovered cell is described in a tip (CellTip), and so is a row of the group list, which then has the room.)
         self.hover_job = None
-        hov.bind("<Configure>", self.hover_resized)
-        self.cell_cells = []
-        for r in range(20 + (len(self.own.numbers) if self.own is not None else 0)):          # (the section, the region (3 lines), the levels, the + note, the z, up to 6 genes, and the numeric columns)
-            a = ttk.Label(self.cell_grid, foreground="gray35", font=("Segoe UI", 9, "bold"), wraplength=HOVER_LABEL_PX, justify=tk.LEFT)
-            b = ttk.Label(self.cell_grid, width=6, anchor="e", font=("Segoe UI", 10, "bold"))
-            c = ttk.Label(self.cell_grid, wraplength=190, justify=tk.LEFT)
-            a.grid(row=r, column=0, sticky="nw", padx=(0, HOVER_GAP_PX))
-            b.grid(row=r, column=1, sticky="ne", padx=(0, HOVER_GAP_PX))
-            c.grid(row=r, column=2, sticky="nw")
-            self.cell_cells.append((a, b, c))
+        self.group_tip = CellTip(self.root, delay_ms=GROUP_TIP_MS)
         self.var_status = tk.StringVar(f, "")
         ttk.Label(f, textvariable=self.var_status, foreground="gray30", wraplength=300, justify=tk.LEFT).pack(anchor="w", side=tk.BOTTOM)
         ttk.Label(f, text="wheel: zoom   drag: pan   double-click: whole view", foreground="gray40", wraplength=300).pack(anchor="w", side=tk.BOTTOM, pady=(0, 6))
@@ -1845,10 +1952,10 @@ class UmapWindow(ExportsMixin):
             self.var_status.set(f"No CCF atlas for section {', '.join(empty)} (Allen did not register it): no outlines there.")
         return True
 
-    def stop_slider(self, parent, shown, var, n, command, value_text):
+    def stop_slider(self, parent, shown, var, n, command, value_text, length=130):
         """A slider of `parent` with `n` stops (0 .. n-1), not yet placed: it jumps from stop to stop, shows `value_text(stop)` in the label `shown`, and
-        calls `command()` when the stop changes. The same width wherever it is."""
-        scale = ttk.Scale(parent, from_=0, to=n - 1, orient=tk.HORIZONTAL, length=130)
+        calls `command()` when the stop changes. The same width wherever it is (but for `length`, in pixels)."""
+        scale = ttk.Scale(parent, from_=0, to=n - 1, orient=tk.HORIZONTAL, length=length)
         pending = []
 
         def run():
@@ -1882,24 +1989,48 @@ class UmapWindow(ExportsMixin):
         label.grid(row=row, column=1, sticky="w", padx=(12, 6))
         if label_tip is not None:
             HoverTip(label, lambda: label_tip)
-        shown = ttk.Label(parent, width=19)
+        shown = ttk.Label(parent, width=11)                # (room for the longest value, "full width" or "Very large", and no more)
         shown.grid(row=row, column=3, sticky="w", padx=(6, 0))
         scale = self.stop_slider(parent, shown, var, n, command, value_text)
         scale.grid(row=row, column=2, sticky="w")
+        scale.companions = (label, shown)                # (greyed out with it: see set_slider_enabled)
         if tip_text is not None:
             HoverTip(scale, lambda: tip_text(var.get()))
         return scale
 
-    def apply_label_scaling(self):
-        self.umap.set_label_scaling(self.var_label_scale.get())
+    @staticmethod
+    def set_slider_enabled(scale, on):
+        """Grey out (or not) a slider made by add_slider, with its label and the value shown beside it."""
+        for w in (scale, *getattr(scale, "companions", ())):
+            w.state(["!disabled"] if on else ["disabled"])
+
+    def update_marker_slider(self):
+        """The Marker size slider is for the hover marks: greyed out while Hover highlight is off."""
+        self.set_slider_enabled(self.sliders[2], self.var_hover.get())
 
     def apply_label_size(self):
         """The UMAP's Label size slider: the group numbers drawn on the UMAP, bigger or smaller."""
         self.umap.set_label_factor(LABEL_SIZES[self.var_label.get()])
 
     def reset_umap_sliders(self):
-        for scale, default in zip(self.umap_sliders, (DEFAULT_LABEL_INDEX,)):
+        for scale, default in zip(self.umap_sliders, (self.umap_size_index(self.umap_default_size), DEFAULT_LABEL_INDEX)):
             scale.set(default)
+
+    def umap_size_index(self, name):
+        """The Cell size slider's stop for a UMAP circle size of Settings (the middle one, Default, if it is not one of them)."""
+        names = self.umap_size_names
+        return names.index(name) if name in names else (names.index("Default") if "Default" in names else 0)
+
+    def apply_umap_dot_size(self):
+        """The UMAP's Cell size slider: the UMAP circle size of Settings, saved, and the UMAP drawn again with it."""
+        name = self.umap_size_names[self.var_umap_dot.get()]
+        if name == self.viewer_settings.get("umap_circle_size", "Default"):
+            return
+        self.viewer_settings["umap_circle_size"] = name
+        if "save_viewer_settings" in self.host:
+            self.host["save_viewer_settings"](self.viewer_settings)
+        if not self.busy:
+            self.recolor()
 
     def view_background(self):
         """The background of the UMAP and the section maps: white, dark in the dark theme of the gene views."""
@@ -1967,11 +2098,16 @@ class UmapWindow(ExportsMixin):
         self.tile_scroll.configure(scrollregion=(0, 0, 4 + cols * (fw + 8), 3 + rows * (fh + 6)))
         self.root.after_idle(self.refresh_visible)
 
-    def place_tiles(self):
+    def place_tiles(self, max_draws=None):
         """While the whole panel is zoomed: each section map's widget is put where the part of the map that is on screen is (and made that big, a
-        little more all round), and drawn there; a map not on screen has no widget shown. A map whose widget still covers what is on screen is left."""
+        little more all round), and drawn there; a map not on screen has no widget shown. A map whose widget still covers what is on screen is left.
+        `max_draws`: at most this many maps are drawn (those with the most on screen first); while the panel is being dragged, none unless it says.
+        Returns how many more are waiting to be drawn."""
         if self.panel_zoom <= 1.0 or not getattr(self, "tiles", None):
-            return
+            return 0
+        if max_draws is None and getattr(self, "panning", False):
+            max_draws = 0                            # (a drag goes on at once, the new parts blank: pan_fill draws them, one map at a time)
+        waiting = []
         vw, vh = self.tile_scroll.winfo_width(), self.tile_scroll.winfo_height()
         vl, vt = self.tile_scroll.canvasx(0), self.tile_scroll.canvasy(0)
         mx, my = int(WINDOW_MARGIN * vw), int(WINDOW_MARGIN * vh)
@@ -1992,6 +2128,12 @@ class UmapWindow(ExportsMixin):
             v = pc.vview
             if t.get("shown", True) and v is not None and v[0] <= nx0 and v[1] <= ny0 and v[0] + v[2] >= nx1 and v[1] + v[3] >= ny1:
                 continue
+            waiting.append(((nx1 - nx0) * (ny1 - ny0), t, ch, cx0, cy0, lw, lh))
+        waiting.sort(key=lambda w: -w[0])
+        if max_draws is None:
+            max_draws = len(waiting)
+        for _area, t, ch, cx0, cy0, lw, lh in waiting[:max_draws]:
+            pc = t["pc"]
             x0, x1 = max(vl - mx - cx0, 0), min(vl + vw + mx - cx0, lw)
             y0, y1 = max(vt - my - cy0, 0), min(vt + vh + my - cy0, lh)
             with_caption = y0 <= 0
@@ -2004,6 +2146,12 @@ class UmapWindow(ExportsMixin):
                 self.tile_scroll.itemconfig(t["item"], state="normal")
                 t["shown"] = True
             pc.set_view(int(x0), int(y0), int(x1) - int(x0), int(y1) - int(y0))
+        if waiting[:max_draws]:
+            # A map's widget moved, resized and given its new picture: Tk does those in passes of its own (the pane moves the widget, the frame packs
+            # its caption and canvas again, the canvas draws), and a screen refresh between them showed a moment of the old picture in the new
+            # place, a blink. All of them now, together, so that only the finished map reaches the screen.
+            self.root.update_idletasks()
+        return max(len(waiting) - max_draws, 0)
 
     # ---- zooming the whole panel (the borders and the sections together)
 
@@ -2064,6 +2212,8 @@ class UmapWindow(ExportsMixin):
         """Enlarge the whole panel to `zoom` times its size (1 to MAX_PANEL_ZOOM): the panels are laid out again, bigger, so that borders, gaps and
         sections grow together, and only those in view are drawn. `anchor` = (x, y in the scrolled pane, x, y in the window): the point that stays
         under the pointer."""
+        if getattr(self, "panning", False):
+            self.end_pan()                           # (a drag just before: its drawing put off no longer, as the maps are laid out and drawn here)
         zoom = min(max(zoom, 1.0), self.max_panel_zoom())
         if abs(zoom - self.panel_zoom) < 1e-9 or not self.tiles:
             return
@@ -2278,8 +2428,39 @@ class UmapWindow(ExportsMixin):
         self.tile_scroll.scan_mark(e.x_root - self.tile_scroll.winfo_rootx(), e.y_root - self.tile_scroll.winfo_rooty())
 
     def panel_pan_move(self, e):
+        """A drag of the zoomed panel moves it at once: the maps whose pictures no longer cover the screen are not all drawn again there and
+        then (which held the drag up as it went past the margin they are drawn with), but one at a time between the mouse's moves (pan_fill),
+        the new parts blank meanwhile; and everything once the drag has been still for PANEL_PAN_SETTLE_MS (pan_settle)."""
+        self.panning = True
         self.tile_scroll.scan_dragto(e.x_root - self.tile_scroll.winfo_rootx(), e.y_root - self.tile_scroll.winfo_rooty(), gain=1)
         self.root.after_idle(self.refresh_visible)
+        if getattr(self, "pan_settle_job", None) is not None:
+            self.root.after_cancel(self.pan_settle_job)
+        self.pan_settle_job = self.root.after(PANEL_PAN_SETTLE_MS, self.pan_settle)
+        if getattr(self, "pan_fill_job", None) is None:
+            self.pan_fill_job = self.root.after(PAN_DRAW_MS, self.pan_fill)
+
+    def pan_fill(self):
+        """During a drag of the zoomed panel: one map drawn where it now is (the one with the most on screen), then the mouse's moves are seen
+        to before the next."""
+        self.pan_fill_job = None
+        if not getattr(self, "panning", False):
+            return
+        if self.place_tiles(max_draws=1):
+            self.pan_fill_job = self.root.after(PAN_FILL_GAP_MS, self.pan_fill)
+
+    def pan_settle(self):
+        """The drag has been still: everything in view drawn, as without one."""
+        self.end_pan()
+        self.refresh_visible()
+
+    def end_pan(self):
+        self.panning = False
+        for name in ("pan_settle_job", "pan_fill_job"):
+            job = getattr(self, name, None)
+            if job is not None:
+                self.root.after_cancel(job)
+                setattr(self, name, None)
 
     def apply_dot_size(self):
         """The Cell size slider: redraw the section panels with bigger or smaller dots (the ones off screen when they come on screen)."""
@@ -2464,6 +2645,8 @@ class UmapWindow(ExportsMixin):
     def refresh_visible(self):
         """Panels that were off screen when they were recolored or moved are made now that they are on screen."""
         self.place_tiles()
+        if getattr(self, "panning", False):          # (while the panel is dragged: drawn bit by bit, by pan_fill, and all of it once the drag stops)
+            return
         for t in self.tiles:
             if t.get("dirty") and self.frame_visible(t["frame"]):
                 self.build_tile(t)
@@ -3259,7 +3442,7 @@ class UmapWindow(ExportsMixin):
         return rows
 
     def show_legend_group(self, key):
-        """Describe the legend row's group in the 'Under the pointer' box (key None: the pointer left the rows)."""
+        """Describe the legend row's group in a tip (key None: the pointer left the rows)."""
         if key == self.hover_group:
             return
         self.hover_group = key
@@ -3268,6 +3451,7 @@ class UmapWindow(ExportsMixin):
         self.clear_highlights()
         self.show_info(None)                         # (also puts the bold row back to normal)
         if key is None:
+            self.group_tip.pointer_off()
             return
         label = key if self.mode == "all" else self.single_names.get(key)
         rows = self.group_info_rows(self.level, label) if label is not None else None
@@ -3277,7 +3461,10 @@ class UmapWindow(ExportsMixin):
             else:
                 canvas, names = self.legend, (self.last_ids or {}).get("targets", [])
             self.bold_legend_row(canvas, names.index(key) if key in names else None)
-            self.show_cell_rows(rows)
+            self.group_tip.pointer_on(("group", self.mode, self.level, key), lambda: rows)
+        else:
+            self.group_tip.pointer_off()
+        if rows is not None:
             self.set_dim(True)                       # (as when the pointer rests on one of the group's cells)
             self.mark_group(label)
 
@@ -3479,9 +3666,7 @@ class UmapWindow(ExportsMixin):
         if self.own is not None and i is not None:                      # (the numeric columns of a dataset of your own, under the groups)
             for name in self.own.numbers:
                 rows.append((name, self.number_text(name, i), ""))
-        z = core.section_z_text(sec, self.abc_cache, wait=False) if sec is not None else ""
-        if z:
-            rows.append(("", "", z))
+        rows += self.coord_rows(info)
         if i is not None and self.values is not None:
             for gene, vals in self.values:
                 if self.own is not None and self.own.is_number(gene):          # (already listed with the numeric columns)
@@ -3491,67 +3676,67 @@ class UmapWindow(ExportsMixin):
             rows.append(("", "", "(not in the UMAP)"))
         return rows
 
-    def fit_cell_names(self):
-        """The first and last columns wrap at the table's right edge, whatever the screen's scaling: each has its minimum, and a wider table
-        gives half of the extra width to each."""
-        try:
-            number = self.cell_cells[0][1].winfo_reqwidth()
-            room = self.cell_grid.winfo_width() - number - 2 * HOVER_GAP_PX - 4
-        except tk.TclError:
+    def coord_rows(self, info):
+        """The cell's position: the atlas's own z of its section, and approximate Paxinos AP, ML and DV (core.paxinos_coords). From the cell's
+        own CCF coordinates once they are read (see start_ccf_lookup); until then AP only, from its section's place in the CCF."""
+        sec = info["sec"]
+        if sec is None:
+            return []
+        core.start_section_coordinate_load(self.abc_cache)
+        z, section_ap = core.section_coords(sec)
+        rows = [("Atlas z", f"{z:.2f}", "mm (the section's)")] if z is not None else []
+        ccf = None
+        if info["umap_idx"] is not None and self.ccf_run is not None:
+            ccf = self.ccf_run[info["umap_idx"]]
+        elif info["bg_idx"] is not None and self.ccf_bg is not None:
+            ccf = self.ccf_bg[info["bg_idx"]]
+        if ccf is not None and np.isfinite(ccf).all():
+            ap, ml, dv = core.paxinos_coords(float(ccf[0]), float(ccf[1]), float(ccf[2]))
+            rows += [("Paxinos AP", f"{ap:+.2f}", "mm from bregma (approx.)"), ("Paxinos ML", f"{ml:.2f}", "mm from the midline"),
+                     ("Paxinos DV", f"{dv:+.2f}", "mm from bregma")]
+        elif section_ap is not None:
+            ap, _ml, _dv = core.paxinos_coords(section_ap)
+            rows.append(("Paxinos AP", f"{ap:+.2f}", "mm from bregma (approx., the section's)"))
+            if self.ccf_state == "reading":
+                rows.append(("Paxinos ML, DV", "", "reading the cells' CCF coordinates..."))
+        return rows
+
+    def ccf_action(self):
+        """The cell tip's extra button: fetch the CCF coordinates that its Paxinos ML and DV need, while they are not on this computer."""
+        if self.ccf_state == "missing" and "ensure_ccf_downloaded" in self.host:
+            return "Get ML/DV...", self.download_ccf_coords
+        return None
+
+    def start_ccf_lookup(self):
+        """Read the CCF coordinates of the run's cells and of the section maps' other cells (for their Paxinos ML and DV), in a thread: slow the
+        first time (the table of every cell of the atlas: a minute or so), seconds after. Only if they are on this computer: see ccf_action."""
+        self.ccf_run = self.ccf_bg = None
+        self.ccf_state = "none"
+        h = self.host
+        if self.own is not None or self.abc_cache is None or "load_ccf_for_cells" not in h:
             return
-        extra = max(room - HOVER_LABEL_PX - HOVER_NAME_MIN_PX, 0)
-        label_wl = HOVER_LABEL_PX + extra // 2
-        name_wl = HOVER_NAME_MIN_PX + extra - extra // 2
-        for a, _b, c in self.cell_cells:
-            if int(str(a.cget("wraplength"))) != label_wl:
-                a.config(wraplength=label_wl)
-            if int(str(c.cget("wraplength"))) != name_wl:
-                c.config(wraplength=name_wl)
+        if core.ccf_files_missing(self.abc_cache):
+            self.ccf_state = "missing"
+            return
+        self.ccf_state = "reading"
+        run_ids = list(self.adata.obs_names)
+        bg_ids = list(self.bg["ids"]) if self.bg is not None and self.bg.get("ids") is not None else []
 
-    def show_cell_rows(self, rows):
-        self.cell_hint.pack_forget()
-        self.cell_grid.pack(fill=tk.X, anchor="w")
-        for k, (a, b, c) in enumerate(self.cell_cells):
-            if k < len(rows):
-                what, num, name = rows[k]
-                a.config(text=what)
-                b.config(text=num)
-                c.config(text=name)
-                a.grid()
-                b.grid()
-                c.grid()
-            else:
-                a.grid_remove()
-                b.grid_remove()
-                c.grid_remove()
-        self.root.after_idle(self.fit_cell_names)
-        self.schedule_hover_floor()
+        def work():
+            try:
+                table, _shell = h["load_ccf_for_cells"](self.abc_cache, run_ids + bg_ids)
+                xyz = table[["x_ccf", "y_ccf", "z_ccf"]].to_numpy(dtype=np.float32)       # (AP, DV, ML)
+                self.ccf_run, self.ccf_bg = xyz[:len(run_ids)], (xyz[len(run_ids):] if bg_ids else None)
+                self.ccf_state = "ready"
+            except Exception as e:
+                self.ccf_state = "failed"
+                print(f"Could not read the cells' CCF coordinates (for their Paxinos ML and DV): {e}", flush=True)
 
-    def schedule_hover_floor(self):
-        """Measure the box once the names have wrapped and the layout has settled (a measure that comes too soon would keep a half-wrapped height)."""
-        if self.floor_job is not None:
-            self.root.after_cancel(self.floor_job)
-        self.floor_job = self.root.after(HOVER_SETTLE_MS, self.grow_hover_floor)
+        threading.Thread(target=work, daemon=True).start()
 
-    def hover_resized(self, event):
-        """The box's height only fits its width: when the width changes (the divider, the window), the floor starts over."""
-        if event.width != self.hover_width:
-            self.hover_width = event.width
-            self.hover_floor = 0
-            self.hover_spacer.configure(height=1)
-            self.schedule_hover_floor()
-
-    def grow_hover_floor(self):
-        """Make the 'Under the pointer' box at least as tall as the longest description it has shown (at this width)."""
-        self.floor_job = None
-        try:
-            need = self.cell_grid.winfo_reqheight() if self.cell_grid.winfo_manager() else self.cell_hint.winfo_reqheight()
-            need = min(need, max(150, self.root.winfo_height() // 3))        # (not more than a third of the window: the controls below must keep their room)
-            if need > self.hover_floor:
-                self.hover_floor = need
-                self.hover_spacer.configure(height=need)
-        except tk.TclError:
-            pass
+    def download_ccf_coords(self):
+        if self.host["ensure_ccf_downloaded"](self.abc_cache, parent=self.root, what="CCF coordinates of every cell (for their Paxinos ML and DV)"):
+            self.start_ccf_lookup()
 
     def cell_info(self, i, source):
         return {"key": ("run", i), "umap_idx": i, "bg_idx": None, "sec": self.section_of[i] if self.section_of is not None else None,
@@ -3601,14 +3786,12 @@ class UmapWindow(ExportsMixin):
         self.bold_legend_row(canvas, k)
 
     def show_info(self, info):
-        """Ring the cell where the pointer is, mirror it in the other plot, and describe it."""
+        """Ring the cell where the pointer is, and mirror it in the other plot (its description is in its tip: see hover)."""
         self.bold_group_of(info)
         if info is None:
             self.umap.set_marker("hover", None, None)
             for t in self.tiles:
                 t["pc"].set_marker("hover", None, None)
-            self.cell_grid.pack_forget()
-            self.cell_hint.pack(anchor="w")
             return
         src = info["source"]
         i = info["umap_idx"]
@@ -3622,18 +3805,20 @@ class UmapWindow(ExportsMixin):
                 t["pc"].set_marker("hover", info["x"], info["y"], style="ring" if src == "section" else "mirror")
             else:
                 t["pc"].set_marker("hover", None, None)
-        self.show_cell_rows(self.cell_rows(info))
 
     def hover(self, info):
         """The pointer is on a cell (info) or on none (None). The ring and description are immediate; once it rests, the plots dim and, a
-        little later, the cell's group is marked with red '+' signs (only those two are turned off by the Hover highlight box)."""
+        little later, the cell's group is marked with red '+' signs (only those two are turned off by the Hover highlight box). After a longer
+        rest the description comes up in a tip as well (CellTip), whether or not the box is ticked."""
         if info is None:
             self.cancel_hover_jobs()
             self.hover_key = None
+            self.cell_tip.pointer_off()
             self.show_info(None)
             self.clear_highlights()
             return
         self.show_info(info)
+        self.cell_tip.pointer_on(info["key"], lambda: self.cell_rows(info), self.ccf_action)
         if not self.var_hover.get():
             self.hover_key = None                    # (so that ticking the box again marks the next cell pointed at)
             return
@@ -3755,12 +3940,13 @@ class UmapWindow(ExportsMixin):
 
     def apply_hover_enabled(self):
         """The Hover highlight box above the section maps: the setting of the same name in Settings, saved as it is when that is. Off: no
-        dimming and no red '+' signs; the hovered cell's ring and its description in the cell info panel stay. In "Browse All Neurons" (which
+        dimming and no red '+' signs; the hovered cell's ring and its description in its tip stay. In "Browse All Neurons" (which
         starts with it off) it is for this window only, so the saved setting, for the other projects, is not changed."""
         if not self.start_panel_zoom:
             self.viewer_settings["hover_enabled"] = bool(self.var_hover.get())
             if "save_viewer_settings" in self.host:
                 self.host["save_viewer_settings"](self.viewer_settings)
+        self.update_marker_slider()
         if not self.var_hover.get():
             self.drop_highlights()
 
@@ -3785,8 +3971,11 @@ class UmapWindow(ExportsMixin):
         self.host["save_viewer_settings"](self.viewer_settings)
         if hover_changed or not self.start_panel_zoom:          # (Browse All Neurons: the box keeps its own state unless the setting itself changed)
             self.var_hover.set(bool(self.viewer_settings.get("hover_enabled", True)))
+        self.update_marker_slider()
         if not self.var_hover.get():
             self.drop_highlights()
+        if size_changed:                                            # (the UMAP's Cell size slider shows it: set without its own redraw, done below)
+            self.umap_sliders[0].set(self.umap_size_index(self.viewer_settings.get("umap_circle_size", "Default")))
         if (size_changed or (shape_changed and self.mode in ("gene", "imputed"))) and not self.busy:
             self.recolor()
         if new_params is not None and self.params is not None:

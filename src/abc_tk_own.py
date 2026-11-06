@@ -484,11 +484,12 @@ def saved_umap(folder, own):
 
 def locate_dialog(old_path):
     """The dataset of a project has moved: ask where it is now. Returns the new path, or None."""
-    from tkinter import filedialog, messagebox
+    from tkinter import filedialog
+    import centered_dialog                              # (in the middle of the screen: there is no window of the app to put it over)
+    centered_dialog.info("Dataset not found", f"The dataset of this project is not where it was:\n\n{old_path}\n\nChoose where it is now.")
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
-    messagebox.showinfo("Dataset not found", f"The dataset of this project is not where it was:\n\n{old_path}\n\nChoose where it is now.", parent=root)
     chosen = filedialog.askopenfilename(parent=root, title=f"Where is {Path(old_path).name}?", initialdir=str(Path(old_path).parent) if Path(old_path).parent.exists() else None,
                                         filetypes=[("AnnData files", "*.h5ad"), ("All files", "*.*")])
     root.destroy()

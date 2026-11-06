@@ -434,16 +434,18 @@ class CellTip:
         self.root, self.tip, self.job, self.key, self.anchor = root, None, None, None, None
         self.delay_ms = CELL_TIP_MS if delay_ms is None else delay_ms
 
-    def pointer_on(self, key, rows_fn, action_fn=None):
+    def pointer_on(self, key, rows_fn, action_fn=None, swatch_fn=None):
         """The pointer is on a new cell (`key`); `rows_fn()` gives its description, as rows (what, number, name), asked when the tip is shown.
-        `action_fn()`, if given, is asked then too: None, or (text, command) for a button beside Copy."""
+        `action_fn()`, if given, is asked then too: None, or (text, command) for a button beside Copy. So is `swatch_fn()`: None, or
+        (rgb, marker code, background rgb), the cell as it is drawn, shown at the top (where cells are close together, which one the
+        description is of is not always plain from the ring alone)."""
         if key == self.key:
             return
         self.key = key
         self.cancel()
         if self.tip is not None and not self.pointer_in_tip() and not self.near_anchor():
             self.hide()
-        self.job = self.root.after(self.delay_ms, lambda: self.show(rows_fn, action_fn))
+        self.job = self.root.after(self.delay_ms, lambda: self.show(rows_fn, action_fn, swatch_fn))
 
     def pointer_off(self):
         """The pointer is on no cell (or left the plot): the tip goes, unless the pointer went onto it."""
@@ -477,7 +479,7 @@ class CellTip:
         if not self.pointer_in_tip():
             self.hide()
 
-    def show(self, rows_fn, action_fn=None):
+    def show(self, rows_fn, action_fn=None, swatch_fn=None):
         self.job = None
         if self.pointer_in_tip():                       # (on its way to the Copy button: the tip it is going to stays as it is)
             return
@@ -491,6 +493,17 @@ class CellTip:
         bg = "#ffffe0"
         box = tk.Frame(self.tip, bg=bg, relief="solid", borderwidth=1)
         box.pack()
+        swatch = swatch_fn() if swatch_fn is not None else None
+        if swatch is not None:                          # the cell as it is drawn: its color and its group's marker, on the plot's background
+            rgb, code, back = swatch
+            hexc = "#%02x%02x%02x" % tuple(int(c) for c in rgb[:3])
+            top = tk.Frame(box, bg=bg)
+            top.pack(anchor="w", padx=6, pady=(5, 0))
+            mark = tk.Canvas(top, width=22, height=22, bg="#%02x%02x%02x" % tuple(int(c) for c in back[:3]),
+                             highlightthickness=1, highlightbackground="gray60")
+            mark.pack(side=tk.LEFT)
+            draw_marker(mark, 12, 12, int(code), hexc, size=14)
+            tk.Label(top, text="this cell, as drawn", bg=bg, fg="gray35", font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(6, 0))
         # in columns: what (gray), the number (bold, to the right), the name
         grid = tk.Frame(box, bg=bg)
         grid.pack(anchor="w", padx=6, pady=(4, 2))
@@ -3710,6 +3723,34 @@ class UmapWindow(ExportsMixin):
                 rows.append(("Paxinos ML, DV", "", "reading the cells' CCF coordinates..."))
         return rows
 
+    def cell_swatch(self, info):
+        """(rgb, marker code, background rgb): the cell as it is drawn where the pointer is, for its tip; None if that is not known. A cell of
+        the run has its own color and its group's marker; a cell of a section that is not in the run, the color its section map gives it."""
+        try:
+            on_section = info["source"] == "section"
+            back = self.umap.bgcolor
+            if on_section:
+                tile = next((t for t in self.tiles if t["label"] == info["sec"]), None)
+                back = tile["pc"].bgcolor if tile is not None else self.view_background()
+            i, g = info["umap_idx"], info["bg_idx"]
+            if i is not None:
+                rank = getattr(self, "run_cell_rank", None)
+                return self.rgb_run[i], int(self.shape_codes([rank[i]])[0]) if rank is not None else 0, back
+            if g is None or self.tile_fn is None:
+                return None
+            got = self.tile_fn(info["sec"])
+            if got is None:
+                return None
+            _x, _y, rgb, w = got
+            at = np.flatnonzero(w == g)
+            if not len(at):
+                return None
+            rank = getattr(self, "bg_cell_rank", None)
+            code = int(self.shape_codes([rank[g]])[0]) if rank is not None and not self.var_roi_only.get() else 0
+            return rgb[at[0]], code, back
+        except Exception:
+            return None                                  # (no swatch, rather than no tip)
+
     def ccf_action(self):
         """The cell tip's extra button: fetch the CCF coordinates that its Paxinos ML and DV need, while they are not on this computer."""
         if self.ccf_state == "missing" and "ensure_ccf_downloaded" in self.host:
@@ -3831,7 +3872,7 @@ class UmapWindow(ExportsMixin):
             self.clear_highlights()
             return
         self.show_info(info)
-        self.cell_tip.pointer_on(info["key"], lambda: self.cell_rows(info), self.ccf_action)
+        self.cell_tip.pointer_on(info["key"], lambda: self.cell_rows(info), self.ccf_action, lambda: self.cell_swatch(info))
         if not self.var_hover.get():
             self.hover_key = None                    # (so that ticking the box again marks the next cell pointed at)
             return

@@ -63,6 +63,7 @@ GROUP_SORT_DESCENDING_FIRST = {"count"}     # the group list's columns whose fir
 LABEL_SIZES = (0.7, 1.0, 1.4, 2.0)         # the UMAP's Label size slider's stops: times the group numbers' font size
 LABEL_SIZE_NAMES = ("Small", "Medium", "Large", "Very large")
 DEFAULT_LABEL_INDEX = 1
+TRANSLUCENT = 0.3                                  # how opaque one cell's dot is with the Translucent box ticked (overlapping dots add up)
 OPACITIES = (0.15, 0.25, 0.35, 0.5, 0.75, 1.0)      # the Opacity slider's stops, low to high: how opaque one cell's dot is (overlapping dots add up)
 DEFAULT_OPACITY_INDEX = 5                          # (fully opaque: the dots on top hide the ones below)
 LABEL_ZOOM_CAP = 5.0               # the group numbers grow with the zoom up to this, then stay the same size
@@ -71,6 +72,9 @@ HOVER_LABEL_PX = 110               # the hover table: its first column wraps her
 HOVER_NAME_MIN_PX = 140
 HOVER_GAP_PX = 8                   # the space between the hover table's columns
 HOVER_SETTLE_MS = 120              # the hover box is measured this long after its text is set (once the names have wrapped)
+PREVIEW_ZOOM = True                # a wheel step on a plot shows the last picture scaled, and draws the view for real once the wheel is still
+ZOOM_DRAW_MS = 120
+PAN_DRAW_MS = 45                   # while a plot is dragged it is drawn again this often (in between, what is on the canvas is moved as it is)
 SHAPE_SETTLE_MS = 250              # while the view is being zoomed or panned the cells are drawn as plain discs; their shapes come back this long after it stops
 LABEL_WEIGHT_RANGE = (0.6, 2.0)    # the size factor of the smallest and the largest group's number, when sized by cell count
 LABEL_HIGHLIGHT_FACTOR = 2.0       # the number of the group being marked with '+' signs is drawn this much bigger, for as long as it is marked
@@ -394,10 +398,19 @@ class HoverTip:
         if self.tip is None:
             self.tip = tk.Toplevel(self.widget)
             self.tip.wm_overrideredirect(True)
-            self.label = tk.Label(self.tip, bg="#ffffe0", relief="solid", borderwidth=1, font=("Segoe UI", 9), padx=4, pady=1)
+            self.label = tk.Label(self.tip, bg="#ffffe0", relief="solid", borderwidth=1, font=("Segoe UI", 9), padx=4, pady=1, justify=tk.LEFT, wraplength=460)
             self.label.pack()
         self.label.config(text=self.text_fn())
-        self.tip.wm_geometry(f"+{e.x_root + 12}+{e.y_root + 18}")
+        # beside the pointer, but kept on the screen: to its left if it would run off the right edge, above it if off the bottom
+        self.tip.update_idletasks()
+        w, h = self.tip.winfo_reqwidth(), self.tip.winfo_reqheight()
+        sw, sh = self.widget.winfo_screenwidth(), self.widget.winfo_screenheight()
+        x, y = e.x_root + 12, e.y_root + 18
+        if 0 <= e.x_root < sw and x + w > sw:
+            x = max(e.x_root - w - 12, 0)
+        if 0 <= e.y_root < sh and y + h > sh:
+            y = max(e.y_root - h - 8, 0)
+        self.tip.wm_geometry(f"+{x}+{y}")
 
     def hide(self, e=None):
         if self.tip is not None:
@@ -427,6 +440,11 @@ class LazyLevels(dict):
 
 
 WINDOW_MARGIN = 0.15                                   # a zoomed section map is made this far (times the pane's size) beyond what is on screen, so that a small move needs no new picture
+
+
+def grown(d, old, new):
+    """An offset `d` from the corner of something of size `old` that is now of size `new`: inside it, it grows with it; before it or beyond it, it stays."""
+    return d if d < 0 else d * new / old if d <= old else new + (d - old)
 
 
 class PointCanvas:
@@ -476,6 +494,14 @@ class PointCanvas:
         self.visible_fn = None                      # fn() -> whether this canvas is on screen; one that is not is only drawn once it is
         self.stale = False                          # needs drawing (it was not on screen when asked)
         self.base = None                            # the last picture of the points (H x W x 3)
+        self.shown_view = None                      # (cx, cy) the items on the canvas were placed for, and the scale: a drag moves them from there (preview_pan)
+        self.shown_scale = None
+        self.previewed = (0, 0)                     # how far a drag has moved them since
+        self.pan_job = None
+        self.zoom_job = None
+        self.view_cache = []                        # [(picture, cx, cy, scale)]: pictures drawn before at other zooms; they fill in what zooming out uncovers (see preview_zoom)
+        self.cache_look = None                      # what the pictures in view_cache were drawn with: they are dropped when it changes
+        self.labels_hidden = False
         self.drawn = None                           # the part of the canvas the picture `base` covers (x0, y0, x1, y1), in the canvas's own (virtual) pixels
         self.vsize = None                           # a virtual canvas (the whole-panel zoom): its size (w, h). The Tk widget is only as big as the part of it that is on screen
         self.vview = None                           # ... and that part: (x0, y0, w, h) of the virtual canvas, which is what the widget shows
@@ -577,8 +603,10 @@ class PointCanvas:
 
     def note_motion(self):
         """The view is changing (zoom, pan, fit, size): until it has been still for SHAPE_SETTLE_MS the cells with shapes are drawn as plain discs,
-        which is quicker (one pass instead of one for each shape), and then they are drawn again with their shapes."""
-        if self.shapes_while_moving or not any(lay.get("marks") is not None for lay in self.layers):
+        which is quicker (one pass instead of one for each shape), and translucent cells are drawn solid (blending them is much slower); then they are
+        drawn again as they are."""
+        shapes = not self.shapes_while_moving and any(lay.get("marks") is not None for lay in self.layers)
+        if not shapes and self.opacity >= 1.0:
             return
         self.moving = True
         if self.settle_job is not None:
@@ -648,15 +676,96 @@ class PointCanvas:
         self.scale = min(max(self.scale * factor, fs), fs * self.MAX_ZOOM)
         if self.scale == before:
             return
-        self.note_motion()
+        by_bitmap = self.can_preview_zoom()
+        if not by_bitmap:
+            self.note_motion()
         self.at_fit = abs(self.scale - fs) < 1e-9 * fs
         w, h = self.size()
         self.cx = x - (px - w / 2) / self.scale
         dy = (py - h / 2) / self.scale
         self.cy = y + dy if self.flip_y else y - dy
         self.clamp()
-        self.request_draw()
+        if by_bitmap:
+            self.preview_zoom()
+        else:
+            self.request_draw()
         self.announce()
+
+    def remember_view(self):
+        """Keep the picture just drawn, for filling in the edges when a later zoom out reaches beyond what a picture covers: the widest one drawn (the
+        first, usually the whole view) and the last three."""
+        if self.vsize is not None or self.moving or self.base is None:
+            return
+        look = (id(self.layers), self.dot_factor, self.opacity, tuple(self.bgcolor), id(self.outlines), self.cell_alpha, self.panel_zoom, self.size())
+        if look != self.cache_look:
+            self.cache_look, self.view_cache = look, []
+        self.view_cache = [e for e in self.view_cache if abs(e[3] / self.scale - 1.0) > 0.02]
+        self.view_cache.append((self.base, self.cx, self.cy, self.scale))
+        if len(self.view_cache) > 4:
+            widest = min(self.view_cache, key=lambda e: e[3])
+            self.view_cache = [widest] + [e for e in self.view_cache if e is not widest][-3:]
+
+    def view_coefficients(self, cx, cy, scale):
+        """(a, bx, by): the picture that was drawn for the view (cx, cy, scale) seen from the current view: its pixel = a * this pixel + (bx, by)."""
+        w, h = self.size()
+        a = scale / self.scale
+        sign = -1.0 if self.flip_y else 1.0
+        return a, w / 2 + (self.cx - cx) * scale - a * w / 2, h / 2 + sign * (self.cy - cy) * scale - a * h / 2
+
+    def can_preview_zoom(self):
+        return (PREVIEW_ZOOM and self.vsize is None and self.base is not None and self.shown_view is not None and self.drawn is not None
+                and self.base.shape[:2] == (self.size()[1], self.size()[0]))
+
+    def preview_zoom(self):
+        """A wheel step shows the last picture enlarged (or reduced) about the pointer, at once; the view is really drawn again when the wheel has been still
+        for ZOOM_DRAW_MS. Drawing every cell at every step is what makes zooming a big plot sluggish. (Like the whole-panel zoom of the section maps.)"""
+        w, h = self.size()
+        a, bx, by = self.view_coefficients(self.shown_view[0], self.shown_view[1], self.shown_scale)      # (old picture pixels per new one)
+        bg = tuple(int(v) for v in self.bgcolor)
+        # (cv2 and a photo reused rather than made again: 4 ms where PIL's transform and a new photo took 20)
+        img = cv2.warpAffine(np.ascontiguousarray(self.base), np.array([[a, 0, bx], [0, a, by]], np.float32), (w, h),
+                             flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_CONSTANT, borderValue=bg)
+        if bx < 0 or by < 0 or a * w + bx > w or a * h + by > h:           # (zoomed out, or moved: the picture does not reach the edges)
+            under = self.earlier_picture(w, h, bg)
+            if under is not None:
+                mask = cv2.warpAffine(np.full((self.base.shape[0], self.base.shape[1]), 255, np.uint8), np.array([[a, 0, bx], [0, a, by]], np.float32),
+                                      (w, h), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_CONSTANT, borderValue=0) > 127
+                under[mask] = img[mask]
+                img = under
+        picture = Image.fromarray(img)
+        if self.photo is not None and (self.photo.width(), self.photo.height()) == (w, h):
+            self.photo.paste(picture)
+        else:
+            self.photo = ImageTk.PhotoImage(picture, master=self.canvas)
+        self.canvas.itemconfig(self.item, image=self.photo)
+        self.canvas.coords(self.item, 0, 0)
+        self.reposition(light=True)                                        # (the ring, the rectangles: at their places in the new view; the labels come back with the real drawing)
+        if self.zoom_job is not None:
+            self.canvas.after_cancel(self.zoom_job)
+        self.zoom_job = self.canvas.after(ZOOM_DRAW_MS, self.request_draw)
+
+    def earlier_picture(self, w, h, bg):
+        """An earlier picture, of a wider (or the widest) view, shown at the current view, for the parts the picture being scaled does not cover; or None."""
+        if not self.view_cache:
+            return None
+        x0, x1 = self.cx - w / (2 * self.scale), self.cx + w / (2 * self.scale)
+        y0, y1 = self.cy - h / (2 * self.scale), self.cy + h / (2 * self.scale)
+        best = None
+        for e in self.view_cache:
+            if abs(e[3] / self.shown_scale - 1.0) <= 0.02:
+                continue                                                 # (the picture already being shown)
+            ew, eh = e[0].shape[1], e[0].shape[0]
+            covers = (e[1] - ew / (2 * e[3]) <= x0 and e[1] + ew / (2 * e[3]) >= x1 and e[2] - eh / (2 * e[3]) <= y0 and e[2] + eh / (2 * e[3]) >= y1)
+            # the sharpest picture that covers the whole view; failing that, the widest there is
+            rank = (1, e[3]) if covers else (0, -e[3])
+            if best is None or rank > best[0]:
+                best = (rank, e)
+        if best is None:
+            return None
+        picture, ecx, ecy, escale = best[1]
+        a, bx, by = self.view_coefficients(ecx, ecy, escale)
+        return cv2.warpAffine(np.ascontiguousarray(picture), np.array([[a, 0, bx], [0, a, by]], np.float32), (w, h),
+                              flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_CONSTANT, borderValue=bg)
 
     def pan_start(self, e):
         if self.panel_hook is not None:
@@ -677,8 +786,25 @@ class PointCanvas:
         self.cy = cy + dy if self.flip_y else cy - dy
         self.at_fit = False
         self.clamp()
-        self.request_draw()
+        self.preview_pan()
         self.announce()
+
+    def preview_pan(self):
+        """A drag moves what is on the canvas (the picture, the ring, the labels) as it is, at once, and draws the view again at most every PAN_DRAW_MS: drawing
+        it at every mouse move, every cell in view, is what makes dragging a big plot slow."""
+        if self.shown_view is None or self.scale != self.shown_scale:
+            self.request_draw()
+            return
+        dx = (self.shown_view[0] - self.cx) * self.scale
+        dy = ((self.cy - self.shown_view[1]) if self.flip_y else (self.shown_view[1] - self.cy)) * self.scale
+        self.canvas.move("all", dx - self.previewed[0], dy - self.previewed[1])
+        self.previewed = (dx, dy)
+        if self.pan_job is None and self.pending is None:
+            self.pan_job = self.canvas.after(PAN_DRAW_MS, self.pan_draw)
+
+    def pan_draw(self):
+        self.pan_job = None
+        self.request_draw()
 
     def pan_end(self, e):
         self.pan_from = None
@@ -695,6 +821,12 @@ class PointCanvas:
 
     def draw(self):
         self.pending = None
+        if self.pan_job is not None:
+            self.canvas.after_cancel(self.pan_job)
+            self.pan_job = None
+        if self.zoom_job is not None:
+            self.canvas.after_cancel(self.zoom_job)
+            self.zoom_job = None
         w, h = self.size()
         if w <= 2 or h <= 2:
             return
@@ -723,6 +855,7 @@ class PointCanvas:
         x_lo, x_hi = self.cx + (ox - W / 2) / self.scale, self.cx + (ex - W / 2) / self.scale
         d_lo, d_hi = (oy - H / 2) / self.scale, (ey - H / 2) / self.scale
         y_lo, y_hi = (self.cy - d_hi, self.cy - d_lo) if self.flip_y else (self.cy + d_lo, self.cy + d_hi)
+        opacity = 1.0 if self.moving else self.opacity                        # (solid while the view moves: blending translucent dots is much slower; see note_motion)
         for lay in self.layers:
             if "size_mm" in lay:                                              # (a size on the tissue: the same at any window size)
                 d = int(max(round(lay["size_mm"] * self.dot_factor * self.scale), 1))
@@ -744,8 +877,8 @@ class PointCanvas:
             if lay.get("marks") is not None and not self.moving:         # (a marker code for each cell: the group's shape; plain discs while the view moves)
                 self.draw_marked(img, px, py, rgb, lay["marks"][idx], d)
                 continue
-            if self.opacity < 1.0 and lay.get("shape") != "half":
-                blend_dots(img, px + d, py + d, rgb, d, self.opacity, self.kernels)
+            if opacity < 1.0 and lay.get("shape") != "half":
+                blend_dots(img, px + d, py + d, rgb, d, opacity, self.kernels)
                 continue
             if d > BIG_DOT_PX:                                             # (very big dots, so few on screen: each drawn as a circle, later ones on top)
                 r = d // 2
@@ -772,6 +905,8 @@ class PointCanvas:
         self.base = img
         self.compose()
         self.reposition()
+        self.shown_view, self.shown_scale, self.previewed = (self.cx, self.cy), self.scale, (0, 0)          # (what is on the canvas is for this view: see preview_pan)
+        self.remember_view()
         if self.on_view:
             self.on_view()
 
@@ -814,10 +949,11 @@ class PointCanvas:
                 draw_big_marker(img, X, Y, c, d, int(code))
             return
         codes = np.unique(marks)
-        if self.opacity < 1.0:
+        opacity = 1.0 if self.moving else self.opacity                        # (solid while the view moves: see note_motion)
+        if opacity < 1.0:
             for code in codes:
                 sel = marks == code
-                blend_dots(img, px[sel] + d, py[sel] + d, rgb[sel], d, self.opacity, self.kernels, kernel=self.marker_kernel(int(code), d))
+                blend_dots(img, px[sel] + d, py[sel] + d, rgb[sel], d, opacity, self.kernels, kernel=self.marker_kernel(int(code), d))
             return
         px, py = px + d, py + d
         numbers = np.arange(1, len(px) + 1, dtype=np.float32)
@@ -987,9 +1123,17 @@ class PointCanvas:
             for it in self.labels:
                 self.canvas.itemconfig(it[0], font=("Segoe UI", self.label_font_size(it[0], size), "bold"))
 
-    def reposition(self):
-        if self.labels:
+    def reposition(self, light=False):
+        """Put the ring, the rectangles, the scale bar and the group labels where they belong in the view. `light`: all but the labels, which are hidden
+        (hundreds of them: moving them and sizing their text at every wheel step is most of what a step cost)."""
+        if light:
+            if not self.labels_hidden:
+                for it, _x, _y in self.labels:
+                    self.canvas.itemconfig(it, state="hidden")
+                self.labels_hidden = True
+        elif self.labels:
             self.update_label_size()
+            self.labels_hidden = False
         if self.scalebar:
             self.place_scalebar()
         for m in self.markers.values():
@@ -1000,7 +1144,7 @@ class PointCanvas:
             self.canvas.coords(it, a, b, c, d)
             self.canvas.tag_raise(it)
         w, h = self.view_size()
-        for it, x, y in self.labels:
+        for it, x, y in ([] if light else self.labels):
             px, py = self.to_canvas(x, y)
             if 0 <= px <= w and 0 <= py <= h:
                 self.canvas.coords(it, px, py)
@@ -1329,25 +1473,29 @@ class UmapWindow(ExportsMixin):
             self.root.after(600, lambda: self.fit_left_pane(False))
 
     def build_side(self, f):
-        self.color_label = ttk.Label(f, text="Color by", font=("Segoe UI", 13, "bold"))
-        self.color_label.pack(anchor="w")
+        self.top_row = ttk.Frame(f)                                       # Color by (left) and Level (right), each a column of radio buttons
+        self.top_row.pack(fill=tk.X)
+        self.top_row.columnconfigure(0, weight=1)
+        self.top_row.columnconfigure(1, weight=1)
+        color_col = ttk.LabelFrame(self.top_row, text="Color by", padding=6)             # (boxed like Level)
+        color_col.grid(row=0, column=0, sticky="nsew")
+        self.color_label = color_col
         self.var_mode = tk.StringVar(f, "all")
-        modes = ttk.Frame(f)                                              # (two to a row, in two columns of equal width: they line up)
+        modes = ttk.Frame(color_col)
         modes.pack(fill=tk.X)
-        modes.columnconfigure(0, weight=1, uniform="mode")
-        modes.columnconfigure(1, weight=1, uniform="mode")
         shown = [(value, text) for value, text in (("all", "All groups"), ("single", "Specific group(s)"), ("gene", "Gene"), ("imputed", "Imputed Gene"))
                  if not (value == "imputed" and self.own is not None)]     # (there is no imputed dataset behind a dataset of the user's own)
         for k, (value, text) in enumerate(shown):
-            ttk.Radiobutton(modes, text=text, value=value, variable=self.var_mode, command=self.on_mode).grid(row=k % 2, column=k // 2, sticky="w")
-        opacity_row = ttk.Frame(f)
-        opacity_row.pack(fill=tk.X, pady=(8, 0))
-        self.var_opacity = tk.IntVar(opacity_row, DEFAULT_OPACITY_INDEX)
-        self.opacity_slider = self.add_slider(opacity_row, 0, "Opacity:", self.var_opacity, len(OPACITIES), self.apply_opacity,
-                                              lambda i: f"{OPACITIES[i] * 100:g}%", None)
-        opacity_row.columnconfigure(0, weight=0)
-        self.level_frame = ttk.LabelFrame(f, text="Level", padding=6)
-        self.level_frame.pack(fill=tk.X, pady=(8, 0))
+            ttk.Radiobutton(modes, text=text, value=value, variable=self.var_mode, command=self.on_mode).grid(row=k, column=0, sticky="w")
+        self.var_translucent = tk.BooleanVar(f, False)
+        translucent_box = ttk.Checkbutton(color_col, text="Translucent", variable=self.var_translucent, command=self.apply_opacity)
+        translucent_box.pack(anchor="w", pady=(4, 0))                      # (under the Color by buttons, in the room beside the Level list)
+        HoverTip(translucent_box, lambda: f"Draw the dots {TRANSLUCENT * 100:g}% opaque instead of fully opaque,\n"
+                                          "so that where they overlap you see how many there are.\n\n"
+                                          "Zooming and moving the plots\n"
+                                          "become much slower while this is on.")
+        self.level_frame = ttk.LabelFrame(self.top_row, text="Level", padding=6)
+        self.level_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
         HoverTip(self.level_frame, self.level_tip)
         self.var_level = tk.StringVar(f, self.level)
         self.build_level_radios()
@@ -1406,8 +1554,12 @@ class UmapWindow(ExportsMixin):
         # the legend for Single group(s)
         self.legend = tk.Canvas(f, width=300, height=10, highlightthickness=0)
         self.select_bar = ttk.Frame(f)                      # All / None, above the group list and the Single group(s) legend
-        ttk.Button(self.select_bar, text="All", width=6, style="Side.TButton", command=self.select_all_groups).pack(side=tk.LEFT)
-        ttk.Button(self.select_bar, text="None", width=6, style="Side.TButton", command=self.select_no_groups).pack(side=tk.LEFT, padx=(6, 0))
+        all_button = ttk.Button(self.select_bar, text="All", width=6, style="Side.TButton", command=self.select_all_groups)
+        all_button.pack(side=tk.LEFT)
+        none_button = ttk.Button(self.select_bar, text="None", width=6, style="Side.TButton", command=self.select_no_groups)
+        none_button.pack(side=tk.LEFT, padx=(6, 0))
+        HoverTip(all_button, lambda: "Select all groups")
+        HoverTip(none_button, lambda: "Deselect all groups")
         self.group_list = ttk.Frame(f)                      # the groups' numbers and colors (All groups), scrollable
         self.group_header = tk.Canvas(self.group_list, height=20, highlightthickness=0, cursor="hand2")      # the column headings: click to sort
         self.group_header.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
@@ -1474,7 +1626,7 @@ class UmapWindow(ExportsMixin):
     def build_buttons(self, f):
         ttk.Style(self.root).configure("Side.TButton", font=("Segoe UI", 9))
         bar = ttk.Frame(f)
-        bar.pack(fill=tk.X, side=tk.TOP, pady=(0, 10), before=self.color_label)
+        bar.pack(fill=tk.X, side=tk.TOP, pady=(0, 10), before=self.top_row)
         bar.columnconfigure(0, weight=1)
         bar.columnconfigure(1, weight=1)
         self.group_buttons = []
@@ -1511,7 +1663,7 @@ class UmapWindow(ExportsMixin):
             b.state(["!disabled"] if self.mode == "single" and self.own is None else ["disabled"])
 
     def update_frames(self):
-        self.level_frame.config(text="Level" if self.mode in ("all", "single") else "Level (group marked with + on hover)")
+        self.level_frame.config(text="Level" if self.mode in ("all", "single") else "Level (hover)")
         for w in (self.id_frame, self.gene_frame, self.select_bar, self.legend, self.group_list):
             w.pack_forget()
         if self.mode == "single":
@@ -1559,7 +1711,7 @@ class UmapWindow(ExportsMixin):
             pc.add_marker("hover", 7)
             pc.plus_arm = 2
             pc.dot_factor = self.dot_factors[self.var_dot.get()]
-            pc.opacity = OPACITIES[self.var_opacity.get()]
+            pc.opacity = TRANSLUCENT if self.var_translucent.get() else 1.0
             pc.marker_factor = MARKER_SIZES[self.var_marker.get()]
             pc.visible_fn = lambda fr=fr: self.frame_visible(fr)
             pc.shapes_while_moving = True
@@ -1858,6 +2010,36 @@ class UmapWindow(ExportsMixin):
                 self.sliders[0].set(self.tile_stop_before_zoom)       # (and back to what they were)
                 self.tile_stop_before_zoom = None
 
+    def tile_geometry(self, t):
+        """(x, y of the panel in the scrolled pane, the caption's height, the map's width and height)."""
+        fr, pc = t["frame"], t["pc"]
+        ch = t["caption"].winfo_reqheight()
+        if pc.vsize is not None:
+            lw, lh = pc.vsize
+        else:
+            lw, lh = pc.canvas.winfo_width(), pc.canvas.winfo_height()
+        return getattr(fr, "tile_x", 0), getattr(fr, "tile_y", 0), ch, max(lw, 1), max(lh, 1)
+
+    def spot_in_tiles(self, ax, ay):
+        """Where a point of the scrolled pane is in the panels, so that it can be found again after they are laid out bigger or smaller: the nearest panel
+        and the point's offset from its map's corner. (The captions and the gaps do not grow with the zoom, the maps do: scaling the pane's
+        coordinates all alike puts the point off by the captions and gaps of every row above it, which showed as a hop when the zoom settled.)"""
+        best = None
+        for k, t in enumerate(self.tiles):
+            x, y, ch, lw, lh = self.tile_geometry(t)
+            dx = max(x - ax, 0, ax - (x + lw))
+            dy = max(y - ay, 0, ay - (y + ch + lh))
+            if best is None or dx * dx + dy * dy < best[0]:
+                best = (dx * dx + dy * dy, k, ax - x, ay - (y + ch), lw, lh)
+        return best[1:] if best else None
+
+    def spot_now(self, spot):
+        """Where that spot is now (x, y in the scrolled pane): offsets within the map grow with the map, those outside it (caption, gaps) stay as they were."""
+        k, dx, dy, old_w, old_h = spot
+        x, y, ch, lw, lh = self.tile_geometry(self.tiles[k])
+
+        return x + grown(dx, old_w, lw), y + ch + grown(dy, old_h, lh)
+
     def set_panel_zoom(self, zoom, anchor=None):
         """Enlarge the whole panel to `zoom` times its size (1 to MAX_PANEL_ZOOM): the panels are laid out again, bigger, so that borders, gaps and
         sections grow together, and only those in view are drawn. `anchor` = (x, y in the scrolled pane, x, y in the window): the point that stays
@@ -1865,7 +2047,7 @@ class UmapWindow(ExportsMixin):
         zoom = min(max(zoom, 1.0), self.max_panel_zoom())
         if abs(zoom - self.panel_zoom) < 1e-9 or not self.tiles:
             return
-        old = [float(v) for v in self.tile_scroll.cget("scrollregion").split()] or [0, 0, 1, 1]
+        spot = self.spot_in_tiles(anchor[0], anchor[1]) if anchor is not None else None
         self.panel_zoom = zoom
         for t in self.tiles:
             t["pc"].panel_zoom = zoom
@@ -1875,10 +2057,11 @@ class UmapWindow(ExportsMixin):
         else:
             self.hsb.pack_forget()
         new = [float(v) for v in self.tile_scroll.cget("scrollregion").split()]
-        if anchor is not None and old[2] > 0 and old[3] > 0 and new[2] > 0 and new[3] > 0:
-            ax, ay, wx, wy = anchor
-            self.tile_scroll.xview_moveto(min(max((ax * new[2] / old[2] - wx) / new[2], 0.0), 1.0))
-            self.tile_scroll.yview_moveto(min(max((ay * new[3] / old[3] - wy) / new[3], 0.0), 1.0))
+        if spot is not None and new[2] > 0 and new[3] > 0:
+            nx, ny = self.spot_now(spot)
+            wx, wy = anchor[2], anchor[3]
+            self.tile_scroll.xview_moveto(min(max((nx - wx) / new[2], 0.0), 1.0))
+            self.tile_scroll.yview_moveto(min(max((ny - wy) / new[3], 0.0), 1.0))
         self.place_tiles()
         self.root.after_idle(self.refresh_visible)
 
@@ -1902,11 +2085,31 @@ class UmapWindow(ExportsMixin):
                 return
             b = self.zoom_burst = {"image": image, "start": self.panel_zoom, "target": self.panel_zoom, "at": (wx, wy),
                                    "content": (self.tile_scroll.canvasx(wx), self.tile_scroll.canvasy(wy)), "label": None, "job": None, "photo": None}
+            b["spot"] = self.spot_in_tiles(*b["content"])
+            self.remember_pane(b, image)
         b["target"] = min(max(b["target"] * factor, 1.0), self.max_panel_zoom())
         self.show_zoom_snapshot(b)
         if b["job"] is not None:
             self.root.after_cancel(b["job"])
         b["job"] = self.root.after(self.ZOOM_SETTLE_MS, self.settle_zoom)
+
+    def pane_look(self):
+        """What the pictures of the pane were made with: they are dropped when it changes (a recolor, a size, ...)."""
+        return (tuple(id(t["pc"].layers) for t in self.tiles), self.var_dot.get(), self.var_marker.get(), self.var_translucent.get(), self.var_ccf.get(),
+                self.var_roi_only.get(), self.var_tile.get(), self.tile_scroll.winfo_width())        # (not its height: the scroll bar that comes with the zoom changes that)
+
+    def remember_pane(self, b, image):
+        """Keep the picture of the pane at the zoom a wheel run starts from: when the zoom later goes out again it fills in what the scaled picture does not
+        reach. The widest (lowest zoom) one is kept, and the last three."""
+        look = self.pane_look()
+        if look != getattr(self, "pane_cache_look", None):
+            self.pane_cache_look, self.pane_cache = look, []
+        b["left"], b["top"] = self.tile_scroll.canvasx(0), self.tile_scroll.canvasy(0)
+        entry = {"z": self.panel_zoom, "left": b["left"], "top": b["top"], "image": image}
+        self.pane_cache = [e for e in self.pane_cache if abs(e["z"] / self.panel_zoom - 1.0) > 0.02] + [entry]
+        if len(self.pane_cache) > 4:
+            widest = min(self.pane_cache, key=lambda e: e["z"])
+            self.pane_cache = [widest] + [e for e in self.pane_cache if e is not widest][-3:]
 
     def snapshot_pane(self):
         """A picture of the section pane as it is on screen now (PIL Image), or None if it cannot be taken."""
@@ -1920,13 +2123,85 @@ class UmapWindow(ExportsMixin):
         except Exception:
             return None
 
+    def layout_at(self, z):
+        """The layout the panels have (or would have) at panel zoom z, as layout_tiles makes it: the number across and down, the slot of one panel (width, height),
+        the caption's height, and the size of its map."""
+        cols = TILE_COLUMNS[self.var_tile.get()]
+        w = max(self.tile_scroll.winfo_width(), 100)
+        base = max((w - 4) // cols - 8 - 2, MIN_TILE_PX)
+        ch = max(t["caption"].winfo_reqheight() for t in self.tiles)
+        px = int(base * z)
+        ph = int(px / self.tile_aspect)
+        border = 2 if z <= 1.0 else 0                                    # (a map of the unzoomed panel has its widget's border)
+        mw, mh = px + border, ph + border
+        return {"cols": cols, "rows": -(-len(self.tiles) // cols), "fw": mw, "fh": ch + mh, "ch": ch, "mw": mw, "mh": mh}
+
+    def view_at(self, z, spot, at, lay):
+        """Where the pane is scrolled to (left, top) at zoom z when the spot under the pointer is to stay under it."""
+        k, dx, dy, old_w, old_h = spot
+        x = 4 + (k % lay["cols"]) * (lay["fw"] + 8) + grown(dx, old_w, lay["mw"])
+        y = 3 + (k // lay["cols"]) * (lay["fh"] + 6) + lay["ch"] + grown(dy, old_h, lay["mh"])
+        total_w = 4 + lay["cols"] * (lay["fw"] + 8)
+        total_h = 3 + lay["rows"] * (lay["fh"] + 6)
+        wx, wy = at
+        return (min(max(x - wx, 0.0), max(total_w - self.tile_scroll.winfo_width(), 0.0)),
+                min(max(y - wy, 0.0), max(total_h - self.tile_scroll.winfo_height(), 0.0)))
+
+    def pane_maps(self, lay_n, left_n, top_n, lay_c, left_c, top_c, w, h):
+        """For each column and row of the pane at the layout lay_n (scrolled to left_n, top_n): where in a picture of the pane at the layout lay_c (scrolled
+        to left_c, top_c) the same place is. The maps grow and the captions and gaps do not, so it is not one scale for all."""
+        xn = left_n + np.arange(w, dtype=np.float64) - 4
+        k = np.clip(np.floor(xn / (lay_n["fw"] + 8)), 0, lay_n["cols"] - 1)
+        o = xn - k * (lay_n["fw"] + 8)
+        oc = np.where(o < 0, o, np.where(o <= lay_n["mw"], o * (lay_c["mw"] / lay_n["mw"]), lay_c["mw"] + (o - lay_n["mw"])))
+        mx = 4 + k * (lay_c["fw"] + 8) + oc - left_c
+        yn = top_n + np.arange(h, dtype=np.float64) - 3
+        r = np.clip(np.floor(yn / (lay_n["fh"] + 6)), 0, lay_n["rows"] - 1)
+        o = yn - r * (lay_n["fh"] + 6)
+        ch = lay_n["ch"]
+        oc = np.where(o < ch, o, np.where(o <= ch + lay_n["mh"], ch + (o - ch) * (lay_c["mh"] / lay_n["mh"]), ch + lay_c["mh"] + (o - ch - lay_n["mh"])))
+        my = 3 + r * (lay_c["fh"] + 6) + oc - top_c
+        return mx, my
+
+    def pane_picture(self, image, maps, w, h):
+        """`image` (a snapshot of the pane) at the places the maps say; also which pixels of the result it covers. (RGB array, boolean array)"""
+        mx, my = maps
+        src = np.asarray(image)
+        sh, sw = src.shape[:2]
+        inside = ((my >= 0) & (my <= sh - 1))[:, None] & ((mx >= 0) & (mx <= sw - 1))[None, :]
+        out = cv2.remap(src, np.ascontiguousarray(np.broadcast_to(mx.astype(np.float32)[None, :], (h, w))),
+                        np.ascontiguousarray(np.broadcast_to(my.astype(np.float32)[:, None], (h, w))), cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT, borderValue=(244, 244, 244))
+        return out, inside
+
+    def earlier_entry(self, b):
+        """The earlier picture of the pane to fill the edges with: the sharpest at or below the zoom reached, else the nearest above; None if there is none."""
+        target, start = b["target"], b["start"]
+        best = None
+        for e in getattr(self, "pane_cache", []):
+            if abs(e["z"] / start - 1.0) <= 0.02:
+                continue                                                 # (the snapshot being scaled)
+            rank = (1, e["z"]) if e["z"] <= target * 1.02 else (0, -e["z"])
+            if best is None or rank > best[0]:
+                best = (rank, e)
+        return best[1] if best else None
+
     def show_zoom_snapshot(self, b):
-        """The snapshot enlarged (or reduced) by the zoom so far, about the point under the pointer, over the pane."""
+        """The snapshot of the pane as it will be at the zoom so far, over the pane: each part of it moved and grown as the real layout will have it (the maps
+        grow, the captions and gaps do not), so that what is drawn for real at the end lands where this was; and the edges it does not reach from an earlier
+        picture of the pane."""
         w, h = b["image"].size
-        r = b["target"] / b["start"]
-        ax, ay = b["at"]
-        scaled = b["image"].transform((w, h), Image.AFFINE, (1 / r, 0, ax - ax / r, 0, 1 / r, ay - ay / r), resample=Image.BILINEAR, fillcolor=(244, 244, 244))
-        b["photo"] = ImageTk.PhotoImage(scaled, master=self.tile_scroll)
+        z = b["target"]
+        lay_n = self.layout_at(z)
+        left_n, top_n = self.view_at(z, b["spot"], b["at"], lay_n) if b.get("spot") else (b["left"] * z / b["start"], b["top"] * z / b["start"])
+        out, inside = self.pane_picture(b["image"], self.pane_maps(lay_n, left_n, top_n, self.layout_at(b["start"]), b["left"], b["top"], w, h), w, h)
+        if not inside.all():
+            e = self.earlier_entry(b)
+            if e is not None:
+                under, _ = self.pane_picture(e["image"], self.pane_maps(lay_n, left_n, top_n, self.layout_at(e["z"]), e["left"], e["top"], w, h), w, h)
+                under[inside] = out[inside]
+                out = under
+        b["photo"] = ImageTk.PhotoImage(Image.fromarray(out), master=self.tile_scroll)
         if b["label"] is None:
             b["label"] = tk.Label(self.tile_scroll, bd=0, highlightthickness=0, cursor="fleur")
             b["label"].bind("<MouseWheel>", lambda e: self.zoom_step(*b["at"], 1.25 if e.delta > 0 else 0.8))
@@ -1997,8 +2272,8 @@ class UmapWindow(ExportsMixin):
                 t["pc"].stale = True
 
     def apply_opacity(self):
-        """The Opacity slider: the UMAP and the section panels are drawn again with dots that are more or less see-through."""
-        f = OPACITIES[self.var_opacity.get()]
+        """The Translucent box: the UMAP and the section panels are drawn again with dots that are see-through (or not)."""
+        f = TRANSLUCENT if self.var_translucent.get() else 1.0
         self.umap.opacity = f
         self.umap.request_draw()
         for t in self.tiles:
@@ -2286,7 +2561,7 @@ class UmapWindow(ExportsMixin):
         self.set_cell_ranks(self.export_cat["rank"], np.where(bgc >= 0, rank_of[np.maximum(bgc, 0)], -1) if bgc is not None else None)
         self.shown_values = None
         n_cat = int((counts > 0).sum())
-        self.var_status.set(f"Showing all {n_cat} {plural_name(self.level_names[level])}" + (f"; the {len(ranked)} largest colored, the rest gray." if n_cat > len(ranked) else " (numbers at each center).") + " Click a group in the list to gray it or color it again.")
+        self.var_status.set(f"Showing all {n_cat} {plural_name(self.level_names[level])}" + (f"; the {len(ranked)} largest colored, the rest gray." if n_cat > len(ranked) else ".") + " Click group in list to select/deselect.")
         self.values = None
         self.draw_group_list(ranked, uniques, counts)
 

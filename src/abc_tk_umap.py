@@ -426,7 +426,7 @@ class LazyLevels(dict):
         return value
 
 
-WINDOW_MARGIN = 0.15                                   # a zoomed canvas is drawn this far (times the pane's size) beyond what is on screen, so that a small move needs no new picture
+WINDOW_MARGIN = 0.15                                   # a zoomed section map is made this far (times the pane's size) beyond what is on screen, so that a small move needs no new picture
 
 
 class PointCanvas:
@@ -456,6 +456,7 @@ class PointCanvas:
         self.label_color = {}                       # item -> the colour it was given (for a light background: see ink_for)
         self.scale_labels = True                    # the labels' size follows their weight
         self.shape_kernels = {}                     # (marker code, diameter) -> the kernel that grows a point into that marker
+        self.shapes_while_moving = False            # True: layers with shapes keep them while the view moves (for small canvases: drawing twice is the slower way)
         self.moving = False                         # the view is being zoomed or panned: layers with shapes are drawn as plain discs
         self.settle_job = None
         self.boosted = None                         # the text of the label drawn bigger now (the highlighted group's), or None
@@ -475,9 +476,11 @@ class PointCanvas:
         self.visible_fn = None                      # fn() -> whether this canvas is on screen; one that is not is only drawn once it is
         self.stale = False                          # needs drawing (it was not on screen when asked)
         self.base = None                            # the last picture of the points (H x W x 3)
-        self.window_fn = None                       # fn(margin) -> (x0, y0, x1, y1): the part of this canvas (pixels) that is on screen, `margin` times the pane's size wider
-                                                    # all round; None when all of it is. A canvas zoomed to thousands of pixels is only drawn there.
-        self.drawn = None                           # the part of the canvas the picture `base` covers (x0, y0, x1, y1)
+        self.drawn = None                           # the part of the canvas the picture `base` covers (x0, y0, x1, y1), in the canvas's own (virtual) pixels
+        self.vsize = None                           # a virtual canvas (the whole-panel zoom): its size (w, h). The Tk widget is only as big as the part of it that is on screen
+        self.vview = None                           # ... and that part: (x0, y0, w, h) of the virtual canvas, which is what the widget shows
+        self.off = (0, 0)                           # where the widget's top left is in the virtual canvas
+        self.border = None                          # a virtual canvas draws its own border (the widget's would be round the part shown)
         self.dim = False                            # a veil over the points (while a cell is highlighted)
         self.bgcolor = (255, 255, 255)
         self.plus_arm = 3                           # the '+' marks' arm length (pixels) at the whole view
@@ -503,7 +506,65 @@ class PointCanvas:
     # ---- geometry
 
     def size(self):
+        """The size of the canvas (a virtual canvas: its whole size, which the widget shows a part of)."""
+        if self.vsize is not None:
+            return self.vsize
         return max(self.canvas.winfo_width(), 2), max(self.canvas.winfo_height(), 2)
+
+    def view_size(self):
+        """The size of the part shown (the widget)."""
+        if self.vview is not None:
+            return self.vview[2], self.vview[3]
+        return self.size()
+
+    def set_virtual(self, size):
+        """Make this a canvas of `size` (w, h) pixels that is too big for a widget (zoomed 100 times, say: tens of thousands of pixels, which Tk makes
+        slowly and may not make at all): the widget is only the part on screen (set_view), and everything is in the big canvas's pixels. None: an
+        ordinary canvas again (the caller sets the widget's size)."""
+        if size is None:
+            if self.vsize is None:
+                return
+            self.vsize = self.vview = None
+            self.off = (0, 0)
+            self.canvas.config(highlightthickness=1)
+            if self.border is not None:
+                self.canvas.delete(self.border)
+                self.border = None
+            return
+        size = (max(int(size[0]), 2), max(int(size[1]), 2))
+        if self.vsize is None:
+            self.canvas.config(highlightthickness=0)
+            self.border = self.canvas.create_rectangle(0, 0, 0, 0, outline="#bbbbbb")
+        if size != self.vsize:
+            self.vsize = size
+            self.vview = None
+            if self.at_fit:
+                self.fit()
+            else:
+                self.note_motion()
+                self.clamp()
+                self.request_draw()
+
+    def set_view(self, x0, y0, w, h):
+        """The part of a virtual canvas the widget shows, and draws."""
+        new = (int(x0), int(y0), max(int(w), 1), max(int(h), 1))
+        if new == self.vview:
+            return
+        old_off = self.off
+        self.vview = new
+        self.off = (new[0], new[1])
+        # What is on the canvas stays where it is in the big canvas until it is drawn again (the picture, the hover ring, the labels): the widget is
+        # in a new place, so they move the other way. Left alone they would jump (backwards, when dragging) for the moment the new picture takes.
+        self.canvas.move("all", old_off[0] - new[0], old_off[1] - new[1])
+        self.canvas.config(width=new[2], height=new[3])
+        lw, lh = self.vsize
+        self.canvas.coords(self.border, -new[0], -new[1], lw - 1 - new[0], lh - 1 - new[1])
+        # Drawn now, not when the program is next idle: the widget's new place and its new picture then reach the screen together (put off, the
+        # screen could show the widget in its new place with the old picture in it for a moment: a strip of it wrong).
+        if self.pending is not None:
+            self.canvas.after_cancel(self.pending)
+            self.pending = None
+        self.draw()
 
     def fit_scale(self):
         w, h = self.size()
@@ -517,7 +578,7 @@ class PointCanvas:
     def note_motion(self):
         """The view is changing (zoom, pan, fit, size): until it has been still for SHAPE_SETTLE_MS the cells with shapes are drawn as plain discs,
         which is quicker (one pass instead of one for each shape), and then they are drawn again with their shapes."""
-        if not any(lay.get("marks") is not None for lay in self.layers):
+        if self.shapes_while_moving or not any(lay.get("marks") is not None for lay in self.layers):
             return
         self.moving = True
         if self.settle_job is not None:
@@ -556,6 +617,8 @@ class PointCanvas:
         self.cy = (y0 + y1) / 2 if 2 * hh >= y1 - y0 else min(max(self.cy, y0 + hh), y1 - hh)
 
     def on_resize(self):
+        if self.vsize is not None:                  # (a virtual canvas has the size it was given; the widget is only the part shown)
+            return
         if self.at_fit:
             self.fit()
         else:
@@ -566,10 +629,11 @@ class PointCanvas:
     def to_canvas(self, x, y):
         w, h = self.size()
         sy = -(y - self.cy) if self.flip_y else (y - self.cy)
-        return w / 2 + (x - self.cx) * self.scale, h / 2 + sy * self.scale
+        return w / 2 + (x - self.cx) * self.scale - self.off[0], h / 2 + sy * self.scale - self.off[1]
 
     def to_data(self, px, py):
         w, h = self.size()
+        px, py = px + self.off[0], py + self.off[1]
         x = self.cx + (px - w / 2) / self.scale
         dy = (py - h / 2) / self.scale
         return x, self.cy + (-dy if self.flip_y else dy)
@@ -642,8 +706,11 @@ class PointCanvas:
             self.scale = self.fit_scale()
             self.cx, self.cy = (self.home[0] + self.home[1]) / 2, (self.home[2] + self.home[3]) / 2
         zoom = self.scale / self.fit_scale()
-        win = self.window_fn(WINDOW_MARGIN) if self.window_fn is not None else None
-        ox, oy, ex, ey = win if win is not None else (0, 0, w, h)
+        if self.vsize is not None:                                            # (a virtual canvas: only the part the widget shows is drawn)
+            v = self.vview or (0, 0, 3, 3)
+            ox, oy, ex, ey = v[0], v[1], v[0] + v[2], v[1] + v[3]
+        else:
+            ox, oy, ex, ey = 0, 0, w, h
         ox, oy, ex, ey = max(int(ox), 0), max(int(oy), 0), min(int(ex), w), min(int(ey), h)
         if ex - ox < 2 or ey - oy < 2:
             ox, oy, ex, ey = 0, 0, min(w, 3), min(h, 3)
@@ -791,7 +858,7 @@ class PointCanvas:
             stamp_plus(img, px, py, np.array([255, 0, 0], np.uint8), max(int(min((self.plus_arm + zoom ** 0.4) * self.marker_factor, 14 * self.marker_factor)), 1))
         self.photo = ImageTk.PhotoImage(Image.fromarray(np.ascontiguousarray(img)), master=self.canvas)
         self.canvas.itemconfig(self.item, image=self.photo)
-        self.canvas.coords(self.item, self.drawn[0], self.drawn[1])
+        self.canvas.coords(self.item, self.drawn[0] - self.off[0], self.drawn[1] - self.off[1])
 
     def request_compose(self):
         if self.pending is None and self.compose_pending is None:
@@ -823,11 +890,6 @@ class PointCanvas:
         """Called when this canvas may have come on screen: draw it if it was waiting."""
         if self.stale and self.pending is None:
             self.request_draw()
-        elif self.window_fn is not None and self.pending is None and self.base is not None and self.drawn is not None:
-            need = self.window_fn(0.0) or (0, 0) + self.size()               # (a canvas zoomed far in is drawn only where it is on screen: drawn again once
-            x0, y0, x1, y1 = self.drawn                                       # the pane has moved on to somewhere the picture does not cover)
-            if need[0] < x0 or need[1] < y0 or need[2] > x1 or need[3] > y1:
-                self.request_draw()
 
     # ---- items in data coordinates
 
@@ -866,7 +928,8 @@ class PointCanvas:
         view_mm = w / self.scale
         cands = [u for u in SCALEBAR_UM if u <= view_mm * 1000 * 0.22]
         um = cands[-1] if cands else SCALEBAR_UM[0]
-        x0, y = w * 0.06, h * 0.94
+        vw, vh = self.view_size()
+        x0, y = vw * 0.06, vh * 0.94
         x1 = x0 + um / 1000 * self.scale
         self.canvas.coords(self.scalebar[0], x0, y, x1, y)
         self.canvas.coords(self.scalebar[1], (x0 + x1) / 2, y - 4)
@@ -936,7 +999,7 @@ class PointCanvas:
             c, d = self.to_canvas(x1, y1)
             self.canvas.coords(it, a, b, c, d)
             self.canvas.tag_raise(it)
-        w, h = self.size()
+        w, h = self.view_size()
         for it, x, y in self.labels:
             px, py = self.to_canvas(x, y)
             if 0 <= px <= w and 0 <= py <= h:
@@ -961,7 +1024,8 @@ class PointCanvas:
 
 class UmapWindow(ExportsMixin):
     def __init__(self, adata, abc_cache, imputed_state, adata_backed, rois, run_folder, ensure_imputed, title, parent=None, host=None, params=None,
-                 own=None):
+                 own=None, panel_zoom=False):
+        self.start_panel_zoom = panel_zoom                  # start with Zoom whole panel ticked (and the section maps at their smallest)
         self.adata, self.abc_cache = adata, abc_cache
         self.own = own                      # a dataset of the user's own (abc_tk_own.OwnDataset): no atlas, no sections, no imputed genes
         self.level_names = dict(own.level_names) if own is not None else dict(LEVEL_NAMES)          # the group types: column -> the words on the screen
@@ -979,7 +1043,11 @@ class UmapWindow(ExportsMixin):
         self.root = tk.Tk() if parent is None else tk.Toplevel(parent)
         self.root.title(title)
         self.root.geometry("1750x950")
-        loading = ttk.Label(self.root, text="Preparing the UMAP viewer...", font=("Segoe UI", 14), padding=40)
+        try:
+            self.root.state("zoomed")                          # (its final size from the start: nothing is drawn at one size and then again at another)
+        except tk.TclError:
+            pass
+        loading =ttk.Label(self.root, text="Preparing the UMAP viewer...", font=("Segoe UI", 14), padding=40)
         loading.pack()
         self.root.update()
         self.msgs = queue.Queue()
@@ -1144,7 +1212,9 @@ class UmapWindow(ExportsMixin):
         left = ttk.Frame(pw)
         bars = ttk.Frame(left, padding=(6, 4))
         bars.pack(side=tk.TOP, fill=tk.X)
-        self.var_tile = tk.IntVar(bars, DEFAULT_TILE_INDEX)
+        # Zoom whole panel from the start ("Browse All Neurons"): the section maps start at their smallest, so that they are made once, not made and then again
+        self.var_tile = tk.IntVar(bars, TILE_COLUMNS.index(max(TILE_COLUMNS)) if self.start_panel_zoom else DEFAULT_TILE_INDEX)
+        self.tile_stop_before_zoom = DEFAULT_TILE_INDEX if self.start_panel_zoom else None
         self.var_dot = tk.IntVar(bars, DEFAULT_DOT_INDEX)
         self.var_marker = tk.IntVar(bars, DEFAULT_MARKER_INDEX)
         self.dot_factors = [um / (DOT_MM * 1000) for um in CELL_SIZES_UM]          # (times DOT_MM)
@@ -1181,12 +1251,16 @@ class UmapWindow(ExportsMixin):
         self.panel_zoom = 1.0                                                                  # (the whole-panel zoom: see set_panel_zoom)
         self.zoom_burst = None                                                                 # (a run of wheel steps being shown on a snapshot: see zoom_step)
         self.panel_hook = types.SimpleNamespace(zoom=self.panel_zoom_at, pan_start=self.panel_pan_start, pan_move=self.panel_pan_move, reset=self.panel_zoom_reset)
-        self.var_panel_zoom = tk.BooleanVar(bars, False)
+        self.var_panel_zoom = tk.BooleanVar(bars, self.start_panel_zoom)
         panel_zoom_box = ttk.Checkbutton(bars, text="Zoom whole panel", variable=self.var_panel_zoom, command=self.apply_panel_zoom_mode)
         panel_zoom_box.grid(row=2, column=4, sticky="w", padx=(12, 6))
         HoverTip(panel_zoom_box, lambda: "Off: the wheel zooms into each section map, which stays in its panel (clipped by its border). "
                                          "On: the wheel zooms the whole panel, the borders and the sections together, and a drag moves the pane; "
                                          "sections scrolled out of view are not drawn. Double-click puts the panel back.")
+        self.var_hover = tk.BooleanVar(bars, bool(self.viewer_settings.get("hover_enabled", True)))          # (the same setting as in the Settings window)
+        hover_box = ttk.Checkbutton(bars, text="Enable hover highlighting", variable=self.var_hover, command=self.apply_hover_enabled)
+        hover_box.grid(row=0, column=5, sticky="nw", padx=(6, 6))
+        HoverTip(hover_box, lambda: "Highlight the cell under the pointer, and its group, in the plots (the same setting as in Settings).")
         bars.columnconfigure(3, weight=1)
         self.tile_scroll = tk.Canvas(left, highlightthickness=0, bg="#f4f4f4")
         sb = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.tile_scroll.yview)
@@ -1221,6 +1295,7 @@ class UmapWindow(ExportsMixin):
         padx = (c[:, 0].max() - c[:, 0].min()) * 0.05 or 1.0
         pady = (c[:, 1].max() - c[:, 1].min()) * 0.05 or 1.0
         self.umap = PointCanvas(mid, (c[:, 0].min() - padx, c[:, 0].max() + padx, c[:, 1].min() - pady, c[:, 1].max() + pady), flip_y=True)
+        self.umap.shapes_while_moving = True                             # (no plain discs while zooming and then the shapes again: that is two drawings)
         self.umap.canvas.pack(fill=tk.BOTH, expand=True)
         self.umap.add_marker("hover", 9)
         self.umap.on_motion = self.umap_motion
@@ -1232,21 +1307,24 @@ class UmapWindow(ExportsMixin):
         self.build_side(side)
         pw.add(side, weight=0)
         self.side_pane = side
+        self.root.update_idletasks()
+        self.fit_left_pane(False)                                        # (the panes at their final widths before the section maps are made: they are laid out once)
         self.build_tiles()
-        self.root.after(400, self.fit_left_pane)
+        self.root.after(400, self.fit_left_pane)                         # (and looked at again once the window has settled: a no-op if all is as it should be)
 
     def fit_left_pane(self, again=True):
-        """Once, at the start: the section pane gets about a third of the window (the panels fill whatever width it has)."""
+        """The section pane gets about a third of the window (the panels fill whatever width it has). Done before the panels are made, so that they are made
+        once; looked at again after the window has settled, which moves nothing when all is as it should be (a move is a second drawing of everything)."""
         if not self.root.winfo_viewable() or self.own is not None:
             return
         total = self.pw.winfo_width()
         side_w = int(self.side_pane.cget("width")) or 420
-        if not again and self.side_pane.winfo_width() >= side_w - 5:
-            return                                                      # (the second look: nothing to put right)
         edge = total - side_w                                           # (the side panel keeps its own width, at the right)
         want = min(max(total * 0.33, 520), total * 0.5, edge - 300)     # (and the UMAP keeps at least 300)
-        self.pw.sashpos(0, int(want))
-        self.pw.sashpos(1, int(edge))
+        if abs(self.pw.sashpos(0) - int(want)) > 2:
+            self.pw.sashpos(0, int(want))
+        if abs(self.pw.sashpos(1) - int(edge)) > 2:
+            self.pw.sashpos(1, int(edge))
         if again:                                                       # (once more after the window has settled)
             self.root.after(600, lambda: self.fit_left_pane(False))
 
@@ -1484,12 +1562,12 @@ class UmapWindow(ExportsMixin):
             pc.opacity = OPACITIES[self.var_opacity.get()]
             pc.marker_factor = MARKER_SIZES[self.var_marker.get()]
             pc.visible_fn = lambda fr=fr: self.frame_visible(fr)
-            pc.window_fn = lambda margin, fr=fr, pc=pc: self.canvas_window(fr, pc, margin)
+            pc.shapes_while_moving = True
             pc.panel_zoom = self.panel_zoom
             pc.panel_hook = self.panel_hook if self.var_panel_zoom.get() else None
             if not self.tiles:
                 pc.enable_scalebar()                       # (the first section's panel carries the scale bar)
-            tile = {"item": item, "label": s, "frame": fr, "pc": pc, "title": title, "token": token, "tree": None}
+            tile = {"item": item, "label": s, "frame": fr, "pc": pc, "title": title, "token": token, "tree": None, "caption": caption}
             pc.on_motion = lambda px, py, t=tile: self.tile_motion(t, px, py)
             pc.on_change = lambda zoom, dx, dy, t=tile: self.link_tiles(t, zoom, dx, dy)
             for r in self.rois:
@@ -1676,7 +1754,8 @@ class UmapWindow(ExportsMixin):
 
     def layout_tiles(self):
         """The panels are a third, a half or all of the pane's width (the Section map size buttons), as many to a row as that gives; the
-        pane scrolls to the rest."""
+        pane scrolls to the rest. While the whole panel is zoomed they are bigger than the pane, by up to 100 times: each is then a virtual
+        canvas (PointCanvas.set_virtual), of which the widget is only the part in view (place_tiles)."""
         if not getattr(self, "tiles", None):
             return
         cols = TILE_COLUMNS[self.var_tile.get()]
@@ -1685,23 +1764,81 @@ class UmapWindow(ExportsMixin):
         if cols == self.tile_cols and px == self.tile_px:
             return
         self.tile_cols, self.tile_px = cols, px
+        big = self.panel_zoom > 1.0
+        ph = int(px / self.tile_aspect)
         for t in self.tiles:
-            t["pc"].outline_px = OUTLINE_PX_LARGEST if cols == min(TILE_COLUMNS) else 1            # (the CCF outlines: wider at the largest size)
-            t["pc"].canvas.config(width=px, height=int(px / self.tile_aspect))
+            pc = t["pc"]
+            pc.outline_px = OUTLINE_PX_LARGEST if cols == min(TILE_COLUMNS) else 1            # (the CCF outlines: wider at the largest size)
+            if big:
+                pc.set_virtual((px, ph))
+            else:
+                pc.set_virtual(None)
+                pc.canvas.config(width=px, height=ph)
+                t["frame"].slot_wh = None
+                t["shown"] = True
+                if not t["caption"].winfo_ismapped():
+                    t["caption"].pack(anchor="w", before=pc.canvas)
+                self.tile_scroll.itemconfig(t["item"], state="normal")
         self.root.update_idletasks()                                  # (so that the panels know their size)
-        fw = max(t["frame"].winfo_reqwidth() for t in self.tiles)
-        fh = max(t["frame"].winfo_reqheight() for t in self.tiles)
+        if big:
+            ch = max(t["caption"].winfo_reqheight() for t in self.tiles)
+            fw, fh = px, ch + ph
+        else:
+            fw = max(t["frame"].winfo_reqwidth() for t in self.tiles)
+            fh = max(t["frame"].winfo_reqheight() for t in self.tiles)
         for k, t in enumerate(self.tiles):                            # (8 across and 6 down between panels, as the grid had)
             x, y = 4 + (k % cols) * (fw + 8), 3 + (k // cols) * (fh + 6)
             t["frame"].tile_x, t["frame"].tile_y = x, y               # (where it is in the scrolled canvas: see frame_visible)
+            t["frame"].slot_wh = (fw, fh) if big else None            # (the room it takes there, when its widget is only the part in view)
             self.tile_scroll.coords(t["item"], x, y)
         rows = -(-len(self.tiles) // cols)
         self.tile_scroll.configure(scrollregion=(0, 0, 4 + cols * (fw + 8), 3 + rows * (fh + 6)))
         self.root.after_idle(self.refresh_visible)
 
+    def place_tiles(self):
+        """While the whole panel is zoomed: each section map's widget is put where the part of the map that is on screen is (and made that big, a
+        little more all round), and drawn there; a map not on screen has no widget shown. A map whose widget still covers what is on screen is left."""
+        if self.panel_zoom <= 1.0 or not getattr(self, "tiles", None):
+            return
+        vw, vh = self.tile_scroll.winfo_width(), self.tile_scroll.winfo_height()
+        vl, vt = self.tile_scroll.canvasx(0), self.tile_scroll.canvasy(0)
+        mx, my = int(WINDOW_MARGIN * vw), int(WINDOW_MARGIN * vh)
+        for t in self.tiles:
+            fr, pc = t["frame"], t["pc"]
+            if getattr(fr, "slot_wh", None) is None or pc.vsize is None:
+                continue
+            lw, lh = pc.vsize
+            ch = fr.slot_wh[1] - lh                                   # (the caption above the map)
+            cx0, cy0 = fr.tile_x, fr.tile_y + ch                      # (where the map is in the scrolled pane)
+            nx0, nx1 = max(vl - cx0, 0), min(vl + vw - cx0, lw)       # (what is on screen, in the map's pixels)
+            ny0, ny1 = max(vt - cy0, 0), min(vt + vh - cy0, lh)
+            if nx1 - nx0 < 1 or ny1 - ny0 < 1:
+                if t.get("shown", True):
+                    self.tile_scroll.itemconfig(t["item"], state="hidden")
+                    t["shown"] = False
+                continue
+            v = pc.vview
+            if t.get("shown", True) and v is not None and v[0] <= nx0 and v[1] <= ny0 and v[0] + v[2] >= nx1 and v[1] + v[3] >= ny1:
+                continue
+            x0, x1 = max(vl - mx - cx0, 0), min(vl + vw + mx - cx0, lw)
+            y0, y1 = max(vt - my - cy0, 0), min(vt + vh + my - cy0, lh)
+            with_caption = y0 <= 0
+            if with_caption and not t["caption"].winfo_ismapped():
+                t["caption"].pack(anchor="w", before=pc.canvas)
+            elif not with_caption and t["caption"].winfo_ismapped():
+                t["caption"].pack_forget()
+            self.tile_scroll.coords(t["item"], cx0 + x0, cy0 + y0 - (ch if with_caption else 0))
+            if not t.get("shown", True):
+                self.tile_scroll.itemconfig(t["item"], state="normal")
+                t["shown"] = True
+            pc.set_view(int(x0), int(y0), int(x1) - int(x0), int(y1) - int(y0))
+
     # ---- zooming the whole panel (the borders and the sections together)
 
-    MAX_PANEL_ZOOM = 24.0
+    MAX_PANEL_ZOOM = 100.0
+
+    def max_panel_zoom(self):
+        return self.MAX_PANEL_ZOOM
 
     def apply_panel_zoom_mode(self):
         """The Zoom whole panel checkbox. On: every section map is put back to its whole view and the wheel then zooms the panel. Off: the panel is
@@ -1725,7 +1862,7 @@ class UmapWindow(ExportsMixin):
         """Enlarge the whole panel to `zoom` times its size (1 to MAX_PANEL_ZOOM): the panels are laid out again, bigger, so that borders, gaps and
         sections grow together, and only those in view are drawn. `anchor` = (x, y in the scrolled pane, x, y in the window): the point that stays
         under the pointer."""
-        zoom = min(max(zoom, 1.0), self.MAX_PANEL_ZOOM)
+        zoom = min(max(zoom, 1.0), self.max_panel_zoom())
         if abs(zoom - self.panel_zoom) < 1e-9 or not self.tiles:
             return
         old = [float(v) for v in self.tile_scroll.cget("scrollregion").split()] or [0, 0, 1, 1]
@@ -1742,6 +1879,7 @@ class UmapWindow(ExportsMixin):
             ax, ay, wx, wy = anchor
             self.tile_scroll.xview_moveto(min(max((ax * new[2] / old[2] - wx) / new[2], 0.0), 1.0))
             self.tile_scroll.yview_moveto(min(max((ay * new[3] / old[3] - wy) / new[3], 0.0), 1.0))
+        self.place_tiles()
         self.root.after_idle(self.refresh_visible)
 
     ZOOM_SETTLE_MS = 180
@@ -1764,7 +1902,7 @@ class UmapWindow(ExportsMixin):
                 return
             b = self.zoom_burst = {"image": image, "start": self.panel_zoom, "target": self.panel_zoom, "at": (wx, wy),
                                    "content": (self.tile_scroll.canvasx(wx), self.tile_scroll.canvasy(wy)), "label": None, "job": None, "photo": None}
-        b["target"] = min(max(b["target"] * factor, 1.0), self.MAX_PANEL_ZOOM)
+        b["target"] = min(max(b["target"] * factor, 1.0), self.max_panel_zoom())
         self.show_zoom_snapshot(b)
         if b["job"] is not None:
             self.root.after_cancel(b["job"])
@@ -2017,7 +2155,8 @@ class UmapWindow(ExportsMixin):
 
     def frame_visible(self, fr):
         """Whether a section panel is (at least partly) in the scrolled pane."""
-        top, h = getattr(fr, "tile_y", fr.winfo_y()), fr.winfo_reqheight()
+        slot = getattr(fr, "slot_wh", None)                          # (while the panel is zoomed: the room the map takes, of which its widget is only the part in view)
+        top, h = getattr(fr, "tile_y", fr.winfo_y()), slot[1] if slot else fr.winfo_reqheight()
         vt, vh = self.tile_scroll.canvasy(0), self.tile_scroll.winfo_height()
         if not (top + h > vt and top < vt + vh):
             return False
@@ -2025,27 +2164,11 @@ class UmapWindow(ExportsMixin):
         if left is None:
             return True
         vl, vw = self.tile_scroll.canvasx(0), self.tile_scroll.winfo_width()
-        return left + fr.winfo_reqwidth() > vl and left < vl + vw
-
-    def canvas_window(self, fr, pc, margin):
-        """The part of a section map's canvas that is on screen (x0, y0, x1, y1 in its pixels), `margin` times the pane's size further all round. While
-        the whole panel is zoomed the canvases are thousands of pixels across but only a corner of one or two is in view: drawing only that part is
-        what keeps zooming and moving quick. None (all of it) when the panel is not zoomed."""
-        left, top = getattr(fr, "tile_x", None), getattr(fr, "tile_y", None)
-        if self.panel_zoom <= 1.0 or left is None:
-            return None
-        c = pc.canvas
-        w, h = pc.size()
-        x, y = left + c.winfo_x(), top + c.winfo_y()                          # (where the canvas is in the scrolled pane)
-        vw, vh = self.tile_scroll.winfo_width(), self.tile_scroll.winfo_height()
-        vl, vt = self.tile_scroll.canvasx(0), self.tile_scroll.canvasy(0)
-        mx, my = margin * vw, margin * vh
-        x0, x1 = max(vl - mx - x, 0), min(vl + vw + mx - x, w)
-        y0, y1 = max(vt - my - y, 0), min(vt + vh + my - y, h)
-        return int(x0), int(y0), int(x1) + 1, int(y1) + 1
+        return left + (slot[0] if slot else fr.winfo_reqwidth()) > vl and left < vl + vw
 
     def refresh_visible(self):
         """Panels that were off screen when they were recolored or moved are made now that they are on screen."""
+        self.place_tiles()
         for t in self.tiles:
             if t.get("dirty") and self.frame_visible(t["frame"]):
                 self.build_tile(t)
@@ -3332,6 +3455,14 @@ class UmapWindow(ExportsMixin):
 
     # ---- Settings and the UMAP parameters
 
+    def apply_hover_enabled(self):
+        """The Enable hover highlighting box above the section maps: the setting of the same name in Settings, saved as it is when that is."""
+        self.viewer_settings["hover_enabled"] = bool(self.var_hover.get())
+        if "save_viewer_settings" in self.host:
+            self.host["save_viewer_settings"](self.viewer_settings)
+        if not self.var_hover.get():
+            self.hover(None)
+
     def open_settings(self):
         dialog = self.host.get("settings_dialog")
         if dialog is None or self.busy:
@@ -3344,6 +3475,7 @@ class UmapWindow(ExportsMixin):
         size_changed = new.get("umap_circle_size") != self.viewer_settings.get("umap_circle_size")
         self.viewer_settings.update(new)
         self.host["save_viewer_settings"](self.viewer_settings)
+        self.var_hover.set(bool(self.viewer_settings.get("hover_enabled", True)))
         if not self.viewer_settings.get("hover_enabled", True):
             self.hover(None)
         if (size_changed or (shape_changed and self.mode in ("gene", "imputed"))) and not self.busy:
@@ -3457,9 +3589,6 @@ class UmapWindow(ExportsMixin):
             self.root.state("zoomed")
         except tk.TclError:
             pass
-        if getattr(self, "start_panel_zoom", False) and getattr(self, "tiles", None):         # ("Browse All Neurons": a map of the whole brain, to zoom into)
-            self.var_panel_zoom.set(True)
-            self.apply_panel_zoom_mode()
         self.root.lift()
         self.root.focus_force()
         if self.own_root:
@@ -3476,6 +3605,5 @@ def show_umap_window_tk(adata, abc_cache, imputed_state=None, adata_backed=None,
         print("No UMAP embedding available; skipping the interactive UMAP viewer.")
         return
     win = UmapWindow(adata, abc_cache, imputed_state, adata_backed, rois, run_folder, ensure_imputed, title or "Interactive UMAP viewer", parent,
-                     host=host, params=params, own=own)
-    win.start_panel_zoom = panel_zoom
+                     host=host, params=params, own=own, panel_zoom=panel_zoom)
     win.run()

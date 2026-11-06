@@ -692,20 +692,22 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
 
     ttk.Separator(outer).pack(fill=tk.X, pady=(20, 14))
     style = ttk.Style(root)
-    # On macOS a button's bezel is drawn at the system's own height, whatever the padding: the padding only made each button's widget taller
-    # than the bezel in it, a band of empty space above and below every button (the window nearly twice as tall as it needed to be).
+    # On macOS an ordinary button's bezel is drawn at the system's one height, a line of text in its own size, whatever the button's: these
+    # bigger buttons were bands of empty space round a bezel too short for them. A Toolbutton's bevel there takes the button's height (as the
+    # UMAP viewer's "Reset slider default" buttons do), so the buttons are as tall as their padding makes them, and the gaps are only the pady.
     aqua = root.tk.call("tk", "windowingsystem") == "aqua"
-    style.configure("Big.TButton", font=("Segoe UI", 12), padding=(10, 2) if aqua else (10, 9))
-    ttk.Button(outer, text="Browse All Neurons", style="Big.TButton", command=all_neurons).pack(fill=tk.X, pady=4)
-    ttk.Button(outer, text="Open Brain Browser/ROI Chooser", style="Big.TButton", command=new_run).pack(fill=tk.X, pady=4)
+    big = "Big.Toolbutton" if aqua else "Big.TButton"
+    style.configure(big, font=("Segoe UI", 12), padding=(10, 9), anchor="center")
+    ttk.Button(outer, text="Browse All Neurons", style=big, command=all_neurons).pack(fill=tk.X, pady=4)
+    ttk.Button(outer, text="Open Brain Browser/ROI Chooser", style=big, command=new_run).pack(fill=tk.X, pady=4)
     pair = ttk.Frame(outer)                                         # (the two less used ones share a row)
     pair.pack(fill=tk.X, pady=4)
     pair.columnconfigure((0, 1), weight=1, uniform="pair")
-    ttk.Button(pair, text="Open Your Own Dataset…", style="Big.TButton", command=own_dataset).grid(row=0, column=0, sticky="ew", padx=(0, 4))
-    ttk.Button(pair, text="Open 3D Viewer…", style="Big.TButton", command=viewer3d).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+    ttk.Button(pair, text="Open Your Own Dataset…", style=big, command=own_dataset).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+    ttk.Button(pair, text="Open 3D Viewer…", style=big, command=viewer3d).grid(row=0, column=1, sticky="ew", padx=(4, 0))
     # a saved run, set apart so that it stands out: space above and below it
     ttk.Frame(outer, height=22).pack(fill=tk.X)
-    ttk.Button(outer, text="Load Existing ROI Dataset…", style="Big.TButton", command=load_existing).pack(fill=tk.X, pady=4)
+    ttk.Button(outer, text="Load Existing ROI Dataset…", style=big, command=load_existing).pack(fill=tk.X, pady=4)
     ttk.Frame(outer, height=22).pack(fill=tk.X)
     def exit_app():
         """Exit (or the window closed): while the atlas is still downloading, warn first, since closing the program stops the download."""
@@ -718,7 +720,7 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
             return
         root.destroy()
 
-    ttk.Button(outer, text="Exit", style="Big.TButton", command=exit_app).pack(fill=tk.X, pady=4)
+    ttk.Button(outer, text="Exit", style=big, command=exit_app).pack(fill=tk.X, pady=4)
 
     root.protocol("WM_DELETE_WINDOW", exit_app)
     root.update_idletasks()

@@ -1506,7 +1506,7 @@ class UmapWindow(ExportsMixin):
         # the checkboxes, in two columns: Hover highlight, ROI only, Zoom whole panel; then CCF atlas overlay, with its slider under it
         self.var_roi_only = tk.BooleanVar(bars, False)
         roi_only_box = ttk.Checkbutton(bars, text="ROI only", variable=self.var_roi_only, command=self.apply_roi_only)
-        roi_only_box.grid(row=1, column=4, sticky="w", padx=(12, 6))
+        roi_only_box.grid(row=1, column=4, sticky="w", padx=(6, 6))
         if self.rois:
             HoverTip(roi_only_box, lambda: "The cells outside the ROIs go gray, on a white background: only the ROIs are colored. Saved section maps "
                                            "have the same look (and, as an SVG, the gray cells are pictures, so the file stays small).")
@@ -1537,7 +1537,7 @@ class UmapWindow(ExportsMixin):
         self.panel_hook = types.SimpleNamespace(zoom=self.panel_zoom_at, pan_start=self.panel_pan_start, pan_move=self.panel_pan_move, reset=self.panel_zoom_reset)
         self.var_panel_zoom = tk.BooleanVar(bars, self.start_panel_zoom)
         panel_zoom_box = ttk.Checkbutton(bars, text="Zoom whole panel", variable=self.var_panel_zoom, command=self.apply_panel_zoom_mode)
-        panel_zoom_box.grid(row=2, column=4, sticky="w", padx=(12, 6))
+        panel_zoom_box.grid(row=2, column=4, sticky="w", padx=(6, 6))
         HoverTip(panel_zoom_box, lambda: "Off: the wheel zooms into each section map, which stays in its panel (clipped by its border). "
                                          "On: the wheel zooms the whole panel, the borders and the sections together, and a drag moves the pane; "
                                          "sections scrolled out of view are not drawn. Double-click puts the panel back.")
@@ -1545,7 +1545,7 @@ class UmapWindow(ExportsMixin):
         # and there the box is for this window alone: see apply_hover_enabled)
         self.var_hover = tk.BooleanVar(bars, False if self.start_panel_zoom else bool(self.viewer_settings.get("hover_enabled", True)))
         hover_box = ttk.Checkbutton(bars, text="Hover highlight", variable=self.var_hover, command=self.apply_hover_enabled)
-        hover_box.grid(row=0, column=4, sticky="w", padx=(12, 6))
+        hover_box.grid(row=0, column=4, sticky="w", padx=(6, 6))
         HoverTip(hover_box, lambda: "When the pointer rests on a cell, dim the plots and mark every cell of its group with a red +. Off: no "
                                     "marking, but the cell is still ringed and described in its tip (the same setting as in Settings).")
         self.update_marker_slider()
@@ -1993,8 +1993,13 @@ class UmapWindow(ExportsMixin):
         label.grid(row=row, column=1, sticky="w", padx=(12, 6))
         if label_tip is not None:
             HoverTip(label, lambda: label_tip)
-        shown = ttk.Label(parent, width=11)                # (room for the longest value, "full width" or "Very large", and no more)
+        shown = ttk.Label(parent)
         shown.grid(row=row, column=3, sticky="w", padx=(6, 0))
+        # The column of values as wide as the longest value its sliders can show, and no wider (a fixed width in characters left empty space
+        # beside the shorter ones, room the checkboxes to the right lacked on a small screen); never narrower, so nothing moves as they change.
+        font = tkfont.nametofont(str(shown.cget("font")) or "TkDefaultFont")
+        widest = max(font.measure(value_text(i)) for i in range(n)) + 12      # (+ the label's padx and its own margin)
+        parent.columnconfigure(3, minsize=max(widest, int(parent.grid_columnconfigure(3)["minsize"])))
         scale = self.stop_slider(parent, shown, var, n, command, value_text)
         scale.grid(row=row, column=2, sticky="w")
         scale.companions = (label, shown)                # (greyed out with it: see set_slider_enabled)

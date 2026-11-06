@@ -2492,9 +2492,9 @@ def read_run_frame(run_folder):
         return 'raw'
 
 
-def ensure_ccf_downloaded(abc_cache, parent=None, files=CCF_FILES, what="CCF coordinates"):
+def ensure_ccf_downloaded(abc_cache, parent=None, files=CCF_FILES, what="CCF coordinates", note=""):
     """True once every CCF file (or each of `files`, as in RECON_FILES) is in the local cache, downloading
-    them first if need be: asks (naming the size) before downloading, then shows a progress window fed
+    them first if need be: asks (naming the size, and saying `note` if given) before downloading, then shows a progress window fed
     by the bytes landing on disk. False if the user declined or cancelled, or the download failed."""
     missing = ccf_files_missing(abc_cache, files)
     if not missing:
@@ -2507,7 +2507,7 @@ def ensure_ccf_downloaded(abc_cache, parent=None, files=CCF_FILES, what="CCF coo
     queued = atlas_download_running() is not None and all((d, f) in atlas_prefetch['keys'] for d, f, _s, _p in missing)
     if not queued:
         question = (f"This needs the Allen {what}, a one-time download of "
-                    f"{size_text} into your atlas cache folder. Download it now?")
+                    f"{size_text} into your atlas cache folder.\n\n" + (f"{note}\n\n" if note else "") + "Download it now?")
         try:
             if parent is None:                          # (no window to put it over: in the middle of the screen, see centered_dialog.py)
                 import centered_dialog

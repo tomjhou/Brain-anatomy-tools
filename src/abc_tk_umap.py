@@ -3735,7 +3735,11 @@ class UmapWindow(ExportsMixin):
         threading.Thread(target=work, daemon=True).start()
 
     def download_ccf_coords(self):
-        if self.host["ensure_ccf_downloaded"](self.abc_cache, parent=self.root, what="CCF coordinates of every cell (for their Paxinos ML and DV)"):
+        # (said when the reconstructed coordinates are in use: a table of much the same size, downloaded earlier, that this is easily taken for)
+        note = ("This is a separate table from the reconstructed coordinates already downloaded: those place the cells on the section "
+                "maps, but are not CCF positions.") if core.reconstructed_in_use() else ""
+        if self.host["ensure_ccf_downloaded"](self.abc_cache, parent=self.root, what="CCF coordinates of every cell (for their Paxinos ML and DV)",
+                                              note=note):
             self.start_ccf_lookup()
 
     def cell_info(self, i, source):

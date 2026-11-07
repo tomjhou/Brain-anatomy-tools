@@ -16,6 +16,7 @@ import os
 import sys
 import threading
 import queue
+import re
 import time
 import tkinter as tk
 from tkinter import ttk
@@ -246,8 +247,8 @@ class RoiLayer:
     HANDLE = 5               # half the size of a handle square, in screen pixels
     HIT = 9                  # how close, in screen pixels, the pointer must be to a handle
     MIN_DRAG = 5             # a drag smaller than this is a stray click, not a new ROI
-    COLOR = "#ff8c00"
-    SELECTED_COLOR = "#e00000"   # the selected region (the last one clicked or drawn): the one the Delete key removes
+    DARK, LIGHT = "#000000", "#ffffff"   # the regions' color: black on a light picture, white on a dark one (see recolor)
+    SELECTED_EXTRA = 4           # the selected region (the last one clicked or drawn: the one the Delete key removes) has a line this much thicker
     LINE_WIDTH = 4           # thickness of an ROI's dashed outline, in screen pixels (raise it to make the regions stand out more)
     DASH = (10, 5)
     HANDLES = [(hx, hy) for hy in (-1, 0, 1) for hx in (-1, 0, 1) if (hx, hy) != (0, 0)]   # (-1 = left/top edge, 0 = middle, 1 = right/bottom)
@@ -259,6 +260,7 @@ class RoiLayer:
         self.rois = {}                 # id -> {"kind": "existing"|"new", "orig": index or None, "box": [x0, y0, x1, y1] in picture px, items}
         self.deleted = []              # indices of existing ROIs that were deleted
         self.selected = None           # id of the selected ROI
+        self.color, self.color_of = self.DARK, None     # the regions' color, and the picture (its array) it was chosen for
         self.next_id = 1
         self.drag = None
         self.right_press = None
@@ -308,7 +310,8 @@ class RoiLayer:
     def add(self, box, kind, orig=None):
         rid = self.next_id
         self.next_id += 1
-        rect = self.canvas.create_rectangle(0, 0, 0, 0, outline=self.COLOR, width=self.LINE_WIDTH, dash=dash(self.DASH, self.LINE_WIDTH), tags="overlay")
+        self.recolor()
+        rect = self.canvas.create_rectangle(0, 0, 0, 0, outline=self.color, width=self.LINE_WIDTH, dash=dash(self.DASH, self.LINE_WIDTH), tags="overlay")
         handles = {h: self.canvas.create_rectangle(0, 0, 0, 0, outline="black", fill="white", tags="overlay") for h in self.HANDLES}
         self.rois[rid] = {"kind": kind, "orig": orig, "box": list(box), "rect": rect, "handles": handles}
         self.place(rid)
@@ -316,13 +319,20 @@ class RoiLayer:
         return rid
 
     def select(self, rid):
-        """Make `rid` (or None) the selected ROI, shown in red."""
+        """Make `rid` (or None) the selected ROI, shown with a thicker, solid line (the color is the same for all: see recolor)."""
         if rid == self.selected:
             return
-        for r, color in ((self.selected, self.COLOR), (rid, self.SELECTED_COLOR)):
+        old, self.selected = self.selected, rid
+        for r in (old, rid):
             if r in self.rois:
-                self.canvas.itemconfig(self.rois[r]["rect"], outline=color)
-        self.selected = rid
+                self.style(r)
+
+    def style(self, rid):
+        """An ROI's line: the regions' color (see recolor), dashed; the selected one is thicker and solid."""
+        if rid == self.selected:
+            self.canvas.itemconfig(self.rois[rid]["rect"], outline=self.color, width=self.LINE_WIDTH + self.SELECTED_EXTRA, dash="")
+        else:
+            self.canvas.itemconfig(self.rois[rid]["rect"], outline=self.color, width=self.LINE_WIDTH, dash=dash(self.DASH, self.LINE_WIDTH))
 
     def delete_selected(self):
         if self.selected in self.rois:
@@ -361,7 +371,25 @@ class RoiLayer:
             self.canvas.coords(roi["handles"][h], x - self.HANDLE, y - self.HANDLE, x + self.HANDLE, y + self.HANDLE)
         self.canvas.tag_raise("overlay")
 
+    def recolor(self):
+        """Black regions on a picture with a light background (Groups), white ones on a dark background (the gene views): chosen from the
+        picture's corners, where there is no tissue. Done when the picture has changed (it is asked at every layout, and costs nothing
+        otherwise)."""
+        src = self.view.src
+        if src is None or src is self.color_of:
+            return
+        self.color_of = src
+        n = max(1, min(10, src.shape[0] // 4, src.shape[1] // 4))
+        corners = np.concatenate([c.reshape(-1, 3) for c in (src[:n, :n], src[:n, -n:], src[-n:, :n], src[-n:, -n:])])
+        light = float(corners.mean(axis=0) @ (0.299, 0.587, 0.114)) >= 128
+        color = self.DARK if light else self.LIGHT
+        if color != self.color:
+            self.color = color
+            for rid in self.rois:
+                self.style(rid)
+
     def layout(self):
+        self.recolor()
         for rid in self.rois:
             self.place(rid)
 
@@ -528,6 +556,7 @@ class SectionWindow:
         self.multi_sliders, self.multi_windows = [], []
         self.shown_dataset = "standard"
         self.hover_job = self.mark_job = None
+        self.cell_tip = None           # the hovered cell's description in a tip, after a second (abc_tk_umap.CellTip; made when first needed)
         self.hover_pos = None
         self.hover_idx = None
         self.mark = None               # (picture x, picture y) of the cells to mark with '+', or None
@@ -1350,6 +1379,7 @@ class SectionWindow:
             self.var_cell.set("No cell within 10 µm.")
             self.view.canvas.itemconfig(self.ring, state="hidden")
             self.cancel_marks()
+            self.tip_off()
             return
         idx = int(idx)
         changed = idx != self.hover_idx
@@ -1358,12 +1388,43 @@ class SectionWindow:
         parts = [f"{lv}: {cells[lv].iloc[idx]}" for lv in LEVELS if lv in cells.columns]
         expression = self.expression_text(idx)
         self.var_cell.set(("\n".join(parts) if parts else "(no class metadata)") + (f"\n{expression}" if expression else ""))
+        self.tip_on(idx)
         self.place_overlays()
         if changed or self.mark_job is None and self.mark is None:
             self.cancel_marks()
             self.mark_job = self.view.canvas.after(self.MARK_DELAY_MS, lambda: self.show_marks(idx))
 
+    def tip_on(self, idx):
+        """The pointer is on cell idx: after a second of rest, its description (the side panel's, as it is then) comes up in a tip with a
+        button that copies it."""
+        if self.cell_tip is None:
+            from abc_tk_umap import CellTip, CELL_TIP_MS         # (imported here: that module is large)
+            self.cell_tip = CellTip(self.root, CELL_TIP_MS)
+        self.cell_tip.pointer_on((self.data.label, idx), lambda: self.tip_rows(idx), copy_text_fn=lambda: self.tip_text(idx))
+
+    def tip_off(self):
+        if self.cell_tip is not None:
+            self.cell_tip.pointer_off()
+
+    def tip_lines(self, idx):
+        """The side panel's lines about the hovered cell, as they are now: its position, then its groups and expression."""
+        if self.hover_idx != idx:
+            return []
+        return self.var_pos.get().splitlines() + self.var_cell.get().splitlines()
+
+    def tip_rows(self, idx):
+        """The tip's rows (what, number, name): each of the panel's lines, a group level's split into its name and value."""
+        rows = []
+        for line in self.tip_lines(idx):
+            m = re.match(r"^([A-Za-z_ ]+?):\s+(.*)$", line)           # (position and gene lines stay whole)
+            rows.append((m.group(1), "", m.group(2)) if m else ("", "", line))
+        return rows
+
+    def tip_text(self, idx):
+        return "\n".join(self.tip_lines(idx))
+
     def clear_hover(self):
+        self.tip_off()
         self.hover_idx = None
         self.view.canvas.itemconfig(self.ring, state="hidden")
         self.var_pos.set("x = —, y = —")

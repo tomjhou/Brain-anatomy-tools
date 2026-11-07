@@ -10,6 +10,7 @@ viewer launcher, the settings window), so this file has no start-up side effects
 the "All neurons" dataset: Neurons, every section, a random ALL_NEURONS_CAP of them; an existing one comes back with its folder as load_folder), or None if
 the window was closed or Exit was clicked. The cell type is None for a new run (not chosen yet) and unused for an existing one (the run says which it is).
 """
+import gc
 import os
 import queue
 import sys
@@ -600,6 +601,46 @@ def check_for_update(root, button):
     run(app_update.check, folder, then=checked, label="Checking…")
 
 
+def watch_for_update(root, show):
+    """At launch: looks on GitHub for newer commits in a background thread, and calls show(summaries) (from the Tk loop) when there are
+    some. Nothing waits for it: a slow or unreachable network only keeps that thread waiting (it is a daemon: it never holds the program
+    open), and any failure (offline, no git, rate limit) is silent: the Update... button reports those when it is clicked."""
+    found = queue.Queue()
+
+    def work():
+        try:
+            import app_update
+            found.put(app_update.check(app_update.repo_root()))
+        except Exception:
+            found.put(None)
+
+    threading.Thread(target=work, daemon=True).start()
+    UpdateWatch(root, show, found).poll_later()
+
+
+class UpdateWatch:
+    """Waits for watch_for_update's answer from the Tk loop. An object with a method, not a function that schedules itself: such a function
+    refers to itself, a reference cycle that keeps the window it was given alive after it is closed, until the cyclic collector frees it, on
+    whichever thread happens to run it (the analysis's threads do, e.g. pynndescent's gc.collect()), and Tcl ends the whole program then:
+    "Tcl_AsyncDelete: async handler deleted by the wrong thread". Here the window's own after-commands are the only reference, and closing
+    the window drops them."""
+
+    def __init__(self, root, show, found):
+        self.root, self.show, self.found = root, show, found
+
+    def poll_later(self):
+        self.root.after(1000, self.poll)
+
+    def poll(self):
+        try:
+            value = self.found.get_nowait()
+        except queue.Empty:
+            self.poll_later()
+            return
+        if value:
+            self.show(value)
+
+
 def restart():
     """Starts the browser again in the same console window (app_update.relaunch() would start it with none, hiding its progress output),
     and ends this one."""
@@ -630,6 +671,12 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
     if not getattr(sys, "frozen", False):                   # (the packaged .exe is not a folder from GitHub: nothing to update)
         update_button = ttk.Button(top, text="Update…", command=lambda: check_for_update(root, update_button))
         update_button.pack(side=tk.RIGHT, anchor="n", padx=(0, 6))
+
+        def update_found(changes):
+            """The check at launch found newer commits: a button for them beside the title (it goes through the Update... dialog)."""
+            ttk.Button(top, text=f"Update available ({len(changes)} change{'s' if len(changes) != 1 else ''})",
+                       command=lambda: check_for_update(root, update_button)).pack(side=tk.LEFT, padx=(14, 0), anchor="s", pady=(0, 4))
+        watch_for_update(root, update_found)
 
     ttk.Label(outer, text="Output folder (where runs are saved and loaded from):", font=("Segoe UI", 11)).pack(anchor="w", pady=(18, 4))
     row = ttk.Frame(outer)
@@ -821,6 +868,14 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
     bring_to_front(root)
     root.after(600, offer_all_neurons)                      # (once the window is in front: the question goes over it)
     root.mainloop()
+    # Anything of this window still waiting for the cyclic collector is freed now, here, on the main thread: freed later by a worker thread
+    # (the analysis's threads call gc.collect()), Tcl ends the program ("Tcl_AsyncDelete: async handler deleted by the wrong thread").
+    try:
+        root.destroy()
+    except tk.TclError:
+        pass
+    root = update_button = None
+    gc.collect()
     return result["outcome"]
 
 

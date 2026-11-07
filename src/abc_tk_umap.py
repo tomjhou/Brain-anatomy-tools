@@ -210,6 +210,17 @@ def draw_big_marker(img, X, Y, c, d, code):
             cv2.fillPoly(img, [pts], c)
 
 
+def shape_outline(code, cx, cy, size):
+    """The flat (x, y, ...) corners of the marker of this code, `size` pixels across and centered on (cx, cy), as drawn into the pictures
+    (a disc: 32 corners)."""
+    marker = SHAPE_MARKERS[code % 10]
+    if marker == 'o':
+        pts = [(0.5 + 0.5 * np.cos(a), 0.5 + 0.5 * np.sin(a)) for a in np.linspace(0, 2 * np.pi, 32, endpoint=False)]
+    else:
+        pts = SHAPE_POLYGONS[marker]
+    return [c for x, y in pts for c in (cx + (x - 0.5) * size, cy + (y - 0.5) * size)]
+
+
 def draw_marker(canvas, cx, cy, code, color, size=12):
     """A marker of this code, `size` pixels across, on a Tk canvas (a legend swatch)."""
     marker, is_open = SHAPE_MARKERS[code % 10], code >= 10
@@ -437,18 +448,19 @@ class CellTip:
         self.root, self.tip, self.job, self.key, self.anchor = root, None, None, None, None
         self.delay_ms = CELL_TIP_MS if delay_ms is None else delay_ms
 
-    def pointer_on(self, key, rows_fn, action_fn=None, swatch_fn=None):
+    def pointer_on(self, key, rows_fn, action_fn=None, swatch_fn=None, copy_text_fn=None):
         """The pointer is on a new cell (`key`); `rows_fn()` gives its description, as rows (what, number, name), asked when the tip is shown.
         `action_fn()`, if given, is asked then too: None, or (text, command) for a button beside Copy. So is `swatch_fn()`: None, or
         (rgb, marker code, background rgb), the cell as it is drawn, shown at the top (where cells are close together, which one the
-        description is of is not always plain from the ring alone)."""
+        description is of is not always plain from the ring alone). `copy_text_fn()`, if given, is the text the Copy button copies (else
+        the rows, a tab between their columns)."""
         if key == self.key:
             return
         self.key = key
         self.cancel()
         if self.tip is not None and not self.pointer_in_tip() and not self.near_anchor():
             self.hide()
-        self.job = self.root.after(self.delay_ms, lambda: self.show(rows_fn, action_fn, swatch_fn))
+        self.job = self.root.after(self.delay_ms, lambda: self.show(rows_fn, action_fn, swatch_fn, copy_text_fn))
 
     def pointer_off(self):
         """The pointer is on no cell (or left the plot): the tip goes, unless the pointer went onto it."""
@@ -482,7 +494,7 @@ class CellTip:
         if not self.pointer_in_tip():
             self.hide()
 
-    def show(self, rows_fn, action_fn=None, swatch_fn=None):
+    def show(self, rows_fn, action_fn=None, swatch_fn=None, copy_text_fn=None):
         self.job = None
         if self.pointer_in_tip():                       # (on its way to the Copy button: the tip it is going to stays as it is)
             return
@@ -516,7 +528,7 @@ class CellTip:
             tk.Label(grid, text=num, bg=bg, font=("Segoe UI", 9, "bold"), anchor="e").grid(row=r, column=1, sticky="ne", padx=(0, HOVER_GAP_PX))
             tk.Label(grid, text=name, bg=bg, font=("Segoe UI", 9), anchor="w", justify=tk.LEFT, wraplength=300).grid(row=r, column=2, sticky="nw")
         # copied with a tab between the columns: pasted into a spreadsheet, they stay columns
-        text = "\n".join("\t".join(row) for row in rows)
+        text = copy_text_fn() if copy_text_fn is not None else "\n".join("\t".join(row) for row in rows)
         buttons = tk.Frame(box, bg=bg)
         buttons.pack(anchor="e", padx=6, pady=(0, 6))
         action = action_fn() if action_fn is not None else None
@@ -614,6 +626,7 @@ class PointCanvas:
         self.pending = None
         self.item = self.canvas.create_image(0, 0, anchor="nw")
         self.markers = {}                           # name -> [item, x, y] (x None: hidden)
+        self.shaped_key = self.shaped_found = None  # the last cell looked for by shaped_cell, and what was found
         self.rects = []                             # [item, x0, y0, x1, y1]
         self.rect_line = None                       # the width the ROI outlines have been given (see rect_width)
         self.rect_px = 2                            # the width they should have
@@ -1006,10 +1019,8 @@ class PointCanvas:
         y_lo, y_hi = (self.cy - d_hi, self.cy - d_lo) if self.flip_y else (self.cy + d_lo, self.cy + d_hi)
         opacity = 1.0 if self.moving else self.opacity                        # (solid while the view moves: blending translucent dots is much slower; see note_motion)
         for lay in self.layers:
-            if "size_mm" in lay:                                              # (a size on the tissue: the same at any window size)
-                d = int(max(round(lay["size_mm"] * self.dot_factor * self.scale), 1))
-            else:
-                d = int(max(round(lay["size"] * (zoom * self.panel_zoom) ** 0.7), 1))          # (the dots grow as the view, or the whole panel, is zoomed in)
+            d = lay["drawn_d"] = self.dot_diameter(lay, zoom)       # (kept, with the scale: the highlighted cell's outline is made as big as the dots really were drawn)
+            lay["drawn_scale"] = self.scale
             x, y = lay["x"], lay["y"]
             pm = d / self.scale
             m = (x >= x_lo - pm) & (x <= x_hi + pm) & (y >= y_lo - pm) & (y <= y_hi + pm)
@@ -1181,13 +1192,41 @@ class PointCanvas:
 
     # ---- items in data coordinates
 
+    def dot_diameter(self, lay, zoom):
+        """The diameter in pixels of a layer's dots (`zoom`: the view's, scale / fit_scale)."""
+        if "size_mm" in lay:                                              # (a size on the tissue: the same at any window size)
+            return int(max(round(lay["size_mm"] * self.dot_factor * self.scale), 1))
+        return int(max(round(lay["size"] * (zoom * self.panel_zoom) ** 0.7), 1))          # (the dots grow as the view, or the whole panel, is zoomed in)
+
+    def shaped_cell(self, x, y):
+        """(layer, index in it) of the cell drawn at data position (x, y) with a group's shape (the topmost layer that has one there: the dots of
+        the other kind of cell are a layer of their own, smaller), or None: no layer has shapes (cells not drawn by group), or none has a cell there."""
+        key = (id(self.layers), x, y)
+        if self.shaped_key != key:
+            found = None
+            tol = 1e-6 * max(self.home[1] - self.home[0], self.home[3] - self.home[2], 1e-12)
+            for lay in reversed(self.layers):
+                if lay.get("marks") is None or not len(lay["x"]):
+                    continue
+                dist = np.hypot(lay["x"] - x, lay["y"] - y)
+                k = int(np.argmin(dist))
+                if dist[k] <= tol:
+                    found = (lay, k)
+                    break
+            self.shaped_key, self.shaped_found = key, found
+        return self.shaped_found
+
     def add_marker(self, name, radius=8):
         item = self.canvas.create_oval(0, 0, 0, 0, outline=RING, width=2, state="hidden")
-        self.markers[name] = [item, None, None, radius]
+        # [ring, x, y, radius, the cell redrawn over itself with a darker edge (when cells are drawn by group)]
+        shape = self.canvas.create_polygon(0, 0, 0, 0, 0, 0, fill="", outline="black", state="hidden")
+        self.markers[name] = [item, None, None, radius, [shape]]
 
     MARKER_STYLES = {"ring": ("", "#e00000"), "mirror": ("white", "black")}      # (fill, outline): the cell under the pointer; the same cell in the other plot
 
     def set_marker(self, name, x, y, style="ring"):
+        """When cells are drawn by group the cell is also drawn again over itself, with its shape, size and color and a darker edge (a ring
+        does not make a triangle's place clear: its center is not the ring's); see place_marker."""
         m = self.markers[name]
         m[1], m[2] = x, y
         fill, outline = self.MARKER_STYLES[style]
@@ -1196,13 +1235,43 @@ class PointCanvas:
 
     def place_marker(self, m):
         if m[1] is None:
-            self.canvas.itemconfig(m[0], state="hidden")
+            for item in [m[0]] + m[4]:
+                self.canvas.itemconfig(item, state="hidden")
             return
         px, py = self.to_canvas(m[1], m[2])
         r = m[3] * self.marker_factor
         self.canvas.coords(m[0], px - r, py - r, px + r, py + r)
         self.canvas.itemconfig(m[0], state="normal")
         self.canvas.tag_raise(m[0])
+        got = self.shaped_cell(m[1], m[2])
+        for item in m[4]:                         # (over the ring: the other plot's cell has a white disc for a ring)
+            if got is None:
+                self.canvas.itemconfig(item, state="hidden")
+                continue
+            lay, k = got
+            code, rgb = int(lay["marks"][k]), lay["rgb"][k]
+            # The size it was drawn at. Until the next drawing (after a zoom step the picture is stretched at once, and drawn again a moment later)
+            # the picture on screen is that one stretched by the change in scale, so this is too.
+            d = lay["drawn_d"] * self.scale / lay["drawn_scale"] if lay.get("drawn_d") else self.dot_diameter(lay, self.scale / self.fit_scale())
+            # The cell again, as it was drawn (its shape, size and color) with a darker edge of its color, both in proportion to its size, so they
+            # keep their relation at any zoom. A canvas line is centered on its path.
+            hollow = code >= 10
+            if hollow:
+                # The cell's own line is d / 6 wide, inside its edge (up to BIG_DOT_PX; the maximum filter's), or d / 12, centered on its edge
+                # (beyond: cv2's, see draw_big_marker). The new line follows the same path and is a third wider, so it covers it and shows as
+                # one darker line of the same color family.
+                line = max(1, round(d / 6)) if d <= BIG_DOT_PX else max(1, d // 12) + 2       # (cv2 draws a line about 2 px wider than asked)
+                wd = max(2.0, 1.35 * line)
+                size = d - line if d <= BIG_DOT_PX else d
+            else:
+                wd = max(2.0, d / 10)                      # (inside the cell's edge: half the line's width in, the whole stays the cell's size)
+                size = d - wd
+            fill = "#%02x%02x%02x" % tuple(int(c) for c in rgb[:3])
+            edge = "#%02x%02x%02x" % tuple(int(c * 0.55) for c in rgb[:3])
+            self.canvas.coords(item, *shape_outline(code, px, py, max(size, 2)))
+            self.canvas.itemconfig(item, state="normal", fill="" if hollow else fill, outline=edge, width=wd,
+                                   joinstyle=tk.MITER)
+            self.canvas.tag_raise(item)
 
     def add_rect(self, x0, y0, x1, y1):
         item = self.canvas.create_rectangle(0, 0, 0, 0, outline="black", width=2, dash=dash((6, 3), 2))

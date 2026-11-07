@@ -25,6 +25,7 @@ import numpy as np
 from PIL import Image, ImageTk
 
 import abc_core as core
+from tk_dash import dash
 
 ACCENT = "#1f5fa8"
 HOVER_RADIUS_MM = 0.010            # a cell is "under the pointer" within 10 um (the matplotlib window's rule too)
@@ -307,7 +308,7 @@ class RoiLayer:
     def add(self, box, kind, orig=None):
         rid = self.next_id
         self.next_id += 1
-        rect = self.canvas.create_rectangle(0, 0, 0, 0, outline=self.COLOR, width=self.LINE_WIDTH, dash=self.DASH, tags="overlay")
+        rect = self.canvas.create_rectangle(0, 0, 0, 0, outline=self.COLOR, width=self.LINE_WIDTH, dash=dash(self.DASH, self.LINE_WIDTH), tags="overlay")
         handles = {h: self.canvas.create_rectangle(0, 0, 0, 0, outline="black", fill="white", tags="overlay") for h in self.HANDLES}
         self.rois[rid] = {"kind": kind, "orig": orig, "box": list(box), "rect": rect, "handles": handles}
         self.place(rid)

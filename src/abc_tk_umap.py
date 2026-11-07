@@ -31,6 +31,7 @@ from PIL import Image, ImageTk
 from scipy.spatial import cKDTree
 
 import abc_core as core
+from tk_dash import dash
 import abc_tk_ccf
 from abc_tk_umap_export import ExportsMixin, hexcolor
 
@@ -581,6 +582,16 @@ WINDOW_MARGIN = 0.15                                   # a zoomed section map is
 def grown(d, old, new):
     """An offset `d` from the corner of something of size `old` that is now of size `new`: inside it, it grows with it; before it or beyond it, it stays."""
     return d if d < 0 else d * new / old if d <= old else new + (d - old)
+
+
+def roi_dash(wd):
+    """The dash option for an ROI outline wd pixels wide. Windows draws (3 * wd, 2 * wd) as short dashes, 5 to 10 along a side; macOS
+    draws it as asked, one or two dashes a side, so there the dashes are given about as long as the line is wide."""
+    if wd <= 2:
+        return dash((6, 3), wd)
+    if sys.platform == "darwin":
+        return dash((max(4, wd + 1), max(3, wd * 2 // 3)), wd)
+    return (3 * wd, 2 * wd)
 
 
 class PointCanvas:
@@ -1194,7 +1205,7 @@ class PointCanvas:
         self.canvas.tag_raise(m[0])
 
     def add_rect(self, x0, y0, x1, y1):
-        item = self.canvas.create_rectangle(0, 0, 0, 0, outline="black", width=2, dash=(6, 3))
+        item = self.canvas.create_rectangle(0, 0, 0, 0, outline="black", width=2, dash=dash((6, 3), 2))
         self.rects.append([item, x0, y0, x1, y1])
 
     def rect_width(self):
@@ -1285,7 +1296,7 @@ class PointCanvas:
             c, d = self.to_canvas(x1, y1)
             self.canvas.coords(it, a, b, c, d)
             if self.rect_line != wd:
-                self.canvas.itemconfig(it, width=wd, dash=(3 * wd, 2 * wd) if wd > 2 else (6, 3))
+                self.canvas.itemconfig(it, width=wd, dash=roi_dash(wd))
             self.canvas.tag_raise(it)
         self.rect_line = wd
         w, h = self.view_size()

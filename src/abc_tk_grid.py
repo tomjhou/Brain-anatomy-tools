@@ -19,6 +19,7 @@ import numpy as np
 from PIL import Image
 
 import abc_core as core
+from tk_dash import dash
 from abc_tk_picker import SectionData, ZoomView, prompt_subregion_selection_tk
 
 SECTION_Z_LABEL_FONTSIZE = 8          # points: the z label at the top-right of each thumbnail
@@ -230,7 +231,7 @@ class GridWindow:
             c.delete(item)
         mine = [r for r in self.rois if r["section"] == section]
         if mine:
-            items = [c.create_rectangle(0, 0, 0, 0, outline=ROI_COLOR, width=3, dash=(8, 4), tags="overlay")]
+            items = [c.create_rectangle(0, 0, 0, 0, outline=ROI_COLOR, width=3, dash=dash((8, 4), 3), tags="overlay")]
             items += [c.create_rectangle(0, 0, 0, 0, outline=ROI_COLOR, width=2, tags="overlay") for _ in mine]
             self.roi_items[section] = items
         self.place_overlays()

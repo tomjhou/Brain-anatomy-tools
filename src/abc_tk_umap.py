@@ -2691,6 +2691,17 @@ class UmapWindow(ExportsMixin):
             want_x = min(max(nx - wx, 0.0), max(new[2] - self.tile_scroll.winfo_width(), 0.0))
             want_y = min(max(ny - wy, 0.0), max(new[3] - self.tile_scroll.winfo_height(), 0.0))
             got_x, got_y = self.tile_scroll.canvasx(0), self.tile_scroll.canvasy(0)
+            # (moveto lands a few pixels off, by the canvas's border and its rounding: put right to the pixel, or the real layout is seen to jump
+            # against the snapshot it replaces)
+            for _ in range(2):
+                if abs(got_x - want_x) < 0.5 and abs(got_y - want_y) < 0.5:
+                    break
+                fx, fy = self.tile_scroll.xview()[0], self.tile_scroll.yview()[0]               # (the fractions it is at now, moved by the error)
+                self.tile_scroll.xview_moveto(min(max(fx + (want_x - got_x) / new[2], 0.0), 1.0))
+                self.tile_scroll.yview_moveto(min(max(fy + (want_y - got_y) / new[3], 0.0), 1.0))
+                got_x, got_y = self.tile_scroll.canvasx(0), self.tile_scroll.canvasy(0)
+            if abs(got_x - want_x) > 1.5 or abs(got_y - want_y) > 1.5:
+                self.trail(f"view {got_x - want_x:+.1f}, {got_y - want_y:+.1f} px off after zoom {zoom:.3g}")
             if abs(got_x - want_x) > 8 or abs(got_y - want_y) > 8:               # (a few pixels is the canvas's own border: moveto is off by it. More is not.)
                 self.zoom_note("the view is not where the zoom put it", want=(want_x, want_y), got=(got_x, got_y), spot=spot, spot_now=(nx, ny), anchor=anchor,
                                scrollregion=new, pane=(self.tile_scroll.winfo_width(), self.tile_scroll.winfo_height()), zoom=(self.panel_zoom, zoom))
@@ -2789,18 +2800,39 @@ class UmapWindow(ExportsMixin):
         return (tuple(id(t["pc"].layers) for t in self.tiles), self.var_dot.get(), self.var_marker.get(), self.var_translucent.get(), self.var_ccf.get(),
                 self.var_roi_only.get(), self.var_tile.get(), self.tile_scroll.winfo_width())        # (not its height: the scroll bar that comes with the zoom changes that)
 
+    PANE_CACHE_BYTES = 160 * 1024 * 1024                         # the pictures of the pane kept (see remember_pane)
+    PANE_CACHE_MAX = 12
+
     def remember_pane(self, b, image):
-        """Keep the picture of the pane at the zoom a wheel run starts from: when the zoom later goes out again it fills in what the scaled picture does not
-        reach. The widest (lowest zoom) one is kept, and the last three."""
+        """Keep the picture of the pane at the zoom a wheel run starts from: the pictures kept make a pyramid, from which show_zoom_snapshot takes,
+        for each part of the pane, the one that fits the zoom best. A picture replaces an older one only if it is of about the same zoom AND the
+        same part of the panel (a picture of somewhere else is not the same picture). The widest (lowest zoom) one is always kept; of the others the
+        newest, to PANE_CACHE_MAX pictures and PANE_CACHE_BYTES."""
         look = self.pane_look()
         if look != getattr(self, "pane_cache_look", None):
             self.pane_cache_look, self.pane_cache = look, []
         b["left"], b["top"] = self.tile_scroll.canvasx(0), self.tile_scroll.canvasy(0)
+        if getattr(self, "panning", False):                           # (a drag leaves parts of the maps blank until it stops: not a picture to keep)
+            return
         entry = {"z": self.panel_zoom, "left": b["left"], "top": b["top"], "image": image}
-        self.pane_cache = [e for e in self.pane_cache if abs(e["z"] / self.panel_zoom - 1.0) > 0.02] + [entry]
-        if len(self.pane_cache) > 4:
+        pw, ph = image.size
+        same = lambda e: (abs(e["z"] / self.panel_zoom - 1.0) <= 0.02 and abs(e["left"] - entry["left"]) < 0.25 * pw
+                          and abs(e["top"] - entry["top"]) < 0.25 * ph)
+        self.pane_cache = [e for e in self.pane_cache if not same(e)] + [entry]
+        size = lambda e: e["image"].size[0] * e["image"].size[1] * 3
+        while len(self.pane_cache) > 1 and (len(self.pane_cache) > self.PANE_CACHE_MAX or sum(size(e) for e in self.pane_cache) > self.PANE_CACHE_BYTES):
             widest = min(self.pane_cache, key=lambda e: e["z"])
-            self.pane_cache = [widest] + [e for e in self.pane_cache if e is not widest][-3:]
+            # (Many pictures of one zoom, from going in and out there, must not push out those of the other zooms: the oldest of the
+            # most crowded half-octave of zoom goes.)
+            band = lambda e: round(2 * math.log2(max(e["z"], 1e-6)))
+            crowd = {}
+            for e in self.pane_cache:
+                crowd[band(e)] = crowd.get(band(e), 0) + 1
+            lost = [e for e in self.pane_cache if e is not widest and e is not entry]
+            if not lost:
+                break
+            top = max(crowd[band(e)] for e in lost)
+            self.pane_cache.remove(next(e for e in lost if crowd[band(e)] == top))
 
     def blit_window_region(self, x, y, w, h):
         """Just that part of the window, copied from the window's own device context (about 20 ms: PrintWindow draws the whole window, 170 ms). The same
@@ -2961,17 +2993,12 @@ class UmapWindow(ExportsMixin):
                         borderMode=cv2.BORDER_CONSTANT, borderValue=(244, 244, 244))
         return out, inside
 
-    def earlier_entry(self, b):
-        """The earlier picture of the pane to fill the edges with: the sharpest at or below the zoom reached, else the nearest above; None if there is none."""
-        target, start = b["target"], b["start"]
-        best = None
-        for e in getattr(self, "pane_cache", []):
-            if abs(e["z"] / start - 1.0) <= 0.02:
-                continue                                                 # (the snapshot being scaled)
-            rank = (1, e["z"]) if e["z"] <= target * 1.02 else (0, -e["z"])
-            if best is None or rank > best[0]:
-                best = (rank, e)
-        return best[1] if best else None
+    def pyramid_order(self, target):
+        """The kept pictures in the order they are wanted for a pane at panel zoom `target`: those of at least that zoom first (they are made smaller, so
+        sharp), the nearest zoom first; then those of a lower zoom (made bigger, so soft), the nearest first."""
+        up = sorted((e for e in getattr(self, "pane_cache", []) if e["z"] >= target * 0.98), key=lambda e: e["z"])
+        down = sorted((e for e in getattr(self, "pane_cache", []) if e["z"] < target * 0.98), key=lambda e: -e["z"])
+        return up + down
 
     def show_zoom_snapshot(self, b):
         """The snapshot of the pane as it will be at the zoom so far, over the pane: each part of it moved and grown as the real layout will have it (the maps
@@ -2982,13 +3009,32 @@ class UmapWindow(ExportsMixin):
         z = b["target"]
         lay_n = self.layout_at(z)
         left_n, top_n = self.view_at(z, b["spot"], b["at"], lay_n) if b.get("spot") else (b["left"] * z / b["start"], b["top"] * z / b["start"])
-        out, inside = self.pane_picture(b["image"], self.pane_maps(lay_n, left_n, top_n, self.layout_at(b["start"]), b["left"], b["top"], w, h), w, h)
-        if not inside.all():
-            e = self.earlier_entry(b)
-            if e is not None:
-                under, _ = self.pane_picture(e["image"], self.pane_maps(lay_n, left_n, top_n, self.layout_at(e["z"]), e["left"], e["top"], w, h), w, h)
-                np.copyto(under, out, where=inside[:, :, None])
-                out = under
+        out = np.empty((h, w, 3), np.uint8)
+        out[:] = (244, 244, 244)
+        todo = np.ones((h, w), bool)                                  # (the parts of the pane no picture has been put on yet)
+        # The picture the zoom started from is always first: it is the pane as it is. The older ones only fill in what it does not reach
+        # (they may be out of date, or have blank parts from a drag: the pane is not drawn all over while one goes on).
+        first = {"z": b["start"], "left": b["left"], "top": b["top"], "image": b["image"]}
+        others = [e for e in self.pyramid_order(z) if e["image"] is not b["image"]]
+        widest = min(others, key=lambda e: e["z"]) if others else None
+        used = 0
+        for e in [first] + [e for e in others if e is not widest] + ([widest] if widest is not None else []):
+            if not todo.any():
+                break
+            if used >= 4 and e is not widest:                        # (the cost of a step: the widest picture, which reaches furthest, is not left out)
+                continue
+            mx, my = self.pane_maps(lay_n, left_n, top_n, self.layout_at(e["z"]), e["left"], e["top"], w, h)
+            sh, sw = e["image"].size[1], e["image"].size[0]
+            ix, iy = (mx >= 0) & (mx <= sw - 1), (my >= 0) & (my <= sh - 1)
+            if not ix.any() or not iy.any():
+                continue
+            reach = iy[:, None] & ix[None, :] & todo
+            if not reach.any():
+                continue                                             # (nothing new: not counted)
+            picture, _ = self.pane_picture(e["image"], (mx, my), w, h)
+            np.copyto(out, picture, where=reach[:, :, None])
+            todo &= ~reach
+            used += 1
         t1 = time.perf_counter()
         fresh = b.get("photo") is None or (b["photo"].width(), b["photo"].height()) != (w, h)
         if fresh:

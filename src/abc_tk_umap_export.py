@@ -227,7 +227,7 @@ class ExportsMixin:
         return f"{token}_{params_token}" if params_token else token
 
     def level_ids(self, level):
-        return core.extract_leading_numeric_id(pd.Series(self.info[level])).to_numpy()
+        return self.group_keys(level, self.info[level])
 
     def group_choice(self, action):
         """(level, targets) of the groups highlighted in Single group(s) that have cells in this run, or None (saying why)."""
@@ -680,8 +680,7 @@ class ExportsMixin:
         def work():
             written, skipped = [], []
             if has_counts:
-                m = adata.copy()
-                m.X = m.layers["counts"].copy()
+                m = self.counts_adata()
                 sc.pp.normalize_total(m)
                 sc.pp.log1p(m)
                 frames = []
@@ -777,8 +776,7 @@ class ExportsMixin:
         def work():
             written, skipped = [], []
             if has_counts:
-                m = adata.copy()
-                m.X = m.layers["counts"].copy()
+                m = self.counts_adata()
                 sc.pp.normalize_total(m)
                 sc.pp.log1p(m)
                 df = pd.DataFrame({"gene_symbol": m.var["gene_symbol"].values, "ensembl_id": m.var_names})
@@ -848,7 +846,7 @@ class ExportsMixin:
         barr = bg["levels"].get(level) if bg else None
         use_bg = bg is not None and barr is not None and bg.get("sec_arr") is not None
         if use_bg:
-            ids = core.extract_leading_numeric_id(pd.Series(barr)).to_numpy()
+            ids = self.group_keys(level, barr)
             for t in targets:
                 rows = np.flatnonzero(ids == t)
                 if not rows.size:

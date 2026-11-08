@@ -258,10 +258,19 @@ def scan_runs(folder):
         entries = [e for e in os.scandir(folder) if e.is_dir()]
     except OSError:
         return runs
+    import abc_project
     for e in entries:
         try:
             saved = os.stat(os.path.join(e.path, RUN_FILE)).st_mtime
         except OSError:
+            # A project made without a UMAP: its project file says so, and it is a finished project.
+            if not abc_project.has_umap(e.path):
+                try:
+                    saved = os.stat(os.path.join(e.path, abc_project.PROJECT_FILE)).st_mtime
+                    runs.append((e.name, Path(e.path), max(saved, opened.get(abc_core._run_key(e.path), 0.0)), 0, None, True))
+                except OSError:
+                    pass
+                continue
             # No UMAP: a run that stopped before it was made. If it saved its ROIs it is listed, as unfinished, to be finished from them.
             try:
                 if e.name.startswith("umap_"):
@@ -698,7 +707,8 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
         if chosen_path is None:
             return
         chosen_path = Path(chosen_path)
-        if not (chosen_path / RUN_FILE).exists() and (chosen_path / ROI_FILE).exists():
+        import abc_project
+        if not (chosen_path / RUN_FILE).exists() and (chosen_path / ROI_FILE).exists() and abc_project.has_umap(chosen_path):
             # a run that stopped before its UMAP was made: finished from the ROIs it saved (the cells, the project name and the size limit are in its name)
             if not messagebox.askyesno(
                     "Finish this project?",

@@ -50,8 +50,8 @@ def legend_selection(v):
     if v.mode == "all":
         chosen = np.isin(np.asarray([str(u) for u in uniques]), np.asarray([str(k) for k in on]))
     else:
-        numbers = core.extract_leading_numeric_id(pd.Series(uniques)).to_numpy()
-        chosen = np.isin(numbers, np.asarray(on))
+        numbers = v.group_keys(level, uniques)
+        chosen = np.isin(numbers, np.asarray(on, dtype=object if not v.level_has_ids.get(level, True) else None))
     mask = (codes >= 0) & chosen[np.maximum(codes, 0)]
     names = [str(k) for k in on]
     return level, mask, names, ""
@@ -135,7 +135,8 @@ def embed_subset(parent, mask, n_components=PCA_COMPONENTS):
     # matrix, would only be in the way)
     obs = source.obs.iloc[rows].copy()
     obs = obs.drop(columns=[c for c in ("n_counts", core_leiden_key()) if c in obs.columns])
-    sub = anndata.AnnData(X=source.layers["counts"][rows].copy(), obs=obs, var=source.var.copy())
+    counts = parent.counts_of_rows(rows)
+    sub = anndata.AnnData(X=counts.copy() if hasattr(counts, "copy") else counts, obs=obs, var=source.var.copy())
     sc.pp.filter_genes(sub, min_cells=5)
     sub.layers["counts"] = sub.X.copy()
     sc.pp.normalize_total(sub)

@@ -337,6 +337,7 @@ from abc_atlas_access.abc_atlas_cache.cloud_cache import OutdatedManifestWarning
 
 # The data and rendering layer lives in abc_core.py (importable without starting this app); everything moved there is imported back
 # under its own name, so the rest of this file is unchanged. Must come after the library check and the matplotlib setup above.
+import abc_project
 from abc_core import (
     CACHE_DIR, CCF_COORDS_FILE_NAME, CCF_DIRECTORY, CCF_FILES, CCF_PARCELLATION_DIRECTORY, CCF_PARCELLATION_FILE_NAME, COORD_SETTINGS,
     DEFAULT_BREGMA_CCF_AP_MM, DEFAULT_BREGMA_CCF_DV_MM, DEFAULT_GREY_RGBA, FRAME_STATE, RECON_FILES, coordinate_frame_name,
@@ -4890,6 +4891,8 @@ def required_cached_run_files(run_folder):
     rebuilt from the other two (see rebuild_processed_adata) — so the
     startup panel treats both as recoverable rather than blocking on them."""
     run_folder = Path(run_folder)
+    if not abc_project.has_umap(run_folder):
+        return {'Project file': run_folder / abc_project.PROJECT_FILE}           # (a project without a UMAP is only its project file, and its ROIs if any)
     return {
         'UMAP coordinates': run_folder / 'umap_coords.csv',
         'ROI coordinates': run_folder / 'roi_coords.csv',
@@ -7214,13 +7217,14 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     if imputed_state is None:
         imputed_state = {'adata': None, 'load_thread': None, 'load_error': None}
 
-    if 'X_umap' not in adata.obsm:
+    no_umap = bool(adata.uns.get('no_umap'))                       # (a project made without a UMAP: the section maps and the genes)
+    if 'X_umap' not in adata.obsm and not no_umap:
         print("No UMAP embedding available; skipping the interactive UMAP viewer.")
         return
 
     # The Tk viewer (abc_tk_umap.py). It opens on the UMAP parameters the run was last viewed with, like the matplotlib one below.
     tk_params = dict(UMAP_PARAM_DEFAULTS)
-    if run_folder is not None:
+    if run_folder is not None and not no_umap:
         last_params = read_last_umap_params(run_folder)
         if not umap_params_are_default(last_params):
             try:
@@ -7233,8 +7237,8 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
                 tk_params = last_params
             except Exception as e:
                 log_status(f"Step 9: Could not reopen the saved UMAP variant ({e}); using the default embedding.")
-    tk_title = "Interactive UMAP viewer"
-    if not umap_params_are_default(tk_params):
+    tk_title = "Section map viewer" if no_umap else "Interactive UMAP viewer"
+    if not no_umap and not umap_params_are_default(tk_params):
         tk_title = f"{tk_title} ({umap_params_label(tk_params)})"
     if run_folder is not None:
         tk_title = f"{Path(run_folder).name} — {tk_title}"
@@ -7256,6 +7260,75 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
                         ensure_imputed=ensure_imputed_gene_dataset_loaded, title=tk_title, host=host, params=tk_params,
                         panel_zoom=panel_zoom)
     return
+
+
+def open_no_umap_project(abc_cache, run_folder, backed, imputed_state, section_series=None, mask=None, panel_zoom=False):
+    """Open a project without a UMAP (its folder holds project.json saying so, and roi_coords.csv if it has ROIs). Its cells are picked out of the
+    atlas's tables from what project.json records (cell type, sections, ROIs), and their genes are read from the atlas's own file when wanted (see
+    abc_project.py): there is no processed file. `mask`: the cells, if the caller has just found them."""
+    global selection_confirmed_at
+    run_folder = Path(run_folder)
+    info = abc_project.read_project(run_folder)
+    cell_type, sections, rois = abc_project.selection_of(info)
+    if rois:
+        run_frame = read_run_frame(run_folder)
+        if run_frame != coordinate_frame_name():
+            print(f"This project's ROIs were drawn on the {run_frame} coordinates, so its cells are placed by those (the setting is for new projects).")
+            FRAME_STATE['override'] = run_frame
+            prepare_coordinate_frame(abc_cache)
+    if abc_project.release_differs(info, abc_cache):
+        print(f"Note: this project was made from the atlas release {(info.get('atlas') or {}).get('release')}; the cache is now on "
+              f"{abc_project.atlas_release(abc_cache)}. Its cells are picked out of the current tables.")
+
+    def build():
+        picked = mask if mask is not None else abc_project.select_cells(backed, abc_cache, cell_type, sections, rois, section_series)
+        return abc_project.build_adata(backed, abc_cache, picked)
+    adata = run_with_loading_window(f"Opening {run_folder.name}.\nPicking out its cells from the atlas.", build)
+    selection_confirmed_at = time.perf_counter()                 # (log_status counts the time from here)
+    log_status(f"Opening {run_folder.name} ({adata.n_obs:,} cells, no UMAP).")
+    run_with_loading_window("Writing this project's statistics.txt (it had none).",
+                            lambda: write_run_statistics(run_folder, adata, abc_cache, rois=rois, overwrite=False,
+                                                         note="made when this project without a UMAP was opened and had none"))
+    log_status("Opening the viewer...")
+    try:
+        show_interactive_umap_window(adata, abc_cache, imputed_state=imputed_state, adata_backed=backed, rois=rois, run_folder=run_folder,
+                                     panel_zoom=panel_zoom)
+    except Exception as e:
+        log_status(f"Could not open the viewer: {e}")
+    log_status("Viewer closed.")
+
+
+def create_no_umap_project(abc_cache, out_folder, backed, section_series, imputed_state, cell_type_selection, sections_suffix, region_suffix,
+                           whole_sections_selected, rois, run_label, panel_zoom=False):
+    """Make a project without a UMAP (the options window's "skip the UMAP"): a folder with project.json and, for ROIs, roi_coords.csv and the ROI
+    map; then open it. No subsampling, no preprocessing, no PCA or UMAP is done, so it takes seconds, whatever the number of cells."""
+    global selection_confirmed_at
+    name = f'browse_{CELL_TYPE_SUFFIXES[cell_type_selection]}_{sections_suffix}{region_suffix}'
+    run_folder = Path(out_folder) / name
+    log_status(f"Making the project {name} (no UMAP).")
+    mask = abc_project.select_cells(backed, abc_cache, cell_type_selection, whole_sections_selected, rois, section_series)
+    n_cells = int(mask.sum())
+    if n_cells == 0:
+        show_error_dialog("Nothing to show", "No cells match this selection (cell type, sections and ROIs), so no project was made.")
+        return
+    run_folder.mkdir(parents=True, exist_ok=True)
+    core_record_run_opened(run_folder)
+    if rois:
+        write_run_frame(run_folder)
+    roi_section_set = {roi['section'] for roi in rois}
+    whole_only_sections = [s for s in (whole_sections_selected or []) if s not in roi_section_set] if rois else []
+    if rois or whole_only_sections:
+        whole_section_rows = [{'section': s, 'x_min': np.nan, 'x_max': np.nan, 'y_min': np.nan, 'y_max': np.nan} for s in whole_only_sections]
+        pd.DataFrame(list(rois) + whole_section_rows)[['section', 'x_min', 'x_max', 'y_min', 'y_max']].to_csv(run_folder / 'roi_coords.csv', index=False)
+    abc_project.write_project(run_folder, cell_type_selection, whole_sections_selected, rois, label=run_label, has_umap=False, n_cells=n_cells,
+                              abc_cache=abc_cache, frame=coordinate_frame_name())
+    log_status(f"{n_cells:,} cells in the project.")
+    if rois:
+        try:
+            save_roi_map(backed, abc_cache, section_series, rois, run_folder / 'roi_map.png')
+        except Exception as e:
+            log_status(f"Could not save the ROI map ({e}); the project is made without it.")
+    open_no_umap_project(abc_cache, run_folder, backed, imputed_state, section_series=section_series, mask=mask, panel_zoom=panel_zoom)
 
 
 def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
@@ -7384,6 +7457,13 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         # get_cached_raw_backed_adata reuses it across sessions instead of
         # re-opening the file every time.
         print(f"Loading cached run from {load_existing_folder}...")
+        if not abc_project.has_umap(load_existing_folder):
+            # A project made without a UMAP: nothing to load but the atlas's own tables (see open_no_umap_project).
+            backed, section_series = run_with_loading_window(
+                f"Loading the MERFISH brain atlas (4+ million cells).\nOpening {Path(load_existing_folder).name}.",
+                lambda: (lambda b: (b, get_section_labels(b, abc_cache)))(get_cached_raw_backed_adata(raw_backed_cache, abc_cache)))
+            open_no_umap_project(abc_cache, load_existing_folder, backed, imputed_state, section_series=section_series, panel_zoom=browse_all_neurons)
+            return
         required_files = required_cached_run_files(load_existing_folder)
         processed_h5ad_path = required_files['Processed AnnData']
         roi_csv_path = required_files['ROI coordinates']
@@ -7595,6 +7675,13 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         region_suffix += f'_{run_label}'
         log_status(f"Adding the project name '{run_label}' to this run's folder name.")
 
+    if run_options is not None and not run_options.get('make_umap', True):
+        # The options window said to skip the UMAP: no subsampling, preprocessing or embedding (and so no size limit): a project that is only
+        # its cells, picked out of the atlas's tables (see create_no_umap_project).
+        create_no_umap_project(abc_cache, out_folder, adata, section_series, imputed_state, cell_type_selection, sections_suffix, region_suffix,
+                               whole_sections_selected, rois, run_label)
+        return
+
     # ---------------------------------------------------------------------------
     # Early cache-hit check: look for an existing UMAP run matching this exact
     # section/cell-type/ROI selection *before* paying for Step 2's metadata
@@ -7754,6 +7841,11 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
     run_folder = Path(out_folder) / session_prefix
     run_folder.mkdir(parents=True, exist_ok=True)
     csv_path = run_folder / 'umap_coords.csv'
+    try:
+        abc_project.write_project(run_folder, cell_type_selection, whole_sections_selected, rois, label=run_label, has_umap=True,
+                                 cap=subsample_target, abc_cache=abc_cache, frame=coordinate_frame_name())
+    except Exception as e:
+        print(f"Could not write {abc_project.PROJECT_FILE} ({e}); the project works without it.")
 
     # Whole-section picks (clicked to select the entire section, no ROI drawn
     # on it) are only worth recording here if the run also has actual ROIs —

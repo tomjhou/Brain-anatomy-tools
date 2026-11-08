@@ -643,8 +643,8 @@ class AnalyzeWindow:
             self.var_status.set(f"The main window shows {plural(v.level_names[v.level].lower())}: set Group type to {v.level_names[v.level]}, or untick the box.")
             return None
         if v.mode == "single":
-            ids, _bad = v.parse_ids()
-            uid = core.extract_leading_numeric_id(pd.Series(uniques)).to_numpy()
+            ids, _bad = v.typed_groups(level, uniques)
+            uid = v.group_keys(level, uniques)
             chosen = [int(i) for t in ids if t not in v.off_groups for i in np.flatnonzero(uid == t)[:1]]
         else:
             chosen = [i for i in everyone[:MAX_COLORED_CATEGORIES] if str(uniques[i]) not in v.off_groups]
@@ -887,8 +887,11 @@ class AnalyzeWindow:
                 return data
         else:
             names = v.adata.var["gene_symbol"].astype(str).to_numpy()
-            matrix = v.adata.layers["counts"] if v.own is None else None
-            means_of = (lambda c, n: group_means_panel(matrix, c, n)) if v.own is None else v.own.group_means      # (a dataset of the user's own: its normalized values)
+            if v.atlas_counts is not None:                          # (a project without a UMAP: the counts are read from the atlas's file, block by block)
+                means_of = lambda c, n: v.atlas_counts.group_means(c, n)
+            else:
+                matrix = v.adata.layers["counts"] if v.own is None else None
+                means_of = (lambda c, n: group_means_panel(matrix, c, n)) if v.own is None else v.own.group_means      # (a dataset of the user's own: its normalized values)
 
             def work(progress, cancelled):
                 return {"names": names, "levels": {k: {"means": means_of(c, len(u_)), "uniques": uniques_of[k], "counts": counts_of[k]}

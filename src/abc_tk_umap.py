@@ -22,7 +22,7 @@ import time
 import types
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import ttk
+from tkinter import ttk, messagebox
 
 import cv2
 import numpy as np
@@ -31,6 +31,7 @@ from PIL import Image, ImageTk
 from scipy.spatial import cKDTree
 
 import abc_core as core
+import abc_project
 from tk_dash import dash
 import abc_tk_ccf
 from abc_tk_umap_export import ExportsMixin, hexcolor
@@ -55,10 +56,13 @@ TILE_PX = 230
 BLINK_PAUSE_MS = 1000              # a highlighted cell (its ring or white dot) starts to blink when it has stood this long...
 BLINK_ON_MS, BLINK_OFF_MS = 450, 250       # ...shown this long, hidden this long, over and over (until another cell is highlighted or it is cleared)
 MIN_TILE_PX = 50
-ROI_LINE_PX = {6: 2, 5: 3, 4: 4, 3: 5, 2: 6, 1: 8}        # the ROI outline's line width at each Section size stop (panels across): thicker as the sections grow
-TILE_COLUMNS = (6, 5, 4, 3, 2, 1)         # the Section size slider's stops: how many panels fit across the pane (1/6 of its width ... all of it)
+ROI_LINE_PX = {8: 2, 7: 2, 6: 2, 5: 3, 4: 4, 3: 5, 2: 6, 1: 8}      # (more across than that, as a fit can have: 2)        # the ROI outline's line width at each Section size stop (panels across): thicker as the sections grow
+TILE_COLUMNS = (0, 8, 7, 6, 5, 4, 3, 2, 1)    # the Section size slider's stops: how many panels fit across the pane (1/8 of its width ... all of it); 0: the
+                                              # size that shows every section in the pane at once, as large as that allows (see fit_tiles)
+FIT_STOP = TILE_COLUMNS.index(0)
+LARGE_PROJECT_CELLS = 200_000             # a project of this many cells or more starts with its UMAP hidden (Show UMAP)
 OUTLINE_PX_LARGEST = 2                    # the CCF outlines' width (pixels) at the largest section map size (one pixel at the others)
-DEFAULT_TILE_INDEX = 4                    # (two across)
+DEFAULT_TILE_INDEX = TILE_COLUMNS.index(2)    # (two across)
 CELL_SIZES_UM = (20, 30, 40, 50, 60, 70, 80, 90, 100)       # the Cell size slider's stops: the width of a cell's dot in the section panels, in microns
 OTHER_CELLS_DOT_RATIO = 0.5       # the dots of the cells of the other kind (e.g. the non-neurons of a neuron run), relative to the others'
 DEFAULT_DOT_INDEX = 2                     # (40 microns, DOT_MM: the size the dots have always had)
@@ -235,15 +239,27 @@ def draw_marker(canvas, cx, cy, code, color, size=12):
         canvas.create_polygon(*[c for x, y in SHAPE_POLYGONS[marker] for c in (cx + (x - 0.5) * size, cy + (y - 0.5) * size)], **style)
 
 
-def stamp_plus(img, px, py, rgb, arm):
-    """A '+' (two pixels thick, `arm` pixels each way) at each point, in place. `rgb`: one color (3,) or one per point (n, 3)."""
+def stamp_plus(img, px, py, rgb, arm, thick=2):
+    """A '+' (`thick` pixels thick, two by default, `arm` pixels each way) at each point, in place. `rgb`: one color (3,) or one per point (n, 3)."""
     h, w = img.shape[:2]
     per_point = np.ndim(rgb) == 2
+    first = 1 - thick // 2                                       # (the first of the thick rows, from the point: 0 and 1 for two)
+    if arm > 12:                                                 # (a big '+', from a close zoom, where few points are in view: a bar or two for each)
+        for i, (X, Y) in enumerate(zip(np.asarray(px).tolist(), np.asarray(py).tolist())):
+            c = rgb[i] if per_point else rgb
+            x0, x1, ya, yb = max(X - arm, 0), min(X + arm + 1, w), max(Y + first, 0), min(Y + first + thick, h)
+            if x1 > x0 and yb > ya:
+                img[ya:yb, x0:x1] = c
+            y0, y1, xa, xb = max(Y - arm, 0), min(Y + arm + 1, h), max(X + first, 0), min(X + first + thick, w)
+            if y1 > y0 and xb > xa:
+                img[y0:y1, xa:xb] = c
+        return
     for k in range(-arm, arm + 1):
-        for dx, dy in ((k, 0), (k, 1), (0, k), (1, k)):
-            xx, yy = px + dx, py + dy
-            ok = (xx >= 0) & (xx < w) & (yy >= 0) & (yy < h)
-            img[yy[ok], xx[ok]] = rgb[ok] if per_point else rgb
+        for j in range(first, first + thick):
+            for dx, dy in ((k, j), (j, k)):
+                xx, yy = px + dx, py + dy
+                ok = (xx >= 0) & (xx < w) & (yy >= 0) & (yy < h)
+                img[yy[ok], xx[ok]] = rgb[ok] if per_point else rgb
 
 
 def blend_dots(img, px, py, rgb, d, opacity, kernel_cache, kernel=None):
@@ -445,21 +461,31 @@ class HoverTip:
 PIN_OUTLINE = [(5, 2), (11, 2), (10, 8), (13, 10), (13, 12), (3, 12), (3, 10), (6, 8)]       # a push-pin's head and body, upright in a 16 x 20 box
 
 
-def draw_pin(canvas, pinned):
-    """A push-pin in `canvas` (16 x 20): upright, red and filled while the tip is pinned; tilted, gray and hollow while it is not."""
+def pin_scale(widget):
+    """How much bigger than 16 x 20 pixels the pin is drawn: the screen's pixels per inch over 72, which is what a Mac counts in (its pin looked the
+    right size at 16 x 20); a Windows screen is 96 pixels per inch or more, and a pin of the same pixels was small."""
+    try:
+        return max(1.0, widget.winfo_fpixels("1i") / 72.0)
+    except tk.TclError:
+        return 1.0
+
+
+def draw_pin(canvas, pinned, scale=None):
+    """A push-pin in `canvas` (16 x 20 times `scale`: see pin_scale): upright, red and filled while the tip is pinned; tilted, gray and hollow while it is not."""
     import math
+    scale = pin_scale(canvas) if scale is None else scale
     canvas.delete("all")
     angle = 0.0 if pinned else math.radians(40)
     cx, cy = 8, 11
 
     def turn(x, y):
         dx, dy = x - cx, y - cy
-        return cx + dx * math.cos(angle) - dy * math.sin(angle), cy + dx * math.sin(angle) + dy * math.cos(angle)
+        return (cx + dx * math.cos(angle) - dy * math.sin(angle)) * scale, (cy + dx * math.sin(angle) + dy * math.cos(angle)) * scale
 
     fill, line = ("#d03030", "#802020") if pinned else ("#ffffe0", "#808080")
     needle = [turn(8, 12), turn(8, 19)]
-    canvas.create_line(*needle[0], *needle[1], fill=line, width=2)
-    canvas.create_polygon([c for pt in PIN_OUTLINE for c in turn(*pt)], fill=fill, outline=line, width=1)
+    canvas.create_line(*needle[0], *needle[1], fill=line, width=max(2, round(2 * scale)))
+    canvas.create_polygon([c for pt in PIN_OUTLINE for c in turn(*pt)], fill=fill, outline=line, width=max(1, round(scale)))
 
 
 class CellTip:
@@ -702,7 +728,8 @@ class CellTip:
         box.pack()
         bar = tk.Frame(box, bg=bg)
         bar.pack(side=tk.TOP, fill=tk.X, padx=3, pady=(2, 0))
-        pin = tk.Canvas(bar, width=16, height=20, bg=bg, highlightthickness=0, cursor="hand2")
+        scale = pin_scale(bar)
+        pin = tk.Canvas(bar, width=round(16 * scale), height=round(20 * scale), bg=bg, highlightthickness=0, cursor="hand2")
         pin.pack(side=tk.LEFT)
         draw_pin(pin, False)
         self.bars[self.tip] = (bar, pin)
@@ -719,6 +746,13 @@ class CellTip:
                              highlightthickness=1, highlightbackground="gray60")
             mark.pack(side=tk.LEFT)
             draw_marker(mark, 12, 12, int(code), hexc, size=14)
+            bring = swatch[4] if len(swatch) > 4 else None
+            if bring is not None:                       # (to the right of the symbol: the cell comes into view in the plots where it is out of it)
+                button = ttk.Button(top, text="Bring into view", command=bring)
+                button.pack(side=tk.LEFT, padx=(8, 0))
+                if len(swatch) > 5 and not swatch[5]:    # (greyed out while the UMAP is not shown)
+                    button.state(["disabled"])
+                    HoverTip(button, lambda: "Show the UMAP (the Show UMAP box above the section maps) to use this.")
             if token is not None and self.row_hover_fn is not None:
                 for w in (top, caption, mark):
                     w.bind("<Enter>", lambda e, t=token, c=caption: self.row_enter(t, [c]), add="+")
@@ -1073,6 +1107,32 @@ class PointCanvas:
         else:
             self.request_draw()
         self.announce()
+
+    def bring_into_view(self, x, y, margin=6):
+        """Put data point (x, y) in view: nothing changes if it is (`margin` pixels from the edges), else the view is centered on it, as far as the view
+        may go (it never leaves the whole view). The zoom stays. Returns whether the view moved."""
+        w, h = self.view_size()
+        px, py = self.to_canvas(x, y)
+        if margin <= px <= w - margin and margin <= py <= h - margin:
+            return False
+        self.note_motion()
+        self.cx, self.cy = x, y
+        self.at_fit = False
+        self.clamp()
+        self.request_draw()
+        self.announce()
+        return True
+
+    def position_in_widget(self, x, y):
+        """Where data point (x, y) is in the widget (to_canvas), also when the widget has not been laid out yet (a map in a pane, scrolled out of
+        view, is 1 x 1 to Tk until it is shown): then, from the size it is to have and its whole view."""
+        if self.vsize is None and (self.canvas.winfo_width() <= 2 or self.canvas.winfo_height() <= 2):
+            w, h = self.canvas.winfo_reqwidth(), self.canvas.winfo_reqheight()
+            x0, x1, y0, y1 = self.home
+            scale = min(w / max(x1 - x0, 1e-9), h / max(y1 - y0, 1e-9))
+            sy = -(y - (y0 + y1) / 2) if self.flip_y else (y - (y0 + y1) / 2)
+            return w / 2 + (x - (x0 + x1) / 2) * scale, h / 2 + sy * scale
+        return self.to_canvas(x, y)
 
     def remember_view(self):
         """Keep the picture just drawn, for filling in the edges when a later zoom out reaches beyond what a picture covers: the widest one drawn (the
@@ -1436,8 +1496,12 @@ class PointCanvas:
             px = np.floor((x - self.cx) * self.scale + W / 2 - ox).astype(np.int32)
             dy = (y - self.cy) * self.scale
             py = np.floor((-dy if self.flip_y else dy) + H / 2 - oy).astype(np.int32)
-            zoom = self.scale / self.fit_scale()
-            stamp_plus(img, px, py, np.array([255, 0, 0], np.uint8), max(int(min((self.plus_arm + zoom ** 0.4) * self.marker_factor, 14 * self.marker_factor)), 1))
+            # The '+' grows with the zoom as the cells' dots do (the whole view's and the whole panel's zoom together: see dot_diameter), and gets thicker
+            # with it; one at the whole view is as it always was.
+            total = self.scale / self.fit_scale() * self.panel_zoom
+            arm = max(int(round((self.plus_arm + 1) * self.marker_factor * total ** 0.7)), 1)
+            keep = (px >= -arm) & (px < w + arm) & (py >= -arm) & (py < h + arm)              # (only those that can show)
+            stamp_plus(img, px[keep], py[keep], np.array([255, 0, 0], np.uint8), arm, thick=max(2, round(arm / 6)))
         self.photo = ImageTk.PhotoImage(Image.fromarray(np.ascontiguousarray(img)), master=self.canvas)
         self.canvas.itemconfig(self.item, image=self.photo)
         self.canvas.coords(self.item, self.drawn[0] - self.off[0], self.drawn[1] - self.off[1])
@@ -1709,6 +1773,8 @@ class UmapWindow(ExportsMixin):
         self.start_panel_zoom = panel_zoom                  # start with Zoom whole panel ticked (and the section maps at their smallest)
         self.adata, self.abc_cache = adata, abc_cache
         self.own = own                      # a dataset of the user's own (abc_tk_own.OwnDataset): no atlas, no sections, no imputed genes
+        self.no_umap = bool(adata.uns.get("no_umap"))        # a project without a UMAP (abc_project.py): the section maps and the genes, read from the atlas
+        self.atlas_counts = None            # ... whose genes are read from the atlas's own file (abc_project.AtlasCounts)
         self.level_names = dict(own.level_names) if own is not None else dict(LEVEL_NAMES)          # the group types: column -> the words on the screen
         self.level_has_ids = dict(own.level_has_ids) if own is not None else {"neurotransmitter": False}      # (whether a level's groups have numbers to type)
         self.host = host or {}             # the browser's own functions this window uses (settings dialog, UMAP variants, the exports)
@@ -1728,7 +1794,7 @@ class UmapWindow(ExportsMixin):
             self.root.state("zoomed")                          # (its final size from the start: nothing is drawn at one size and then again at another)
         except tk.TclError:
             pass
-        loading =ttk.Label(self.root, text="Preparing the UMAP viewer...", font=("Segoe UI", 14), padding=40)
+        loading =ttk.Label(self.root, text="Preparing the project window...", font=("Segoe UI", 14), padding=40)
         loading.place(relx=0.5, rely=0.5, anchor="center")     # (in the middle of the window, which already fills the screen)
         self.root.update()
         self.msgs = queue.Queue()
@@ -1763,12 +1829,19 @@ class UmapWindow(ExportsMixin):
         self.ccf_run = self.ccf_bg = None  # the cells' CCF coordinates (AP, DV, ML), for the ML and DV of the cell tip: see start_ccf_lookup
         self.ccf_state = "none"
         self.variants = {}                 # UMAP parameter key -> (coordinates, Leiden labels), the ones already shown
-        self.load_data(adata_backed, rois)
-        if self.host and self.params is not None:
-            self.variants[self.host["umap_params_key"](self.params)] = (self.coords.copy(), self.info.get("leiden"))
-        loading.destroy()
-        self.build()
-        self.recolor()
+        try:
+            self.load_data(adata_backed, rois)
+            if self.host and self.params is not None:
+                self.variants[self.host["umap_params_key"](self.params)] = (self.coords.copy(), self.info.get("leiden"))
+            loading.destroy()
+            self.build()
+            self.recolor()
+        except BaseException:
+            try:
+                self.root.destroy()                       # (not left on the screen, blank, when the window could not be made)
+            except tk.TclError:
+                pass
+            raise
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.bind("<Escape>", lambda e: self.close())
         self.poll()
@@ -1788,9 +1861,15 @@ class UmapWindow(ExportsMixin):
 
     def load_data(self, adata_backed, rois):
         a = self.adata
-        self.coords = np.asarray(a.obsm["X_umap"], dtype=float)[:, :2]
+        if self.no_umap:
+            self.coords = np.zeros((a.n_obs, 2))                # (no embedding: every cell at one point of a UMAP that is not shown)
+        else:
+            self.coords = np.asarray(a.obsm["X_umap"], dtype=float)[:, :2]
         self.n = len(self.coords)
-        self.has_counts = "counts" in a.layers or self.own is not None
+        if self.no_umap and adata_backed is not None:
+            self.atlas_counts = abc_project.AtlasCounts(adata_backed, core.atlas_positions(a.obs.index, adata_backed.obs.index))
+        self.has_counts = "counts" in a.layers or self.own is not None or self.atlas_counts is not None
+        self.has_umap_data = not self.no_umap                                   # (a project made without a UMAP has none to show)
         sec_col = core.SECTION_COL
         bsp = None
         if adata_backed is not None and sec_col in a.obs.columns:
@@ -1862,6 +1941,9 @@ class UmapWindow(ExportsMixin):
             cid = core.extract_leading_numeric_id(pd.Series(self.info["class"])).to_numpy()
             frac = float(np.isin(cid, list(core.NON_NEURON_CLASS_IDS)).mean())
             self.bg_under = "nonneuron" if frac < 0.5 else "neuron"           # (the minority kind is drawn underneath)
+        # Show UMAP: off to begin with for a large project, whose section maps then take the room. Not when there are no section maps to take it (a
+        # dataset of the user's own, a project without sections): then the UMAP is all there is.
+        self.umap_shown = self.has_umap_data and (self.n < LARGE_PROJECT_CELLS or self.own is not None or not self.sections)
         # ...unless the run says which cell type it was made for: the launch screen's choice is in the run folder's name
         name = Path(self.run_folder).name.lower() if self.run_folder is not None else ""
         for prefix, under in (("umap_neurons_", "nonneuron"), ("umap_nonneurons_", "neuron"), ("umap_all-cells_", None), ("umap_all_", None)):         # (umap_all_: the older name of an all-cells run)
@@ -1891,6 +1973,7 @@ class UmapWindow(ExportsMixin):
 
     def build(self):
         self.tiles = []                    # (made by build_tiles; empty until then, for the scroll callbacks that can come first)
+        self.fit_cache, self.fit_across = {}, None      # (see fit_tiles)
         self.cell_tip = CellTip(self.root)
         self.cell_tip.row_hover_fn = self.tip_row_hover
         self.pw = pw = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
@@ -1910,7 +1993,9 @@ class UmapWindow(ExportsMixin):
         marker_names = ("Small", "Medium", "Large")
         self.sliders = [
             self.add_slider(bars, 0, "Section size:", self.var_tile, len(TILE_COLUMNS), self.layout_tiles,
-                            lambda i: "full width" if TILE_COLUMNS[i] == 1 else f"1/{TILE_COLUMNS[i]} width", None),
+                            lambda i: "fit all" if TILE_COLUMNS[i] == 0 else "full width" if TILE_COLUMNS[i] == 1 else f"1/{TILE_COLUMNS[i]} width",
+                            lambda i: (f"Every section in the pane at once, as large as that allows: {self.fit_across} across." if self.fit_across else
+                                       "Every section in the pane at once, as large as that allows.") if TILE_COLUMNS[i] == 0 else f"{TILE_COLUMNS[i]} across the pane."),
             self.add_slider(bars, 1, "Cell size:", self.var_dot, len(CELL_SIZES_UM), self.apply_dot_size,
                             lambda i: f"{CELL_SIZES_UM[i]} \u00b5m", None,
                             label_tip="The size of every cell's dot in the section maps: all the neurons or glia shown, not only the highlighted ones."),
@@ -1934,6 +2019,12 @@ class UmapWindow(ExportsMixin):
         else:
             roi_only_box.state(["disabled"])
             HoverTip(roi_only_box, lambda: "This project has no ROIs.")
+        self.var_show_umap = tk.BooleanVar(bars, self.umap_shown)
+        show_umap_box = ttk.Checkbutton(bars, text="Show UMAP", variable=self.var_show_umap, command=self.toggle_umap)
+        show_umap_box.grid(row=0, column=5, sticky="w", padx=(6, 6))
+        HoverTip(show_umap_box, lambda: ("Show the UMAP beside the section maps. Off, the section maps use its room. A project of "
+                                         f"{LARGE_PROJECT_CELLS:,} cells or more starts with it off." if self.has_umap_data
+                                         else "This project was made without a UMAP."))
         self.var_ccf = tk.BooleanVar(bars, False)
         ccf_box = ttk.Checkbutton(bars, text="CCF atlas overlay", variable=self.var_ccf, command=self.apply_ccf)
         ccf_box.grid(row=1, column=5, sticky="w", padx=(6, 6))
@@ -1967,11 +2058,17 @@ class UmapWindow(ExportsMixin):
         self.var_hover = tk.BooleanVar(bars, False if self.start_panel_zoom else bool(self.viewer_settings.get("hover_enabled", True)))
         hover_box = ttk.Checkbutton(bars, text="Hover highlight", variable=self.var_hover, command=self.apply_hover_enabled)
         hover_box.grid(row=0, column=4, sticky="w", padx=(6, 6))
-        HoverTip(hover_box, lambda: "When the pointer rests on a cell, dim the plots and mark every cell of its group with a red +. Off: no "
-                                    "marking, but the cell is still ringed and described in its tip (the same setting as in Settings).")
+        self.hover_box = hover_box
+        HoverTip(hover_box, lambda: ("When the pointer rests on a cell, dim the plots and mark every cell of its group with a red +. Off: no "
+                                     "marking, but the cell is still ringed and described in its tip (the same setting as in Settings)."
+                                     if self.umap_shown else "Hover highlight marks the cell's group in the UMAP as well as in the section maps: "
+                                                             "it is available while the UMAP is shown."))
+        if not self.umap_shown:
+            hover_box.state(["disabled"])
         self.update_marker_slider()
         bars.columnconfigure(6, weight=1)          # (the spare width goes to an empty column on the right: the controls stay where they are)
         self.tile_scroll = tk.Canvas(left, highlightthickness=0, bg="#f4f4f4")
+        self.watch_scroll(self.tile_scroll)
         sb = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.tile_scroll.yview)
         self.hsb = ttk.Scrollbar(left, orient=tk.HORIZONTAL, command=self.tile_scroll.xview)        # (shown only while the panel is zoomed in)
         self.tile_scroll.configure(yscrollcommand=lambda a, b: (sb.set(a, b), self.note_view("y", a), self.root.after_idle(self.refresh_visible)),
@@ -2017,8 +2114,10 @@ class UmapWindow(ExportsMixin):
         self.umap.on_motion = self.umap_motion
         self.umap.drag_hook = self.drag_state
         self.umap.on_view = None
-        self.umap_tree = cKDTree(c)
-        pw.add(mid, weight=3)
+        self.umap_tree = None if self.no_umap else cKDTree(c)
+        self.mid = mid
+        if self.umap_shown:
+            pw.add(mid, weight=3)
         side = ttk.Frame(pw, padding=10, width=420)
         side.pack_propagate(False)
         self.build_side(side)
@@ -2030,6 +2129,36 @@ class UmapWindow(ExportsMixin):
         self.build_tiles()
         self.root.after(400, self.fit_left_pane)                         # (and looked at again once the window has settled: a no-op if all is as it should be)
 
+    def toggle_umap(self):
+        """The Show UMAP box."""
+        want = bool(self.var_show_umap.get())
+        if want and not self.has_umap_data:
+            self.var_show_umap.set(False)
+            messagebox.showinfo("Show UMAP", "A UMAP is not available for this project: it was made without one.", parent=self.root)
+            return
+        self.set_umap_shown(want)
+
+    def set_umap_shown(self, on):
+        """Show or hide the UMAP pane. Hidden, the section maps take its room (they are laid out again for the wider pane), and Hover highlight, which
+        marks cells in the UMAP too, is greyed out."""
+        if on == self.umap_shown:
+            return
+        self.umap_shown = on
+        if on:
+            self.pw.insert(1, self.mid, weight=3)
+        else:
+            self.pw.forget(self.mid)
+        self.hover_box.state(["!disabled"] if on else ["disabled"])
+        if not on:
+            self.drop_highlights()
+        self.update_marker_slider()
+        self.root.update_idletasks()
+        self.fit_left_pane(False)
+
+    def hover_on(self):
+        """Hover highlight is on: its box is ticked and the UMAP is shown (it marks the group there too)."""
+        return bool(self.var_hover.get()) and self.umap_shown
+
     def fit_left_pane(self, again=True):
         """The section pane gets about a third of the window (the panels fill whatever width it has). Done before the panels are made, so that they are made
         once; looked at again after the window has settled, which moves nothing when all is as it should be (a move is a second drawing of everything)."""
@@ -2038,6 +2167,12 @@ class UmapWindow(ExportsMixin):
         total = self.pw.winfo_width()
         side_w = int(self.side_pane.cget("width")) or 420
         edge = total - side_w                                           # (the side panel keeps its own width, at the right)
+        if not self.umap_shown:                                         # (no UMAP shown: the section maps fill what the side panel leaves)
+            if abs(self.pw.sashpos(0) - int(edge)) > 2:
+                self.pw.sashpos(0, int(edge))
+            if again:
+                self.root.after(600, lambda: self.fit_left_pane(False))
+            return
         want = min(max(total * 0.33, 520), total * 0.5, edge - 300)     # (and the UMAP keeps at least 300)
         if abs(self.pw.sashpos(0) - int(want)) > 2:
             self.pw.sashpos(0, int(want))
@@ -2077,7 +2212,8 @@ class UmapWindow(ExportsMixin):
         self.box.pack(fill=tk.X, pady=(8, 0))
         # a group number box (Specific group(s))
         self.id_frame = ttk.LabelFrame(self.box, text="Group number(s)", padding=6)
-        ttk.Label(self.id_frame, text="One or more, separated by commas (Enter):", foreground="gray30", wraplength=300).pack(anchor="w")
+        self.id_hint = ttk.Label(self.id_frame, text="One or more, separated by commas (Enter):", foreground="gray30", wraplength=300)
+        self.id_hint.pack(anchor="w")
         self.var_ids = tk.StringVar(f, "")
         self.ids_by_level = {}                              # level -> the group numbers last typed for it (see on_level)
         e = ttk.Entry(self.id_frame, textvariable=self.var_ids)
@@ -2129,12 +2265,12 @@ class UmapWindow(ExportsMixin):
         # the legend for Single group(s)
         self.legend = tk.Canvas(f, width=300, height=10, highlightthickness=0)
         self.select_bar = ttk.Frame(f)                      # All / None, above the group list and the Single group(s) legend
-        all_button = ttk.Button(self.select_bar, text="All", width=6, style="Side.TButton", command=self.select_all_groups)
+        all_button = ttk.Button(self.select_bar, text="Show all", width=10, style="Side.TButton", command=self.select_all_groups)
         all_button.pack(side=tk.LEFT)
-        none_button = ttk.Button(self.select_bar, text="None", width=6, style="Side.TButton", command=self.select_no_groups)
+        none_button = ttk.Button(self.select_bar, text="Show none", width=10, style="Side.TButton", command=self.select_no_groups)
         none_button.pack(side=tk.LEFT, padx=(6, 0))
-        HoverTip(all_button, lambda: "Select all groups")
-        HoverTip(none_button, lambda: "Deselect all groups")
+        HoverTip(all_button, lambda: "Show all groups")
+        HoverTip(none_button, lambda: "Show no groups (every group gray)")
         self.group_list = ttk.Frame(f)                      # the groups' numbers and colors (All groups), scrollable
         self.group_header = tk.Canvas(self.group_list, height=20, highlightthickness=0, cursor="hand2")      # the column headings: click to sort
         self.group_header.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
@@ -2166,10 +2302,15 @@ class UmapWindow(ExportsMixin):
     def build_level_radios(self):
         for w in self.level_frame.winfo_children():
             w.destroy()
-        for k, name in enumerate(self.levels):
+        shown = [k for k in self.level_names if k in self.levels or (self.no_umap and k == LEIDEN_KEY)]
+        for k, name in enumerate(shown):
             rb = ttk.Radiobutton(self.level_frame, text=self.level_names[name], value=name, variable=self.var_level, command=self.on_level)
             rb.grid(row=k, column=0, sticky="w")                       # (one column, coarse to fine, top to bottom)
-            HoverTip(rb, self.level_tip)
+            if name not in self.levels:
+                rb.state(["disabled"])                                 # (Leiden clusters come from the UMAP's computation: a project without a UMAP has none)
+                HoverTip(rb, lambda: "Leiden clusters are found along with the UMAP; this project was made without one.")
+            else:
+                HoverTip(rb, self.level_tip)
 
     def level_tip(self):
         if self.mode in ("gene", "imputed"):
@@ -2198,6 +2339,9 @@ class UmapWindow(ExportsMixin):
                     self.group_buttons.append(b)
                 if self.own is not None and text == "Save section maps":
                     b.state(["disabled"])                                 # (no section maps)
+                if self.no_umap and text == "Save UMAP":
+                    b.state(["disabled"])
+                    HoverTip(b, lambda: "This project was made without a UMAP.")
                 if text == "Create subproject":
                     HoverTip(b, lambda: "Analyze only the groups switched on in the legend: a project of its own, in a subfolder of this one, with its own "
                                         "PCA and UMAP, opened in a second window.")
@@ -2215,6 +2359,12 @@ class UmapWindow(ExportsMixin):
 
     def update_frames(self):
         self.level_frame.config(text="Group by" if self.mode in ("all", "single") else "Group by (hover)")
+        if self.level_has_ids.get(self.level, True):                 # (what the box takes: the groups' numbers, or their names where they have no numbers)
+            self.id_frame.config(text="Group number(s)")
+            self.id_hint.config(text="One or more, separated by commas (Enter):")
+        else:
+            self.id_frame.config(text="Group name(s)")
+            self.id_hint.config(text="One or more names (a start will do: GABA, Glut), separated by commas (Enter):")
         for w in (self.id_frame, self.gene_frame, self.select_bar, self.legend, self.group_list):
             w.pack_forget()
         if self.mode == "single":
@@ -2440,7 +2590,7 @@ class UmapWindow(ExportsMixin):
 
     def update_marker_slider(self):
         """The Marker size slider is for the hover marks: greyed out while Hover highlight is off."""
-        self.set_slider_enabled(self.sliders[2], self.var_hover.get())
+        self.set_slider_enabled(self.sliders[2], self.hover_on())
 
     def apply_label_size(self):
         """The UMAP's Label size slider: the group numbers drawn on the UMAP, bigger or smaller."""
@@ -2471,7 +2621,7 @@ class UmapWindow(ExportsMixin):
         return MULTI_BG if getattr(self, "tiles_dark", False) else (255, 255, 255)
 
     def reset_sliders(self):
-        for scale, default in zip(self.sliders, (DEFAULT_TILE_INDEX, DEFAULT_DOT_INDEX, DEFAULT_MARKER_INDEX)):
+        for scale, default in zip(self.sliders, (self.panel_zoom_tile_index() if self.var_panel_zoom.get() else DEFAULT_TILE_INDEX, DEFAULT_DOT_INDEX, DEFAULT_MARKER_INDEX)):
             scale.set(default)
 
     def layout_tiles_when_settled(self):
@@ -2496,9 +2646,8 @@ class UmapWindow(ExportsMixin):
         canvas (PointCanvas.set_virtual), of which the widget is only the part in view (place_tiles)."""
         if not getattr(self, "tiles", None):
             return
-        cols = TILE_COLUMNS[self.var_tile.get()]
-        w = max(self.tile_scroll.winfo_width(), 100)
-        px = int(max((w - 4) // cols - 8 - 2, MIN_TILE_PX) * self.panel_zoom)          # (8: the gaps either side of a panel; 2: its canvas border)
+        cols, base = self.tile_params()
+        px = int(base * self.panel_zoom)
         same = cols == self.tile_cols and px == self.tile_px
         self.trail(f"layout_tiles cols={cols} px={px} zoom={self.panel_zoom:.3g} " + ("(unchanged: nothing done)" if same else "(laid out again)"))
         if same:
@@ -2508,8 +2657,8 @@ class UmapWindow(ExportsMixin):
         ph = int(px / self.tile_aspect)
         for t in self.tiles:
             pc = t["pc"]
-            pc.outline_px = OUTLINE_PX_LARGEST if cols == min(TILE_COLUMNS) else 1            # (the CCF outlines: wider at the largest size)
-            pc.rect_px = ROI_LINE_PX[cols]
+            pc.outline_px = OUTLINE_PX_LARGEST if cols == 1 else 1            # (the CCF outlines: wider at the largest size)
+            pc.rect_px = ROI_LINE_PX.get(cols, 2)
             if pc.rects and pc.rect_line != pc.rect_px:
                 pc.reposition()                                                         # (the ROI outlines take the new line width)
             if big:
@@ -2605,11 +2754,47 @@ class UmapWindow(ExportsMixin):
         return self.MAX_PANEL_ZOOM
 
     def panel_zoom_tile_index(self):
-        """The Section size stop the whole-panel zoom starts at: 1 over the square root of the number of sections across (rounded down, and kept within
-        the slider's stops), so that a few sections are not left small in a big pane."""
-        across = int(math.isqrt(max(len(self.sections), 1)))
-        across = min(max(across, min(TILE_COLUMNS)), max(TILE_COLUMNS))
-        return TILE_COLUMNS.index(across)
+        """The Section size stop the whole-panel zoom starts at: the one that fits every section into the pane (whatever shape the pane is), as large as
+        that allows, so that a few sections are not left small in a big pane and many are not left below its edge."""
+        return FIT_STOP
+
+    def tile_params(self):
+        """(panels across, the width of a panel's map at panel zoom 1) for the Section size stop and the pane as it is now."""
+        stop = TILE_COLUMNS[self.var_tile.get()]
+        w = max(self.tile_scroll.winfo_width(), 100)
+        if stop == 0:
+            return self.fit_tiles(w)
+        return stop, max((w - 4) // stop - 8 - 2, MIN_TILE_PX)               # (8: the gaps either side of a panel; 2: its canvas border)
+
+    def fit_tiles(self, w):
+        """(across, map width) for the largest panels that show every section in the pane (width `w`, its height now) at once: for each number of panels
+        across, the panels are as wide as the width allows or, if the rows then run below the bottom, as the height allows (and then do not fill the
+        width), and the number across that gives the biggest panels is taken. The same for a pane wide or tall, and for few sections or many. If even the
+        smallest panels (MIN_TILE_PX) do not fit, they are that small, as many across as the width holds, and the pane scrolls."""
+        # (the height as it is without the scroll bar under the pane, which comes while the panel is zoomed: or the size would change with the zoom)
+        h = self.tile_scroll.winfo_height() + (self.hsb.winfo_reqheight() if self.hsb.winfo_manager() else 0)
+        n = max(len(self.tiles), 1)
+        ch = max((t["caption"].winfo_reqheight() for t in self.tiles), default=20)
+        key = (w, h, n, ch, self.tile_aspect)
+        hit = self.fit_cache.get(key)
+        if hit is None:
+            best = None
+            for across in range(1, n + 1):
+                px = (w - 4) // across - 8 - 2
+                if px < MIN_TILE_PX:
+                    break
+                rows = -(-n // across)
+                px = min(px, int(((h - 3) / rows - ch - 8) * self.tile_aspect) + 2)        # (a row is the caption, the map with its border, and a gap of 6; the loop below makes it exact)
+                while px >= MIN_TILE_PX and 3 + rows * (ch + int(px / self.tile_aspect) + 2 + 6) > h:
+                    px -= 1
+                if px >= MIN_TILE_PX and (best is None or px > best[1]):
+                    best = (across, px)
+            if best is None:
+                best = (max(1, (w - 4) // (MIN_TILE_PX + 10)), MIN_TILE_PX)
+            self.fit_cache.clear()
+            hit = self.fit_cache[key] = best
+        self.fit_across = hit[0]
+        return hit
 
     def apply_panel_zoom_mode(self):
         """The Zoom whole panel checkbox. On: every section map is put back to its whole view and the wheel then zooms the panel. Off: the panel is
@@ -2743,7 +2928,28 @@ class UmapWindow(ExportsMixin):
         now = float(first)
         if now == 0.0 and last[axis] > 0.0:
             self.trail(f"view {axis} went to 0 (was {last[axis]:.3f})")
+            if last[axis] > 0.05:                                # (not a step of a drag or a click on the scroll bar: all at once)
+                self.zoom_note(f"the view jumped to the start ({axis}, was {last[axis]:.3f})", panning=bool(getattr(self, "panning", False)),
+                               zoom=self.panel_zoom, scrollregion=self.tile_scroll.cget("scrollregion"),
+                               pane=(self.tile_scroll.winfo_width(), self.tile_scroll.winfo_height()))
         last[axis] = now
+
+    def watch_scroll(self, canvas):
+        """(Diagnostic, for the view that jumps to the top left by itself: see zoom_debug.log.) Every call that scrolls the section pane goes into the trail with
+        the function that made it, so that a jump to the start says what did it."""
+        def wrap(name, scrolls):
+            original = getattr(canvas, name)
+
+            def traced(*args, **kw):
+                if scrolls(args):
+                    caller = sys._getframe(1)
+                    self.trail(f"{name}{tuple(args)[:3]} by {caller.f_code.co_name}:{caller.f_lineno}")
+                return original(*args, **kw)
+            setattr(canvas, name, traced)
+        for name in ("xview_moveto", "yview_moveto", "xview_scroll", "yview_scroll"):
+            wrap(name, lambda args: True)
+        for name in ("xview", "yview"):                         # (also what the scroll bars call; with no arguments they only ask)
+            wrap(name, lambda args: bool(args))
 
     def zoom_note(self, what, **state):
         """A line in zoom_debug.log (next to the cache) for a zoom that did not go as it should: for finding what makes the view jump."""
@@ -2947,9 +3153,7 @@ class UmapWindow(ExportsMixin):
     def layout_at(self, z):
         """The layout the panels have (or would have) at panel zoom z, as layout_tiles makes it: the number across and down, the slot of one panel (width, height),
         the caption's height, and the size of its map."""
-        cols = TILE_COLUMNS[self.var_tile.get()]
-        w = max(self.tile_scroll.winfo_width(), 100)
-        base = max((w - 4) // cols - 8 - 2, MIN_TILE_PX)
+        cols, base = self.tile_params()
         ch = max(t["caption"].winfo_reqheight() for t in self.tiles)
         px = int(base * z)
         ph = int(px / self.tile_aspect)
@@ -3140,6 +3344,7 @@ class UmapWindow(ExportsMixin):
                 b["label"].destroy()
 
     def panel_zoom_reset(self):
+        self.trail("panel_zoom_reset: a double-click on a map put the panel back")
         self.cancel_zoom_burst()
         self.set_panel_zoom(1.0)
 
@@ -3274,6 +3479,7 @@ class UmapWindow(ExportsMixin):
         if self.level != old:                                          # (each level keeps its own group numbers: those last typed for it, else none)
             self.ids_by_level[old] = self.var_ids.get()
             self.var_ids.set(self.ids_by_level.get(self.level, ""))
+            self.update_frames()
         if self.mode in ("all", "single"):
             self.recolor()
 
@@ -3600,6 +3806,35 @@ class UmapWindow(ExportsMixin):
         self.draw_group_list(*self.group_list_args)
         self.group_canvas.yview_moveto(0)
 
+    def group_keys(self, level, values):
+        """What each of `values` (a level's group labels) is called when typed in Specific group(s): its number, or, at a level whose groups have names and no
+        numbers (neurotransmitter), the name itself."""
+        if self.level_has_ids.get(level, True):
+            return core.extract_leading_numeric_id(pd.Series(values)).to_numpy()
+        return np.asarray([str(v) for v in values], dtype=object)
+
+    def typed_groups(self, level, uniques):
+        """(the groups typed in the box, the entries that name none): numbers at a level that has them, else names (see parse_names)."""
+        return self.parse_ids() if self.level_has_ids.get(level, True) else self.parse_names(uniques)
+
+    def parse_names(self, uniques):
+        """The group names typed in the box, separated by commas, as the level's own names: whatever the case, and the start of a name will do if it is of
+        one group alone ('Glut' is Glut, though Glut-GABA also starts with it: the whole name wins). (names, the entries that name no group or several)"""
+        names = [str(u) for u in uniques]
+        folded = [n.casefold() for n in names]
+        found, bad = [], []
+        for tok in (t.strip() for t in self.var_ids.get().split(",")):
+            if not tok:
+                continue
+            key = tok.casefold()
+            hits = [i for i, f in enumerate(folded) if f == key] or [i for i, f in enumerate(folded) if f.startswith(key)]
+            if len(hits) == 1:
+                if names[hits[0]] not in found:
+                    found.append(names[hits[0]])
+            else:
+                bad.append(tok)
+        return found, bad
+
     def parse_ids(self):
         ids, bad = [], []
         for tok in re.split(r"[,\s]+", self.var_ids.get().strip()):
@@ -3619,12 +3854,9 @@ class UmapWindow(ExportsMixin):
         if self.info.get(level) is None:
             self.var_status.set(f"No '{level}' column on this dataset.")
             return
-        if not self.level_has_ids.get(level, True):
-            self.var_status.set(f"{plural_name(self.level_names[level]).capitalize()} have names, not numbers: use All groups to see them (click a group in the list to gray it).")
-            return
-        ids, bad = self.parse_ids()
         codes, uniques = self.category_codes(level)
-        uid = core.extract_leading_numeric_id(pd.Series(uniques)).to_numpy()
+        ids, bad = self.typed_groups(level, uniques)
+        uid = self.group_keys(level, uniques)
         colors = {t: (GREY if t in self.off_groups else np.array([255, 0, 0], np.uint8) if len(ids) == 1 else rank_color(i)) for i, t in enumerate(ids)}
         lut = np.tile(GREY, (len(uniques), 1))
         for t, col in colors.items():
@@ -3667,7 +3899,7 @@ class UmapWindow(ExportsMixin):
             if any(not counts[t] for t in ids):
                 parts.append("not found: " + ", ".join(str(t) for t in ids if not counts[t]))
         else:
-            parts.append(f"Enter one or more {self.level_names[level].lower()} numbers.")
+            parts.append(f"Enter one or more {self.level_names[level].lower()} {'numbers' if self.level_has_ids.get(level, True) else 'names'}")        # (the joined status ends with its own period)
         if bad:
             parts.append("ignored: " + ", ".join(bad))
         self.var_status.set("; ".join(parts) + ".")
@@ -3682,8 +3914,10 @@ class UmapWindow(ExportsMixin):
         self.sync_select_bar()
         self.legend.delete("all")
         self.legend.config(height=22 * len(ids) + 8)
-        rows = [("#%02x%02x%02x" % tuple(int(v) for v in colors[t]), str(t), f"({counts[t]})",
-                 re.sub(r"^\s*\d+\s*", "", (names or {}).get(t, "")), t in self.off_groups, int(self.shape_codes(np.array([i]))[0]))
+        numbered = self.level_has_ids.get(self.level, True)
+        rows = [("#%02x%02x%02x" % tuple(int(v) for v in colors[t]), str(t) if numbered else "", f"({counts[t]})",
+                 re.sub(r"^\s*\d+\s*", "", (names or {}).get(t, "")) if numbered else str(t), t in self.off_groups,
+                 int(self.shape_codes(np.array([i]))[0]))
                 for i, t in enumerate(ids)]
         self.draw_legend_rows(self.legend, rows, 4)
 
@@ -3890,6 +4124,10 @@ class UmapWindow(ExportsMixin):
             vals[found] = full[pos[found]]
             if scale == "linear":
                 vals = np.exp2(vals) - 1.0
+        elif self.atlas_counts is not None:                      # (no UMAP: the gene's column of the atlas's own file, for the project's cells)
+            vals = self.atlas_counts.column(col).astype(float)
+            if scale == "log":
+                vals = core.log2p1(vals)
         else:
             expr = adata.layers["counts"][:, col]
             expr = expr.toarray() if hasattr(expr, "toarray") else expr
@@ -3897,6 +4135,24 @@ class UmapWindow(ExportsMixin):
             if scale == "log":
                 vals = core.log2p1(vals)
         return vals
+
+    def counts_of_rows(self, rows):
+        """The raw counts of the run's cells `rows` (indices into the run) as a cells x genes matrix (scipy sparse or a numpy array): from the run's own
+        counts layer, or, for a project without a UMAP, read from the atlas."""
+        if self.atlas_counts is not None:
+            return self.atlas_counts.rows(rows)
+        return self.adata.layers["counts"][rows]
+
+    def counts_adata(self):
+        """A copy of the run's AnnData with the raw counts as its X, for the exports (a project without a UMAP: the counts of all its cells read from the
+        atlas, so a big project needs the memory for them)."""
+        if self.atlas_counts is None:
+            m = self.adata.copy()
+            m.X = m.layers["counts"].copy()
+            return m
+        import anndata
+        m = anndata.AnnData(X=self.atlas_counts.rows(np.arange(self.adata.n_obs)), obs=self.adata.obs.copy(), var=self.adata.var.copy())
+        return m
 
     def open_analyze(self):
         """The Analyze button: a window to plot genes against each other, per cell or per group."""
@@ -4593,7 +4849,9 @@ class UmapWindow(ExportsMixin):
                 else:
                     ids = (self.last_ids or {}).get("targets", [])
                     m = re.match(r"^\s*(\d+)", str(label))
-                    if len(ids) > 1 and m and int(m.group(1)) in ids:
+                    if len(ids) > 1 and not self.level_has_ids.get(self.level, True) and str(label) in ids:
+                        canvas, k = self.legend, ids.index(str(label))
+                    elif len(ids) > 1 and m and int(m.group(1)) in ids:
                         canvas, k = self.legend, ids.index(int(m.group(1)))
         self.bold_legend_row(canvas, k)
 
@@ -4643,7 +4901,7 @@ class UmapWindow(ExportsMixin):
             return
         self.show_info(info)
         self.cell_tip.pointer_on(info["key"], lambda: self.cell_rows(info), self.ccf_action, lambda: self.swatch_with_token(info))
-        if not self.var_hover.get():
+        if not self.hover_on():
             self.hover_key = None                    # (so that ticking the box again marks the next cell pointed at)
             return
         if info["key"] == self.hover_key:
@@ -4699,7 +4957,40 @@ class UmapWindow(ExportsMixin):
     def swatch_with_token(self, info):
         """cell_swatch, with the cell itself added: the tip lights the cell on the plots while the pointer is on its picture."""
         got = self.cell_swatch(info)
-        return None if got is None else tuple(got) + (("cell", info),)
+        return None if got is None else tuple(got) + (("cell", info), lambda: self.bring_cell_into_view(info), self.umap_shown)
+
+    def bring_cell_into_view(self, info):
+        """The tip's Bring into view: the cell is made visible in the UMAP and in its section's map, in whichever it is out of view (centered where it
+        can be); where it is in view nothing changes. Not while the UMAP is hidden (the button is greyed out then; a tip kept up may still have it)."""
+        if not self.umap_shown:
+            return
+        i = info["umap_idx"]
+        if i is not None:
+            self.umap.bring_into_view(*self.coords[i])
+        finite = info["x"] is not None and np.isfinite(info["x"]) and np.isfinite(info["y"])
+        tile = next((t for t in self.tiles if t["label"] == info["sec"]), None)
+        if tile is None or not finite:
+            return
+        pc, fr = tile["pc"], tile["frame"]
+        if pc.vsize is None and pc.panel_hook is None:                 # (a map zoomed on its own: the cell is brought into the map's view first)
+            pc.bring_into_view(info["x"], info["y"])
+        px, py = pc.position_in_widget(info["x"], info["y"])
+        if pc.vsize is not None and getattr(fr, "slot_wh", None) is not None:        # (the whole panel zoomed: where the map is in the pane, from the layout)
+            ax = fr.tile_x + px + pc.off[0]
+            ay = fr.tile_y + (fr.slot_wh[1] - pc.vsize[1]) + py + pc.off[1]
+        else:                                                           # (the panels at their size: the map is under its caption in its frame)
+            ax = getattr(fr, "tile_x", fr.winfo_x()) + px
+            ay = getattr(fr, "tile_y", fr.winfo_y()) + (tile["caption"].winfo_reqheight() if tile["caption"].winfo_manager() else 0) + py
+        c = self.tile_scroll
+        region = [float(v) for v in c.cget("scrollregion").split()]
+        vw, vh = c.winfo_width(), c.winfo_height()
+        left, top, margin = c.canvasx(0), c.canvasy(0), 6
+        if margin <= ax - left <= vw - margin and margin <= ay - top <= vh - margin:
+            return                                                     # (in view in the pane: nothing to do)
+        if region[2] > vw:
+            c.xview_moveto(min(max(ax - vw / 2, 0.0), region[2] - vw) / region[2])
+        if region[3] > vh:
+            c.yview_moveto(min(max(ay - vh / 2, 0.0), region[3] - vh) / region[3])
 
     def show_cell_dot(self, info):
         """The exact cell the tip is about, with the white dot of the other plot's copy of a hovered cell (bigger than a red +), in the UMAP and
@@ -4872,7 +5163,7 @@ class UmapWindow(ExportsMixin):
             if "save_viewer_settings" in self.host:
                 self.host["save_viewer_settings"](self.viewer_settings)
         self.update_marker_slider()
-        if not self.var_hover.get():
+        if not self.hover_on():
             self.drop_highlights()
 
     def drop_highlights(self):
@@ -4897,7 +5188,7 @@ class UmapWindow(ExportsMixin):
         if hover_changed or not self.start_panel_zoom:          # (Browse All Neurons: the box keeps its own state unless the setting itself changed)
             self.var_hover.set(bool(self.viewer_settings.get("hover_enabled", True)))
         self.update_marker_slider()
-        if not self.var_hover.get():
+        if not self.hover_on():
             self.drop_highlights()
         if size_changed:                                            # (the UMAP's Cell size slider shows it: set without its own redraw, done below)
             self.umap_sliders[0].set(self.umap_size_index(self.viewer_settings.get("umap_circle_size", "Default")))

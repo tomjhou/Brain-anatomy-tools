@@ -2394,9 +2394,8 @@ def nice_length(um):
 HIST_BINS = 4096              # (a channel's counts are kept in this many bins over 0..its largest value: fine enough for a dim 16-bit image)
 HIST_SAMPLE = 1_000_000      # (pixels: an overview larger than this is sampled evenly for its histogram)
 HIST_HEIGHT = 120
-HIST_TIP = ("Histogram of the plane shown (all of it, not just the part in view), for each channel switched on, in its color and on a "
-            "log scale. The vertical bars are its black and white levels (drag one to move it; Shift: slower); it is darker outside "
-            "them. Pixels of value 0 (e.g. outside a stitched scan) are left out.")
+HIST_TIP = ("Histogram axes are log scaled. Drag or shift-drag vertical lines for coarse/fine adjustment of black/white levels; "
+            "Button at top right of histogram panel docks or undocks it from main window")
 
 
 class HistogramView(tk.Canvas):
@@ -2408,22 +2407,27 @@ class HistogramView(tk.Canvas):
     A bar can be dragged (Shift: 10x slower): command(index, black, white, first) is called on every change (first: the drag's first),
     and the axis keeps its end until the mouse is let go (else it would move under a white level being dragged up). Where bars lie on
     one another, the one grabbed is the channel with the most pixels there. The button in the top right corner (its symbol: corner)
-    calls popout(), as does a double click away from the bars."""
+    calls popout(), as does a double click away from the bars.
+    The pointer over the histogram shows what is under it: the brightness (the values the pixel column stands for) and, for each channel, how
+    many pixels have those values (see _show_readout). Dict keys for it: name, and scale (how many pixels each counted one stands for, when
+    the plane was sampled). A channel may also give draw_bins: bins to draw in place of its bins, which the readout and the axis' end still use."""
 
     FILL = 0.6          # (how opaque a histogram is)
     OUTSIDE = 0.3       # (its brightness outside the black/white levels)
     REACH = 5           # (px: how near a bar the mouse must be to grab it)
 
-    def __init__(self, parent, command=None, popout=None, corner="\u21f1"):
+    def __init__(self, parent, command=None, popout=None, corner="\u21f1", help=None):
         super().__init__(parent, highlightthickness=0, background=PAL["bg"], width=170, height=HIST_HEIGHT)
+        self.help = help             # (how the histogram is used: at the foot of the readout)
         self.channels, self.picture = [], None
         self.command, self.popout, self.corner = command, popout, corner
         self.heights = {}           # (channel index: its drawn height at each x, to choose between bars on one another)
         self.top = None             # (the axis' end while a bar is dragged)
         self.drag = self.hover = None
+        self.readout = self.readout_text = None      # (the note that follows the pointer, and what it says now)
         self.bind("<Configure>", lambda e: self._draw())
         self.bind("<Motion>", self._move)
-        self.bind("<Leave>", lambda e: self.drag is None and self._set_hover(None))
+        self.bind("<Leave>", self._leave)
         self.bind("<ButtonPress-1>", self._press)
         self.bind("<B1-Motion>", self._motion)
         self.bind("<ButtonRelease-1>", self._release)
@@ -2479,11 +2483,87 @@ class HistogramView(tk.Canvas):
     def _move(self, event):
         if self.drag is None and not self._on_corner():
             self._set_hover(self._bar_at(event.x) if self.command else None)
+            self._show_readout(event)
+        else:
+            self._hide_readout()
+
+    def _leave(self, event):
+        self._hide_readout()
+        if self.drag is None:
+            self._set_hover(None)
+
+    def _readout_rows(self, x):
+        """(the brightness the pixel column x stands for, [(color, text)] for each channel): its pixels, counted as the column is drawn."""
+        W = max(self.winfo_width(), 1)
+        top = self._axis()
+        v0 = int(x / W * top)
+        v1 = max(int((x + 1) / W * top) - 1, v0)
+        head = f"brightness {v0:,}" if v1 <= v0 else f"brightness {v0:,} \u2013 {v1:,}"
+        rows = []
+        for c in self.channels:
+            name = c.get("name") or f"channel {c['index'] + 1}"
+            color = "#%02x%02x%02x" % tuple(int(k * 255) for k in c["color"])
+            if c["bins"] is None:
+                rows.append((color, f"{name}: not read yet"))
+                continue
+            cum = np.concatenate(([0.0], np.cumsum(c["bins"])))
+            at = np.arange(len(cum))
+            lo, hi = v0 / c["width"], (v1 + 1) / c["width"]
+            n = np.interp(hi, at, cum) - np.interp(lo, at, cum)
+            if c.get("draw_bins") is not None:
+                # (From a pyramid's few levels: a column between two levels holds none of the image's pixels, or a fraction of those of the level it
+                # lies in, which would read "0 pixels" where the curve is clearly above 0. So where a column is narrower than a level it gives
+                # the curve's own height there, the pixels of the level it is in; where it is wider, the pixels of the levels it takes in.)
+                shape = np.concatenate(([0.0], np.cumsum(c["draw_bins"])))
+                height = (np.interp(hi, at, shape) - np.interp(lo, at, shape)) / max(v1 + 1 - v0, 1)
+                n = max(n, height)
+            n = n * c.get("scale", 1)
+            approx = "\u2248 " if c.get("scale", 1) > 1 else ""
+            plural = "s" if round(n) != 1 else ""
+            rows.append((color, f"{name}: {approx}{n:,.0f} pixel{plural}"))
+        return head, rows
+
+    def _show_readout(self, event):
+        """A thin line at the pointer, and a note beside it with the brightness there and each channel's pixel count (the plane's pixels: a
+        large one is sampled, which the \u2248 says; pixels of value 0 are not counted, as the histogram leaves them out)."""
+        if not self.channels or self.winfo_width() < 8:
+            return self._hide_readout()
+        self.delete("guide")
+        self.create_line(event.x, 0, event.x, self.winfo_height() - 14, fill=PAL["muted"], width=1, tags=("guide",))
+        head, rows = self._readout_rows(event.x)
+        if self.readout is None:
+            self.readout = tk.Toplevel(self)
+            self.readout.wm_overrideredirect(True)
+            self.readout_text = None
+        if self.readout_text != (head, rows):
+            self.readout_text = (head, rows)
+            for w in self.readout.winfo_children():
+                w.destroy()
+            box = tk.Frame(self.readout, background="#ffffe0", relief=tk.SOLID, borderwidth=1)
+            box.pack()
+            tk.Label(box, text=head, background="#ffffe0", foreground="black", font=("Segoe UI", 9, "bold")).grid(row=0, column=0, columnspan=2,
+                                                                                                                 sticky="w", padx=4, pady=(2, 0))
+            for r, (color, text) in enumerate(rows, start=1):
+                tk.Label(box, background=color, width=1).grid(row=r, column=0, padx=(4, 3), pady=1, sticky="ns")
+                tk.Label(box, text=text, background="#ffffe0", foreground="black", font=("Segoe UI", 9), anchor="w").grid(
+                    row=r, column=1, sticky="w", padx=(0, 4))
+            if self.help:                                   # (after the readings: what the histogram is, and how to use it)
+                tk.Frame(box, background="#c8c8a0", height=1).grid(row=len(rows) + 1, column=0, columnspan=2, sticky="ew", padx=4, pady=(3, 2))
+                tk.Label(box, text=self.help, background="#ffffe0", foreground="gray30", font=("Segoe UI", 8), justify=tk.LEFT,
+                         wraplength=250).grid(row=len(rows) + 2, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 3))
+        place_on_monitor(self.readout, event.x_root + 14, event.y_root + 18, avoid_y=self.winfo_rooty())
+
+    def _hide_readout(self):
+        self.delete("guide")
+        if self.readout is not None:
+            self.readout.destroy()
+            self.readout = self.readout_text = None
 
     def _on_corner(self):
         return "corner" in self.gettags("current")
 
     def _press(self, event):
+        self._hide_readout()
         if self._on_corner():
             if self.popout:
                 self.popout()
@@ -2539,7 +2619,7 @@ class HistogramView(tk.Canvas):
                 rgb = np.array(c["color"]) * 255
                 x_lo, x_hi = self._x(c["black"], top), self._x(c["white"], top)
                 if c["bins"] is not None:
-                    cum = np.concatenate(([0.0], np.cumsum(c["bins"])))
+                    cum = np.concatenate(([0.0], np.cumsum(c["bins"] if c.get("draw_bins") is None else c["draw_bins"])))
                     counts = np.diff(np.interp(edges / c["width"], np.arange(len(cum)), cum))
                     logs = np.log1p(np.maximum(counts, 0))
                     if logs.max() > 0:
@@ -3401,9 +3481,12 @@ class XlefViewer:
         menu.add_cascade(label="View", menu=vm)
         # (a menu of its own, to be found easily; a command straight on the menu bar would not show on macOS, whose menu bar has only menus)
         um = tk.Menu(menu, tearoff=0)
-        um.add_command(label="Update from GitHub...", command=self.update_app)
-        menu.add_cascade(label="Update", menu=um)
+        um.add_command(label="Check GitHub now...", command=self.update_app)
+        menu.add_cascade(label="Check for updates", menu=um)
         self.root.config(menu=menu)
+        self.menubar = menu
+        if not getattr(sys, "frozen", False):                 # (the packaged .exe is not a folder from GitHub: nothing to update)
+            app_update.watch_for_update(self.root, self.updates_found)      # (in the background: nothing waits for it, and it is silent unless there is news)
 
         panes = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         panes.pack(fill=tk.BOTH, expand=True)
@@ -3565,11 +3648,9 @@ class XlefViewer:
         ttk.Button(btns, text="Auto contrast", command=self.auto_all).pack(side=tk.LEFT, expand=True, fill=tk.X)
         ttk.Button(btns, text="LAS X contrast", command=self.lasx_all).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(4, 0))
         self.contrast_buttons = btns
-        self.hist = HistogramView(side, command=self._hist_dragged, popout=self.toggle_hist_window)
+        self.hist = HistogramView(side, command=self._hist_dragged, popout=self.toggle_hist_window, help=HIST_TIP)
         self.hist.pack(fill=tk.X, pady=(4, 0))
         self.hist_key, self.hist_cache, self.hist_window, self.hist_float = None, collections.OrderedDict(), None, None
-        Tooltip(self.hist, HIST_TIP + " The button in the corner (or a double click) opens it in a window of its own, which can be "
-                           "made larger.")
         if self.settings.get("histogram_window"):
             self.root.after_idle(self.toggle_hist_window)
 
@@ -3920,6 +4001,14 @@ class XlefViewer:
         if event.widget is self.root and self.root.state() == "normal":
             self.normal_geometry = self.root.geometry()
 
+    def updates_found(self, changes):
+        """The check at launch found newer commits: an "Updates available" menu at the end of the menu bar, which goes through the same dialog as
+        Check for updates (it lists the changes and asks)."""
+        n = len(changes)
+        menu = tk.Menu(self.menubar, tearoff=0)
+        menu.add_command(label=f"See the {n} new change{'s' if n != 1 else ''} and update...", command=self.update_app)
+        self.menubar.add_cascade(label=f"Updates available ({n})", menu=menu)
+
     def update_app(self):
         """Update > Update from GitHub: looks for newer commits (in a thread: the network), says what is new, and on a yes pulls them and
         offers to restart the viewer."""
@@ -4191,14 +4280,14 @@ class XlefViewer:
         time_text = "under a minute or two" if seconds < 90 else f"roughly {minutes} minutes"
         total = len(self._entries_of(pid))
         message = (
-            f"\"{name}\" has no pyramids for {len(can)} of its {total} image{'s' * (total != 1)}. A pyramid is a set of reduced resolution copies of an image, which LAS X "
-            f"makes for most experiments to greatly speed up image display when zoomed out.\n\n"
+            f"\"{name}\" has no pyramids for {len(can)} of its {total} image{'s' * (total != 1)}. These are reduced resolution copies of images "
+            f"which greatly speed up display when zoomed out.\n\n"
             f"Making them adds about {extra / 1e9:.1f} GB of files"
-            + (f" (about {100 * extra / full:.0f}% more than the images)" if full > 1 else "")
+            + (f" (about {100 * extra / full:.0f}% more than the full images)" if full > 1 else "")
             + f" and is estimated to take {time_text} for all {planes} channels.\n\n"
-            f"Making pyramids will write a new project, \"{os.path.basename(new_xlef)}\" and a new pyramid folder alongside the existing project, "
-            f"and the original project will not be altered. Both projects will refer to the same full-resolution images, so they must stay where they are. Annotations and "
-            f"other changes made later in one of the two projects are not made in the other."
+            f"Making pyramids will write a new project, \"{os.path.basename(new_xlef)}\", and a new pyramid folder alongside the existing project, "
+            f"and the original project will not be altered. Both projects will refer to the same full-resolution images, so they must stay where they are, and neither project should move or rename them. Annotations "
+            f"and other changes made later in either project won't be visible in the other."
             + (f"\n\nNot made: {len(cannot)} image{'s' * (len(cannot) != 1)} (online-only, inside a .lif file, or small already)." if cannot else ""))
         pick = ask_choice(self.root, "Make pyramids?", message,
                           [("Make pyramids", "make"), ("Not now" if offered else "Cancel", None)]
@@ -5647,22 +5736,47 @@ class XlefViewer:
             w, h = max(1, round((i1 - i0) * step * self.scale)), max(1, round((j1 - j0) * step * self.scale))
         return (i0, j0, i1, j1), (left, top, w, h)
 
-    def _hist_bins(self, array, max_value):
-        """Counts of `array`'s pixel values, not 0, in HIST_BINS bins over 0..max_value (kept for as long as the array is: a plane gone back
-        to is not counted again)."""
+    def _hist_bins(self, array, max_value, from_pyramid=False):
+        """(counts, shape) of `array`'s pixel values, not 0, in HIST_BINS bins over 0..max_value (kept for as long as the array is: a plane gone
+        back to is not counted again). `counts` are what the bins hold; `shape` is what to draw, None to draw the counts. A pyramid level has only
+        256 values (LAS X's 8-bit copy, taken back to the image's range through its gamma, see pyramid_to_original), so its counts stand in
+        thin teeth with gaps between them that widen with the brightness; then (see _smooth_levels) the counts are spread over the values each
+        level stands for, and the shape is a line through the levels' own counts."""
         hit = self.hist_cache.get(id(array))
         if hit is not None and hit[0]() is array:
             self.hist_cache.move_to_end(id(array))
-            return hit[1]
+            return hit[1], hit[2]
         stride = max(1, int(np.ceil(np.sqrt(array.size / HIST_SAMPLE))))
         v = array[::stride, ::stride].ravel()
         v = v[v > 0]
         nb = min(HIST_BINS, max_value + 1)
-        bins = np.bincount((v.astype(np.int64) * nb) // (max_value + 1), minlength=nb)[:nb]
-        self.hist_cache[id(array)] = (weakref.ref(array), bins)
+        bins, shape = np.bincount((v.astype(np.int64) * nb) // (max_value + 1), minlength=nb)[:nb], None
+        if from_pyramid and len(v):
+            per_value = np.bincount(v.astype(np.int64), minlength=max_value + 1)[:max_value + 1]
+            levels = np.flatnonzero(per_value)
+            if 3 <= len(levels) <= 256:
+                bins, shape = self._smooth_levels(levels, per_value[levels], max_value, nb)
+        self.hist_cache[id(array)] = (weakref.ref(array), bins, shape)
         while len(self.hist_cache) > 256:
             self.hist_cache.popitem(last=False)
-        return bins
+        return bins, shape
+
+    @staticmethod
+    def _smooth_levels(values, counts, max_value, nb):
+        """For an image of only a few values (a pyramid level's 256): (bins, shape) over `nb` bins on 0..max_value+1. bins: each value's count
+        spread evenly over the stretch of values it stands for (half way to its neighbours), so a count taken over a range of values is
+        about right. shape: the values' own counts joined by straight lines (down to 0 one step past the first and the last), as the
+        mass of each bin: drawn with the same scale across, not divided by how many values a level stands for, so that the tail, where
+        the levels are far apart, stays as high as the counts say."""
+        bw = (max_value + 1) / nb
+        gaps = np.diff(values).astype(float)
+        bounds = np.concatenate(([values[0] - gaps[0] / 2], (values[:-1] + values[1:]) / 2, [values[-1] + gaps[-1] / 2]))
+        cum = np.concatenate(([0.0], np.cumsum(counts)))
+        bins = np.diff(np.interp(np.arange(nb + 1) * bw, bounds, cum, left=0.0, right=cum[-1]))
+        xs = np.concatenate(([values[0] - gaps[0]], values, [values[-1] + gaps[-1]]))
+        ys = np.concatenate(([0.0], counts, [0.0]))
+        shape = np.interp((np.arange(nb) + 0.5) * bw, xs, ys, left=0.0, right=0.0) * bw
+        return bins, shape
 
     def _hist_refresh(self):
         """The histogram below the sliders: of the shown plane's overview, whole, for each channel switched on. Cheap when nothing it
@@ -5678,10 +5792,13 @@ class XlefViewer:
         if key == self.hist_key:
             return
         self.hist_key = key
-        (self.hist_float or self.hist).show(
-            [{"index": i, "bins": None if a is None else self._hist_bins(a, ch.max_value),
-              "width": (ch.max_value + 1) / min(HIST_BINS, ch.max_value + 1), "color": ch.color,
-              "black": st["lo"], "white": st["hi"], "max": ch.max_value} for i, ch, st, a in chans])
+        shown = []
+        for i, ch, st, a in chans:
+            bins, shape = (None, None) if a is None else self._hist_bins(a, ch.max_value, from_pyramid=img.pyramid is not None)
+            shown.append({"index": i, "name": ch.name, "scale": 1 if a is None else max(1, int(np.ceil(np.sqrt(a.size / HIST_SAMPLE)))) ** 2,
+                          "bins": bins, "draw_bins": shape, "width": (ch.max_value + 1) / min(HIST_BINS, ch.max_value + 1),
+                          "color": ch.color, "black": st["lo"], "white": st["hi"], "max": ch.max_value})
+        (self.hist_float or self.hist).show(shown)
 
     def _hist_dragged(self, i, lo, hi, first):
         """A black or white bar of the histogram was dragged: as the channel's slider would (a drag is one step of Undo)."""
@@ -5700,9 +5817,8 @@ class XlefViewer:
             win.configure(background=PAL["bg"])
             win.geometry(on_screen_geometry(self.root, self.settings.get("histogram_geometry") or
                                             f"520x260+{self.root.winfo_rootx() + 200}+{self.root.winfo_rooty() + 200}"))
-            self.hist_float = HistogramView(win, command=self._hist_dragged, popout=self.toggle_hist_window, corner="⇲")
+            self.hist_float = HistogramView(win, command=self._hist_dragged, popout=self.toggle_hist_window, corner="⇲", help=HIST_TIP)
             self.hist_float.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
-            Tooltip(self.hist_float, HIST_TIP + " The button in the corner (or closing this window) puts it back below the sliders.")
             win.protocol("WM_DELETE_WINDOW", self.toggle_hist_window)
             win.bind("<Escape>", lambda e: self.toggle_hist_window())
             self.hist.pack_forget()

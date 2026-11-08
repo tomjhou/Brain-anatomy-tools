@@ -9,10 +9,12 @@ repo_root() says which folder (and the way), check() and pull() use the network 
 starts the app again."""
 import json
 import os
+import queue
 import shutil
 import ssl
 import subprocess
 import sys
+import threading
 import urllib.error
 import urllib.request
 import zipfile
@@ -243,3 +245,42 @@ def _remove_empty_folders(root, folder):
     while os.path.abspath(folder).startswith(root + os.sep) and os.path.isdir(folder) and not os.listdir(folder):
         os.rmdir(folder)
         folder = os.path.dirname(folder)
+
+
+def watch_for_update(root, show):
+    """At launch: looks on GitHub for newer commits in a background thread, and calls show(summaries) (from the Tk loop) when there are
+    some. Nothing waits for it: a slow or unreachable network only keeps that thread waiting (it is a daemon: it never holds the program
+    open), and any failure (offline, no git, rate limit) is silent: the Check for updates button (or menu) reports those when it is used."""
+    found = queue.Queue()
+
+    def work():
+        try:
+            found.put(check(repo_root()))
+        except Exception:
+            found.put(None)
+
+    threading.Thread(target=work, daemon=True).start()
+    UpdateWatch(root, show, found).poll_later()
+
+
+class UpdateWatch:
+    """Waits for watch_for_update's answer from the Tk loop. An object with a method, not a function that schedules itself: such a function
+    refers to itself, a reference cycle that keeps the window it was given alive after it is closed, until the cyclic collector frees it, on
+    whichever thread happens to run it (the analysis's threads do, e.g. pynndescent's gc.collect()), and Tcl ends the whole program then:
+    "Tcl_AsyncDelete: async handler deleted by the wrong thread". Here the window's own after-commands are the only reference, and closing
+    the window drops them."""
+
+    def __init__(self, root, show, found):
+        self.root, self.show, self.found = root, show, found
+
+    def poll_later(self):
+        self.root.after(1000, self.poll)
+
+    def poll(self):
+        try:
+            value = self.found.get_nowait()
+        except queue.Empty:
+            self.poll_later()
+            return
+        if value:
+            self.show(value)

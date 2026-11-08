@@ -52,6 +52,8 @@ MAX_COLORED_CATEGORIES = 400
 LEVEL_NAMES = {"class": "Class", "subclass": "Subclass", "supertype": "Supertype", "cluster": "Cluster", "leiden": "Leiden", "neurotransmitter": "Neurotransmitter"}
 NOT_IN_TAXONOMY = ("leiden", "neurotransmitter")        # the levels that are not a step down from the one above (so a group's table is just its own row)
 TILE_PX = 230
+BLINK_PAUSE_MS = 1000              # a highlighted cell (its ring or white dot) starts to blink when it has stood this long...
+BLINK_ON_MS, BLINK_OFF_MS = 450, 250       # ...shown this long, hidden this long, over and over (until another cell is highlighted or it is cleared)
 MIN_TILE_PX = 50
 ROI_LINE_PX = {6: 2, 5: 3, 4: 4, 3: 5, 2: 6, 1: 8}        # the ROI outline's line width at each Section size stop (panels across): thicker as the sections grow
 TILE_COLUMNS = (6, 5, 4, 3, 2, 1)         # the Section size slider's stops: how many panels fit across the pane (1/6 of its width ... all of it)
@@ -439,6 +441,26 @@ class HoverTip:
             self.tip = self.label = None
 
 
+PIN_OUTLINE = [(5, 2), (11, 2), (10, 8), (13, 10), (13, 12), (3, 12), (3, 10), (6, 8)]       # a push-pin's head and body, upright in a 16 x 20 box
+
+
+def draw_pin(canvas, pinned):
+    """A push-pin in `canvas` (16 x 20): upright, red and filled while the tip is pinned; tilted, gray and hollow while it is not."""
+    import math
+    canvas.delete("all")
+    angle = 0.0 if pinned else math.radians(40)
+    cx, cy = 8, 11
+
+    def turn(x, y):
+        dx, dy = x - cx, y - cy
+        return cx + dx * math.cos(angle) - dy * math.sin(angle), cy + dx * math.sin(angle) + dy * math.cos(angle)
+
+    fill, line = ("#d03030", "#802020") if pinned else ("#ffffe0", "#808080")
+    needle = [turn(8, 12), turn(8, 19)]
+    canvas.create_line(*needle[0], *needle[1], fill=line, width=2)
+    canvas.create_polygon([c for pt in PIN_OUTLINE for c in turn(*pt)], fill=fill, outline=line, width=1)
+
+
 class CellTip:
     """The hovered cell's description in a tip of its own, once the pointer has rested on one cell for
     CELL_TIP_MS, with a button that copies it. Unlike a HoverTip it stays while the pointer goes onto it (to reach the button): it goes when
@@ -447,6 +469,13 @@ class CellTip:
     def __init__(self, root, delay_ms=None):
         self.root, self.tip, self.job, self.key, self.anchor = root, None, None, None, None
         self.delay_ms = CELL_TIP_MS if delay_ms is None else delay_ms
+        self.drag = None               # while a tip is being dragged: {"top", "dx", "dy", "moved"}, so that it is not taken away from under the pointer
+        self.pinned = []               # the tips that were pinned (by moving them or by the pin): they stay, with a close box, until closed or unpinned
+        self.bars = {}                 # tip -> (its top bar, its pin picture)
+        self.last_moved = False        # the last press on a tip went on to move it (so that it was not a click on the pin)
+        self.suspended = False         # a plot or the pane is being dragged: no tip, and no waiting for one, until it stops (suspend, resume)
+        self.row_hover_fn = None       # fn(token) when the pointer rests on a row that has a token (a 4th item), fn(None) when it leaves it
+        self.row_active = self.row_labels = self.row_job = None       # the row the pointer is on: its token and its labels (shown highlighted)
 
     def pointer_on(self, key, rows_fn, action_fn=None, swatch_fn=None, copy_text_fn=None):
         """The pointer is on a new cell (`key`); `rows_fn()` gives its description, as rows (what, number, name), asked when the tip is shown.
@@ -454,6 +483,8 @@ class CellTip:
         (rgb, marker code, background rgb), the cell as it is drawn, shown at the top (where cells are close together, which one the
         description is of is not always plain from the ring alone). `copy_text_fn()`, if given, is the text the Copy button copies (else
         the rows, a tab between their columns)."""
+        if self.suspended:
+            return
         if key == self.key:
             return
         self.key = key
@@ -461,6 +492,17 @@ class CellTip:
         if self.tip is not None and not self.pointer_in_tip() and not self.near_anchor():
             self.hide()
         self.job = self.root.after(self.delay_ms, lambda: self.show(rows_fn, action_fn, swatch_fn, copy_text_fn))
+
+    def suspend(self):
+        """A drag has begun: the tip that is up goes (not the ones that were moved), the wait for one is dropped, and none starts until resume."""
+        self.suspended = True
+        self.cancel()
+        self.key = None
+        if self.tip is not None and not self.pointer_in_tip():
+            self.hide()
+
+    def resume(self):
+        self.suspended = False
 
     def pointer_off(self):
         """The pointer is on no cell (or left the plot): the tip goes, unless the pointer went onto it."""
@@ -491,8 +533,110 @@ class CellTip:
         return abs(x - self.anchor[0]) <= CELL_TIP_GRACE_PX and abs(y - self.anchor[1]) <= CELL_TIP_GRACE_PX
 
     def hide_unless_pointer_in(self):
-        if not self.pointer_in_tip():
+        if self.drag is None and not self.pointer_in_tip():
             self.hide()
+
+    def make_movable(self, widget):
+        """The tip can be dragged by any of its text (not its buttons) with the left button. Once moved it is pinned (see pin)."""
+        if isinstance(widget, ttk.Button):
+            return
+        widget.config(cursor="fleur")
+        widget.bind("<ButtonPress-1>", self.drag_start, add="+")
+        widget.bind("<B1-Motion>", self.drag_to, add="+")
+        widget.bind("<ButtonRelease-1>", self.drag_end, add="+")
+        for child in widget.winfo_children():
+            self.make_movable(child)
+
+    ROW_COLOR = "#ffe08a"
+
+    def row_enter(self, token, labels):
+        """The pointer is on a row of the tip that stands for a group of cells: the row is lit, and the cells are shown (row_hover_fn)."""
+        if self.row_job is not None:
+            self.root.after_cancel(self.row_job)
+            self.row_job = None
+        if token == self.row_active and labels[0] is self.row_labels[0]:
+            return
+        self.row_unlight()
+        self.row_active, self.row_labels = token, labels
+        for w in labels:
+            w.config(bg=self.ROW_COLOR)
+        self.row_hover_fn(token)
+
+    def row_leave(self):
+        """(a little later: going from one of the row's labels to the next leaves and enters again at once)"""
+        if self.row_job is None and self.row_active is not None:
+            self.row_job = self.root.after(60, self.row_left)
+
+    def row_left(self):
+        self.row_job = None
+        self.row_unlight()
+
+    def row_unlight(self):
+        if self.row_active is None:
+            return
+        labels, self.row_active, self.row_labels = self.row_labels, None, None
+        for w in labels:
+            try:
+                w.config(bg="#ffffe0")
+            except tk.TclError:
+                pass
+        if self.row_hover_fn is not None:
+            self.row_hover_fn(None)
+
+    def drag_start(self, e):
+        top = e.widget.winfo_toplevel()
+        self.drag = {"top": top, "dx": e.x_root - top.winfo_x(), "dy": e.y_root - top.winfo_y(), "x": e.x_root, "y": e.y_root, "moved": False}
+
+    def drag_to(self, e):
+        d = self.drag
+        if d is None:
+            return
+        if abs(e.x_root - d["x"]) > 3 or abs(e.y_root - d["y"]) > 3:
+            d["moved"] = True
+        if d["moved"]:
+            d["top"].wm_geometry(f"+{e.x_root - d['dx']}+{e.y_root - d['dy']}")
+
+    def drag_end(self, e):
+        d, self.drag = self.drag, None
+        self.last_moved = bool(d is not None and d["moved"])
+        if self.last_moved and d["top"] is self.tip:
+            self.pin()
+
+    def pin_clicked(self, tip):
+        """A click on the pin (not a drag that began on it): a tip that is up becomes pinned; a pinned one is unpinned, and so goes."""
+        if self.last_moved:
+            self.last_moved = False
+            return
+        if tip is self.tip:
+            self.pin()
+        elif tip in self.pinned:
+            self.close_pinned(tip)
+
+    def pin(self):
+        """The tip was moved or its pin clicked: it stays where it is until its close box is clicked or it is unpinned, whatever the pointer
+        does, and a new tip can come up for the next cell beside it. It can still be moved."""
+        tip = self.tip
+        self.tip = self.anchor = None
+        self.key = None
+        tip.unbind("<Leave>")
+        bar, pin = self.bars[tip]
+        draw_pin(pin, True)
+        close = tk.Label(bar, text="\u2715", bg="#ffffe0", fg="gray35", font=("Segoe UI", 9, "bold"), padx=5, cursor="hand2")
+        close.pack(side=tk.RIGHT)
+        close.bind("<Enter>", lambda e: close.config(bg="#e04040", fg="white"))
+        close.bind("<Leave>", lambda e: close.config(bg="#ffffe0", fg="gray35"))
+        close.bind("<ButtonRelease-1>", lambda e: self.close_pinned(tip))
+        self.pinned.append(tip)
+
+    def close_pinned(self, tip):
+        self.row_unlight()
+        self.bars.pop(tip, None)
+        if tip in self.pinned:
+            self.pinned.remove(tip)
+        try:
+            tip.destroy()
+        except tk.TclError:
+            pass
 
     def show(self, rows_fn, action_fn=None, swatch_fn=None, copy_text_fn=None):
         self.job = None
@@ -508,27 +652,46 @@ class CellTip:
         bg = "#ffffe0"
         box = tk.Frame(self.tip, bg=bg, relief="solid", borderwidth=1)
         box.pack()
+        bar = tk.Frame(box, bg=bg)
+        bar.pack(side=tk.TOP, fill=tk.X, padx=3, pady=(2, 0))
+        pin = tk.Canvas(bar, width=16, height=20, bg=bg, highlightthickness=0, cursor="hand2")
+        pin.pack(side=tk.LEFT)
+        draw_pin(pin, False)
+        self.bars[self.tip] = (bar, pin)
         swatch = swatch_fn() if swatch_fn is not None else None
         if swatch is not None:                          # the cell as it is drawn: its color and its group's marker, on the plot's background
-            rgb, code, back = swatch
+            rgb, code, back = swatch[:3]
+            token = swatch[3] if len(swatch) > 3 else None         # (what the row_hover_fn is told while the pointer is on this: the cell itself)
             hexc = "#%02x%02x%02x" % tuple(int(c) for c in rgb[:3])
             top = tk.Frame(box, bg=bg)
             top.pack(anchor="e", padx=6, pady=(5, 0))               # (at the right: the tip opens with its top left corner at the pointer, so the symbol was under it)
-            tk.Label(top, text="this cell, as drawn", bg=bg, fg="gray35", font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(0, 6))
+            caption = tk.Label(top, text="this cell, as drawn", bg=bg, fg="gray35", font=("Segoe UI", 9))
+            caption.pack(side=tk.LEFT, padx=(0, 6))
             mark = tk.Canvas(top, width=22, height=22, bg="#%02x%02x%02x" % tuple(int(c) for c in back[:3]),
                              highlightthickness=1, highlightbackground="gray60")
             mark.pack(side=tk.LEFT)
             draw_marker(mark, 12, 12, int(code), hexc, size=14)
+            if token is not None and self.row_hover_fn is not None:
+                for w in (top, caption, mark):
+                    w.bind("<Enter>", lambda e, t=token, c=caption: self.row_enter(t, [c]), add="+")
+                    w.bind("<Leave>", lambda e: self.row_leave(), add="+")
         # in columns: what (gray), the number (bold, to the right), the name
         grid = tk.Frame(box, bg=bg)
         grid.pack(anchor="w", padx=6, pady=(4, 2))
-        for r, (what, num, name) in enumerate(rows):
+        for r, row in enumerate(rows):
+            what, num, name = row[:3]
+            token = row[3] if len(row) > 3 else None
             tk.Label(grid, text=what, bg=bg, fg="gray35", font=("Segoe UI", 9, "bold"), anchor="w", justify=tk.LEFT,
                      wraplength=HOVER_LABEL_PX).grid(row=r, column=0, sticky="nw", padx=(0, HOVER_GAP_PX))
             tk.Label(grid, text=num, bg=bg, font=("Segoe UI", 9, "bold"), anchor="e").grid(row=r, column=1, sticky="ne", padx=(0, HOVER_GAP_PX))
             tk.Label(grid, text=name, bg=bg, font=("Segoe UI", 9), anchor="w", justify=tk.LEFT, wraplength=300).grid(row=r, column=2, sticky="nw")
+            if token is not None and self.row_hover_fn is not None:
+                labels = [w for w in grid.grid_slaves(row=r)]
+                for w in labels:
+                    w.bind("<Enter>", lambda e, t=token, ls=labels: self.row_enter(t, ls), add="+")
+                    w.bind("<Leave>", lambda e: self.row_leave(), add="+")
         # copied with a tab between the columns: pasted into a spreadsheet, they stay columns
-        text = copy_text_fn() if copy_text_fn is not None else "\n".join("\t".join(row) for row in rows)
+        text = copy_text_fn() if copy_text_fn is not None else "\n".join("\t".join(row[:3]) for row in rows)
         buttons = tk.Frame(box, bg=bg)
         buttons.pack(anchor="e", padx=6, pady=(0, 6))
         action = action_fn() if action_fn is not None else None
@@ -539,6 +702,9 @@ class CellTip:
         copy.config(command=lambda: self.copy(text, copy))
         copy.pack(side=tk.LEFT)
         self.tip.bind("<Leave>", lambda e: self.root.after(100, self.hide_unless_pointer_in))
+        self.make_movable(box)
+        pin.bind("<ButtonRelease-1>", lambda e, t=self.tip: self.pin_clicked(t), add="+")        # (after the drag handlers: they say whether this press moved the tip)
+        pin.config(cursor="hand2")
         # just beside the pointer (close, so that it is quickly reached), but kept on the screen
         x0, y0 = self.root.winfo_pointerxy()
         self.anchor = (x0, y0)
@@ -559,7 +725,9 @@ class CellTip:
         self.root.after(1200, lambda: button.winfo_exists() and button.config(text="Copy to clipboard"))
 
     def hide(self):
+        self.row_unlight()
         if self.tip is not None:
+            self.bars.pop(self.tip, None)
             try:
                 self.tip.destroy()
             except tk.TclError:
@@ -647,6 +815,7 @@ class PointCanvas:
         self.on_view = None                         # fn() after a redraw
         self.on_change = None                       # fn(zoom, dx, dy) after the user zoomed or panned (the view, relative to the whole view)
         self.pan_from = None
+        self.drag_hook = None                       # fn(True) when a drag of this view begins, fn(False) when it ends
         self.panel_hook = None                      # when set (the whole-panel zoom of the section maps): its wheel, drag and double-click act on the panel, not on this view
         self.panel_zoom = 1.0                       # how much the whole panel is enlarged: the dots grow with it
         self.opacity = 1.0                          # of one cell's dot, below 1 overlapping dots add up (the Opacity slider)
@@ -930,6 +1099,8 @@ class PointCanvas:
                               flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_CONSTANT, borderValue=bg)
 
     def pan_start(self, e):
+        if self.drag_hook is not None:
+            self.drag_hook(True)
         if self.panel_hook is not None:
             self.panel_hook.pan_start(e)
             return
@@ -970,6 +1141,8 @@ class PointCanvas:
 
     def pan_end(self, e):
         self.pan_from = None
+        if self.drag_hook is not None:
+            self.drag_hook(False)
 
     # ---- drawing
 
@@ -1220,7 +1393,7 @@ class PointCanvas:
         item = self.canvas.create_oval(0, 0, 0, 0, outline=RING, width=2, state="hidden")
         # [ring, x, y, radius, the cell redrawn over itself with a darker edge (when cells are drawn by group)]
         shape = self.canvas.create_polygon(0, 0, 0, 0, 0, 0, fill="", outline="black", state="hidden")
-        self.markers[name] = [item, None, None, radius, [shape]]
+        self.markers[name] = [item, None, None, radius, [shape], {"job": None, "off": False}]       # (the last: its blinking, see set_marker)
 
     MARKER_STYLES = {"ring": ("", "#e00000"), "mirror": ("white", "black")}      # (fill, outline): the cell under the pointer; the same cell in the other plot
 
@@ -1228,10 +1401,33 @@ class PointCanvas:
         """When cells are drawn by group the cell is also drawn again over itself, with its shape, size and color and a darker edge (a ring
         does not make a triangle's place clear: its center is not the ring's); see place_marker."""
         m = self.markers[name]
+        self.stop_blink(m)
         m[1], m[2] = x, y
         fill, outline = self.MARKER_STYLES[style]
         self.canvas.itemconfig(m[0], fill=fill, outline=outline)
         self.place_marker(m)
+        if x is not None:                         # (after a pause it blinks: a single cell is easy to lose among so many)
+            m[5]["job"] = self.canvas.after(BLINK_PAUSE_MS, lambda: self.blink_step(m, True))
+
+    def stop_blink(self, m):
+        job, m[5]["job"], m[5]["off"] = m[5]["job"], None, False
+        if job is not None:
+            try:
+                self.canvas.after_cancel(job)
+            except tk.TclError:
+                pass
+
+    def blink_step(self, m, off):
+        """Hide the marked cell (`off`) or show it again, and come back for the other half; ends when the marker is cleared or moved."""
+        m[5]["job"] = None
+        if m[1] is None:
+            return
+        try:
+            m[5]["off"] = off
+            self.place_marker(m)
+            m[5]["job"] = self.canvas.after(BLINK_OFF_MS if off else BLINK_ON_MS, lambda: self.blink_step(m, not off))
+        except tk.TclError:
+            m[5]["off"] = False                   # (the window is gone)
 
     def place_marker(self, m):
         if m[1] is None:
@@ -1272,6 +1468,9 @@ class PointCanvas:
             self.canvas.itemconfig(item, state="normal", fill="" if hollow else fill, outline=edge, width=wd,
                                    joinstyle=tk.MITER)
             self.canvas.tag_raise(item)
+        if m[5]["off"]:                           # (the dark half of a blink: placed all the same, so that it is where it should be on coming back)
+            for item in [m[0]] + m[4]:
+                self.canvas.itemconfig(item, state="hidden")
 
     def add_rect(self, x0, y0, x1, y1):
         item = self.canvas.create_rectangle(0, 0, 0, 0, outline="black", width=2, dash=dash((6, 3), 2))
@@ -1580,6 +1779,7 @@ class UmapWindow(ExportsMixin):
     def build(self):
         self.tiles = []                    # (made by build_tiles; empty until then, for the scroll callbacks that can come first)
         self.cell_tip = CellTip(self.root)
+        self.cell_tip.row_hover_fn = self.tip_row_hover
         self.pw = pw = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         pw.pack(fill=tk.BOTH, expand=True)
         # the section panels
@@ -1661,8 +1861,8 @@ class UmapWindow(ExportsMixin):
         self.tile_scroll = tk.Canvas(left, highlightthickness=0, bg="#f4f4f4")
         sb = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.tile_scroll.yview)
         self.hsb = ttk.Scrollbar(left, orient=tk.HORIZONTAL, command=self.tile_scroll.xview)        # (shown only while the panel is zoomed in)
-        self.tile_scroll.configure(yscrollcommand=lambda a, b: (sb.set(a, b), self.root.after_idle(self.refresh_visible)),
-                                   xscrollcommand=lambda a, b: (self.hsb.set(a, b), self.root.after_idle(self.refresh_visible)))
+        self.tile_scroll.configure(yscrollcommand=lambda a, b: (sb.set(a, b), self.note_view("y", a), self.root.after_idle(self.refresh_visible)),
+                                   xscrollcommand=lambda a, b: (self.hsb.set(a, b), self.note_view("x", a), self.root.after_idle(self.refresh_visible)))
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         sb.bind("<MouseWheel>", lambda e: self.tile_scroll.yview_scroll(-1 if e.delta > 0 else 1, "units"))
         self.tile_scroll.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -1702,6 +1902,7 @@ class UmapWindow(ExportsMixin):
         self.umap.canvas.pack(fill=tk.BOTH, expand=True)
         self.umap.add_marker("hover", 9)
         self.umap.on_motion = self.umap_motion
+        self.umap.drag_hook = self.drag_state
         self.umap.on_view = None
         self.umap_tree = cKDTree(c)
         pw.add(mid, weight=3)
@@ -1754,7 +1955,7 @@ class UmapWindow(ExportsMixin):
                                           "so that where they overlap you see how many there are.\n\n"
                                           "Zooming and moving the plots\n"
                                           "become much slower while this is on.")
-        self.level_frame = ttk.LabelFrame(self.top_row, text="Level", padding=6)
+        self.level_frame = ttk.LabelFrame(self.top_row, text="Group by", padding=6)
         self.level_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
         HoverTip(self.level_frame, self.level_tip)
         self.var_level = tk.StringVar(f, self.level)
@@ -1900,7 +2101,7 @@ class UmapWindow(ExportsMixin):
             b.state(["!disabled"] if self.mode == "single" and self.own is None else ["disabled"])
 
     def update_frames(self):
-        self.level_frame.config(text="Level" if self.mode in ("all", "single") else "Level (hover)")
+        self.level_frame.config(text="Group by" if self.mode in ("all", "single") else "Group by (hover)")
         for w in (self.id_frame, self.gene_frame, self.select_bar, self.legend, self.group_list):
             w.pack_forget()
         if self.mode == "single":
@@ -1958,6 +2159,7 @@ class UmapWindow(ExportsMixin):
                 pc.enable_scalebar()                       # (the first section's panel carries the scale bar)
             tile = {"item": item, "label": s, "frame": fr, "pc": pc, "title": title, "token": token, "tree": None, "caption": caption}
             pc.on_motion = lambda px, py, t=tile: self.tile_motion(t, px, py)
+            pc.drag_hook = self.drag_state
             pc.on_change = lambda zoom, dx, dy, t=tile: self.link_tiles(t, zoom, dx, dy)
             for r in self.rois:
                 if r[0] == str(s) or core.sanitize_section_token(r[0]) == token:
@@ -2166,6 +2368,7 @@ class UmapWindow(ExportsMixin):
             self.layout_seen = True
             self.layout_tiles()
             return
+        self.trail(f"pane resized to {self.tile_scroll.winfo_width()}x{self.tile_scroll.winfo_height()}")
         if self.layout_job is not None:
             self.root.after_cancel(self.layout_job)
         self.layout_job = self.root.after(LAYOUT_SETTLE_MS, self.layout_after_settling)
@@ -2183,7 +2386,9 @@ class UmapWindow(ExportsMixin):
         cols = TILE_COLUMNS[self.var_tile.get()]
         w = max(self.tile_scroll.winfo_width(), 100)
         px = int(max((w - 4) // cols - 8 - 2, MIN_TILE_PX) * self.panel_zoom)          # (8: the gaps either side of a panel; 2: its canvas border)
-        if cols == self.tile_cols and px == self.tile_px:
+        same = cols == self.tile_cols and px == self.tile_px
+        self.trail(f"layout_tiles cols={cols} px={px} zoom={self.panel_zoom:.3g} " + ("(unchanged: nothing done)" if same else "(laid out again)"))
+        if same:
             return
         self.tile_cols, self.tile_px = cols, px
         big = self.panel_zoom > 1.0
@@ -2347,6 +2552,7 @@ class UmapWindow(ExportsMixin):
         if abs(zoom - self.panel_zoom) < 1e-9 or not self.tiles:
             return
         spot = self.spot_in_tiles(anchor[0], anchor[1]) if anchor is not None else None
+        self.trail(f"set_panel_zoom {self.panel_zoom:.3g} -> {zoom:.3g}")
         self.panel_zoom = zoom
         for t in self.tiles:
             t["pc"].panel_zoom = zoom
@@ -2388,8 +2594,23 @@ class UmapWindow(ExportsMixin):
                            scrollregion=self.tile_scroll.cget("scrollregion"), pane=(self.tile_scroll.winfo_width(), self.tile_scroll.winfo_height()))
         self.zoom_view = None
 
+    def trail(self, what):
+        """The last few things that moved or re-laid the section pane, with the time, kept for zoom_note to write out with a jump."""
+        trail = self.__dict__.setdefault("zoom_trail", [])
+        trail.append(f"{time.time() % 1000:8.3f} {what}")
+        del trail[:-40]
+
+    def note_view(self, axis, first):
+        """The pane's scroll position changed (`first`: the fraction at its top or left): a jump to the very start is put in the trail."""
+        last = self.__dict__.setdefault("last_view", {"x": 0.0, "y": 0.0})
+        now = float(first)
+        if now == 0.0 and last[axis] > 0.0:
+            self.trail(f"view {axis} went to 0 (was {last[axis]:.3f})")
+        last[axis] = now
+
     def zoom_note(self, what, **state):
         """A line in zoom_debug.log (next to the cache) for a zoom that did not go as it should: for finding what makes the view jump."""
+        state["trail"] = list(self.__dict__.get("zoom_trail", []))
         try:
             with open(core.CACHE_DIR / "zoom_debug.log", "a", encoding="utf-8") as f:
                 f.write(time.strftime("%Y-%m-%d %H:%M:%S") + " " + what + " " + repr(state) + chr(10))
@@ -2624,6 +2845,7 @@ class UmapWindow(ExportsMixin):
         own) act on the whole panel while Zoom whole panel is on. The wheel over the pane itself scrolls it as it always did."""
         widget.bind("<MouseWheel>", self.on_pane_wheel, add="+")
         for press, motion in (("<ButtonPress-1>", "<B1-Motion>"), ("<ButtonPress-2>", "<B2-Motion>"), ("<ButtonPress-3>", "<B3-Motion>")):
+            widget.bind(press.replace("Press", "Release"), lambda e: self.drag_state(False), add="+")
             widget.bind(press, lambda e: self.var_panel_zoom.get() and self.panel_pan_start(e), add="+")
             widget.bind(motion, lambda e: self.var_panel_zoom.get() and self.panel_pan_move(e), add="+")
         # (No double-click here: Tk gives a quick second press to a Double-Button-1 binding instead of to the press binding above, so a drag that
@@ -2636,13 +2858,17 @@ class UmapWindow(ExportsMixin):
             self.tile_scroll.yview_scroll(-1 if e.delta > 0 else 1, "units")
 
     def panel_pan_start(self, e):
+        self.drag_state(True)
         self.cancel_zoom_burst()
+        self.trail("pan: button pressed on the pane")
         self.tile_scroll.scan_mark(e.x_root - self.tile_scroll.winfo_rootx(), e.y_root - self.tile_scroll.winfo_rooty())
 
     def panel_pan_move(self, e):
         """A drag of the zoomed panel moves it at once: the maps whose pictures no longer cover the screen are not all drawn again there and
         then (which held the drag up as it went past the margin they are drawn with), but one at a time between the mouse's moves (pan_fill),
         the new parts blank meanwhile; and everything once the drag has been still for PANEL_PAN_SETTLE_MS (pan_settle)."""
+        if not getattr(self, "panning", False):
+            self.trail("pan: drag begins")
         self.panning = True
         self.tile_scroll.scan_dragto(e.x_root - self.tile_scroll.winfo_rootx(), e.y_root - self.tile_scroll.winfo_rooty(), gain=1)
         self.root.after_idle(self.refresh_visible)
@@ -3836,11 +4062,8 @@ class UmapWindow(ExportsMixin):
             lines.append("(not in the UMAP)")
         return "\n".join(lines)
 
-    def region_of(self, info):
-        """(acronym, name, structure, division) of the CCF region Allen gives the hovered cell (the registration's own answer, whatever the outlines
-        drawn show), or None if there is no table of regions or the cell has none."""
-        if self.region_names is None:
-            return None
+    def region_index(self, info):
+        """The number of the CCF region Allen gives the hovered cell, or None if it has none."""
         i = info["umap_idx"]
         if i is not None:
             value = self.region_of_run[i] if self.region_of_run is not None else np.nan
@@ -3849,25 +4072,34 @@ class UmapWindow(ExportsMixin):
             value = arr[info["bg_idx"]] if arr is not None else np.nan
         if value is None or not np.isfinite(value):
             return None
-        return self.region_names.get(int(value))
+        return int(value)
+
+    def region_of(self, info):
+        """(acronym, name, structure, division) of the CCF region Allen gives the hovered cell (the registration's own answer, whatever the outlines
+        drawn show), or None if there is no table of regions or the cell has none."""
+        if self.region_names is None:
+            return None
+        value = self.region_index(info)
+        return None if value is None else self.region_names.get(value)
 
     def cell_rows(self, info):
         """The hovered cell as table rows: (what, number, name). A group's label '268 CS-PRNr-DR ...' is split into its number and its name."""
         rows = []
         sec = info["sec"]
         if sec is not None:
-            rows.append(("Section", core.sanitize_section_token(sec), ""))
+            rows.append(("Section", core.sanitize_section_token(sec), "", ("section", sec)))          # (a token: the row lights the section's cells)
         region = self.region_of(info)
         if region is not None:
             acronym, name, structure, division = region
+            number = self.region_index(info)               # (the rows are tokens: each lights the cells of its region, its structure or its division)
             if acronym == "unassigned":
-                rows.append(("Region", "", "unassigned (outside the CCF atlas)"))
+                rows.append(("Region", "", "unassigned (outside the CCF atlas)", ("region", ("region", number))))
             else:
-                rows.append(("Region", acronym, name))
+                rows.append(("Region", acronym, name, ("region", ("region", number))))
                 if structure and structure not in (name, "unassigned"):
-                    rows.append(("", "", f"in {structure}"))
+                    rows.append(("", "", f"in {structure}", ("region", ("structure", structure))))
                 if division and division not in (structure, name, "unassigned"):
-                    rows.append(("Division", "", division))
+                    rows.append(("Division", "", division, ("region", ("division", division))))
         i = info["umap_idx"]
         for k in self.level_names:
             if i is not None:
@@ -3878,7 +4110,7 @@ class UmapWindow(ExportsMixin):
             if v is None or str(v) == "nan":
                 continue
             m = re.match(r"^\s*(\d+)\s*(.*)$", str(v))
-            rows.append((self.level_names[k], m.group(1) if m else "", m.group(2) if m else str(v)))
+            rows.append((self.level_names[k], m.group(1) if m else "", m.group(2) if m else str(v), (k, v) if self.info.get(k) is not None else None))
         if self.own is not None and i is not None:                      # (the numeric columns of a dataset of your own, under the groups)
             for name in self.own.numbers:
                 rows.append((name, self.number_text(name, i), ""))
@@ -4078,10 +4310,22 @@ class UmapWindow(ExportsMixin):
             else:
                 t["pc"].set_marker("hover", None, None)
 
+    def drag_state(self, on):
+        """A plot, a section map or the zoomed pane is being dragged (or the drag has ended): no cell tip comes up while it is, and the wait for
+        one starts again when it stops (at the cell then under the pointer)."""
+        if on:
+            self.cell_tip.suspend()
+            return
+        self.cell_tip.resume()
+        info = getattr(self, "last_hover_info", None)
+        if info is not None:
+            self.cell_tip.pointer_on(info["key"], lambda: self.cell_rows(info), self.ccf_action, lambda: self.swatch_with_token(info))
+
     def hover(self, info):
         """The pointer is on a cell (info) or on none (None). The ring and description are immediate; once it rests, the plots dim and, a
         little later, the cell's group is marked with red '+' signs (only those two are turned off by the Hover highlight box). After a longer
         rest the description comes up in a tip as well (CellTip), whether or not the box is ticked."""
+        self.last_hover_info = info
         if info is None:
             self.cancel_hover_jobs()
             self.hover_key = None
@@ -4090,7 +4334,7 @@ class UmapWindow(ExportsMixin):
             self.clear_highlights()
             return
         self.show_info(info)
-        self.cell_tip.pointer_on(info["key"], lambda: self.cell_rows(info), self.ccf_action, lambda: self.cell_swatch(info))
+        self.cell_tip.pointer_on(info["key"], lambda: self.cell_rows(info), self.ccf_action, lambda: self.swatch_with_token(info))
         if not self.var_hover.get():
             self.hover_key = None                    # (so that ticking the box again marks the next cell pointed at)
             return
@@ -4144,10 +4388,111 @@ class UmapWindow(ExportsMixin):
             return
         self.mark_group(label, skip=i)
 
-    def mark_group(self, label, skip=None):
-        """Red '+' signs on every cell of the group `label` (at the Group level), in the UMAP and in every section. `skip`: a UMAP cell that
-        keeps its own ring instead."""
-        level = self.level
+    def swatch_with_token(self, info):
+        """cell_swatch, with the cell itself added: the tip lights the cell on the plots while the pointer is on its picture."""
+        got = self.cell_swatch(info)
+        return None if got is None else tuple(got) + (("cell", info),)
+
+    def show_cell_dot(self, info):
+        """The exact cell the tip is about, with the white dot of the other plot's copy of a hovered cell (bigger than a red +), in the UMAP and
+        in its section's map."""
+        i = info["umap_idx"]
+        if i is None:
+            self.umap.set_marker("hover", None, None)
+        else:
+            self.umap.set_marker("hover", *self.coords[i], style="mirror")
+        finite = info["x"] is not None and np.isfinite(info["x"]) and np.isfinite(info["y"])
+        for t in self.tiles:
+            if t["label"] == info["sec"] and finite:
+                t["pc"].set_marker("hover", info["x"], info["y"], style="mirror")
+            else:
+                t["pc"].set_marker("hover", None, None)
+
+    def tip_row_hover(self, token):
+        """The pointer is on a group's row in a cell tip (token: (level, label)), or left it (None): that group's cells are marked with red '+'
+        signs and the rest dimmed, as for Hover highlight, whether or not that is on."""
+        self.cancel_hover_jobs()
+        self.hover_key = None                       # (so that the cell under the pointer later is marked again, if Hover highlight is on)
+        self.clear_highlights()
+        if token is None:
+            self.show_info(None)                    # (the dot of a cell lit from the tip goes)
+            return
+        if token[0] == "cell":
+            self.show_cell_dot(token[1])
+            return
+        if token[0] == "section":
+            done = self.mark_section(token[1])
+        elif token[0] == "region":
+            done = self.mark_region(*token[1])
+        else:
+            done = self.mark_group(token[1], level=token[0])
+        if done:
+            self.set_dim(True)
+
+    def region_ids(self, kind, key):
+        """The numbers of the CCF regions that make up a region (itself), a structure or a division."""
+        if kind == "region":
+            return [key]
+        column = {"structure": 2, "division": 3}[kind]
+        return [number for number, names in (self.region_names or {}).items() if names[column] == key]
+
+    def mark_region(self, kind, key):
+        """Red '+' signs on every cell in a CCF region, structure or division (as Allen gives it): in the UMAP and in the section maps in view."""
+        if self.region_of_run is None and not (self.bg and self.bg.get("region") is not None):
+            return False
+        ids = self.region_ids(kind, key)
+        run_mask = np.isin(self.region_of_run, ids) if self.region_of_run is not None else np.zeros(len(self.coords), bool)
+        if run_mask.any():
+            self.umap.set_pluses((self.coords[run_mask, 0], self.coords[run_mask, 1]))
+        else:
+            self.umap.set_pluses(None)
+        self.umap.boost_label(None)
+        barr = self.bg.get("region") if self.bg else None
+        found = bool(run_mask.any())
+        for t in self.tiles:
+            if not self.frame_visible(t["frame"]):
+                t["pc"].set_pluses(None)
+                continue
+            if barr is not None:
+                w = self.bg["where"][t["label"]]
+                m = np.isin(barr[w], ids)
+                xy = (self.bg["x"][w][m], self.bg["y"][w][m])
+            elif self.region_of_run is not None:
+                idx = self.run_idx[t["label"]]
+                m = np.isin(self.region_of_run[idx], ids)
+                xy = (self.cx[idx][m], self.cy[idx][m])
+            else:
+                xy = ((), ())
+            t["pc"].set_pluses(xy if len(xy[0]) else None)
+            found = found or len(xy[0]) > 0
+        return found
+
+    def mark_section(self, sec):
+        """Red '+' signs on every cell of the section `sec`: in the UMAP (those of the run) and in that section's map (all its cells)."""
+        if self.section_of is None:
+            return False
+        run_mask = self.section_of == sec
+        if not run_mask.any():
+            return False
+        self.umap.set_pluses((self.coords[run_mask, 0], self.coords[run_mask, 1]))
+        self.umap.boost_label(None)
+        for t in self.tiles:
+            if t["label"] != sec or not self.frame_visible(t["frame"]):
+                t["pc"].set_pluses(None)
+                continue
+            if self.bg is not None and sec in self.bg["where"]:
+                w = self.bg["where"][sec]
+                xy = (self.bg["x"][w], self.bg["y"][w])
+            else:
+                idx = self.run_idx[sec]
+                xy = (self.cx[idx], self.cy[idx])
+            t["pc"].set_pluses(xy if len(xy[0]) else None)
+        return True
+
+    def mark_group(self, label, skip=None, level=None):
+        """Red '+' signs on every cell of the group `label` (at `level`, the Group level if not given), in the UMAP and in every section. `skip`:
+        a UMAP cell that keeps its own ring instead."""
+        level = level or self.level
         run_mask = self.info[level] == label
         if not run_mask.any():
             return False                             # (a group none of the run's cells is in: nothing in the UMAP to relate to)
@@ -4155,7 +4500,7 @@ class UmapWindow(ExportsMixin):
             run_mask[skip] = False                   # (the hovered cell keeps its own ring)
         self.umap.set_pluses((self.coords[run_mask, 0], self.coords[run_mask, 1]))
         number = re.match(r"^\s*(\d+)", str(label))               # (the group's number is what the UMAP shows at its center: bigger while it is marked)
-        self.umap.boost_label(number.group(1) if number else None)
+        self.umap.boost_label(number.group(1) if number and level == self.level else None)
         barr = self.bg["levels"].get(level) if self.bg else None
         for t in self.tiles:
             if not self.frame_visible(t["frame"]):

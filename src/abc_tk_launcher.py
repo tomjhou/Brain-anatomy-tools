@@ -569,7 +569,7 @@ def check_for_update(root, button):
         poll()
 
     def finish(text=None, error=False):
-        button.config(text="Check for updates", state=tk.NORMAL)
+        button.config(text=getattr(button, "idle_text", "Check for updates"), state=tk.NORMAL)
         root.config(cursor="")
         if text:
             (messagebox.showerror if error else messagebox.showinfo)("Update", text, parent=root)
@@ -578,6 +578,7 @@ def check_for_update(root, button):
         if not ok:
             return finish(value, True)
         if not value:
+            button.idle_text = "Check for updates"
             return finish("You have the newest version.")
         shown = "\n".join("  • " + line for line in value[:12]) + (f"\n  ... and {len(value) - 12} more" if len(value) > 12 else "")
         root.config(cursor="")
@@ -589,6 +590,7 @@ def check_for_update(root, button):
     def pulled(ok, value):
         if not ok:
             return finish(value, True)
+        button.idle_text = "Check for updates"
         finish()
         if messagebox.askyesno("Update", "Updated. The new version runs after the browser restarts.\n\nRestart it now?", parent=root):
             root.destroy()
@@ -633,9 +635,10 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
         update_button.pack(side=tk.RIGHT, anchor="n", padx=(0, 6))
 
         def update_found(changes):
-            """The check at launch found newer commits: a button for them beside the title (it goes through the Update... dialog)."""
-            ttk.Button(top, text=f"Update available ({len(changes)} change{'s' if len(changes) != 1 else ''})",
-                       command=lambda: check_for_update(root, update_button)).pack(side=tk.LEFT, padx=(14, 0), anchor="s", pady=(0, 4))
+            """The check at launch found newer commits: the Check for updates button becomes the Update available one (same dialog)."""
+            update_button.idle_text = f"Update available ({len(changes)} change{'s' if len(changes) != 1 else ''})"
+            if str(update_button.cget("state")) != "disabled":
+                update_button.config(text=update_button.idle_text)
         import app_update
         app_update.watch_for_update(root, update_found)
 

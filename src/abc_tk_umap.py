@@ -93,6 +93,7 @@ DOT_MM = 0.04                      # a cell's dot in the section panels: 40 um a
 BIG_DOT_PX = 40                    # dots wider than this are drawn one by one as circles (the maximum filter gets slow)
 SCALEBAR_UM = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000)
 HOVER_RADIUS_PX = 9
+HOVER_REACH_DOTS = 0.75               # at a high zoom the pointer reaches a cell this many dot widths away (HOVER_RADIUS_PX is the least)
 SCALE_UNITS = {("standard", "log"): "log2(1 + expr)", ("standard", "linear"): "expr (raw counts)",
                ("imputed", "log"): "log2 (imputed)", ("imputed", "linear"): "linear (imputed)"}
 
@@ -953,8 +954,8 @@ class PointCanvas:
                 self.clamp()
                 self.request_draw()
 
-    def set_view(self, x0, y0, w, h):
-        """The part of a virtual canvas the widget shows, and draws."""
+    def set_view(self, x0, y0, w, h, background=None):
+        """The part of a virtual canvas the widget shows, and draws (`background`: see draw)."""
         new = (int(x0), int(y0), max(int(w), 1), max(int(h), 1))
         if new == self.vview:
             return
@@ -972,7 +973,7 @@ class PointCanvas:
         if self.pending is not None:
             self.canvas.after_cancel(self.pending)
             self.pending = None
-        self.draw()
+        self.draw(background)
 
     def fit_scale(self):
         w, h = self.size()
@@ -1205,7 +1206,13 @@ class PointCanvas:
         if self.pending is None:
             self.pending = self.canvas.after_idle(self.draw)
 
-    def draw(self):
+    def draw(self, background=None):
+        """Draw the view. `background`: a function; then the picture is made in a thread (numpy and cv2 let go of Python while they work, so the
+        program goes on seeing to the mouse and the wheel meanwhile), and the function is called when it has been put on the canvas, or has been
+        dropped because something else was drawn since. It is called at once if there is nothing to draw."""
+        self.draw_inner(background)
+
+    def draw_inner(self, background=None):
         self.pending = None
         if self.pan_job is not None:
             self.canvas.after_cancel(self.pan_job)
@@ -1215,11 +1222,15 @@ class PointCanvas:
             self.zoom_job = None
         w, h = self.size()
         if w <= 2 or h <= 2:
-            return
+            return background and background()
+        if self.vsize is not None and self.vview is None:
+            self.stale = True                                                 # (a virtual canvas no part of which is shown yet: place_tiles gives it its view, and that draws)
+            return background and background()
         if self.visible_fn is not None and not self.visible_fn():
             self.stale = True
-            return
+            return background and background()
         self.stale = False
+        self.draw_token = getattr(self, "draw_token", 0) + 1
         if self.at_fit:
             self.scale = self.fit_scale()
             self.cx, self.cy = (self.home[0] + self.home[1]) / 2, (self.home[2] + self.home[3]) / 2
@@ -1232,83 +1243,122 @@ class PointCanvas:
         ox, oy, ex, ey = max(int(ox), 0), max(int(oy), 0), min(int(ex), w), min(int(ey), h)
         if ex - ox < 2 or ey - oy < 2:
             ox, oy, ex, ey = 0, 0, min(w, 3), min(h, 3)
-        self.drawn = (ox, oy, ex, ey)
         W, H = w, h                                                           # (the whole canvas; w, h below are the picture's)
         w, h = ex - ox, ey - oy
-        img = np.empty((h, w, 3), np.uint8)
-        img[:] = self.bgcolor
+        cx, cy, scale = self.cx, self.cy, self.scale                          # (what the picture is made from, kept: the view may move while a thread makes it)
         # the data in view: the picture's pixels (ox..ex, oy..ey of the canvas) in data units
-        x_lo, x_hi = self.cx + (ox - W / 2) / self.scale, self.cx + (ex - W / 2) / self.scale
-        d_lo, d_hi = (oy - H / 2) / self.scale, (ey - H / 2) / self.scale
-        y_lo, y_hi = (self.cy - d_hi, self.cy - d_lo) if self.flip_y else (self.cy + d_lo, self.cy + d_hi)
+        x_lo, x_hi = cx + (ox - W / 2) / scale, cx + (ex - W / 2) / scale
+        d_lo, d_hi = (oy - H / 2) / scale, (ey - H / 2) / scale
+        y_lo, y_hi = (cy - d_hi, cy - d_lo) if self.flip_y else (cy + d_lo, cy + d_hi)
         opacity = 1.0 if self.moving else self.opacity                        # (solid while the view moves: blending translucent dots is much slower; see note_motion)
+        diameters = []
         for lay in self.layers:
             d = lay["drawn_d"] = self.dot_diameter(lay, zoom)       # (kept, with the scale: the highlighted cell's outline is made as big as the dots really were drawn)
-            lay["drawn_scale"] = self.scale
-            x, y = lay["x"], lay["y"]
-            pm = d / self.scale
-            m = (x >= x_lo - pm) & (x <= x_hi + pm) & (y >= y_lo - pm) & (y <= y_hi + pm)
-            idx = np.flatnonzero(m)
-            if not len(idx):
-                continue
-            px = np.floor((x[idx] - self.cx) * self.scale + W / 2 - ox).astype(np.int32)      # (floor: the same pixel as on the whole canvas, also left of or above the picture)
-            dy = (y[idx] - self.cy) * self.scale
-            py = np.floor((-dy if self.flip_y else dy) + H / 2 - oy).astype(np.int32)
-            rgb = lay["rgb"][idx]
-            if lay.get("shape") == "plus":
-                stamp_plus(img, px, py, rgb, d)
-                continue
-            if lay.get("marks") is not None and not self.moving:         # (a marker code for each cell: the group's shape; plain discs while the view moves)
-                self.draw_marked(img, px, py, rgb, lay["marks"][idx], d)
-                continue
-            if opacity < 1.0 and lay.get("shape") != "half":
-                blend_dots(img, px + d, py + d, rgb, d, opacity, self.kernels)
-                continue
-            if d > BIG_DOT_PX:                                             # (very big dots, so few on screen: each drawn as a circle, later ones on top)
-                r = d // 2
-                for X, Y, c in zip(px.tolist(), py.tolist(), rgb.tolist()):
-                    cv2.circle(img, (X, Y), r, c, -1)
-                continue
-            px, py = px + d, py + d
-            # each point writes its number (later = on top) at its pixel; a bigger dot is that number grown by a maximum filter
-            lab = np.zeros((h + 2 * d, w + 2 * d), np.float32)
-            lab[py, px] = np.arange(1, len(idx) + 1, dtype=np.float32)
-            if lay.get("shape") == "half" and d > 1:                     # (the right half of a disc, flat side on the cell)
-                k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d))
-                k[:, :d // 2] = 0
-                lab = cv2.dilate(lab, k[:, d // 2:], anchor=(0, d // 2))
-            elif d > 1:
-                lab = cv2.dilate(lab, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d)))
-            lab = lab[d:d + h, d:d + w]
-            hit = lab > 0
-            img[hit] = rgb[lab[hit].astype(np.int64) - 1]
-        if self.cell_alpha < 0.999:
-            img = (img.astype(np.float32) * self.cell_alpha + np.asarray(self.bgcolor, np.float32) * (1.0 - self.cell_alpha)).astype(np.uint8)
-        if self.outlines:
-            self.draw_outlines(img, W, H, ox, oy, (x_lo, x_hi, y_lo, y_hi))
-        self.base = img
-        self.compose()
-        self.reposition()
-        self.shown_view, self.shown_scale, self.previewed = (self.cx, self.cy), self.scale, (0, 0)          # (what is on the canvas is for this view: see preview_pan)
-        self.remember_view()
-        if self.on_view:
-            self.on_view()
+            lay["drawn_scale"] = scale
+            diameters.append(d)
+        layers, flip_y, bgcolor, cell_alpha, outlines = list(self.layers), self.flip_y, self.bgcolor, self.cell_alpha, self.outlines
+
+        def render():
+            img = np.empty((h, w, 3), np.uint8)
+            img[:] = bgcolor
+            for lay, d in zip(layers, diameters):
+                x, y = lay["x"], lay["y"]
+                pm = d / scale
+                m = (x >= x_lo - pm) & (x <= x_hi + pm) & (y >= y_lo - pm) & (y <= y_hi + pm)
+                idx = np.flatnonzero(m)
+                if not len(idx):
+                    continue
+                px = np.floor((x[idx] - cx) * scale + W / 2 - ox).astype(np.int32)      # (floor: the same pixel as on the whole canvas, also left of or above the picture)
+                dy = (y[idx] - cy) * scale
+                py = np.floor((-dy if flip_y else dy) + H / 2 - oy).astype(np.int32)
+                rgb = lay["rgb"][idx]
+                if lay.get("shape") == "plus":
+                    stamp_plus(img, px, py, rgb, d)
+                    continue
+                if lay.get("marks") is not None and not self.moving:         # (a marker code for each cell: the group's shape; plain discs while the view moves)
+                    self.draw_marked(img, px, py, rgb, lay["marks"][idx], d)
+                    continue
+                if opacity < 1.0 and lay.get("shape") != "half":
+                    blend_dots(img, px + d, py + d, rgb, d, opacity, self.kernels)
+                    continue
+                if d > BIG_DOT_PX:                                             # (very big dots, so few on screen: each drawn as a circle, later ones on top)
+                    r = d // 2
+                    for X, Y, c in zip(px.tolist(), py.tolist(), rgb.tolist()):
+                        cv2.circle(img, (X, Y), r, c, -1)
+                    continue
+                px, py = px + d, py + d
+                # each point writes its number (later = on top) at its pixel; a bigger dot is that number grown by a maximum filter
+                lab = np.zeros((h + 2 * d, w + 2 * d), np.float32)
+                lab[py, px] = np.arange(1, len(idx) + 1, dtype=np.float32)
+                if lay.get("shape") == "half" and d > 1:                     # (the right half of a disc, flat side on the cell)
+                    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d))
+                    k[:, :d // 2] = 0
+                    lab = cv2.dilate(lab, k[:, d // 2:], anchor=(0, d // 2))
+                elif d > 1:
+                    lab = cv2.dilate(lab, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d)))
+                lab = lab[d:d + h, d:d + w]
+                hit = lab > 0
+                img[hit] = rgb[lab[hit].astype(np.int64) - 1]
+            if cell_alpha < 0.999:
+                img = (img.astype(np.float32) * cell_alpha + np.asarray(bgcolor, np.float32) * (1.0 - cell_alpha)).astype(np.uint8)
+            if outlines:
+                self.draw_outlines(img, W, H, ox, oy, (x_lo, x_hi, y_lo, y_hi), (cx, cy, scale), outlines)
+            return img
+
+        def put(img):
+            self.drawn = (ox, oy, ex, ey)
+            self.base = img
+            self.compose()
+            self.reposition()
+            self.shown_view, self.shown_scale, self.previewed = (cx, cy), scale, (0, 0)          # (what is on the canvas is for this view: see preview_pan)
+            self.remember_view()
+            if self.on_view:
+                self.on_view()
+
+        if background is None:
+            self.drawn = (ox, oy, ex, ey)           # (set first: the notes below say how big the picture was)
+            put(render())
+            return
+        token, box = self.draw_token, {}
+
+        def work():
+            try:
+                box["img"] = render()
+            except Exception as e:                    # (e.g. the arrays changed under it: the picture is made again on the main thread when it is wanted)
+                box["error"] = e
+
+        thread = threading.Thread(target=work, daemon=True)
+        thread.start()
+
+        def poll():
+            if thread.is_alive():
+                self.canvas.after(4, poll)
+                return
+            if token == getattr(self, "draw_token", 0):          # (nothing has been drawn since: else this picture is for a view that is gone)
+                if "img" in box:
+                    put(box["img"])
+                else:
+                    self.stale = True
+                    self.request_draw()
+            background()
+        self.canvas.after(4, poll)
 
     def set_outlines(self, polygons):
         self.outlines = polygons or None
         self.request_draw()
 
-    def draw_outlines(self, img, w, h, ox, oy, view):
+    def draw_outlines(self, img, w, h, ox, oy, view, at=None, outlines=None):
         """The outlines in view, one pixel wide, dark on a light background and light on a dark one. (w, h: the whole canvas; ox, oy: where the
         picture starts in it; view: the data x0, x1, y0, y1 it shows.)"""
         x0, x1, y0, y1 = view
+        cx, cy, scale = at or (self.cx, self.cy, self.scale)
         shown = []
-        for p in self.outlines:
+        for p in (self.outlines if outlines is None else outlines):
             lo, hi = p.min(axis=0), p.max(axis=0)
             if hi[0] < x0 or lo[0] > x1 or hi[1] < y0 or lo[1] > y1:
                 continue
-            px = (p[:, 0] - self.cx) * self.scale + w / 2 - ox
-            dy = (p[:, 1] - self.cy) * self.scale
+            px = (p[:, 0] - cx) * scale + w / 2 - ox
+            dy = (p[:, 1] - cy) * scale
             py = (-dy if self.flip_y else dy) + h / 2 - oy
             shown.append(np.round(np.column_stack([px, py])).astype(np.int32))
         if shown:
@@ -1341,6 +1391,15 @@ class PointCanvas:
             for code in codes:
                 sel = marks == code
                 blend_dots(img, px[sel] + d, py[sel] + d, rgb[sel], d, opacity, self.kernels, kernel=self.marker_kernel(int(code), d))
+            return
+        if d >= 6 and len(px) <= h * w * d / 6000:                         # (few, big markers: each stamped where it is, in order, which comes out the same as the
+            stamps = {int(c): self.marker_kernel(int(c), d)[::-1, ::-1] > 0 for c in codes}       # filter's result but is not a filter over the whole picture)
+            off = d - 1 - d // 2
+            for X, Y, c, code in zip(px.tolist(), py.tolist(), rgb.tolist(), marks.tolist()):
+                x0, y0 = X - off, Y - off
+                sx0, sy0, sx1, sy1 = max(-x0, 0), max(-y0, 0), min(d, w - x0), min(d, h - y0)
+                if sx1 > sx0 and sy1 > sy0:
+                    img[y0 + sy0:y0 + sy1, x0 + sx0:x0 + sx1][stamps[code][sy0:sy1, sx0:sx1]] = c
             return
         px, py = px + d, py + d
         numbers = np.arange(1, len(px) + 1, dtype=np.float32)
@@ -1633,9 +1692,12 @@ class PointCanvas:
                     self.canvas.tag_raise(it)
 
     def nearest(self, tree, px, py):
-        """Index (into the tree's points) of the point within HOVER_RADIUS_PX of the canvas position, or None."""
+        """Index (into the tree's points) of the point within reach of the canvas position, or None. The reach is HOVER_RADIUS_PX, or more when the
+        dots have grown with the zoom (cells are then far apart on the screen): most of a dot's width, so the pointer need not be on the center."""
         x, y = self.to_data(px, py)
-        dist, k = tree.query([x, y], distance_upper_bound=HOVER_RADIUS_PX / self.scale)
+        biggest = max((lay.get("drawn_d", 0) for lay in self.layers), default=0)
+        reach = max(HOVER_RADIUS_PX, HOVER_REACH_DOTS * biggest)
+        dist, k = tree.query([x, y], distance_upper_bound=reach / self.scale)
         return None if not np.isfinite(dist) else int(k)
 
 
@@ -2476,11 +2538,12 @@ class UmapWindow(ExportsMixin):
         self.tile_scroll.configure(scrollregion=(0, 0, 4 + cols * (fw + 8), 3 + rows * (fh + 6)))
         self.root.after_idle(self.refresh_visible)
 
-    def place_tiles(self, max_draws=None):
+    def place_tiles(self, max_draws=None, background=None):
         """While the whole panel is zoomed: each section map's widget is put where the part of the map that is on screen is (and made that big, a
         little more all round), and drawn there; a map not on screen has no widget shown. A map whose widget still covers what is on screen is left.
         `max_draws`: at most this many maps are drawn (those with the most on screen first); while the panel is being dragged, none unless it says.
-        Returns how many more are waiting to be drawn."""
+        `background`: a function; the map is then drawn in a thread and the function called when that is done (see PointCanvas.draw), at most one
+        map to a call. Returns how many more are waiting to be drawn."""
         if self.panel_zoom <= 1.0 or not getattr(self, "tiles", None):
             return 0
         if max_draws is None and getattr(self, "panning", False):
@@ -2523,7 +2586,8 @@ class UmapWindow(ExportsMixin):
             if not t.get("shown", True):
                 self.tile_scroll.itemconfig(t["item"], state="normal")
                 t["shown"] = True
-            pc.set_view(int(x0), int(y0), int(x1) - int(x0), int(y1) - int(y0))
+            self.drawing_in_background = background is not None
+            pc.set_view(int(x0), int(y0), int(x1) - int(x0), int(y1) - int(y0), background)
         if waiting[:max_draws]:
             # A map's widget moved, resized and given its new picture: Tk does those in passes of its own (the pane moves the widget, the frame packs
             # its caption and canvas again, the canvas draws), and a screen refresh between them showed a moment of the old picture in the new
@@ -2593,16 +2657,18 @@ class UmapWindow(ExportsMixin):
 
         return x + grown(dx, old_w, lw), y + ch + grown(dy, old_h, lh)
 
-    def set_panel_zoom(self, zoom, anchor=None):
+    def set_panel_zoom(self, zoom, anchor=None, spot=None, draw=True):
         """Enlarge the whole panel to `zoom` times its size (1 to MAX_PANEL_ZOOM): the panels are laid out again, bigger, so that borders, gaps and
         sections grow together, and only those in view are drawn. `anchor` = (x, y in the scrolled pane, x, y in the window): the point that stays
-        under the pointer."""
+        under the pointer. `spot`: that point already found in the panels (see spot_in_tiles; for a layout that is not the one the anchor's x, y
+        are of). `draw` False: only laid out, the maps drawn by the caller (zoom_fill)."""
         if getattr(self, "panning", False):
             self.end_pan()                           # (a drag just before: its drawing put off no longer, as the maps are laid out and drawn here)
         zoom = min(max(zoom, 1.0), self.max_panel_zoom())
         if abs(zoom - self.panel_zoom) < 1e-9 or not self.tiles:
             return
-        spot = self.spot_in_tiles(anchor[0], anchor[1]) if anchor is not None else None
+        if spot is None and anchor is not None:
+            spot = self.spot_in_tiles(anchor[0], anchor[1])
         self.trail(f"set_panel_zoom {self.panel_zoom:.3g} -> {zoom:.3g}")
         self.panel_zoom = zoom
         for t in self.tiles:
@@ -2632,8 +2698,9 @@ class UmapWindow(ExportsMixin):
                 self.tile_scroll.yview_moveto(want_y / new[3])
             self.zoom_view = (self.tile_scroll.canvasx(0), self.tile_scroll.canvasy(0))
             self.root.after(400, self.check_zoom_view)
-        self.place_tiles()
-        self.root.after_idle(self.refresh_visible)
+        if draw:
+            self.place_tiles()
+            self.root.after_idle(self.refresh_visible)
 
     def check_zoom_view(self):
         """Some time after a zoom: has the view moved since, with no drag or wheel? (The sudden jump to the top left: see zoom_debug.log.)"""
@@ -2644,6 +2711,12 @@ class UmapWindow(ExportsMixin):
             self.zoom_note("the view moved by itself after a zoom", was=self.zoom_view, now=now, zoom=self.panel_zoom,
                            scrollregion=self.tile_scroll.cget("scrollregion"), pane=(self.tile_scroll.winfo_width(), self.tile_scroll.winfo_height()))
         self.zoom_view = None
+
+    def time_note(self, what, since, limit=0.04):
+        """A step of the zoom that took longer than `limit` seconds goes in the trail (and so in zoom_debug.log with the next note)."""
+        took = time.perf_counter() - since
+        if took > limit:
+            self.trail(f"SLOW {what}: {took * 1000:.0f} ms")
 
     def trail(self, what):
         """The last few things that moved or re-laid the section pane, with the time, kept for zoom_note to write out with a jump."""
@@ -2681,8 +2754,10 @@ class UmapWindow(ExportsMixin):
         step takes a snapshot of it, each step shows that snapshot, scaled, at once, and when the wheel has been still for ZOOM_SETTLE_MS the panels
         really are laid out and drawn at the new size (set_panel_zoom). Without a snapshot (no screen to take it from) each step does it all."""
         b = self.zoom_burst
+        t_step = time.perf_counter()
         if b is None:
             image = self.snapshot_pane()
+            self.time_note("snapshot_pane", t_step)
             if image is None:
                 self.set_panel_zoom(self.panel_zoom * factor, (self.tile_scroll.canvasx(wx), self.tile_scroll.canvasy(wy), wx, wy))
                 return
@@ -2691,10 +2766,23 @@ class UmapWindow(ExportsMixin):
             b["spot"] = self.spot_in_tiles(*b["content"])
             self.remember_pane(b, image)
         b["target"] = min(max(b["target"] * factor, 1.0), self.max_panel_zoom())
-        self.show_zoom_snapshot(b)
+        if b.get("fill") is not None:                                # (settling was drawing the maps: it stops, to start again when the wheel does)
+            self.root.after_cancel(b["fill"])
+            b["fill"] = None
+        if b.get("show") is None:                                    # (steps that came in while the last was being shown are shown as one: no backlog)
+            b["show"] = self.root.after_idle(self.show_zoom_step)
         if b["job"] is not None:
             self.root.after_cancel(b["job"])
         b["job"] = self.root.after(self.ZOOM_SETTLE_MS, self.settle_zoom)
+
+    def show_zoom_step(self):
+        b = self.zoom_burst
+        if b is None:
+            return
+        b["show"] = None
+        t_show = time.perf_counter()
+        self.show_zoom_snapshot(b)
+        self.time_note("show_zoom_snapshot", t_show)
 
     def pane_look(self):
         """What the pictures of the pane were made with: they are dropped when it changes (a recolor, a size, ...)."""
@@ -2714,11 +2802,56 @@ class UmapWindow(ExportsMixin):
             widest = min(self.pane_cache, key=lambda e: e["z"])
             self.pane_cache = [widest] + [e for e in self.pane_cache if e is not widest][-3:]
 
+    def blit_window_region(self, x, y, w, h):
+        """Just that part of the window, copied from the window's own device context (about 20 ms: PrintWindow draws the whole window, 170 ms). The same
+        picture on any monitor. None if it cannot be had, or is blank."""
+        try:
+            import ctypes
+            from ctypes import wintypes as wt
+            u, g = ctypes.WinDLL("user32"), ctypes.WinDLL("gdi32")            # (their own copies of the functions: the argument types set here are not the program's)
+            vp, ci = ctypes.c_void_p, ctypes.c_int
+            u.GetDC.restype, u.GetDC.argtypes = vp, [vp]
+            u.ReleaseDC.argtypes = [vp, vp]
+            g.CreateCompatibleDC.restype, g.CreateCompatibleDC.argtypes = vp, [vp]
+            g.CreateCompatibleBitmap.restype, g.CreateCompatibleBitmap.argtypes = vp, [vp, ci, ci]
+            g.SelectObject.argtypes = [vp, vp]
+            g.BitBlt.argtypes = [vp, ci, ci, ci, ci, vp, ci, ci, ctypes.c_uint]
+            g.GetDIBits.argtypes = [vp, vp, ctypes.c_uint, ctypes.c_uint, vp, vp, ctypes.c_uint]
+            g.DeleteObject.argtypes = [vp]
+            g.DeleteDC.argtypes = [vp]
+
+            class Header(ctypes.Structure):
+                _fields_ = [("size", wt.DWORD), ("w", wt.LONG), ("h", wt.LONG), ("planes", wt.WORD), ("bits", wt.WORD), ("compression", wt.DWORD),
+                            ("image", wt.DWORD), ("xppm", wt.LONG), ("yppm", wt.LONG), ("used", wt.DWORD), ("important", wt.DWORD)]
+            hwnd = self.root.winfo_id()
+            dc = u.GetDC(hwnd)
+            if not dc:
+                return None
+            mem = g.CreateCompatibleDC(dc)
+            bmp = g.CreateCompatibleBitmap(dc, w, h)
+            try:
+                g.SelectObject(mem, bmp)
+                if not g.BitBlt(mem, 0, 0, w, h, dc, x, y, 0x00CC0020):
+                    return None
+                buf = ctypes.create_string_buffer(w * h * 4)
+                g.GetDIBits(mem, bmp, 0, h, buf, ctypes.byref(Header(40, w, -h, 1, 32, 0, 0, 0, 0, 0, 0)), 0)
+            finally:
+                g.DeleteObject(bmp)
+                g.DeleteDC(mem)
+                u.ReleaseDC(hwnd, dc)
+            part = Image.frombuffer("RGBA", (w, h), buf, "raw", "BGRA", 0, 1).convert("RGB")
+            return None if part.getextrema() == ((0, 0), (0, 0), (0, 0)) else part
+        except Exception:
+            return None
+
     def print_window_region(self, x, y, w, h):
         """A part of this window's own picture of itself (Windows PrintWindow), x, y from the window's top left: right on any monitor, whatever its scaling.
         (A screen grab is not: it comes out black, or the wrong place, for a window on a monitor other than the main one.) None if it cannot be had."""
         if sys.platform != "win32":
             return None
+        quick = self.blit_window_region(x, y, w, h)
+        if quick is not None:
+            return quick
         try:
             import ctypes
             from ctypes import wintypes as wt
@@ -2844,6 +2977,7 @@ class UmapWindow(ExportsMixin):
         """The snapshot of the pane as it will be at the zoom so far, over the pane: each part of it moved and grown as the real layout will have it (the maps
         grow, the captions and gaps do not), so that what is drawn for real at the end lands where this was; and the edges it does not reach from an earlier
         picture of the pane."""
+        t0 = time.perf_counter()
         w, h = b["image"].size
         z = b["target"]
         lay_n = self.layout_at(z)
@@ -2853,18 +2987,29 @@ class UmapWindow(ExportsMixin):
             e = self.earlier_entry(b)
             if e is not None:
                 under, _ = self.pane_picture(e["image"], self.pane_maps(lay_n, left_n, top_n, self.layout_at(e["z"]), e["left"], e["top"], w, h), w, h)
-                under[inside] = out[inside]
+                np.copyto(under, out, where=inside[:, :, None])
                 out = under
-        b["photo"] = ImageTk.PhotoImage(Image.fromarray(out), master=self.tile_scroll)
+        t1 = time.perf_counter()
+        fresh = b.get("photo") is None or (b["photo"].width(), b["photo"].height()) != (w, h)
+        if fresh:
+            b["photo"] = ImageTk.PhotoImage(Image.fromarray(out), master=self.tile_scroll)
+        else:
+            b["photo"].paste(Image.fromarray(out))                   # (the label shows the same photo, now with the new picture in it: nothing else to do)
+        t2 = time.perf_counter()
         if b["label"] is None:
             b["label"] = tk.Label(self.tile_scroll, bd=0, highlightthickness=0, cursor="fleur")
             b["label"].bind("<MouseWheel>", lambda e: self.zoom_step(*b["at"], 1.25 if e.delta > 0 else 0.8))
             b["label"].bind("<Button-4>", lambda e: self.zoom_step(*b["at"], 1.25))
             b["label"].bind("<Button-5>", lambda e: self.zoom_step(*b["at"], 0.8))
             b["label"].place(x=0, y=0, width=w, height=h)
-        b["label"].configure(image=b["photo"])
-        b["label"].lift()
+        if fresh:
+            b["label"].configure(image=b["photo"])
+            b["label"].lift()
+        t3 = time.perf_counter()
         b["label"].update_idletasks()
+        if time.perf_counter() - t0 > 0.04:
+            self.time_note(f"snapshot step: maps+remap {1000 * (t1 - t0):.0f}, photo {1000 * (t2 - t1):.0f}, configure {1000 * (t3 - t2):.0f}, "
+                           f"update_idletasks {1000 * (time.perf_counter() - t3):.0f} ms; total", t0, 0)
 
     def settle_zoom(self):
         """The wheel has been still: the panels are laid out and drawn for real at the zoom reached, and the snapshot taken away."""
@@ -2873,17 +3018,76 @@ class UmapWindow(ExportsMixin):
             return
         b["job"] = None
         wx, wy = b["at"]
-        self.set_panel_zoom(b["target"], (b["content"][0], b["content"][1], wx, wy))
+        if b.get("spot") is None:
+            self.set_panel_zoom(b["target"], (b["content"][0], b["content"][1], wx, wy))
+            self.root.update_idletasks()
+            self.refresh_visible()                                  # (what is in view is drawn before the snapshot goes, so that there is no blank between)
+            self.root.update_idletasks()
+            self.cancel_zoom_burst()
+            return
+        # The panels are laid out now (quick), and drawn one map at a time with the snapshot still over them, so that the wheel
+        # starting again is seen to between the maps: it goes on from the snapshot (which does not depend on the layout under it), and the
+        # maps drawn so far are laid out again at the new zoom when it stops. (zoom_fill)
+        t_lay = time.perf_counter()
+        b["laid"] = True                                            # (before the layout: its idle work must not draw everything, see refresh_visible)
+        self.set_panel_zoom(b["target"], (None, None, wx, wy), spot=b["spot"], draw=False)
+        self.time_note("settle: set_panel_zoom (layout)", t_lay, 0.02)
+        b["settled_at"] = time.perf_counter()
+        self.trail("settle: laid out, filling")
+        self.zoom_fill()
+
+    def zoom_fill(self):
+        """Settling a zoom: one map drawn where it now is (those with the most on screen first), then the next after the events that came in between;
+        when all are drawn the snapshot goes."""
+        b = self.zoom_burst
+        if b is None:
+            return
+        b["fill"] = None
+        if b["job"] is not None:                                    # (the wheel has started again: settle_zoom comes when it stops)
+            return
+        if b.get("busy"):                                           # (a map is being drawn in its thread: its end comes back here)
+            return
+        t_fill = time.perf_counter()
+        self.drawing_in_background = False
+        more = self.place_tiles(max_draws=1, background=lambda: self.map_drawn(b))
+        self.time_note(f"zoom_fill map (more={more})", t_fill)
+        if self.drawing_in_background:
+            b["busy"] = True
+            return
+        if more:
+            b["fill"] = self.root.after(PAN_FILL_GAP_MS, self.zoom_fill)
+            return
+        t0 = time.perf_counter()
+        for t in self.tiles:                                        # (maps off screen when recolored, and maps that are waiting for a draw)
+            if t.get("dirty") and self.frame_visible(t["frame"]):
+                self.build_tile(t)
+            t["pc"].refresh()
+            if time.perf_counter() - t0 > 0.03 and t is not self.tiles[-1]:
+                b["fill"] = self.root.after(PAN_FILL_GAP_MS, self.zoom_fill)
+                return
+        t_idle = time.perf_counter()
         self.root.update_idletasks()
-        self.refresh_visible()                                      # (what is in view is drawn before the snapshot goes, so that there is no blank between)
-        self.root.update_idletasks()
+        self.time_note("settle: final update_idletasks", t_idle, 0.02)
+        if any(t["pc"].pending is not None for t in self.tiles):    # (those draws come at idle: the snapshot goes after them)
+            b["fill"] = self.root.after(PAN_FILL_GAP_MS, self.zoom_fill)
+            return
+        self.time_note("settle: whole (laid out to snapshot gone)", b.get("settled_at", time.perf_counter()), 0.0)
         self.cancel_zoom_burst()
+        self.trail("settle: done, snapshot gone")
+
+    def map_drawn(self, b):
+        """A map drawn in the background by zoom_fill is on the screen (or dropped): on to the next, unless the wheel has started again, in which case
+        settle_zoom goes on from here when it stops."""
+        b["busy"] = False
+        if self.zoom_burst is b and b["job"] is None and b.get("fill") is None:
+            b["fill"] = self.root.after(PAN_FILL_GAP_MS, self.zoom_fill)
 
     def cancel_zoom_burst(self):
         b, self.zoom_burst = self.zoom_burst, None
         if b is not None:
-            if b["job"] is not None:
-                self.root.after_cancel(b["job"])
+            for name in ("job", "fill", "show"):
+                if b.get(name) is not None:
+                    self.root.after_cancel(b[name])
             if b["label"] is not None:
                 b["label"].destroy()
 
@@ -3137,6 +3341,11 @@ class UmapWindow(ExportsMixin):
 
     def refresh_visible(self):
         """Panels that were off screen when they were recolored or moved are made now that they are on screen."""
+        b = self.zoom_burst
+        if b is not None and b.get("laid"):                    # (a zoom settling: its maps are drawn one at a time, see zoom_fill)
+            if b.get("fill") is None and b["job"] is None:
+                b["fill"] = self.root.after(PAN_FILL_GAP_MS, self.zoom_fill)
+            return
         self.place_tiles()
         if getattr(self, "panning", False):          # (while the panel is dragged: drawn bit by bit, by pan_fill, and all of it once the drag stops)
             return

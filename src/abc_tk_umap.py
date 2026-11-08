@@ -2519,7 +2519,7 @@ class UmapWindow(ExportsMixin):
                 pc.canvas.config(width=px, height=ph)
                 t["frame"].slot_wh = None
                 t["shown"] = True
-                if not t["caption"].winfo_ismapped():
+                if not t["caption"].winfo_manager():                # (not winfo_ismapped: that is only true once Tk has had its idle turn after a pack)
                     t["caption"].pack(anchor="w", before=pc.canvas)
                 self.tile_scroll.itemconfig(t["item"], state="normal")
         self.root.update_idletasks()                                  # (so that the panels know their size)
@@ -2578,9 +2578,11 @@ class UmapWindow(ExportsMixin):
             x0, x1 = max(vl - mx - cx0, 0), min(vl + vw + mx - cx0, lw)
             y0, y1 = max(vt - my - cy0, 0), min(vt + vh + my - cy0, lh)
             with_caption = y0 <= 0
-            if with_caption and not t["caption"].winfo_ismapped():
+            # (winfo_manager, not winfo_ismapped: a caption just packed is not "mapped" until Tk's idle turn, and one taken for absent here was
+            # then never hidden, and appeared later: the map's picture 31 pixels low in its frame, the vertical hiccup at the end of a zoom)
+            if with_caption and not t["caption"].winfo_manager():
                 t["caption"].pack(anchor="w", before=pc.canvas)
-            elif not with_caption and t["caption"].winfo_ismapped():
+            elif not with_caption and t["caption"].winfo_manager():
                 t["caption"].pack_forget()
             self.tile_scroll.coords(t["item"], cx0 + x0, cy0 + y0 - (ch if with_caption else 0))
             if not t.get("shown", True):

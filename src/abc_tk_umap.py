@@ -472,6 +472,9 @@ class CellTip:
         self.drag = None               # while a tip is being dragged: {"top", "dx", "dy", "moved"}, so that it is not taken away from under the pointer
         self.pinned = []               # the tips that were pinned (by moving them or by the pin): they stay, with a close box, until closed or unpinned
         self.bars = {}                 # tip -> (its top bar, its pin picture)
+        self.hot = []                  # the rows that react to the pointer: (tip, token, the labels to light, the widgets that make up its area)
+        self.poll_job = None           # the pointer is looked at while a tip is up (see poll)
+        self.entered = False           # the pointer has been on the floating tip since it came up
         self.last_moved = False        # the last press on a tip went on to move it (so that it was not a click on the pin)
         self.suspended = False         # a plot or the pane is being dragged: no tip, and no waiting for one, until it stops (suspend, resume)
         self.row_hover_fn = None       # fn(token) when the pointer rests on a row that has a token (a 4th item), fn(None) when it leaves it
@@ -548,6 +551,50 @@ class CellTip:
             self.make_movable(child)
 
     ROW_COLOR = "#ffe08a"
+
+    POLL_MS = 80
+
+    def start_poll(self):
+        if self.poll_job is None:
+            self.poll_job = self.root.after(self.POLL_MS, self.poll)
+
+    def poll(self):
+        """While a tip is up, look at where the pointer is, instead of waiting to be told: on macOS a tip (a window without a frame, never the
+        active one) is sent no Enter, Leave or Motion events until it is clicked, so its rows would not react and it would not go when the pointer
+        left it. The rows are lit by where the pointer is over them, and the floating tip goes when the pointer has been on it and then leaves."""
+        self.poll_job = None
+        live = []
+        for h in self.hot:
+            try:
+                if h[0].winfo_exists():
+                    live.append(h)
+            except tk.TclError:
+                pass
+        self.hot = live
+        if not live and self.tip is None and not self.pinned:
+            return
+        try:
+            x, y = self.root.winfo_pointerxy()
+            hit = None
+            for tip, token, labels, area in live:
+                boxes = [(w.winfo_rootx(), w.winfo_rooty(), w.winfo_rootx() + w.winfo_width(), w.winfo_rooty() + w.winfo_height())
+                         for w in area if w.winfo_ismapped()]
+                if boxes and min(b[0] for b in boxes) <= x < max(b[2] for b in boxes) and min(b[1] for b in boxes) <= y < max(b[3] for b in boxes):
+                    hit = (token, labels)
+                    break
+            if hit is not None and self.row_hover_fn is not None and self.drag is None:
+                self.row_enter(*hit)
+            elif self.row_active is not None:
+                self.row_leave()
+            if self.tip is not None:
+                if self.pointer_in_tip():
+                    self.entered = True
+                elif self.entered and self.drag is None:
+                    self.entered = False
+                    self.hide()
+        except tk.TclError:
+            pass
+        self.start_poll()
 
     def row_enter(self, token, labels):
         """The pointer is on a row of the tip that stands for a group of cells: the row is lit, and the cells are shown (row_hover_fn)."""
@@ -675,6 +722,7 @@ class CellTip:
                 for w in (top, caption, mark):
                     w.bind("<Enter>", lambda e, t=token, c=caption: self.row_enter(t, [c]), add="+")
                     w.bind("<Leave>", lambda e: self.row_leave(), add="+")
+                self.hot.append((self.tip, token, [caption], [top]))
         # in columns: what (gray), the number (bold, to the right), the name
         grid = tk.Frame(box, bg=bg)
         grid.pack(anchor="w", padx=6, pady=(4, 2))
@@ -690,6 +738,7 @@ class CellTip:
                 for w in labels:
                     w.bind("<Enter>", lambda e, t=token, ls=labels: self.row_enter(t, ls), add="+")
                     w.bind("<Leave>", lambda e: self.row_leave(), add="+")
+                self.hot.append((self.tip, token, labels, labels))
         # copied with a tab between the columns: pasted into a spreadsheet, they stay columns
         text = copy_text_fn() if copy_text_fn is not None else "\n".join("\t".join(row[:3]) for row in rows)
         buttons = tk.Frame(box, bg=bg)
@@ -703,6 +752,8 @@ class CellTip:
         copy.pack(side=tk.LEFT)
         self.tip.bind("<Leave>", lambda e: self.root.after(100, self.hide_unless_pointer_in))
         self.make_movable(box)
+        self.entered = False
+        self.start_poll()
         pin.bind("<ButtonRelease-1>", lambda e, t=self.tip: self.pin_clicked(t), add="+")        # (after the drag handlers: they say whether this press moved the tip)
         pin.config(cursor="hand2")
         # just beside the pointer (close, so that it is quickly reached), but kept on the screen

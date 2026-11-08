@@ -353,15 +353,33 @@ def label_weights(counts):
     return LABEL_WEIGHT_RANGE[0] + (LABEL_WEIGHT_RANGE[1] - LABEL_WEIGHT_RANGE[0]) * t
 
 
-def expressing_percentile(vals, point):
-    """Where `point` stands among the cells that express the gene (a finite value above 0): the percentage of them whose value is below it (0 if none
-    express it). The cells with no expression are left out, as they are below any point above 0 and would only say how few cells express the gene."""
+def expressing_percentile(vals, point, info=None, hi=None):
+    """Where `point` stands among the cells that express the gene (a finite value above 0): the percentage of them below it (0 if none express it). It is
+    read from the same distribution the histogram draws (see histogram_columns; `info` is its data, expression_histogram(vals), `hi` the top of the range):
+    where the values are whole, each value's cells are spread over the stretch it stands for, so a point inside that stretch has part of them below it, as the
+    histogram shows, and the reading is the usual percentile rank of a value, counting half of the cells that have it. The cells with no expression are left
+    out, as they are below any point above 0 and would only say how few cells express the gene."""
+    if info is not None and info[1] is not None and hi is not None:
+        u, c = info[1]
+        return 100.0 * float(np.interp(point, discrete_bounds(u, hi), np.concatenate(([0.0], np.cumsum(c))), left=0.0, right=float(c.sum()))) / float(c.sum())
     expr = np.isfinite(vals) & (vals > 0)
     ne = int(np.count_nonzero(expr))
     return 100.0 * np.count_nonzero(expr & (vals < point)) / ne if ne else 0.0
 
 
+def value_at_percentile(info, hi, percent):
+    """The value that is the `percent`th percentile of the cells that express the gene (the inverse of expressing_percentile), or None if none do."""
+    srt, discrete = info
+    if not len(srt):
+        return None
+    if discrete is not None:
+        u, c = discrete
+        return float(np.interp(percent / 100.0 * c.sum(), np.concatenate(([0.0], np.cumsum(c))), discrete_bounds(u, hi)))
+    return float(np.quantile(srt, percent / 100.0))
+
+
 HIST_HEIGHT = 34                    # the histogram under a gene's levels slider (pixels)
+LINEAR_WHITE_PERCENTILE = 98.0      # in the linear scale the white point of a gene starts at this percentile of the cells that express it
 HIST_PAD = 5                        # and room under its axis for the dot that shows the value of the cell the pointer is on
 HIST_MAX_DISCRETE = 600             # a gene with no more different values than this (counts are whole numbers: a few dozen) has its cells spread over the stretch each value stands for
 
@@ -380,6 +398,14 @@ def expression_histogram(vals):
     return srt, discrete
 
 
+def discrete_bounds(u, hi):
+    """The stretches of the values `u` (few and whole: counts, or the log of 1 + counts) as the histogram spreads them: the edges halfway between one value and the
+    next (from 0 below the first), len(u) + 1 of them; the highest value's stretch ends where the track does (`hi`), so that no cell is cut off."""
+    points = np.concatenate(([0.0], u))
+    end = min(u[-1] + (u[-1] - (u[-2] if len(u) > 1 else 0.0)) / 2, hi)
+    return np.concatenate(((points[:-1] + points[1:]) / 2, [end]))
+
+
 def histogram_columns(info, lo, hi, even, n):
     """How many of the cells in `info` (see expression_histogram) fall in each of `n` equal parts of a slider's track, the track running over the values
     from `lo` to `hi` (a position is the fraction of the range, or its square root unless `even`: see RangeSlider). Where the values are few and whole
@@ -392,10 +418,7 @@ def histogram_columns(info, lo, hi, even, n):
     edges = lo + (position if even else position ** 2) * (hi - lo)
     if discrete is not None:
         u, c = discrete
-        points = np.concatenate(([0.0], u))
-        end = min(u[-1] + (u[-1] - (u[-2] if len(u) > 1 else 0.0)) / 2, hi)               # (the highest value's stretch ends where the track does: no cell is cut off)
-        bounds = np.concatenate(((points[:-1] + points[1:]) / 2, [end]))
-        return np.diff(np.interp(edges, bounds, np.concatenate(([0.0], np.cumsum(c))), left=0.0, right=float(c.sum())))
+        return np.diff(np.interp(edges, discrete_bounds(u, hi), np.concatenate(([0.0], np.cumsum(c))), left=0.0, right=float(c.sum())))
     below = np.searchsorted(srt, edges, side="left")
     below[-1] = len(srt)
     return np.diff(below).astype(float)
@@ -413,11 +436,12 @@ class RangeSlider(tk.Canvas):
         super().__init__(parent, height=height, highlightthickness=0)
         self.low, self.high, self.margin, self.command, self.dragging = 0.0, 1.0, margin, command, None
         self.even = False                                  # (True: the track is even, a position is the fraction itself)
+        self.default = (0.0, 1.0)                          # (where a double-click puts the handles: the whole range, or what the window sets)
         self.bind("<Configure>", lambda e: self.draw())
         self.bind("<ButtonPress-1>", self.press)
         self.bind("<B1-Motion>", self.move)
         self.bind("<ButtonRelease-1>", lambda e: setattr(self, "dragging", None))
-        self.bind("<Double-Button-1>", lambda e: self.set(0.0, 1.0, notify=True))
+        self.bind("<Double-Button-1>", lambda e: self.set(*self.default, notify=True))
 
     def x_of(self, fraction):
         fraction = min(max(fraction, 0.0), 1.0)
@@ -2296,6 +2320,7 @@ class UmapWindow(ExportsMixin):
         th.pack(fill=tk.X, pady=(4, 0))
         ttk.Label(th, text="Theme:").pack(side=tk.LEFT)
         self.var_theme = tk.StringVar(f, "light")
+        self.theme_choice = None                # (None until Dark or Light is clicked: then what was chosen, kept. Until then several genes are shown dark, one gene light)
         self.theme_buttons = []
         for value, text in (("dark", "Dark"), ("light", "Light")):
             b = ttk.Radiobutton(th, text=text, value=value, variable=self.var_theme, command=self.on_theme)
@@ -2328,7 +2353,7 @@ class UmapWindow(ExportsMixin):
             HoverTip(canvas, lambda c=canvas: self.hist_pointer[0] and self.histogram_readout(c, self.hist_pointer[0]))
         HoverTip(self.cbar_slider, lambda: "Drag the black and white handles to set the lowest and the highest value of the color scale. "
                                         + ("The track is even." if self.cbar_slider.even else "The track is by the square root of the value: most of it is for the low values. ")
-                                        + " Double-click to reset.")
+                                        + " Double-click to reset the handles to where they started.")
         # the legend for Single group(s)
         self.legend = tk.Canvas(f, width=300, height=10, highlightthickness=0)
         self.select_bar = ttk.Frame(f)                      # All / None, above the group list and the Single group(s) legend
@@ -3110,7 +3135,7 @@ class UmapWindow(ExportsMixin):
     def pane_look(self):
         """What the pictures of the pane were made with: they are dropped when it changes (a recolor, a size, ...)."""
         return (tuple(id(t["pc"].layers) for t in self.tiles), self.var_dot.get(), self.var_marker.get(), self.var_translucent.get(), self.var_ccf.get(),
-                self.var_roi_only.get(), self.var_tile.get(), self.tile_scroll.winfo_width())        # (not its height: the scroll bar that comes with the zoom changes that)
+                self.var_roi_only.get(), self.var_tile.get(), self.tile_scroll.winfo_width(), getattr(self, "tiles_dark", False))        # (not its height: the scroll bar that comes with the zoom changes that)
 
     PANE_CACHE_BYTES = 160 * 1024 * 1024                         # the pictures of the pane kept (see remember_pane)
     PANE_CACHE_MAX = 12
@@ -3301,7 +3326,7 @@ class UmapWindow(ExportsMixin):
         inside = ((my >= 0) & (my <= sh - 1))[:, None] & ((mx >= 0) & (mx <= sw - 1))[None, :]
         out = cv2.remap(src, np.ascontiguousarray(np.broadcast_to(mx.astype(np.float32)[None, :], (h, w))),
                         np.ascontiguousarray(np.broadcast_to(my.astype(np.float32)[:, None], (h, w))), cv2.INTER_LINEAR,
-                        borderMode=cv2.BORDER_CONSTANT, borderValue=(244, 244, 244))
+                        borderMode=cv2.BORDER_CONSTANT, borderValue=self.margin_rgb())
         return out, inside
 
     def pyramid_order(self, target):
@@ -3322,7 +3347,7 @@ class UmapWindow(ExportsMixin):
         left_n, top_n = self.view_at(z, b["spot"], b["at"], lay_n) if b.get("spot") else (b["left"] * z / b["start"], b["top"] * z / b["start"])
         b["shown_layout"], b["shown_view"] = lay_n, (left_n, top_n)          # (what the picture shown is, for reanchor)
         out = np.empty((h, w, 3), np.uint8)
-        out[:] = (244, 244, 244)
+        out[:] = self.margin_rgb()
         todo = np.ones((h, w), bool)                                  # (the parts of the pane no picture has been put on yet)
         # The picture the zoom started from is always first: it is the pane as it is. The older ones only fill in what it does not reach
         # (they may be out of date, or have blank parts from a drag: the pane is not drawn all over while one goes on).
@@ -3599,6 +3624,7 @@ class UmapWindow(ExportsMixin):
         if self.busy:
             self.var_theme.set("light" if self.var_theme.get() == "dark" else "dark")
             return
+        self.theme_choice = self.var_theme.get()          # (chosen: from now on it is kept, for one gene and for several)
         if self.mode in ("gene", "imputed") and self.gene_cache is not None:
             key = self.gene_cache[0]
             self.show_genes(list(key[0]), key[1], key[2], self.gene_cache[1])
@@ -3677,6 +3703,11 @@ class UmapWindow(ExportsMixin):
         UMAP's cells take their group's shape now, and the section panels' when they are made (just after: see apply)."""
         self.run_cell_rank, self.bg_cell_rank = run_rank, bg_rank
         self.set_umap_marks(run_rank)
+
+    def margin_rgb(self):
+        """The color of the blank margins a zoom out shows where no picture of the pane reaches (see show_zoom_snapshot): the dark of the plots in the dark
+        theme, light gray (the pane's own color) otherwise: dark plots are not shown in a sea of white. The pane itself, between the panels, stays light."""
+        return MULTI_BG if getattr(self, "tiles_dark", False) else (244, 244, 244)
 
     def set_tile_background(self):
         """The section panels' background: the UMAP's (see view_background), and white in ROI only (whose gray cells are for it)."""
@@ -4173,7 +4204,7 @@ class UmapWindow(ExportsMixin):
             if isinstance(res, BaseException):
                 self.var_status.set(f"Could not read {', '.join(resolved)}: {res}")
                 return
-            self.keep_gene_settings(self.gene_cache[0] if self.gene_cache is not None else None, key)
+            self.keep_gene_settings(self.gene_cache[0] if self.gene_cache is not None else None, key, res)
             self.gene_cache = (key, res)
             self.show_genes(resolved, imputed, scale, res)
 
@@ -4204,11 +4235,24 @@ class UmapWindow(ExportsMixin):
             return {("standard", "log"): "log2(1 + expr)", ("standard", "linear"): linear}
         return SCALE_UNITS
 
-    def keep_gene_settings(self, old_key, new_key):
+    def default_levels_for(self, vals, scale):
+        """The black and white levels a gene starts at: the whole range in the log scale; in the linear scale, where the few cells that express a gene most
+        strongly make the rest all but black, the white point at the 98th percentile of the cells that express it (LINEAR_WHITE_PERCENTILE)."""
+        if scale != "linear":
+            return (0.0, 1.0)
+        fin = np.isfinite(vals)
+        if not fin.any():
+            return (0.0, 1.0)
+        lo, hi = float(np.nanmin(vals)), float(np.nanmax(vals))
+        v = value_at_percentile(self.histogram_of(vals), hi, LINEAR_WHITE_PERCENTILE)
+        return (0.0, min(max((v - lo) / (hi - lo), 0.0), 1.0)) if v is not None and hi > lo else (0.0, 1.0)
+
+    def keep_gene_settings(self, old_key, new_key, per_gene=None):
         """A different set of genes is going to be shown: a gene that was shown before keeps what was set for it (the black and white levels of its
-        slider, and whether it was hidden); a new gene starts at the full range, shown. Nothing is kept when the dataset or the scale changed (the
-        levels are fractions of a range that is not the same any more)."""
+        slider, and whether it was hidden); a new gene starts at the default levels (default_levels_for), shown. Nothing is kept when the dataset or the
+        scale changed (the levels are fractions of a range that is not the same any more). `per_gene`: the genes' values, [(run, background)]."""
         names = list(new_key[0])
+        self.default_levels = {i: (self.default_levels_for(per_gene[i][0], new_key[2]) if per_gene is not None else (0.0, 1.0)) for i in range(len(names))}
         levels, hidden = {}, set()
         if old_key is not None and old_key[1:] == new_key[1:]:
             old_names = list(old_key[0])
@@ -4216,8 +4260,8 @@ class UmapWindow(ExportsMixin):
             hidden_names = {old_names[i] for i in self.hidden if i < len(old_names)} if len(old_names) > 1 else set()
             levels = {i: old_levels[g] for i, g in enumerate(names) if g in old_levels}
             hidden = {i for i, g in enumerate(names) if g in hidden_names}
-        self.gene_levels = levels.get(0, (0.0, 1.0)) if len(names) == 1 else (0.0, 1.0)
-        self.multi_levels = levels if len(names) > 1 else {}
+        self.gene_levels = levels.get(0, self.default_levels[0]) if len(names) == 1 else (0.0, 1.0)
+        self.multi_levels = {i: levels.get(i, self.default_levels[i]) for i in range(len(names))} if len(names) > 1 else {}
         self.hidden = hidden if len(names) > 1 else set()
 
     def read_run_gene(self, gene, imputed, scale):
@@ -4287,6 +4331,8 @@ class UmapWindow(ExportsMixin):
         dataset = "imputed" if imputed else "standard"
         if self.mode not in ("gene", "imputed") or (self.mode == "imputed") != imputed:
             return
+        if self.theme_choice is None:                         # (not chosen yet: several genes are mixed on a dark background, one gene is on a light one)
+            self.var_theme.set("dark" if len(genes) > 1 else "light")
         self.values = [(g, pv[0]) for g, pv in zip(genes, per_gene)]
         self.view_token = "_".join(genes) + ("_imputed" if imputed else "")
         self.export_cat = None
@@ -4312,6 +4358,7 @@ class UmapWindow(ExportsMixin):
         self.shown_range = (vmin, vmax)                 # (the colors' range as shown, with the black and white levels: a saved picture's color bar has it too)
         self.show_levels_slider(True)
         self.cbar_slider.set_even(scale == "log")                                       # (a log scale is already spread out: an even track)
+        self.cbar_slider.default = self.default_levels.get(0, (0.0, 1.0))
         self.cbar_slider.set(low, high)
         self.hist_args = (self.histogram_of(vals), whole[0], whole[1], scale == "log", low, high, self.gene_rgb, self.units_text(dataset, scale))
         self.redraw_hist()
@@ -4338,7 +4385,8 @@ class UmapWindow(ExportsMixin):
             return self.bg["x"][w][o], self.bg["y"][w][o], col[o], w[o]
 
         self.apply(rgb, order, bg_fn, dark=self.var_theme.get() == "dark")             # (the dark theme: a black background, as in the multi-gene view)
-        readout = (expressing_percentile(vals, vmin), expressing_percentile(vals, vmax))
+        info = self.histogram_of(vals)
+        readout = (expressing_percentile(vals, vmin, info, whole[1]), expressing_percentile(vals, vmax, info, whole[1]))
         self.legend_redraw = lambda: self.draw_colorbar(vmin, vmax, scale, dataset, readout=readout)
         self.legend_redraw()
         self.var_status.set(f"Showing {gene}{' [imputed]' if dataset == 'imputed' else ''} (every cell of the sections, colored on the selection's scale)."
@@ -4407,7 +4455,8 @@ class UmapWindow(ExportsMixin):
             return self.bg["x"][w][o], self.bg["y"][w][o], col[o], w[o]
 
         self.apply(rgb, order, bg_fn, extra_umap_layers=extra, dark=not light)
-        readouts = [(expressing_percentile(per_gene[i][0], norm[i][1]), expressing_percentile(per_gene[i][0], norm[i][2])) for i in range(n)]
+        readouts = [(expressing_percentile(per_gene[i][0], norm[i][1], self.histogram_of(per_gene[i][0]), wholes[i][1]),
+                     expressing_percentile(per_gene[i][0], norm[i][2], self.histogram_of(per_gene[i][0]), wholes[i][1])) for i in range(n)]
         channel = lambda i: (lambda t, c=i % 3: mix([t if k == c else np.zeros_like(t) for k in range(3)]))          # (a gene's color at a place in its range: its own ink alone)
         legend_ranges = [(v[1], v[2]) for v in norm]
         legend_hists = [(self.histogram_of(per_gene[i][0]),) + wholes[i] + (channel(i), self.units_text(dataset, scale)) for i in range(n)]
@@ -4458,6 +4507,7 @@ class UmapWindow(ExportsMixin):
                 for e, x, anchor in ((readouts[i][0], 10, "nw"), (readouts[i][1], max(c.winfo_width(), 200) - 10, "ne")):
                     c.create_text(x, y + cells_y, anchor=anchor, text=f"{e:.1f} percentile", font=("Segoe UI", 8), fill="gray30", tags="legend")
             self.multi_sliders[i].set_even(scale == "log")
+            self.multi_sliders[i].default = self.default_levels.get(i, (0.0, 1.0))
             self.multi_sliders[i].set(*self.multi_levels.get(i, (0.0, 1.0)))
             c.coords(self.multi_windows[i], 0, y + slider_y)
             c.itemconfig(self.multi_windows[i], width=max(c.winfo_width(), 200))

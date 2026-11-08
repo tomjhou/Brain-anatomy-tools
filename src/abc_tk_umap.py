@@ -362,6 +362,7 @@ def expressing_percentile(vals, point):
 
 
 HIST_HEIGHT = 34                    # the histogram under a gene's levels slider (pixels)
+HIST_PAD = 5                        # and room under its axis for the dot that shows the value of the cell the pointer is on
 HIST_MAX_DISCRETE = 600             # a gene with no more different values than this (counts are whole numbers: a few dozen) has its cells spread over the stretch each value stands for
 
 
@@ -2312,7 +2313,8 @@ class UmapWindow(ExportsMixin):
         self.multi_windows = []
         self.levels_job = None
         self.cbar_slider = RangeSlider(self.gene_frame, self.on_gene_levels)
-        self.hist = tk.Canvas(self.gene_frame, height=HIST_HEIGHT, highlightthickness=0)
+        self.hist = tk.Canvas(self.gene_frame, height=HIST_HEIGHT + HIST_PAD, highlightthickness=0)
+        self.cell_marks = None                                 # {gene number: the value of the cell under the pointer}: a dot on each histogram (see mark_cell_on_histograms)
         self.hist_args = None                                  # (what it shows now, to draw again when its width changes: see redraw_hist)
         self.hist_cache = {}                                   # id of a values array -> (the array, its histogram data): the sliders redraw on every drag
         self.hist.hist_regions, self.hist.hist_photos = [], []
@@ -3611,6 +3613,7 @@ class UmapWindow(ExportsMixin):
             self.off_groups = set()                      # (a new level, mode or list of groups starts with every group colored)
         self.var_status.set("")
         self.legend_redraw = None                        # (the color bar or gene legend is drawn again only while there is one: see cbar_resized)
+        self.cell_marks = None
         self.select_bar.pack_forget()
         self.legend.pack_forget()
         self.group_list.pack_forget()
@@ -4298,6 +4301,7 @@ class UmapWindow(ExportsMixin):
             self.show_multi(genes, dataset, scale, per_gene)
 
     def show_single(self, gene, dataset, scale, vals, bg_vals):
+        self.cell_marks = None                          # (the dots of the cell under the pointer are for the genes shown: they come back with the next move)
         fin = np.isfinite(vals)
         vmin, vmax = (float(np.nanmin(vals)), float(np.nanmax(vals))) if fin.any() else (0.0, 1.0)
         # The black and white levels can be moved (the slider under the color bar), in either scale: they cut the range the colors cover.
@@ -4349,6 +4353,7 @@ class UmapWindow(ExportsMixin):
         return CHANNEL_HEX_LIGHT if self.var_theme.get() == "light" else CHANNEL_HEX
 
     def show_multi(self, genes, dataset, scale, per_gene):
+        self.cell_marks = None
         self.show_levels_slider(False)                  # (the single gene's slider: each gene has its own in the legend)
         light = self.var_theme.get() == "light"
         mix = (lambda chans: ink_rgb(chans)) if light else (lambda chans: (core.multi_gene_rgb(chans, (0.0, 0.0, 0.0)) * 255).astype(np.uint8))
@@ -4423,7 +4428,7 @@ class UmapWindow(ExportsMixin):
         cells_y = range_y + h8 + 2
         slider_y = cells_y + h8 + 4
         hist_y = slider_y + 26 + 2                                  # (the histogram under the slider)
-        row = hist_y + HIST_HEIGHT + 10
+        row = hist_y + HIST_HEIGHT + HIST_PAD + 10
         if len(self.multi_sliders) != len(genes):
             c.delete("all")
             self.clear_multi_sliders()                              # (the sliders are kept while they are dragged: only made again for other genes)
@@ -4459,13 +4464,14 @@ class UmapWindow(ExportsMixin):
             if hists is not None and not off:
                 info, whole_lo, whole_hi, color_fn, units = hists[i]
                 low, high = self.multi_levels.get(i, (0.0, 1.0))
-                self.draw_histogram(c, y + hist_y, max(c.winfo_width(), 200), info, whole_lo, whole_hi, scale == "log", low, high, color_fn, units)
+                self.draw_histogram(c, y + hist_y, max(c.winfo_width(), 200), info, whole_lo, whole_hi, scale == "log", low, high, color_fn, units, key=i)
         width = max(c.winfo_width(), 200)
         hint = c.create_text(width / 2, 8 + row * len(genes) + 2, anchor="n", width=width - 20, justify=tk.CENTER,          # (wrapped: it is wider than a narrow panel)
                              text="click a gene to hide / show it; drag the handles for its black and white levels",
                              fill="#888888", font=("Segoe UI", 8, "italic"), tags="legend")
         c.config(height=c.bbox(hint)[3] + 6)                        # (as tall as the hint, however many lines it took)
         self.multi_rows = (8, row, len(genes))
+        self.apply_cell_marks()
 
     def clear_multi_sliders(self):
         for slider in self.multi_sliders:
@@ -4649,7 +4655,7 @@ class UmapWindow(ExportsMixin):
             hit = self.hist_cache[id(vals)] = (vals, expression_histogram(vals))
         return hit[1]
 
-    def draw_histogram(self, canvas, y_top, width, info, lo, hi, even, low, high, color_fn, label):
+    def draw_histogram(self, canvas, y_top, width, info, lo, hi, even, low, high, color_fn, label, key=0):
         """The histogram in `canvas` from y_top down HIST_HEIGHT pixels: along the track of a slider of this width (RangeSlider: the same margins and the same
         mapping), the number of cells in each pixel's stretch of it, as the logarithm of 1 + the number, over the whole range `lo`..`hi`. Each bar has the color
         the cells of its value have (`color_fn(t)`, t the place in the colors' range, between the slider's handles `low` and `high`, fractions of the whole
@@ -4658,7 +4664,8 @@ class UmapWindow(ExportsMixin):
         margin = 10
         track = max(int(width) - 2 * margin, 1)
         counts = histogram_columns(info, lo, hi, even, track)
-        canvas.hist_regions.append({"x0": margin, "y0": y_top, "n": track, "counts": counts, "lo": lo, "hi": hi, "even": even, "label": label})
+        canvas.hist_regions.append({"x0": margin, "y0": y_top, "n": track, "counts": counts, "lo": lo, "hi": hi, "even": even, "label": label, "key": key,
+                                    "color_fn": color_fn, "black": lo + low * (hi - lo), "white": lo + high * (hi - lo)})
         heights = np.log10(1.0 + counts)
         top = float(heights.max())
         if top <= 0:
@@ -4720,8 +4727,41 @@ class UmapWindow(ExportsMixin):
         self.hist.hist_regions, self.hist.hist_photos = [], []
         if self.hist_args is not None and self.hist.winfo_manager():
             info, lo, hi, even, low, high, color_fn, label = self.hist_args
-            self.draw_histogram(self.hist, 0, max(self.hist.winfo_width(), 200), info, lo, hi, even, low, high, color_fn, label)
+            self.draw_histogram(self.hist, 0, max(self.hist.winfo_width(), 200), info, lo, hi, even, low, high, color_fn, label, key=0)
+        self.apply_cell_marks()
 
+    def apply_cell_marks(self):
+        """The dots of the cell under the pointer on the histograms (in the single gene's, and in each gene's of the legend): at the place of its value on the
+        histogram's axis, which is the slider's track, in the color the cell has on the maps (the histogram's there), with a black rim."""
+        marks = self.cell_marks or {}
+        for canvas in (self.hist, self.cbar):
+            canvas.delete("cellmark")
+            for r in getattr(canvas, "hist_regions", []):
+                v = marks.get(r["key"])
+                if v is None or not np.isfinite(v):
+                    continue
+                span = r["hi"] - r["lo"]
+                f = min(max((v - r["lo"]) / span, 0.0), 1.0) if span > 0 else 0.0
+                x = r["x0"] + (f if r["even"] else math.sqrt(f)) * r["n"]
+                y = r["y0"] + HIST_HEIGHT - 1
+                t = min(max((v - r["black"]) / (r["white"] - r["black"]), 0.0), 1.0) if r["white"] > r["black"] else 0.0
+                color = np.asarray(r["color_fn"](np.array([t])), dtype=np.uint8)[0]
+                canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill="#%02x%02x%02x" % tuple(int(c) for c in color[:3]), outline="black", width=1, tags="cellmark")
+
+    def mark_cell_on_histograms(self, info):
+        """The cell `info` is under the pointer (None: it is not on one): while genes are shown, a dot on each gene's histogram where that cell's value
+        is. A cell of the run has its value in the genes read for the run; any other cell of the sections in those read for the whole atlas."""
+        marks = None
+        if info is not None and self.mode in ("gene", "imputed") and self.gene_cache is not None and self.view_kind in ("gene", "multi"):
+            marks = {}
+            i, g = info["umap_idx"], info["bg_idx"]
+            for k, (vals, bg) in enumerate(self.gene_cache[1]):
+                v = vals[i] if i is not None else bg[g] if g is not None and bg is not None else None
+                if v is not None:
+                    marks[k] = float(v)
+        if marks != self.cell_marks:
+            self.cell_marks = marks
+            self.apply_cell_marks()
     def line_height(self, size, bold=False):
         """The height in pixels of a line of Segoe UI text of this size on this screen (the scaling of Windows makes it more than the points say)."""
         fonts = self.__dict__.setdefault("line_fonts", {})
@@ -5064,6 +5104,7 @@ class UmapWindow(ExportsMixin):
     def show_info(self, info):
         """Ring the cell where the pointer is, and mirror it in the other plot (its description is in its tip: see hover)."""
         self.bold_group_of(info)
+        self.mark_cell_on_histograms(info)
         if info is None:
             self.umap.set_marker("hover", None, None)
             for t in self.tiles:
@@ -5201,6 +5242,7 @@ class UmapWindow(ExportsMixin):
     def show_cell_dot(self, info):
         """The exact cell the tip is about, with the white dot of the other plot's copy of a hovered cell (bigger than a red +), in the UMAP and
         in its section's map."""
+        self.mark_cell_on_histograms(info)
         i = info["umap_idx"]
         if i is None:
             self.umap.set_marker("hover", None, None)

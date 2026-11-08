@@ -82,6 +82,7 @@ HOVER_GAP_PX = 8                   # the space between the cell tip's columns
 PREVIEW_ZOOM = True                # a wheel step on a plot shows the last picture scaled, and draws the view for real once the wheel is still
 ZOOM_DRAW_MS = 120
 PAN_DRAW_MS = 45                   # while a plot is dragged it is drawn again this often (in between, what is on the canvas is moved as it is)
+ZOOM_FILL_PARALLEL = 4             # while a zoom settles, this many section maps are drawn at once (in threads of their own: see PointCanvas.draw)
 PAN_FILL_GAP_MS = 10               # while the zoomed panel is dragged, its maps are drawn one at a time, this far apart (for the mouse's moves between)
 PANEL_PAN_SETTLE_MS = 150          # ...and all of them once the drag has been still this long
 SHAPE_SETTLE_MS = 250              # while the view is being zoomed or panned the cells are drawn as plain discs; their shapes come back this long after it stops
@@ -380,7 +381,7 @@ def value_at_percentile(info, hi, percent):
 
 HIST_HEIGHT = 34                    # the histogram under a gene's levels slider (pixels)
 LINEAR_WHITE_PERCENTILE = 98.0      # in the linear scale the white point of a gene starts at this percentile of the cells that express it
-HIST_PAD = 5                        # and room under its axis for the dot that shows the value of the cell the pointer is on
+HIST_PAD = 7                        # and room under its axis for the dot that shows the value of the cell the pointer is on (with its halo)
 HIST_MAX_DISCRETE = 600             # a gene with no more different values than this (counts are whole numbers: a few dozen) has its cells spread over the stretch each value stands for
 
 
@@ -2045,6 +2046,7 @@ class UmapWindow(ExportsMixin):
     def build(self):
         self.tiles = []                    # (made by build_tiles; empty until then, for the scroll callbacks that can come first)
         self.fit_cache, self.fit_across = {}, None      # (see fit_tiles)
+        self.started_in_background = 0
         self.cell_tip = CellTip(self.root)
         self.cell_tip.row_hover_fn = self.tip_row_hover
         self.pw = pw = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
@@ -2780,12 +2782,13 @@ class UmapWindow(ExportsMixin):
         self.tile_scroll.configure(scrollregion=(0, 0, 4 + cols * (fw + 8) + pad_x, 3 + rows * (fh + 6) + pad_y))
         self.root.after_idle(self.refresh_visible)
 
-    def place_tiles(self, max_draws=None, background=None):
+    def place_tiles(self, max_draws=None, background=None, started=None):
         """While the whole panel is zoomed: each section map's widget is put where the part of the map that is on screen is (and made that big, a
         little more all round), and drawn there; a map not on screen has no widget shown. A map whose widget still covers what is on screen is left.
         `max_draws`: at most this many maps are drawn (those with the most on screen first); while the panel is being dragged, none unless it says.
         `background`: a function; the map is then drawn in a thread and the function called when that is done (see PointCanvas.draw), at most one
-        map to a call. Returns how many more are waiting to be drawn."""
+        map to a call. `started()` is called as each map's draw is about to begin (before it can end: a map that has nothing to draw ends at once). Returns how many
+        more are waiting to be drawn."""
         if self.panel_zoom <= 1.0 or not getattr(self, "tiles", None):
             return 0
         if max_draws is None and getattr(self, "panning", False):
@@ -2830,7 +2833,10 @@ class UmapWindow(ExportsMixin):
             if not t.get("shown", True):
                 self.tile_scroll.itemconfig(t["item"], state="normal")
                 t["shown"] = True
-            self.drawing_in_background = background is not None
+            if background is not None:
+                self.started_in_background += 1
+                if started is not None:
+                    started()
             pc.set_view(int(x0), int(y0), int(x1) - int(x0), int(y1) - int(y0), background)
         if waiting[:max_draws]:
             # A map's widget moved, resized and given its new picture: Tk does those in passes of its own (the pane moves the widget, the frame packs
@@ -3429,14 +3435,18 @@ class UmapWindow(ExportsMixin):
         b["fill"] = None
         if b["job"] is not None:                                    # (the wheel has started again: settle_zoom comes when it stops)
             return
-        if b.get("busy"):                                           # (a map is being drawn in its thread: its end comes back here)
+        busy = b.get("busy", 0)                                     # (maps being drawn in their threads: the end of each comes back here)
+        if busy >= ZOOM_FILL_PARALLEL:
             return
         t_fill = time.perf_counter()
-        self.drawing_in_background = False
-        more = self.place_tiles(max_draws=1, background=lambda: self.map_drawn(b))
-        self.time_note(f"zoom_fill map (more={more})", t_fill)
-        if self.drawing_in_background:
-            b["busy"] = True
+        self.started_in_background = 0
+
+        def started():
+            b["busy"] = b.get("busy", 0) + 1                        # (counted before the draw can end, and so call map_drawn)
+            b["maps"] = b.get("maps", 0) + 1
+        more = self.place_tiles(max_draws=ZOOM_FILL_PARALLEL - busy, background=lambda: self.map_drawn(b), started=started)
+        self.time_note(f"zoom_fill maps (more={more})", t_fill)
+        if self.started_in_background or b.get("busy", 0):          # (some are being drawn: the next are started as they end)
             return
         if more:
             b["fill"] = self.root.after(PAN_FILL_GAP_MS, self.zoom_fill)
@@ -3455,6 +3465,14 @@ class UmapWindow(ExportsMixin):
         if any(t["pc"].pending is not None for t in self.tiles):    # (those draws come at idle: the snapshot goes after them)
             b["fill"] = self.root.after(PAN_FILL_GAP_MS, self.zoom_fill)
             return
+        took = time.perf_counter() - b.get("settled_at", time.perf_counter())
+        if took > 2.0:                                              # (a slow settle: said in zoom_debug.log, with what it was spent on)
+            try:
+                with open(core.CACHE_DIR / "zoom_debug.log", "a", encoding="utf-8") as f:
+                    f.write(time.strftime("%H:%M:%S") + f" SLOW SETTLE {took:.1f}s: zoom {b['start']:.3g} -> {b['target']:.3g}, {b.get('maps', 0)} maps drawn, "
+                            f"{len(self.tiles)} sections, pane {self.tile_scroll.winfo_width()}x{self.tile_scroll.winfo_height()}, mode {self.mode}" + chr(10))
+            except Exception:
+                pass
         self.time_note("settle: whole (laid out to snapshot gone)", b.get("settled_at", time.perf_counter()), 0.0)
         self.cancel_zoom_burst()
         self.trail("settle: done, snapshot gone")
@@ -3462,7 +3480,7 @@ class UmapWindow(ExportsMixin):
     def map_drawn(self, b):
         """A map drawn in the background by zoom_fill is on the screen (or dropped): on to the next, unless the wheel has started again, in which case
         settle_zoom goes on from here when it stops."""
-        b["busy"] = False
+        b["busy"] = max(b.get("busy", 0) - 1, 0)
         if self.zoom_burst is b and b["job"] is None and b.get("fill") is None:
             b["fill"] = self.root.after(PAN_FILL_GAP_MS, self.zoom_fill)
 
@@ -4796,6 +4814,7 @@ class UmapWindow(ExportsMixin):
                 y = r["y0"] + HIST_HEIGHT - 1
                 t = min(max((v - r["black"]) / (r["white"] - r["black"]), 0.0), 1.0) if r["white"] > r["black"] else 0.0
                 color = np.asarray(r["color_fn"](np.array([t])), dtype=np.uint8)[0]
+                canvas.create_oval(x - 6, y - 6, x + 6, y + 6, fill="white", outline="", tags="cellmark")                   # (a white halo: the dot shows on the dark bars of the dark theme)
                 canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill="#%02x%02x%02x" % tuple(int(c) for c in color[:3]), outline="black", width=1, tags="cellmark")
 
     def mark_cell_on_histograms(self, info):

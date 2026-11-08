@@ -339,6 +339,7 @@ from abc_atlas_access.abc_atlas_cache.cloud_cache import OutdatedManifestWarning
 # under its own name, so the rest of this file is unchanged. Must come after the library check and the matplotlib setup above.
 import abc_project
 from abc_core import (
+    BREGMA_CCF_ML_MM,
     CACHE_DIR, CCF_COORDS_FILE_NAME, CCF_DIRECTORY, CCF_FILES, CCF_PARCELLATION_DIRECTORY, CCF_PARCELLATION_FILE_NAME, COORD_SETTINGS,
     DEFAULT_BREGMA_CCF_AP_MM, DEFAULT_BREGMA_CCF_DV_MM, DEFAULT_GREY_RGBA, FRAME_STATE, RECON_FILES, coordinate_frame_name,
     file_complete, reconstructed_in_use, record_run_opened as core_record_run_opened, IMPUTED_DATASET_DIRECTORY,
@@ -413,6 +414,7 @@ DEFAULT_VIEWER_SETTINGS = {
     'hover_enabled': True,
     'gene456_shape': 'small circle',
     'umap_circle_size': 'Default',
+    'group_colors': 'cycle',        # 'cycle': every group colored, the look repeating past 400; 'lineage': a group's color comes from its parent's
     # Itself a setting, with a deliberately asymmetric persistence rule —
     # see load_viewer_settings/save_viewer_settings's own docstrings.
     'persist_settings': False,
@@ -452,6 +454,8 @@ def load_viewer_settings():
             settings['gene456_shape'] = on_disk['gene456_shape']
         if on_disk.get('umap_circle_size') in UMAP_CIRCLE_SIZE_REGISTRY:
             settings['umap_circle_size'] = on_disk['umap_circle_size']
+        if on_disk.get('group_colors') in ('cycle', 'lineage'):
+            settings['group_colors'] = on_disk['group_colors']
     return settings
 
 
@@ -476,6 +480,7 @@ def save_viewer_settings(settings):
         to_write['hover_enabled'] = bool(settings.get('hover_enabled', True))
         to_write['gene456_shape'] = settings.get('gene456_shape', GENE456_SHAPE_DEFAULT)
         to_write['umap_circle_size'] = settings.get('umap_circle_size', UMAP_CIRCLE_SIZE_DEFAULT)
+        to_write['group_colors'] = settings.get('group_colors', 'cycle')
     try:
         SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
@@ -506,34 +511,33 @@ SECTION_Z_LABEL_FONTSIZE = 8    # points: the z label at the top-right of each t
 
 
 
-def show_coordinate_settings_dialog(abc_cache):
-    """The launcher's Settings window: where bregma is in the CCF (for the AP, DV and ML from bregma), and whether cells are placed by Allen's reconstructed
-    coordinates. Applies and saves on OK."""
+def build_common_settings_tab(tab):
+    """The "Common" tab of the Settings window (what the launcher and the project browser share): where bregma is in the CCF (for the AP, DV and ML from
+    bregma), and whether cells are placed by Allen's reconstructed coordinates. Fills the frame `tab`; returns read(), which gives the values as a dict
+    {'bregma_ap_mm', 'bregma_dv_mm', 'reconstructed_coords'}, or raises ValueError with the message to show when an entry is not acceptable."""
     import tkinter as tk
-    from tkinter import ttk, messagebox
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes('-topmost', True)
-    dlg = tk.Toplevel(root)
-    dlg.title("Settings")
-    dlg.attributes('-topmost', True)
-    dlg.resizable(False, False)
-    bregma_var = tk.StringVar(dlg, f"{COORD_SETTINGS['bregma_ap_mm']:g}")
-    bregma_dv_var = tk.StringVar(dlg, f"{COORD_SETTINGS['bregma_dv_mm']:g}")
-    frame = ttk.Frame(dlg, padding=14)
-    frame.pack()
+    from tkinter import ttk
+    bregma_var = tk.StringVar(tab, f"{COORD_SETTINGS['bregma_ap_mm']:g}")
+    bregma_dv_var = tk.StringVar(tab, f"{COORD_SETTINGS['bregma_dv_mm']:g}")
+    frame = ttk.Frame(tab, padding=14)
+    frame.pack(fill=tk.BOTH)
     row = ttk.Frame(frame)
     row.pack(anchor="w", pady=(0, 0))
     ttk.Label(row, text="Bregma in the CCF (mm):   AP").pack(side=tk.LEFT)
     ttk.Entry(row, textvariable=bregma_var, width=7).pack(side=tk.LEFT, padx=6)
     ttk.Label(row, text="DV").pack(side=tk.LEFT)
     ttk.Entry(row, textvariable=bregma_dv_var, width=7).pack(side=tk.LEFT, padx=6)
+    ttk.Label(row, text="ML").pack(side=tk.LEFT)
+    ml_entry = ttk.Entry(row, width=7)                          # (the midline: fixed, shown for completeness)
+    ml_entry.insert(0, f"{BREGMA_CCF_ML_MM:g}")
+    ml_entry.state(["readonly"])
+    ml_entry.pack(side=tk.LEFT, padx=6)
 
     def reset_bregma():
         bregma_var.set(f"{DEFAULT_BREGMA_CCF_AP_MM:g}")
         bregma_dv_var.set(f"{DEFAULT_BREGMA_CCF_DV_MM:g}")
 
-    reset = ttk.Button(row, text="Reset both", command=reset_bregma)
+    reset = ttk.Button(row, text="Reset all", command=reset_bregma)
     reset.pack(side=tk.LEFT, padx=(8, 0))
     reset_tip = {'win': None}
 
@@ -557,56 +561,50 @@ def show_coordinate_settings_dialog(abc_cache):
     reset.bind("<Leave>", hide_reset_tip)
     reset.bind("<ButtonPress>", hide_reset_tip, add="+")
     ttk.Label(frame, foreground="gray35", justify=tk.LEFT, wraplength=460, text=(
-        "Used to estimate the conversion from common coordinate framework (CCF) brain coordinates to conventional bregma-centered (e.g. Paxinos) values. Note that there is no exact mapping between the Allen CCF "
-        "and Paxinos coordinates: the CCF has no skull, and is not known to be leveled with bregma and lambda at one height). "
-        "Hence, the conversion is approximate. The defaults, AP 5.40 mm and DV 0.332 mm (and "
-        "5.739 mm for the midline, which is fixed), are the International Brain Laboratory's (IBL's) estimate of bregma in the CCF (iblatlas, "
-        "the average of five experimenters' picks); set them to the bregma position of the registration you rely on (for example "
-        "Chon et al. 2019). The AP from bregma of the sections, and the cells' coordinates, need the CCF coordinate files (a one-time download).")).pack(
+        "Offsets used to convert common coordinate framework (CCF) brain coordinates to standard bregma-centered (e.g. Paxinos) values. There is no exact mapping between Allen CCF "
+        "and Paxinos coordinates: the CCF has no skull, and is not known to be leveled with bregma and lambda at one height (it is pitched down about 5 degrees relative to a flat skull). "
+        "Hence, the conversion is approximate. The defaults are the International Brain Laboratory's (IBL's) estimate of bregma in the CCF, the average of five experimenters' picks of "
+        "the bregma voxel. To use the bregma position of another registration instead (for example Chon et al. 2019), enter it here.")).pack(
         anchor="w", pady=(6, 0))
+
+    def add_citation(text, links):
+        """A line of citation text followed by clickable links [(text, url)]."""
+        line = ttk.Frame(frame)
+        line.pack(anchor="w", pady=(2, 0))
+        ttk.Label(line, foreground="gray35", text=text).pack(side=tk.LEFT)
+        for name, url in links:
+            link = tk.Label(line, text=name, foreground="#0645ad", cursor="hand2", font=("Segoe UI", 9, "underline"))
+            link.pack(side=tk.LEFT, padx=(6, 0))
+            link.bind("<Button-1>", lambda e, u=url: __import__("webbrowser").open(u))
+
+    add_citation("Defaults: International Brain Laboratory, iblatlas (Python package):", [("PyPI", "https://pypi.org/project/iblatlas")])
+    add_citation("Chon et al. 2019, Nat Commun 10:5067:", [("paper", "https://doi.org/10.1038/s41467-019-13057-w"),
+                                                           ("PubMed", "https://pubmed.ncbi.nlm.nih.gov/?term=10.1038%2Fs41467-019-13057-w")])
     ttk.Separator(frame).pack(fill=tk.X, pady=(14, 8))
-    recon_var = tk.BooleanVar(dlg, bool(COORD_SETTINGS['reconstructed_coords']))
+    recon_var = tk.BooleanVar(tab, bool(COORD_SETTINGS['reconstructed_coords']))
     ttk.Checkbutton(frame, text="Place cells by Allen's reconstructed coordinates", variable=recon_var).pack(anchor="w")
     ttk.Label(frame, foreground="gray35", justify=tk.LEFT, wraplength=460, text=(
         "May be more biologically accurate: it corrects possible tissue distortions in the raw coordinates, and the CCF atlas then lines "
         "up with the cells. One-time download (about 260 MB); applies to the next run you open.")).pack(anchor="w", pady=(2, 0))
-    result = {'ok': False}
 
-    def ok():
+    def read():
         try:
             bregma = float(bregma_var.get())
             bregma_dv = float(bregma_dv_var.get())
             if not (0.0 < bregma < 13.5 and -5.0 < bregma_dv < 8.0):
                 raise ValueError
         except ValueError:
-            messagebox.showerror("Settings", "Enter bregma's position as numbers of mm: AP between 0 and 13.5, DV between -5 and 8.", parent=dlg)
-            return
-        result['ok'], result['bregma'], result['bregma_dv'] = True, bregma, bregma_dv
-        dlg.destroy()
+            raise ValueError("Enter bregma's position as numbers of mm: AP between 0 and 13.5, DV between -5 and 8.")
+        return {'bregma_ap_mm': bregma, 'bregma_dv_mm': bregma_dv, 'reconstructed_coords': bool(recon_var.get())}
 
-    buttons = ttk.Frame(frame)
-    buttons.pack(fill=tk.X, pady=(12, 0))
-    ttk.Button(buttons, text="OK", command=ok).pack(side=tk.RIGHT)
-    ttk.Button(buttons, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT, padx=6)
-    dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
-    dlg.bind("<Escape>", lambda e: dlg.destroy())
-    dlg.update_idletasks()
-    dlg.grab_set()
-    root.wait_window(dlg)
-    try:
-        if result['ok']:
-            COORD_SETTINGS['bregma_ap_mm'] = result['bregma']
-            COORD_SETTINGS['bregma_dv_mm'] = result['bregma_dv']
-            COORD_SETTINGS['reconstructed_coords'] = bool(recon_var.get())
-            save_coordinate_settings()
-            start_section_coordinate_load(abc_cache)
-    finally:
-        # The window's Tk variables are freed here, on this thread, while Tk is still up: left to the garbage collector they can be freed later
-        # on a background thread, which prints "main thread is not in main loop" once for each of them.
-        bregma_var = bregma_dv_var = recon_var = dlg = frame = buttons = row = reset = None
-        import gc
-        gc.collect()
-        root.destroy()
+    return read
+
+
+def show_coordinate_settings_dialog(abc_cache):
+    """The launcher's Settings button: the Settings window (see prompt_viewer_settings_dialog), opened on its Common tab."""
+    new = prompt_viewer_settings_dialog(None, load_viewer_settings(), abc_cache=abc_cache, tab="Common")
+    if new is not None:
+        save_viewer_settings(new)
 
 
 # Where the ABC atlas download lives. By default it's next to this repository,
@@ -5403,60 +5401,45 @@ _umap_warmup_started = False
 
 
 
-def prompt_viewer_settings_dialog(parent_window, current_settings, umap_params=None, n_cells=None):
-    """The interactive UMAP viewer's own Settings dialog: hover-
-    highlighting on/off, the multi-gene overlay's genes-4-6 marker shape
-    (GENE456_SHAPE_REGISTRY), the overall UMAP dot size (UMAP_CIRCLE_SIZE_
-    REGISTRY), and whether these choices persist across sessions (see
-    load_viewer_settings/save_viewer_settings's own docstrings for that
-    setting's own asymmetric persistence rule). Same modal-child pattern
-    as prompt_deg_comparison_mode — see its own docstring for why a real
-    Toplevel rather than tkinter.messagebox, and why transient()/
-    grab_set()/wait_window() rather than a second, competing Tk() root.
-
-    When `umap_params` (the run's current n_neighbors/min_dist/n_pcs) is
-    given, the dialog also offers those three, validated against `n_cells`;
-    the result then carries them under 'umap_params'. They belong to the
-    run rather than to the user's preferences, so the caller must keep them
-    out of the persisted settings.
-
-    `current_settings` is read but never mutated — the caller decides what
-    to do with the result. Returns an updated settings dict once OK is
-    clicked, or None if cancelled (Cancel, the window's own close button,
-    or Escape)."""
+def build_viewer_settings_tab(tab, current_settings, umap_params=None, n_cells=None):
+    """The "Project browser" tab of the Settings window: hover-highlighting on/off, the multi-gene overlay's genes-4-6 marker shape (GENE456_SHAPE_REGISTRY),
+    the overall UMAP dot size (UMAP_CIRCLE_SIZE_REGISTRY), how groups are colored, whether these choices persist across sessions (see load_viewer_settings/
+    save_viewer_settings's own docstrings for that setting's own asymmetric persistence rule) and, when `umap_params` (the run's current n_neighbors/min_dist/
+    n_pcs) is given, those three, validated against `n_cells`. Fills the frame `tab`; returns read(), which gives the chosen settings as a dict (with
+    'umap_params' when they were offered) or raises ValueError with the message to show."""
     import tkinter as tk
-    from tkinter import messagebox
 
-    result = {'value': None}
-    dialog = tk.Toplevel(parent_window)
-    dialog.title("Viewer settings")
-    dialog.transient(parent_window)
-    dialog.resizable(False, False)
-
-    hover_var = tk.BooleanVar(value=current_settings['hover_enabled'])
-    tk.Checkbutton(dialog, text="Hover highlight", variable=hover_var, anchor='w').pack(
+    hover_var = tk.BooleanVar(tab, value=current_settings['hover_enabled'])
+    tk.Checkbutton(tab, text="Hover highlight", variable=hover_var, anchor='w').pack(
         fill='x', padx=12, pady=(12, 6))
 
-    size_frame = tk.Frame(dialog)
+    size_frame = tk.Frame(tab)
     tk.Label(size_frame, text="UMAP circle size:").pack(side='left')
-    size_var = tk.StringVar(value=current_settings.get('umap_circle_size', UMAP_CIRCLE_SIZE_DEFAULT))
+    size_var = tk.StringVar(tab, value=current_settings.get('umap_circle_size', UMAP_CIRCLE_SIZE_DEFAULT))
     tk.OptionMenu(size_frame, size_var, *UMAP_CIRCLE_SIZE_REGISTRY.keys()).pack(side='left', padx=(6, 0))
     size_frame.pack(fill='x', padx=12, pady=(0, 6))
 
-    shape_frame = tk.Frame(dialog)
+    shape_frame = tk.Frame(tab)
     tk.Label(shape_frame, text="Genes 4-6 shape:").pack(side='left')
-    shape_var = tk.StringVar(value=current_settings.get('gene456_shape', GENE456_SHAPE_DEFAULT))
+    shape_var = tk.StringVar(tab, value=current_settings.get('gene456_shape', GENE456_SHAPE_DEFAULT))
     tk.OptionMenu(shape_frame, shape_var, *GENE456_SHAPE_REGISTRY.keys()).pack(side='left', padx=(6, 0))
     shape_frame.pack(fill='x', padx=12, pady=(0, 6))
 
-    persist_var = tk.BooleanVar(value=current_settings['persist_settings'])
+    colors_var = tk.StringVar(tab, value=current_settings.get('group_colors', 'cycle'))
+    colors_frame = tk.LabelFrame(tab, text="Group colors (when there are more groups than looks)")
+    for value, text in (('cycle', "Cycle: every group colored; past the 400th largest the colors and shapes repeat (hover tells which)"),
+                        ('lineage', "Lineage: a group's color comes from its parent group, so related groups look alike (experimental)")):
+        tk.Radiobutton(colors_frame, text=text, value=value, variable=colors_var, anchor='w', justify='left').pack(fill='x', padx=6)
+    colors_frame.pack(fill='x', padx=12, pady=(0, 6))
+
+    persist_var = tk.BooleanVar(tab, value=current_settings['persist_settings'])
     tk.Checkbutton(
-        dialog, text="Remember these settings across sessions", variable=persist_var, anchor='w',
+        tab, text="Remember these settings across sessions", variable=persist_var, anchor='w',
     ).pack(fill='x', padx=12, pady=(0, 12))
 
     umap_vars = {}
     if umap_params is not None:
-        umap_frame = tk.LabelFrame(dialog, text="UMAP calculation (kept with this run)")
+        umap_frame = tk.LabelFrame(tab, text="UMAP calculation (kept with this run)")
         field_rows = (
             ('n_neighbors', "Neighbors (n_neighbors):", "2 or more; larger favors broad structure"),
             ('min_dist', "Minimum distance (min_dist):", "0 to 1; smaller packs cells tighter"),
@@ -5464,7 +5447,7 @@ def prompt_viewer_settings_dialog(parent_window, current_settings, umap_params=N
         )
         for row, (key, label, hint) in enumerate(field_rows):
             tk.Label(umap_frame, text=label, anchor='w').grid(row=row, column=0, sticky='w', padx=(8, 4), pady=2)
-            umap_vars[key] = tk.StringVar(value=f"{umap_params[key]:g}")
+            umap_vars[key] = tk.StringVar(tab, value=f"{umap_params[key]:g}")
             tk.Entry(umap_frame, textvariable=umap_vars[key], width=7).grid(row=row, column=1, pady=2)
             tk.Label(umap_frame, text=f"default {UMAP_PARAM_DEFAULTS[key]:g} - {hint}", fg='gray35',
                      anchor='w').grid(row=row, column=2, sticky='w', padx=(6, 8), pady=2)
@@ -5481,25 +5464,76 @@ def prompt_viewer_settings_dialog(parent_window, current_settings, umap_params=N
             row=4, column=0, columnspan=3, sticky='w', padx=8, pady=(2, 8))
         umap_frame.pack(fill='x', padx=12, pady=(0, 12))
 
-    button_frame = tk.Frame(dialog)
-    button_frame.pack(pady=(0, 12))
-
-    def on_ok():
+    def read():
         chosen_umap_params = None
         if umap_vars:
             chosen_umap_params, problem = parse_umap_params(
                 umap_vars['n_neighbors'].get(), umap_vars['min_dist'].get(), umap_vars['n_pcs'].get(), n_cells)
             if problem:
-                messagebox.showerror("Viewer settings", problem, parent=dialog)
-                return
-        result['value'] = {
+                raise ValueError(problem)
+        value = {
             'hover_enabled': hover_var.get(),
             'gene456_shape': shape_var.get(),
             'umap_circle_size': size_var.get(),
+            'group_colors': colors_var.get(),
             'persist_settings': persist_var.get(),
         }
         if chosen_umap_params is not None:
-            result['value']['umap_params'] = chosen_umap_params
+            value['umap_params'] = chosen_umap_params
+        return value
+
+    return read
+
+
+def prompt_viewer_settings_dialog(parent_window, current_settings, umap_params=None, n_cells=None, abc_cache=None, tab="Project browser"):
+    """The Settings window of the launcher and of the project browser (the interactive viewer): one dialog with two tabs, "Common" (build_common_settings_tab:
+    bregma and the coordinates, applied and saved here) and "Project browser" (build_viewer_settings_tab), opened on `tab`. Same modal-child pattern as
+    prompt_deg_comparison_mode — see its own docstring for why a real Toplevel rather than tkinter.messagebox, and why transient()/grab_set()/wait_window()
+    rather than a second, competing Tk() root; `parent_window` None (the launcher has no window to hang it on) makes a hidden root of its own.
+
+    `umap_params`/`n_cells`: see build_viewer_settings_tab (they belong to the run, so the caller must keep 'umap_params' out of the persisted settings).
+    `abc_cache`: when given, a change of the common settings starts the read of the sections' coordinates again.
+    `current_settings` is read but never mutated — the caller decides what to do with the result. Returns the project browser's settings dict once OK is
+    clicked (the common ones are already in COORD_SETTINGS and saved), or None if cancelled (Cancel, the window's own close button, or Escape)."""
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+
+    own_root = None
+    if parent_window is None:
+        own_root = parent_window = tk.Tk()
+        own_root.withdraw()
+        own_root.attributes('-topmost', True)
+    result = {'value': None}
+    dialog = tk.Toplevel(parent_window)
+    dialog.title("Settings")
+    if own_root is not None:
+        dialog.attributes('-topmost', True)
+    else:
+        dialog.transient(parent_window)
+    dialog.resizable(False, False)
+
+    notebook = ttk.Notebook(dialog)
+    notebook.pack(fill='both', padx=8, pady=(8, 0))
+    common_tab, viewer_tab = tk.Frame(notebook), tk.Frame(notebook)
+    notebook.add(common_tab, text="Common")
+    notebook.add(viewer_tab, text="Project browser")
+    read_common = build_common_settings_tab(common_tab)
+    read_viewer = build_viewer_settings_tab(viewer_tab, current_settings, umap_params, n_cells)
+    notebook.select(common_tab if tab == "Common" else viewer_tab)
+
+    button_frame = tk.Frame(dialog)
+    button_frame.pack(pady=12)
+
+    def on_ok():
+        for tab_frame, read in ((common_tab, read_common), (viewer_tab, read_viewer)):
+            try:
+                result[tab_frame] = read()
+            except ValueError as problem:
+                notebook.select(tab_frame)
+                messagebox.showerror("Settings", str(problem), parent=dialog)
+                return
+        result['value'] = result.pop(viewer_tab)
+        COORD_SETTINGS.update(result.pop(common_tab))
         dialog.destroy()
 
     def on_cancel():
@@ -5516,15 +5550,30 @@ def prompt_viewer_settings_dialog(parent_window, current_settings, umap_params=N
     # Centered over the parent window — see prompt_deg_comparison_mode's
     # own identical block for why update_idletasks() has to run first.
     dialog.update_idletasks()
-    px, py = parent_window.winfo_rootx(), parent_window.winfo_rooty()
-    pw, ph = parent_window.winfo_width(), parent_window.winfo_height()
-    dw, dh = dialog.winfo_width(), dialog.winfo_height()
-    dialog.geometry(f"+{px + max(0, (pw - dw) // 2)}+{py + max(0, (ph - dh) // 2)}")
+    if own_root is None:
+        px, py = parent_window.winfo_rootx(), parent_window.winfo_rooty()
+        pw, ph = parent_window.winfo_width(), parent_window.winfo_height()
+        dw, dh = dialog.winfo_width(), dialog.winfo_height()
+        dialog.geometry(f"+{px + max(0, (pw - dw) // 2)}+{py + max(0, (ph - dh) // 2)}")
 
     dialog.grab_set()
     dialog.focus_set()
-    dialog.wait_window()
-    return result['value']
+    try:
+        dialog.wait_window()
+        if result['value'] is not None:
+            save_coordinate_settings()
+            if abc_cache is not None:
+                start_section_coordinate_load(abc_cache)
+        return result['value']
+    finally:
+        if own_root is not None:
+            # The window's Tk variables are freed here, on this thread, while Tk is still up: left to the garbage collector they can be freed later
+            # on a background thread, which prints "main thread is not in main loop" once for each of them.
+            read_common = read_viewer = notebook = common_tab = viewer_tab = dialog = None
+            result.clear()
+            import gc
+            gc.collect()
+            own_root.destroy()
 
 
 TAXONOMY_COLUMNS = ('class', 'subclass', 'supertype', 'cluster')

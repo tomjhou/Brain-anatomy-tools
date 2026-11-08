@@ -31,6 +31,8 @@ UMAP_POINT_SIZE = 10                          # matplotlib's s (an area) of a do
 POINT_ALPHA = 0.75
 
 
+LEGEND_MAX_ROWS = 400          # the most groups a saved legend lists (the largest)
+
 def hexcolor(rgb):
     return "#%02x%02x%02x" % tuple(int(v) for v in rgb)
 
@@ -442,7 +444,7 @@ class ExportsMixin:
     def legend_handles(self, cat, sort="id"):
         from matplotlib.lines import Line2D
         rows = []
-        for r, (color, label, count) in enumerate(cat["entries"]):
+        for r, (color, label, count) in enumerate(cat["entries"][:LEGEND_MAX_ROWS]):          # (a saved legend of thousands of groups would be a wall)
             marker, is_open = self.host["category_rank_shape"](r)
             rows.append((color, label, count, marker, is_open))
         if sort == "given":                                              # (as the entries are: the groups in the order they were typed)

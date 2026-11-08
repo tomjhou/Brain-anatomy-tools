@@ -632,9 +632,8 @@ class AnalyzeWindow:
 
     def main_window_groups(self, level, uniques, counts, everyone):
         """The indexes (in `uniques`) of the groups the main window colors now: those of Specific group(s) that are not grayed, or of All groups the
-        colored ones (not grayed by a click in the list, and within the largest MAX_COLORED_CATEGORIES). None, with the status saying why, when the
+        colored ones (not grayed by a click in the list). None, with the status saying why, when the
         window shows genes, or another group type than this one."""
-        from abc_tk_umap import MAX_COLORED_CATEGORIES            # (imported here: that module imports this one)
         v = self.v
         if v.mode not in ("all", "single"):
             self.var_status.set("The main window is showing genes, not groups: untick the box to use every group.")
@@ -647,7 +646,7 @@ class AnalyzeWindow:
             uid = v.group_keys(level, uniques)
             chosen = [int(i) for t in ids if t not in v.off_groups for i in np.flatnonzero(uid == t)[:1]]
         else:
-            chosen = [i for i in everyone[:MAX_COLORED_CATEGORIES] if str(uniques[i]) not in v.off_groups]
+            chosen = [i for i in everyone if str(uniques[i]) not in v.off_groups]
         if not chosen:
             self.var_status.set("No group is colored in the main window.")
             return None
@@ -722,7 +721,8 @@ class AnalyzeWindow:
         vx, vy = values
         ok = np.isfinite(vx) & np.isfinite(vy)
         position = {g: i for i, g in enumerate(chosen)}
-        color_of = {g: hexcolor(rank_color(i)) for g, i in position.items()}
+        palette = getattr(self.v, "group_rgb", None) if self.v.mode == "all" and level == self.v.level else None
+        color_of = {g: hexcolor(palette[g] if palette is not None and g < len(palette) else rank_color(i)) for g, i in position.items()}
         in_group = np.isin(codes, chosen) & ok
         fig, ax = self.fig, self.ax
         if self.cax is not None:

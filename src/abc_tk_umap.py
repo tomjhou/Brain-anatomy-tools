@@ -49,7 +49,8 @@ INK_ABSORB = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.3, 1.0]])    # 
 INK_PAPER = 230.0                 # the light theme's colour for no expression: a light grey, close to the white background
 LIGHT_GREY = np.array([222, 222, 222], np.uint8)
 RING = "#ff1493"
-MAX_COLORED_CATEGORIES = 400
+MAX_COLORED_CATEGORIES = 400       # the distinct looks (colors x shapes): past this many groups the looks repeat; also the most centroid labels and legend rows
+TAXONOMY_LEVELS = ("class", "subclass", "supertype", "cluster")
 LEVEL_NAMES = {"class": "Class", "subclass": "Subclass", "supertype": "Supertype", "cluster": "Cluster", "leiden": "Leiden", "neurotransmitter": "Neurotransmitter"}
 NOT_IN_TAXONOMY = ("leiden", "neurotransmitter")        # the levels that are not a step down from the one above (so a group's table is just its own row)
 TILE_PX = 230
@@ -3844,10 +3845,13 @@ class UmapWindow(ExportsMixin):
             self.var_status.set(f"No cell of this dataset has a {self.level_names[level].lower()}.")
             return
         counts = np.bincount(codes[codes >= 0], minlength=len(uniques))
-        ranked = np.argsort(-counts, kind="stable")[:MAX_COLORED_CATEGORIES]
+        ranked = np.argsort(-counts, kind="stable")
+        ranked = ranked[counts[ranked] > 0]
+        palette = self.group_palette(level, codes, uniques, counts, ranked)
+        self.group_rgb = palette
         lut = np.tile(GREY, (len(uniques), 1))
         for r, u in enumerate(ranked):
-            lut[u] = GREY if str(uniques[u]) in self.off_groups else rank_color(r)
+            lut[u] = GREY if str(uniques[u]) in self.off_groups else palette[u]
         rgb = np.where((codes >= 0)[:, None], lut[np.maximum(codes, 0)], LIGHT_GREY).astype(np.uint8)         # (code -1: a cell with no annotation at this level: gray)
         self.rank_run = np.zeros(self.n, np.int32)
         bgc = self.bg_codes(level) if self.bg else None
@@ -3864,7 +3868,7 @@ class UmapWindow(ExportsMixin):
 
         # each coloured group's number at its centre
         cent = pd.DataFrame({"g": codes, "x": self.coords[:, 0], "y": self.coords[:, 1]})
-        on = [u for u in ranked if str(uniques[u]) not in self.off_groups]
+        on = [u for u in ranked if str(uniques[u]) not in self.off_groups][:MAX_COLORED_CATEGORIES]          # (labels for the largest: thousands would only be a smear)
         cent = cent[cent["g"].isin(on)].groupby("g").median()
         labels = []
         weights = label_weights(counts[cent.index.to_numpy()])
@@ -3878,13 +3882,70 @@ class UmapWindow(ExportsMixin):
         rank_of = np.full(len(uniques), -1)
         rank_of[ranked] = np.arange(len(ranked))
         self.export_cat = {"rank": np.where(codes >= 0, rank_of[np.maximum(codes, 0)], -1), "title": self.level_names[level],
-                           "entries": [(hexcolor(GREY if str(uniques[u]) in self.off_groups else rank_color(r)), str(uniques[u]), int(counts[u])) for r, u in enumerate(ranked)]}
+                           "entries": [(hexcolor(GREY if str(uniques[u]) in self.off_groups else palette[u]), str(uniques[u]), int(counts[u])) for r, u in enumerate(ranked)]}
         self.set_cell_ranks(self.export_cat["rank"], np.where(bgc >= 0, rank_of[np.maximum(bgc, 0)], -1) if bgc is not None else None)
         self.shown_values = None
         n_cat = int((counts > 0).sum())
-        self.var_status.set(f"Showing all {n_cat} {plural_name(self.level_names[level])}" + (f"; the {len(ranked)} largest colored, the rest gray." if n_cat > len(ranked) else ".") + " Click group in list to select/deselect.")
+        self.var_status.set(f"Showing all {n_cat} {plural_name(self.level_names[level])}" + (f"; the looks repeat past the {MAX_COLORED_CATEGORIES} largest: hover a cell for its group." if n_cat > MAX_COLORED_CATEGORIES and self.viewer_settings.get("group_colors", "cycle") == "cycle" else ".") + " Click group in list to select/deselect.")
         self.values = None
         self.draw_group_list(ranked, uniques, counts)
+
+    def group_palette(self, level, codes, uniques, counts, ranked):
+        """The color of each group of a level (indexed like `uniques`), by the Group colors setting: 'cycle' gives the r-th largest the browser's r-th color (they
+        repeat past MAX_COLORED_CATEGORIES); 'lineage' derives a group's color from its parent's (see lineage_palette), falling back to the cycle for a level that
+        is not a step down the taxonomy."""
+        if self.viewer_settings.get("group_colors", "cycle") == "lineage":
+            palette = self.lineage_palette(level, codes, uniques, counts)
+            if palette is not None:
+                return palette
+        palette = np.tile(GREY, (len(uniques), 1))
+        for r, u in enumerate(ranked):
+            palette[u] = rank_color(r)
+        return palette
+
+    def lineage_palette(self, level, codes, uniques, counts):
+        """Colors that follow the taxonomy: the classes get the browser's hues; each group below takes its parent's hue (the parent most of its cells are in),
+        shifted a little by its place among its siblings (largest first) and alternately paler or darker, so that neighbours in the taxonomy look related and
+        no group is left out however many there are. None when the level is not one of the taxonomy's steps."""
+        chain = [l for l in TAXONOMY_LEVELS if self.info.get(l) is not None]
+        if level not in chain:
+            return None
+        chain = chain[:chain.index(level) + 1]
+        prev_codes, prev_hsv = None, None
+        for depth, l in enumerate(chain):
+            c, u = self.category_codes(l)
+            cnt = np.bincount(c[c >= 0], minlength=len(u))
+            order = np.argsort(-cnt, kind="stable")
+            hsv = np.zeros((len(u), 3))
+            if prev_codes is None:
+                for r, g in enumerate(order):
+                    hsv[g] = (((r % 10) * 0.6180339887498949) % 1.0, 0.90 if (r // 10) % 2 == 0 else 0.5, 0.95 if (r // 10) % 2 == 0 else 0.85)
+            else:
+                ok = (c >= 0) & (prev_codes >= 0)
+                n_prev = len(prev_hsv)
+                key = c[ok].astype(np.int64) * n_prev + prev_codes[ok]
+                uk, kc = np.unique(key, return_counts=True)
+                child, parent = uk // n_prev, uk % n_prev
+                best = np.lexsort((-kc, child))                      # (by child, then the commonest parent first)
+                first = np.r_[True, child[best][1:] != child[best][:-1]]
+                parent_of = np.full(len(u), -1, np.int64)
+                parent_of[child[best][first]] = parent[best][first]
+                df = pd.DataFrame({"g": order, "p": parent_of[order], "n": cnt[order]})
+                df = df[df["n"] > 0]
+                df["j"] = df.groupby("p").cumcount()
+                df["m"] = df.groupby("p")["g"].transform("size")
+                spread = 0.16 / (depth ** 0.5 + 0.0)
+                for g, p, j, m in zip(df["g"].to_numpy(), df["p"].to_numpy(), df["j"].to_numpy(), df["m"].to_numpy()):
+                    if p < 0:                                        # (no parent: its own hue, from its rank)
+                        hsv[g] = (((j * 0.6180339887498949) % 1.0), 0.6, 0.8)
+                        continue
+                    h0, s0, v0 = prev_hsv[p]
+                    shift = ((j / (m - 1)) - 0.5) * spread * min(m, 6) / 6 if m > 1 else 0.0
+                    hsv[g] = ((h0 + shift) % 1.0, (0.92, 0.92, 0.58, 0.58)[j % 4], (0.97, 0.76, 0.92, 0.72)[j % 4])
+            prev_codes, prev_hsv = c, hsv
+        palette = np.array([[int(round(x * 255)) for x in colorsys.hsv_to_rgb(*row)] for row in prev_hsv], np.uint8)
+        palette[counts == 0] = GREY
+        return palette
 
     def draw_legend_rows(self, canvas, rows, x0):
         """The rows of a group legend, in columns: swatch, number, cell count (right-aligned) and the group's name (all names start at the same x).
@@ -3916,7 +3977,7 @@ class UmapWindow(ExportsMixin):
             m = re.match(r"^\s*(\d+)", str(uniques[u]))
             off = str(uniques[u]) in self.off_groups
             name = re.sub(r"^\s*\d+\s*", "", str(uniques[u])) if m else ""
-            rows.append({"id": int(m.group(1)) if m else 10 ** 9, "color": hexcolor(GREY if off else rank_color(r)),
+            rows.append({"id": int(m.group(1)) if m else 10 ** 9, "color": hexcolor(GREY if off else self.group_rgb[u]),
                          "num": m.group(1) if m else str(uniques[u]), "count": int(counts[u]), "name": name, "off": off, "key": str(uniques[u]),
                          "code": int(self.shape_codes(np.array([r]))[0])})
         column, descending = self.group_sort
@@ -5487,10 +5548,11 @@ class UmapWindow(ExportsMixin):
         dialog = self.host.get("settings_dialog")
         if dialog is None or self.busy:
             return
-        new = dialog(self.root, self.viewer_settings, umap_params=self.params, n_cells=self.n)
+        new = dialog(self.root, self.viewer_settings, umap_params=self.params, n_cells=self.n, abc_cache=self.abc_cache, tab="Project browser")
         if new is None:
             return
         new_params = new.pop("umap_params", None)        # (belong to this run, not to the user's preferences)
+        old_colors = self.viewer_settings.get("group_colors", "cycle")
         shape_changed = new.get("gene456_shape") != self.viewer_settings.get("gene456_shape")
         size_changed = new.get("umap_circle_size") != self.viewer_settings.get("umap_circle_size")
         hover_changed = bool(new.get("hover_enabled", True)) != bool(self.viewer_settings.get("hover_enabled", True))
@@ -5503,7 +5565,8 @@ class UmapWindow(ExportsMixin):
             self.drop_highlights()
         if size_changed:                                            # (the UMAP's Cell size slider shows it: set without its own redraw, done below)
             self.umap_sliders[0].set(self.umap_size_index(self.viewer_settings.get("umap_circle_size", "Default")))
-        if (size_changed or (shape_changed and self.mode in ("gene", "imputed"))) and not self.busy:
+        colors_changed = new.get("group_colors", "cycle") != old_colors
+        if (size_changed or colors_changed or (shape_changed and self.mode in ("gene", "imputed"))) and not self.busy:
             self.recolor()
         if new_params is not None and self.params is not None:
             self.switch_variant(new_params)

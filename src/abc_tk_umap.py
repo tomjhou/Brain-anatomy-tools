@@ -353,17 +353,51 @@ def label_weights(counts):
     return LABEL_WEIGHT_RANGE[0] + (LABEL_WEIGHT_RANGE[1] - LABEL_WEIGHT_RANGE[0]) * t
 
 
-def percent_below(vals, point):
-    """The percentage of the cells (the finite values) below `point`, and of those that express the gene (a value above 0) that are:
-    (all cells, expressing cells)."""
-    fin = np.isfinite(vals)
-    n = int(np.count_nonzero(fin))
-    if n == 0:
-        return 0.0, 0.0
-    below = fin & (vals < point)
-    expr = fin & (vals > 0)
+def expressing_percentile(vals, point):
+    """Where `point` stands among the cells that express the gene (a finite value above 0): the percentage of them whose value is below it (0 if none
+    express it). The cells with no expression are left out, as they are below any point above 0 and would only say how few cells express the gene."""
+    expr = np.isfinite(vals) & (vals > 0)
     ne = int(np.count_nonzero(expr))
-    return 100.0 * np.count_nonzero(below) / n, (100.0 * np.count_nonzero(below & expr) / ne if ne else 0.0)
+    return 100.0 * np.count_nonzero(expr & (vals < point)) / ne if ne else 0.0
+
+
+HIST_HEIGHT = 34                    # the histogram under a gene's levels slider (pixels)
+HIST_MAX_DISCRETE = 600             # a gene with no more different values than this (counts are whole numbers: a few dozen) has its cells spread over the stretch each value stands for
+
+
+def expression_histogram(vals):
+    """What a histogram of a gene's expression is drawn from: (the values of the cells that express it (finite, above 0), sorted; the different values and
+    how many cells have each, if there are few of them (else None)). The cells with no expression are left out: there are far more of them than of any
+    other value, and they would be all there is to see."""
+    v = vals[np.isfinite(vals) & (vals > 0)]
+    srt = np.sort(v)
+    discrete = None
+    if len(srt):
+        u, c = np.unique(srt, return_counts=True)
+        if len(u) <= HIST_MAX_DISCRETE:
+            discrete = (u, c)
+    return srt, discrete
+
+
+def histogram_columns(info, lo, hi, even, n):
+    """How many of the cells in `info` (see expression_histogram) fall in each of `n` equal parts of a slider's track, the track running over the values
+    from `lo` to `hi` (a position is the fraction of the range, or its square root unless `even`: see RangeSlider). Where the values are few and whole
+    (counts; the log of 1 + counts), each value's cells are spread over the stretch halfway to its neighbors, so that the track is filled and not a
+    comb of spikes: a column narrower than that holds its share."""
+    srt, discrete = info
+    if not len(srt) or hi <= lo:
+        return np.zeros(n)
+    position = np.linspace(0.0, 1.0, n + 1)
+    edges = lo + (position if even else position ** 2) * (hi - lo)
+    if discrete is not None:
+        u, c = discrete
+        points = np.concatenate(([0.0], u))
+        end = min(u[-1] + (u[-1] - (u[-2] if len(u) > 1 else 0.0)) / 2, hi)               # (the highest value's stretch ends where the track does: no cell is cut off)
+        bounds = np.concatenate(((points[:-1] + points[1:]) / 2, [end]))
+        return np.diff(np.interp(edges, bounds, np.concatenate(([0.0], np.cumsum(c))), left=0.0, right=float(c.sum())))
+    below = np.searchsorted(srt, edges, side="left")
+    below[-1] = len(srt)
+    return np.diff(below).astype(float)
 
 
 class RangeSlider(tk.Canvas):
@@ -371,12 +405,13 @@ class RangeSlider(tk.Canvas):
     (right, a white dot) of a color scale. It is as wide as the color bar above it (the track runs between the same margins), calls
     `command(low, high)` as a handle is dragged, and a double-click puts both back at the ends. `low` and `high` are the fractions of the range
     the levels are at; the track is drawn by their square root (a position is the square root of its value), so that the low end, where most of a
-    gene's expression is, has most of the track."""
+    gene's expression is, has most of the track, unless `even` is set (a log scale, which already spreads the values): then by the fractions themselves."""
     MIN_GAP = 0.005           # the handles keep at least this much of the track between them
 
     def __init__(self, parent, command, margin=10, height=26):
         super().__init__(parent, height=height, highlightthickness=0)
         self.low, self.high, self.margin, self.command, self.dragging = 0.0, 1.0, margin, command, None
+        self.even = False                                  # (True: the track is even, a position is the fraction itself)
         self.bind("<Configure>", lambda e: self.draw())
         self.bind("<ButtonPress-1>", self.press)
         self.bind("<B1-Motion>", self.move)
@@ -384,11 +419,18 @@ class RangeSlider(tk.Canvas):
         self.bind("<Double-Button-1>", lambda e: self.set(0.0, 1.0, notify=True))
 
     def x_of(self, fraction):
-        return self.margin + math.sqrt(min(max(fraction, 0.0), 1.0)) * max(self.winfo_width() - 2 * self.margin, 1)
+        fraction = min(max(fraction, 0.0), 1.0)
+        return self.margin + (fraction if self.even else math.sqrt(fraction)) * max(self.winfo_width() - 2 * self.margin, 1)
 
     def fraction_of(self, x):
         position = min(max((x - self.margin) / max(self.winfo_width() - 2 * self.margin, 1), 0.0), 1.0)
-        return position * position
+        return position if self.even else position * position
+
+    def set_even(self, on):
+        """An even track (for a log scale) or the square-root one (linear): the handles stay at the same fractions, at other places of the track."""
+        if bool(on) != self.even:
+            self.even = bool(on)
+            self.draw()
 
     def set(self, low, high, notify=False):
         self.low, self.high = low, high
@@ -435,12 +477,16 @@ class HoverTip:
         widget.bind("<ButtonPress>", self.show, add="+")
 
     def show(self, e):
+        text = self.text_fn()
+        if not text:                                          # (nothing to say where the pointer is now: no tip)
+            self.hide()
+            return
         if self.tip is None:
             self.tip = tk.Toplevel(self.widget)
             self.tip.wm_overrideredirect(True)
             self.label = tk.Label(self.tip, bg="#ffffe0", relief="solid", borderwidth=1, font=("Segoe UI", 9), padx=4, pady=1, justify=tk.LEFT, wraplength=460)
             self.label.pack()
-        self.label.config(text=self.text_fn())
+        self.label.config(text=text)
         # beside the pointer, but kept on the screen: to its left if it would run off the right edge, above it if off the bottom
         self.tip.update_idletasks()
         w, h = self.tip.winfo_reqwidth(), self.tip.winfo_reqheight()
@@ -2165,7 +2211,7 @@ class UmapWindow(ExportsMixin):
         if not self.root.winfo_viewable() or self.own is not None:
             return
         total = self.pw.winfo_width()
-        side_w = int(self.side_pane.cget("width")) or 420
+        side_w = self.side_pane.winfo_width() if self.side_pane.winfo_width() > 50 else int(self.side_pane.cget("width")) or 420       # (as wide as it is: the user may have dragged it wider)
         edge = total - side_w                                           # (the side panel keeps its own width, at the right)
         if not self.umap_shown:                                         # (no UMAP shown: the section maps fill what the side panel leaves)
             if abs(self.pw.sashpos(0) - int(edge)) > 2:
@@ -2195,7 +2241,11 @@ class UmapWindow(ExportsMixin):
         shown = [(value, text) for value, text in (("all", "All groups"), ("single", "Specific group(s)"), ("gene", "Gene"), ("imputed", "Imputed Gene"))
                  if not (value == "imputed" and self.own is not None)]     # (there is no imputed dataset behind a dataset of the user's own)
         for k, (value, text) in enumerate(shown):
-            ttk.Radiobutton(modes, text=text, value=value, variable=self.var_mode, command=self.on_mode).grid(row=k, column=0, sticky="w")
+            depends = value in ("all", "single")             # (these two work on the groups of the level chosen in Group by, to the right: an arrow points to it)
+            rb = ttk.Radiobutton(modes, text=text + ("  →" if depends else ""), value=value, variable=self.var_mode, command=self.on_mode)
+            rb.grid(row=k, column=0, sticky="w")
+            if depends:
+                HoverTip(rb, lambda: "What this shows depends on the level chosen in Group by, to the right.")
         self.var_translucent = tk.BooleanVar(f, False)
         translucent_box = ttk.Checkbutton(color_col, text="Translucent", variable=self.var_translucent, command=self.apply_opacity)
         translucent_box.pack(anchor="w", pady=(4, 0))                      # (under the Color by buttons, in the room beside the Level list)
@@ -2210,6 +2260,8 @@ class UmapWindow(ExportsMixin):
         self.build_level_radios()
         self.box = ttk.Frame(f)
         self.box.pack(fill=tk.X, pady=(8, 0))
+        ttk.Frame(self.box, height=1).pack(fill=tk.X)             # (always something in it: a frame with nothing left in it keeps the height its last contents gave it, as the gene
+                                                                  # box's, and the group list under it was pushed down by it)
         # a group number box (Specific group(s))
         self.id_frame = ttk.LabelFrame(self.box, text="Group number(s)", padding=6)
         self.id_hint = ttk.Label(self.id_frame, text="One or more, separated by commas (Enter):", foreground="gray30", wraplength=300)
@@ -2254,14 +2306,27 @@ class UmapWindow(ExportsMixin):
         self.cbar.pack(fill=tk.X, pady=(6, 0))
         self.cbar_photo = None
         self.cbar.bind("<Button-1>", self.on_legend_click)
-        self.gene_levels = (0.0, 1.0)          # the black and white levels of a gene shown in linear scale, as fractions of its range (the slider under the color bar)
+        self.gene_levels = (0.0, 1.0)          # the black and white levels of a gene, as fractions of its range (the slider under the color bar)
         self.multi_levels = {}                 # the same for each of several genes (gene number -> (low, high)): the sliders in the legend
         self.multi_sliders = []
         self.multi_windows = []
         self.levels_job = None
         self.cbar_slider = RangeSlider(self.gene_frame, self.on_gene_levels)
-        HoverTip(self.cbar_slider, lambda: "Drag the black and white handles to set the lowest and the highest value of the color scale. The track is by the square root of the value: "
-                                        "most of it is for the low values. Double-click to reset.")
+        self.hist = tk.Canvas(self.gene_frame, height=HIST_HEIGHT, highlightthickness=0)
+        self.hist_args = None                                  # (what it shows now, to draw again when its width changes: see redraw_hist)
+        self.hist_cache = {}                                   # id of a values array -> (the array, its histogram data): the sliders redraw on every drag
+        self.hist.hist_regions, self.hist.hist_photos = [], []
+        self.hist.bind("<Configure>", lambda e: self.redraw_hist())
+        self.legend_redraw, self.cbar_width, self.cbar_job = None, 0, None      # (how to draw the color bar or the several genes' legend again when the panel changes width)
+        self.cbar.bind("<Configure>", lambda e: self.cbar_resized(), add="+")
+        self.hist_pointer = [None]
+        for canvas in (self.hist, self.cbar):
+            canvas.bind("<Motion>", lambda e: self.hist_pointer.__setitem__(0, e), add="+")          # (before the tips' own: they ask for the text as the pointer moves)
+            canvas.hist_regions, canvas.hist_photos = canvas.__dict__.get("hist_regions", []), canvas.__dict__.get("hist_photos", [])
+            HoverTip(canvas, lambda c=canvas: self.hist_pointer[0] and self.histogram_readout(c, self.hist_pointer[0]))
+        HoverTip(self.cbar_slider, lambda: "Drag the black and white handles to set the lowest and the highest value of the color scale. "
+                                        + ("The track is even." if self.cbar_slider.even else "The track is by the square root of the value: most of it is for the low values. ")
+                                        + " Double-click to reset.")
         # the legend for Single group(s)
         self.legend = tk.Canvas(f, width=300, height=10, highlightthickness=0)
         self.select_bar = ttk.Frame(f)                      # All / None, above the group list and the Single group(s) legend
@@ -2684,7 +2749,8 @@ class UmapWindow(ExportsMixin):
             t["frame"].slot_wh = (fw, fh) if big else None            # (the room it takes there, when its widget is only the part in view)
             self.tile_scroll.coords(t["item"], x, y)
         rows = -(-len(self.tiles) // cols)
-        self.tile_scroll.configure(scrollregion=(0, 0, 4 + cols * (fw + 8), 3 + rows * (fh + 6)))
+        pad_x, pad_y = self.pane_slack()
+        self.tile_scroll.configure(scrollregion=(0, 0, 4 + cols * (fw + 8) + pad_x, 3 + rows * (fh + 6) + pad_y))
         self.root.after_idle(self.refresh_visible)
 
     def place_tiles(self, max_draws=None, background=None):
@@ -2765,6 +2831,18 @@ class UmapWindow(ExportsMixin):
         if stop == 0:
             return self.fit_tiles(w)
         return stop, max((w - 4) // stop - 8 - 2, MIN_TILE_PX)               # (8: the gaps either side of a panel; 2: its canvas border)
+
+    def pane_slack(self):
+        """(width, height) of the room at the right and the bottom of the pane that the panels leave empty at panel zoom 1 (a fit that the height limits does not
+        fill the width: 0 if they fill it). It stays part of what the pane scrolls over at every zoom: or a zoom close to the unzoomed one, with the content
+        hardly wider than the pane, could not scroll as far as it takes to keep the point under the pointer in place, and the content slid instead."""
+        cols, base = self.tile_params()
+        n = max(len(self.tiles), 1)
+        ch = max((t["caption"].winfo_reqheight() for t in self.tiles), default=20)
+        fw, fh = base + 2, ch + int(base / self.tile_aspect) + 2                # (a panel's slot at zoom 1: its map with the border it has then)
+        w = self.tile_scroll.winfo_width()
+        h = self.tile_scroll.winfo_height() + (self.hsb.winfo_reqheight() if self.hsb.winfo_manager() else 0)
+        return max(0, w - (4 + cols * (fw + 8))), max(0, h - (3 + -(-n // cols) * (fh + 6)))
 
     def fit_tiles(self, w):
         """(across, map width) for the largest panels that show every section in the pane (width `w`, its height now) at once: for each number of panels
@@ -2984,6 +3062,8 @@ class UmapWindow(ExportsMixin):
                                    "content": (self.tile_scroll.canvasx(wx), self.tile_scroll.canvasy(wy)), "label": None, "job": None, "photo": None}
             b["spot"] = self.spot_in_tiles(*b["content"])
             self.remember_pane(b, image)
+        elif abs(wx - b["at"][0]) > 2 or abs(wy - b["at"][1]) > 2:
+            self.reanchor(b, wx, wy)                                 # (the pointer has moved since the zoom began: the zoom goes on about where it is now)
         b["target"] = min(max(b["target"] * factor, 1.0), self.max_panel_zoom())
         if b.get("fill") is not None:                                # (settling was drawing the maps: it stops, to start again when the wheel does)
             self.root.after_cancel(b["fill"])
@@ -2993,6 +3073,28 @@ class UmapWindow(ExportsMixin):
         if b["job"] is not None:
             self.root.after_cancel(b["job"])
         b["job"] = self.root.after(self.ZOOM_SETTLE_MS, self.settle_zoom)
+
+    def spot_in_layout(self, lay, ax, ay):
+        """spot_in_tiles for the layout `lay` (see layout_at) instead of the panels as they are: where the point (ax, ay) of the scrolled pane is in them."""
+        best = None
+        for k in range(len(self.tiles)):
+            x, y = 4 + (k % lay["cols"]) * (lay["fw"] + 8), 3 + (k // lay["cols"]) * (lay["fh"] + 6)
+            dx = max(x - ax, 0, ax - (x + lay["mw"]))
+            dy = max(y - ay, 0, ay - (y + lay["ch"] + lay["mh"]))
+            if best is None or dx * dx + dy * dy < best[0]:
+                best = (dx * dx + dy * dy, k, ax - x, ay - (y + lay["ch"]), lay["mw"], lay["mh"])
+        return best[1:] if best else None
+
+    def reanchor(self, b, wx, wy):
+        """The pointer moved while the zoom was going on (the snapshot is up, and the wheel is turned again): the zoom is about the point of the maps that
+        is under the pointer now, in the picture as it is shown. The picture does not jump: the view that keeps that point under the pointer is the one
+        it is in."""
+        lay, view = b.get("shown_layout"), b.get("shown_view")
+        if lay is not None and view is not None:
+            b["spot"] = self.spot_in_layout(lay, view[0] + wx, view[1] + wy)
+        else:                                                        # (nothing shown yet: the panels are as they were when the zoom began)
+            b["spot"] = self.spot_in_tiles(self.tile_scroll.canvasx(wx), self.tile_scroll.canvasy(wy))
+        b["at"] = (wx, wy)
 
     def show_zoom_step(self):
         b = self.zoom_burst
@@ -3159,15 +3261,16 @@ class UmapWindow(ExportsMixin):
         ph = int(px / self.tile_aspect)
         border = 2 if z <= 1.0 else 0                                    # (a map of the unzoomed panel has its widget's border)
         mw, mh = px + border, ph + border
-        return {"cols": cols, "rows": -(-len(self.tiles) // cols), "fw": mw, "fh": ch + mh, "ch": ch, "mw": mw, "mh": mh}
+        pad_x, pad_y = self.pane_slack()
+        return {"cols": cols, "rows": -(-len(self.tiles) // cols), "fw": mw, "fh": ch + mh, "ch": ch, "mw": mw, "mh": mh, "pad_x": pad_x, "pad_y": pad_y}
 
     def view_at(self, z, spot, at, lay):
         """Where the pane is scrolled to (left, top) at zoom z when the spot under the pointer is to stay under it."""
         k, dx, dy, old_w, old_h = spot
         x = 4 + (k % lay["cols"]) * (lay["fw"] + 8) + grown(dx, old_w, lay["mw"])
         y = 3 + (k // lay["cols"]) * (lay["fh"] + 6) + lay["ch"] + grown(dy, old_h, lay["mh"])
-        total_w = 4 + lay["cols"] * (lay["fw"] + 8)
-        total_h = 3 + lay["rows"] * (lay["fh"] + 6)
+        total_w = 4 + lay["cols"] * (lay["fw"] + 8) + lay["pad_x"]
+        total_h = 3 + lay["rows"] * (lay["fh"] + 6) + lay["pad_y"]
         wx, wy = at
         return (min(max(x - wx, 0.0), max(total_w - self.tile_scroll.winfo_width(), 0.0)),
                 min(max(y - wy, 0.0), max(total_h - self.tile_scroll.winfo_height(), 0.0)))
@@ -3215,6 +3318,7 @@ class UmapWindow(ExportsMixin):
         z = b["target"]
         lay_n = self.layout_at(z)
         left_n, top_n = self.view_at(z, b["spot"], b["at"], lay_n) if b.get("spot") else (b["left"] * z / b["start"], b["top"] * z / b["start"])
+        b["shown_layout"], b["shown_view"] = lay_n, (left_n, top_n)          # (what the picture shown is, for reanchor)
         out = np.empty((h, w, 3), np.uint8)
         out[:] = (244, 244, 244)
         todo = np.ones((h, w), bool)                                  # (the parts of the pane no picture has been put on yet)
@@ -3250,9 +3354,10 @@ class UmapWindow(ExportsMixin):
         t2 = time.perf_counter()
         if b["label"] is None:
             b["label"] = tk.Label(self.tile_scroll, bd=0, highlightthickness=0, cursor="fleur")
-            b["label"].bind("<MouseWheel>", lambda e: self.zoom_step(*b["at"], 1.25 if e.delta > 0 else 0.8))
-            b["label"].bind("<Button-4>", lambda e: self.zoom_step(*b["at"], 1.25))
-            b["label"].bind("<Button-5>", lambda e: self.zoom_step(*b["at"], 0.8))
+            pointer = lambda e: (e.x_root - self.tile_scroll.winfo_rootx(), e.y_root - self.tile_scroll.winfo_rooty())       # (where it is now, not where the zoom began)
+            b["label"].bind("<MouseWheel>", lambda e: self.zoom_step(*pointer(e), 1.25 if e.delta > 0 else 0.8))
+            b["label"].bind("<Button-4>", lambda e: self.zoom_step(*pointer(e), 1.25))
+            b["label"].bind("<Button-5>", lambda e: self.zoom_step(*pointer(e), 0.8))
             b["label"].place(x=0, y=0, width=w, height=h)
         if fresh:
             b["label"].configure(image=b["photo"])
@@ -3505,6 +3610,7 @@ class UmapWindow(ExportsMixin):
             self.last_group_click = None
             self.off_groups = set()                      # (a new level, mode or list of groups starts with every group colored)
         self.var_status.set("")
+        self.legend_redraw = None                        # (the color bar or gene legend is drawn again only while there is one: see cbar_resized)
         self.select_bar.pack_forget()
         self.legend.pack_forget()
         self.group_list.pack_forget()
@@ -3514,6 +3620,8 @@ class UmapWindow(ExportsMixin):
             self.color_single()
         else:
             self.color_gene()
+            self.group_list.pack_forget()                # (a gene's colors say nothing of the groups: no list, even before a gene is entered and the cells keep their group colors)
+            self.legend.pack_forget()
         self.sync_select_bar()
 
     def dot_scale(self):
@@ -4192,15 +4300,17 @@ class UmapWindow(ExportsMixin):
     def show_single(self, gene, dataset, scale, vals, bg_vals):
         fin = np.isfinite(vals)
         vmin, vmax = (float(np.nanmin(vals)), float(np.nanmax(vals))) if fin.any() else (0.0, 1.0)
-        # In linear scale the black and white levels can be moved (the slider under the color bar): they cut the range the colors cover.
-        linear = scale == "linear"
+        # The black and white levels can be moved (the slider under the color bar), in either scale: they cut the range the colors cover.
         self.clear_multi_sliders()
-        low, high = self.gene_levels if linear else (0.0, 1.0)
+        low, high = self.gene_levels
+        whole = (vmin, vmax)                            # (the histogram runs over all of it, whatever the levels)
         vmin, vmax = vmin + low * (vmax - vmin), vmin + high * (vmax - vmin)
         self.shown_range = (vmin, vmax)                 # (the colors' range as shown, with the black and white levels: a saved picture's color bar has it too)
-        self.show_levels_slider(linear)
-        if linear:
-            self.cbar_slider.set(low, high)
+        self.show_levels_slider(True)
+        self.cbar_slider.set_even(scale == "log")                                       # (a log scale is already spread out: an even track)
+        self.cbar_slider.set(low, high)
+        self.hist_args = (self.histogram_of(vals), whole[0], whole[1], scale == "log", low, high, self.gene_rgb, self.units_text(dataset, scale))
+        self.redraw_hist()
         t = np.clip((vals - vmin) / (vmax - vmin), 0, 1) if vmax > vmin else np.zeros_like(vals)
         rgb = self.gene_rgb(np.where(fin, t, 0))
         rgb[~fin] = GREY
@@ -4224,7 +4334,9 @@ class UmapWindow(ExportsMixin):
             return self.bg["x"][w][o], self.bg["y"][w][o], col[o], w[o]
 
         self.apply(rgb, order, bg_fn, dark=self.var_theme.get() == "dark")             # (the dark theme: a black background, as in the multi-gene view)
-        self.draw_colorbar(vmin, vmax, scale, dataset, readout=(percent_below(vals, vmin), percent_below(vals, vmax)) if linear else None)
+        readout = (expressing_percentile(vals, vmin), expressing_percentile(vals, vmax))
+        self.legend_redraw = lambda: self.draw_colorbar(vmin, vmax, scale, dataset, readout=readout)
+        self.legend_redraw()
         self.var_status.set(f"Showing {gene}{' [imputed]' if dataset == 'imputed' else ''} (every cell of the sections, colored on the selection's scale)."
                             if bg_vals is not None else f"Showing {gene}." if self.own is not None else "(cells outside this run's selection are gray).")
 
@@ -4237,17 +4349,17 @@ class UmapWindow(ExportsMixin):
         return CHANNEL_HEX_LIGHT if self.var_theme.get() == "light" else CHANNEL_HEX
 
     def show_multi(self, genes, dataset, scale, per_gene):
-        self.show_levels_slider(False)
+        self.show_levels_slider(False)                  # (the single gene's slider: each gene has its own in the legend)
         light = self.var_theme.get() == "light"
         mix = (lambda chans: ink_rgb(chans)) if light else (lambda chans: (core.multi_gene_rgb(chans, (0.0, 0.0, 0.0)) * 255).astype(np.uint8))
         n = len(genes)
-        norm = []
+        norm, wholes = [], []
         for i, (vals, _bg) in enumerate(per_gene):
             fin = np.isfinite(vals)
             lo, hi = (float(np.nanmin(vals)), float(np.nanmax(vals))) if fin.any() else (0.0, 1.0)
-            if scale == "linear":                  # (the black and white levels set with the legend's sliders cut the range)
-                low, high = self.multi_levels.get(i, (0.0, 1.0))
-                lo, hi = lo + low * (hi - lo), lo + high * (hi - lo)
+            wholes.append((lo, hi))                                   # (the histogram runs over all of it, whatever the levels)
+            low, high = self.multi_levels.get(i, (0.0, 1.0))          # (the black and white levels set with the legend's sliders cut the range)
+            lo, hi = lo + low * (hi - lo), lo + high * (hi - lo)
             norm.append((np.clip((vals - lo) / (hi - lo), 0, 1) if hi > lo else np.zeros_like(vals), lo, hi))
         self.multi_ranges = [(v[1], v[2]) for v in norm]           # (each gene's range as shown: for the legend of a saved picture)
         self.multi_scale = scale
@@ -4290,30 +4402,36 @@ class UmapWindow(ExportsMixin):
             return self.bg["x"][w][o], self.bg["y"][w][o], col[o], w[o]
 
         self.apply(rgb, order, bg_fn, extra_umap_layers=extra, dark=not light)
-        readouts = [(percent_below(per_gene[i][0], norm[i][1]), percent_below(per_gene[i][0], norm[i][2])) for i in range(n)] if scale == "linear" else None
-        self.draw_multi_legend(genes, [(v[1], v[2]) for v in norm], scale, readouts)
+        readouts = [(expressing_percentile(per_gene[i][0], norm[i][1]), expressing_percentile(per_gene[i][0], norm[i][2])) for i in range(n)]
+        channel = lambda i: (lambda t, c=i % 3: mix([t if k == c else np.zeros_like(t) for k in range(3)]))          # (a gene's color at a place in its range: its own ink alone)
+        legend_ranges = [(v[1], v[2]) for v in norm]
+        legend_hists = [(self.histogram_of(per_gene[i][0]),) + wholes[i] + (channel(i), self.units_text(dataset, scale)) for i in range(n)]
+        self.legend_redraw = lambda: self.draw_multi_legend(genes, legend_ranges, scale, readouts, legend_hists)
+        self.legend_redraw()
         parts = " and ".join(f"'{g}' ({self.channel_names()[i]})" for i, g in enumerate(genes))
         self.var_status.set(f"Showing {parts}{' [imputed]' if dataset == 'imputed' else ''}."
                             + (f" Hidden: {', '.join(genes[i] for i in sorted(hidden))}." if hidden else ""))
 
-    def draw_multi_legend(self, genes, ranges, scale, readouts=None):
+    def draw_multi_legend(self, genes, ranges, scale, readouts=None, hists=None):
         c = self.cbar
         self.cbar_photo = None
-        linear = scale == "linear"
+        self.cbar_width = c.winfo_width()
+        c.hist_regions, c.hist_photos = [], []                      # (the histograms are drawn again below)
         h8, h10 = self.line_height(8), self.line_height(10, bold=True)
-        name_y = h10 // 2 + 3                                       # (the name and its circle; then the range; in linear scale what is below the two levels, and their slider)
+        name_y = h10 // 2 + 3                                       # (the name and its circle; then the range; where the two levels stand among the cells that express the gene, and their slider)
         range_y = h10 + 4
         cells_y = range_y + h8 + 2
-        slider_y = cells_y + 2 * h8 + 4
-        row = slider_y + 26 + 10 if linear else range_y + h8 + 12
-        if len(self.multi_sliders) != (len(genes) if linear else 0):
+        slider_y = cells_y + h8 + 4
+        hist_y = slider_y + 26 + 2                                  # (the histogram under the slider)
+        row = hist_y + HIST_HEIGHT + 10
+        if len(self.multi_sliders) != len(genes):
             c.delete("all")
             self.clear_multi_sliders()                              # (the sliders are kept while they are dragged: only made again for other genes)
-            if linear:
-                self.multi_sliders = [RangeSlider(c, lambda lo, hi, i=i: self.on_multi_levels(i, lo, hi)) for i in range(len(genes))]
-                self.multi_windows = [c.create_window(0, 0, anchor="nw", window=sl, height=26) for sl in self.multi_sliders]
+            self.multi_sliders = [RangeSlider(c, lambda lo, hi, i=i: self.on_multi_levels(i, lo, hi)) for i in range(len(genes))]
+            self.multi_windows = [c.create_window(0, 0, anchor="nw", window=sl, height=26) for sl in self.multi_sliders]
         else:
             c.delete("legend")                                      # (only the texts and circles: the sliders stay where they are, so that a drag in progress goes on)
+            c.delete("hist")
         c.config(height=8 + row * len(genes) + 2 * h8 + 8)
         for i, (g, (lo, hi)) in enumerate(zip(genes, ranges)):
             y = 8 + row * i
@@ -4331,17 +4449,20 @@ class UmapWindow(ExportsMixin):
             c.create_text(34, y + name_y, anchor="w", text=g, fill=color, font=("Segoe UI", 10, "bold"), tags=("legend", f"row{i}"))      # (centered on the circle)
             c.create_text(34, y + range_y, anchor="nw", text="hidden" if off else f"{'' if scale == 'linear' else 'log2: '}{lo:.1f}\u2013{hi:.1f}",
                           fill="#666666", font=("Segoe UI", 8), tags="legend")
-            if linear:
-                if readouts is not None and not off:
-                    for (a, e), x, anchor in ((readouts[i][0], 10, "nw"), (readouts[i][1], max(c.winfo_width(), 200) - 10, "ne")):
-                        c.create_text(x, y + cells_y, anchor=anchor, text=f"{a:.1f}% of cells below", font=("Segoe UI", 8), fill="gray30", tags="legend")
-                        c.create_text(x, y + cells_y + h8, anchor=anchor, text=f"{e:.1f}% of expressing", font=("Segoe UI", 8), fill="gray30", tags="legend")
-                self.multi_sliders[i].set(*self.multi_levels.get(i, (0.0, 1.0)))
-                c.coords(self.multi_windows[i], 0, y + slider_y)
-                c.itemconfig(self.multi_windows[i], width=max(c.winfo_width(), 200))
+            if readouts is not None and not off:
+                for e, x, anchor in ((readouts[i][0], 10, "nw"), (readouts[i][1], max(c.winfo_width(), 200) - 10, "ne")):
+                    c.create_text(x, y + cells_y, anchor=anchor, text=f"{e:.1f} percentile", font=("Segoe UI", 8), fill="gray30", tags="legend")
+            self.multi_sliders[i].set_even(scale == "log")
+            self.multi_sliders[i].set(*self.multi_levels.get(i, (0.0, 1.0)))
+            c.coords(self.multi_windows[i], 0, y + slider_y)
+            c.itemconfig(self.multi_windows[i], width=max(c.winfo_width(), 200))
+            if hists is not None and not off:
+                info, whole_lo, whole_hi, color_fn, units = hists[i]
+                low, high = self.multi_levels.get(i, (0.0, 1.0))
+                self.draw_histogram(c, y + hist_y, max(c.winfo_width(), 200), info, whole_lo, whole_hi, scale == "log", low, high, color_fn, units)
         width = max(c.winfo_width(), 200)
         hint = c.create_text(width / 2, 8 + row * len(genes) + 2, anchor="n", width=width - 20, justify=tk.CENTER,          # (wrapped: it is wider than a narrow panel)
-                             text="click a gene to hide / show it" + ("; drag the handles for its black and white levels" if linear else ""),
+                             text="click a gene to hide / show it; drag the handles for its black and white levels",
                              fill="#888888", font=("Segoe UI", 8, "italic"), tags="legend")
         c.config(height=c.bbox(hint)[3] + 6)                        # (as tall as the hint, however many lines it took)
         self.multi_rows = (8, row, len(genes))
@@ -4514,8 +4635,92 @@ class UmapWindow(ExportsMixin):
     def show_levels_slider(self, on):
         if on:
             self.cbar_slider.pack(fill=tk.X, after=self.cbar)
+            self.hist.pack(fill=tk.X, after=self.cbar_slider)
         else:
             self.cbar_slider.pack_forget()
+            self.hist.pack_forget()
+
+    def histogram_of(self, vals):
+        """The data of a gene's histogram (expression_histogram), made once for the values on the screen: the sliders redraw as they are dragged."""
+        hit = self.hist_cache.get(id(vals))
+        if hit is None or hit[0] is not vals:
+            if len(self.hist_cache) >= 8:
+                self.hist_cache.pop(next(iter(self.hist_cache)))
+            hit = self.hist_cache[id(vals)] = (vals, expression_histogram(vals))
+        return hit[1]
+
+    def draw_histogram(self, canvas, y_top, width, info, lo, hi, even, low, high, color_fn, label):
+        """The histogram in `canvas` from y_top down HIST_HEIGHT pixels: along the track of a slider of this width (RangeSlider: the same margins and the same
+        mapping), the number of cells in each pixel's stretch of it, as the logarithm of 1 + the number, over the whole range `lo`..`hi`. Each bar has the color
+        the cells of its value have (`color_fn(t)`, t the place in the colors' range, between the slider's handles `low` and `high`, fractions of the whole
+        range: below the black handle the cells are the first color, above the white one the last); the bars outside the handles are paler. The pointer over
+        it says the value and the height (see histogram_readout)."""
+        margin = 10
+        track = max(int(width) - 2 * margin, 1)
+        counts = histogram_columns(info, lo, hi, even, track)
+        canvas.hist_regions.append({"x0": margin, "y0": y_top, "n": track, "counts": counts, "lo": lo, "hi": hi, "even": even, "label": label})
+        heights = np.log10(1.0 + counts)
+        top = float(heights.max())
+        if top <= 0:
+            return
+        rows = HIST_HEIGHT
+        px = np.where(counts > 0, np.maximum(np.round(heights / top * (rows - 3)).astype(int), 1), 0)            # (a column with any cell is at least one pixel high)
+        centre = (np.arange(track) + 0.5) / track
+        value = lo + (centre if even else centre ** 2) * (hi - lo)
+        black, white = lo + low * (hi - lo), lo + high * (hi - lo)
+        t = np.clip((value - black) / (white - black), 0.0, 1.0) if white > black else np.zeros(track)
+        colors = np.asarray(color_fn(t), dtype=np.uint8)
+        bar = (rows - 1 - np.arange(rows))[:, None] < px[None, :]                                                # (rows from the bottom up to each column's height)
+        picture = np.zeros((rows, track, 4), np.uint8)
+        picture[..., :3] = colors[None, :, :]
+        a = int(round((low if even else math.sqrt(low)) * track))
+        b = int(round((high if even else math.sqrt(high)) * track))
+        inside = (np.arange(track) >= a) & (np.arange(track) < max(b, a))
+        picture[..., 3] = np.where(bar, np.where(inside, 255, 110)[None, :], 0)
+        left, right, above = np.zeros_like(bar), np.zeros_like(bar), np.zeros_like(bar)       # (a gray edge round the bars: a bar of the palest color shows on the pane)
+        left[:, 1:], right[:, :-1], above[1:, :] = bar[:, :-1], bar[:, 1:], bar[:-1, :]
+        edge = bar & (~left | ~right | ~above)
+        picture[edge] = (118, 118, 118, 255)
+        picture[..., 3][edge & ~inside[None, :].repeat(rows, axis=0)] = 140
+        photo = ImageTk.PhotoImage(Image.fromarray(picture, "RGBA"), master=canvas)
+        canvas.hist_photos.append(photo)                                                                          # (kept: Tk shows the picture only while Python holds it)
+        canvas.create_image(margin, y_top, anchor="nw", image=photo, tags="hist")
+        canvas.create_line(margin, y_top + rows - 1, margin + track, y_top + rows - 1, fill="#a8a8a8", tags="hist")
+
+    def histogram_readout(self, canvas, event):
+        """What the pointer is over in a histogram of `canvas` (as draw_histogram left it): the value there and the height of the bar, the number of cells in
+        that pixel's stretch of the track (None if it is not over one)."""
+        for r in getattr(canvas, "hist_regions", []):
+            x, y = canvas.canvasx(event.x) - r["x0"], canvas.canvasy(event.y) - r["y0"]
+            if 0 <= x < r["n"] and 0 <= y < HIST_HEIGHT:
+                p = (int(x) + 0.5) / r["n"]
+                v = r["lo"] + (p if r["even"] else p * p) * (r["hi"] - r["lo"])
+                n = float(r["counts"][int(x)])
+                cells = "no cells" if n <= 0 else "fewer than 1 cell" if n < 0.5 else f"{n:,.0f} cell{'s' if round(n) != 1 else ''}"
+                return f"{r['label']}: {v:.2f}\n{cells} (the bar's height)"
+        return None
+
+    def cbar_resized(self):
+        """The side panel was made wider or narrower: the color bar (or the legend of several genes, with its histograms) is drawn again for the new width,
+        once the panel has stopped changing. (Only for a change of width: drawing it changes its height, which comes back here.)"""
+        if self.legend_redraw is None or self.cbar.winfo_width() == self.cbar_width:
+            return
+        if self.cbar_job is not None:
+            self.root.after_cancel(self.cbar_job)
+        self.cbar_job = self.root.after(60, self.run_legend_redraw)
+
+    def run_legend_redraw(self):
+        self.cbar_job = None
+        if self.legend_redraw is not None and self.mode in ("gene", "imputed"):
+            self.legend_redraw()
+
+    def redraw_hist(self):
+        """The histogram under the single gene's slider, again (a new gene or levels, or the panel changed width)."""
+        self.hist.delete("all")
+        self.hist.hist_regions, self.hist.hist_photos = [], []
+        if self.hist_args is not None and self.hist.winfo_manager():
+            info, lo, hi, even, low, high, color_fn, label = self.hist_args
+            self.draw_histogram(self.hist, 0, max(self.hist.winfo_width(), 200), info, lo, hi, even, low, high, color_fn, label)
 
     def line_height(self, size, bold=False):
         """The height in pixels of a line of Segoe UI text of this size on this screen (the scaling of Windows makes it more than the points say)."""
@@ -4526,9 +4731,11 @@ class UmapWindow(ExportsMixin):
         return fonts[key].metrics("linespace")
 
     def draw_colorbar(self, vmin, vmax, scale, dataset, readout=None):
-        """`readout` (linear scale): the percentages below the black and the white point, ((all, expressing), (all, expressing))."""
+        """`readout`: where the black and the white point stand among the cells that express the gene (see expressing_percentile): (black, white)."""
         c = self.cbar
+        self.cbar_width = c.winfo_width()
         c.delete("all")
+        c.hist_regions, c.hist_photos = [], []                      # (no histograms in it: they are the legend's of several genes)
         h8, h9 = self.line_height(8), self.line_height(9)
         w = max(c.winfo_width(), 200)
         ramp = self.gene_rgb(np.linspace(0, 1, w - 20))[None, :, :]
@@ -4539,10 +4746,9 @@ class UmapWindow(ExportsMixin):
         c.create_text(w - 10, 28, anchor="ne", text=f"{vmax:.2f}", font=("Segoe UI", 9))
         y = 28 + h9 + 2
         if readout is not None:
-            for (a, e), x, anchor in ((readout[0], 10, "nw"), (readout[1], w - 10, "ne")):
-                c.create_text(x, y, anchor=anchor, text=f"{a:.1f}% of cells below", font=("Segoe UI", 8), fill="gray30")
-                c.create_text(x, y + h8, anchor=anchor, text=f"{e:.1f}% of expressing", font=("Segoe UI", 8), fill="gray30")
-            y += 2 * h8 + 4
+            for e, x, anchor in ((readout[0], 10, "nw"), (readout[1], w - 10, "ne")):
+                c.create_text(x, y, anchor=anchor, text=f"{e:.1f} percentile", font=("Segoe UI", 8), fill="gray30")
+            y += h8 + 4
         c.create_text(w / 2, y + h9 / 2, text=self.units_text(dataset, scale), font=("Segoe UI", 9), fill="gray30")
         c.config(height=int(y + h9 + 8))
 
@@ -5315,7 +5521,7 @@ def show_umap_window_tk(adata, abc_cache, imputed_state=None, adata_backed=None,
                         parent=None, host=None, params=None, own=None, panel_zoom=False):
     """Open the viewer and return when it is closed. `panel_zoom`: start with Zoom whole panel ticked. `host`: the browser's own functions (see UmapWindow); `params`: the UMAP parameters
     the embedding in `adata` was made with."""
-    if "X_umap" not in adata.obsm:
+    if "X_umap" not in adata.obsm and not adata.uns.get("no_umap"):            # (a project made without a UMAP has none, and is shown without it)
         print("No UMAP embedding available; skipping the interactive UMAP viewer.")
         return
     win = UmapWindow(adata, abc_cache, imputed_state, adata_backed, rois, run_folder, ensure_imputed, title or "Interactive UMAP viewer", parent,

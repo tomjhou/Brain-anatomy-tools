@@ -7,7 +7,7 @@ viewer launcher, the settings window), so this file has no start-up side effects
     outcome = prompt_startup_panel_tk(out_folder, abc_cache, helpers)
 
 `outcome` is (action, cell_type_selection, load_folder, out_folder) with action 'new_run', 'load_existing', 'own_dataset' or 'all_neurons' (make
-the "All neurons" dataset: Neurons, every section, a random ALL_NEURONS_CAP of them; an existing one comes back with its folder as load_folder), or None if
+the "All neurons" project: every neuron, every section, with no UMAP; an existing one comes back with its folder as load_folder), or None if
 the window was closed or Exit was clicked. The cell type is None for a new run (not chosen yet) and unused for an existing one (the run says which it is).
 """
 import gc
@@ -26,10 +26,8 @@ RECOVERABLE = {"ROI coordinates", "Processed AnnData"}      # (cached files of a
 
 
 SUBSAMPLE_CAPS = (("200,000 cells (recommended)", 200_000), ("No limit: every cell", None))
-ALL_NEURONS_CAP = 500_000                # "Browse All Neurons": a random this many neurons from every section, saved as ALL_NEURONS_FOLDER
-ALL_NEURONS_LABEL = "All neurons"
-ALL_NEURONS_FOLDER = f"umap_neurons_allsections_All-neurons_sub{ALL_NEURONS_CAP}"       # (the name a run of Neurons / all sections / this label / this cap gets)
-ALL_NEURONS_FOLDER_UNNAMED = f"umap_neurons_allsections_sub{ALL_NEURONS_CAP}"           # (the same run made through the ordinary route, with no project name)
+ALL_NEURONS_LABEL = "All neurons"         # "Browse All Neurons": every neuron of every section, without a UMAP (a project of seconds), saved as ALL_NEURONS_FOLDER
+ALL_NEURONS_FOLDER = "browse_neurons_allsections_All-neurons"        # (the name a project of Neurons / all sections / this label, without a UMAP, gets)
 LARGE_PROJECT_CELLS = 200_000          # a selection of more cells than this is a "large project": the dialog asks how to handle it
 
 
@@ -48,18 +46,19 @@ def bring_to_front(root):
 
 def choose_run_options(current="Neurons", counts=None, folder_for=None, whole_brain=False, count_state=None):
     """The one window between confirming the sections and ROIs and the long analysis that follows, so that the analysis then runs without
-    asking anything more: which cells to analyze, how to handle a large project (a selection of more than LARGE_PROJECT_CELLS cells: use a
-    random subset, or all), the project name that is added to the folder name, and whether to make the optional subclass / supertype plots.
+    asking anything more: which cells to analyze, whether to make a UMAP at all (not making one, the default for a large project, takes seconds,
+    whatever the cells), how to handle a large project that is to have one (a selection of more than LARGE_PROJECT_CELLS cells: use a random subset, or
+    all), the project name that is added to the folder name, and whether to make the optional subclass / supertype plots.
     `counts`: {"Neurons": n, "NonNeurons": n, "All": n}, the cells in the selection, if known (they are shown, and the large-project question
     is asked only when the chosen kind has more than LARGE_PROJECT_CELLS; if not known it is always asked).
-    Returns a dict {"cell_type": "Neurons" | "NonNeurons" | "All", "cap": the most cells to use, or None for no limit, "label": the project
-    name (may be empty), "optional_plots": bool}, or None if cancelled.
+    Returns a dict {"cell_type": "Neurons" | "NonNeurons" | "All", "make_umap": bool, "cap": the most cells to use in the UMAP, or None for no limit
+    (always None without a UMAP), "label": the project name (may be empty), "optional_plots": bool}, or None if cancelled.
     `count_state`: {"done": bool, "counts": {...} or None, "error": exception or None}, filled in by a thread that is counting the cells now: the
     window opens at once, shows "counting..." for the numbers, keeps Continue off, and fills the numbers in (and settles the large-project question)
     when the counting is done. The caller's `folder_for` may read the same dict.
     `whole_brain`: no sections or ROIs were picked, so every section is used: the window says so (it is the question that used to be asked at the console).
-    `folder_for(cell_type, project_name, cap)`, if given, returns the path of the project's folder for those choices (`cap`: the most cells
-    to use, None for no limit): it is shown, read-only, under the project name, and follows the choices as they are made."""
+    `folder_for(cell_type, project_name, cap, make_umap)`, if given, returns the path of the project's folder for those choices (`cap`: the most
+    cells to use, None for no limit): it is shown, read-only, under the project name, and follows the choices as they are made."""
     root = tk.Tk()
     root.title("Analysis options")
     root.resizable(False, False)
@@ -68,13 +67,15 @@ def choose_run_options(current="Neurons", counts=None, folder_for=None, whole_br
     custom_cap = tk.StringVar(root, "")
     label = tk.StringVar(root, "")
     optional = tk.BooleanVar(root, False)
+    skip_umap = tk.BooleanVar(root, False)                        # (set from the number of cells when it is known: see sync_skip)
+    skip_touched = {"yes": False}                                 # (the box was ticked or unticked by hand: it is no longer set from the number of cells)
     answer = {"value": None}
     f = ttk.Frame(root, padding=22)
     f.pack()
 
     ttk.Label(f, text="Which cells do you want to analyze?", font=("Segoe UI", 12, "bold")).pack(anchor="w")
-    ttk.Label(f, text="The cells of this kind in the sections and ROIs you chose are made into the UMAP.", foreground="gray30",
-              wraplength=400, justify=tk.LEFT).pack(anchor="w", pady=(2, 4))
+    ttk.Label(f, text="The cells of this kind in the sections and ROIs you chose are shown in the section maps, and made into a UMAP unless you skip it.",
+              foreground="gray30", wraplength=400, justify=tk.LEFT).pack(anchor="w", pady=(2, 4))
     if whole_brain:                                               # (nothing was picked: this stands in for a question, which Cancel answers with no)
         ttk.Label(f, text="Whole brain: no sections or ROIs were picked, so every section is used. Cancel returns to the start screen.",
                   foreground="#a05000", font=("Segoe UI", 10, "bold"), wraplength=400, justify=tk.LEFT).pack(anchor="w", pady=(2, 6))
@@ -91,12 +92,20 @@ def choose_run_options(current="Neurons", counts=None, folder_for=None, whole_br
         kind_buttons[value] = ttk.Radiobutton(f, text=kind_text(value, text), value=value, variable=cell_type)
         kind_buttons[value].pack(anchor="w", pady=(3, 0))
 
+    ttk.Label(f, text="UMAP", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(16, 0))
+    skip_box = ttk.Checkbutton(f, text="Skip the UMAP (the default for a large project)", variable=skip_umap,
+                               command=lambda: (skip_touched.update(yes=True), show_large(), show_folder()))
+    skip_box.pack(anchor="w", pady=(3, 0))
+    ttk.Label(f, text="Without a UMAP the project opens in seconds, however many cells it has, and shows every cell of the selection in the section "
+                      "maps. Gene expression is read from the atlas as it is wanted. There is then no UMAP to show, and no Leiden clusters; a UMAP "
+                      "cannot be added to the project later.", foreground="gray30", wraplength=400, justify=tk.LEFT).pack(anchor="w", pady=(2, 0))
+
     slot = ttk.Frame(f)                                           # (where the large-project question goes: always there, greyed until it applies: see show_large)
     slot.pack(anchor="w")
     large = ttk.Frame(slot)
     large.pack(anchor="w")
     large_widgets = []
-    ttk.Label(large, text="How to handle large projects", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(16, 0))
+    ttk.Label(large, text="How to handle large projects (with a UMAP)", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(16, 0))
     large_text = tk.StringVar(large, "")
     ttk.Label(large, textvariable=large_text, foreground="gray30", wraplength=400, justify=tk.LEFT).pack(anchor="w", pady=(2, 4))
     first_text, last_text = SUBSAMPLE_CAPS[0][0], SUBSAMPLE_CAPS[-1][0]            # (the recommended number, then a number of your own, then no limit)
@@ -126,8 +135,9 @@ def choose_run_options(current="Neurons", counts=None, folder_for=None, whole_br
         folder_text = tk.StringVar(f, "")
         ttk.Entry(f, textvariable=folder_text, width=70, state="readonly").pack(anchor="w", fill=tk.X)
 
-    ttk.Checkbutton(f, text="Also make optional subclass / supertype UMAP plots and spatial maps (may be very time consuming)",
-                    variable=optional).pack(anchor="w", pady=(16, 0))
+    optional_box = ttk.Checkbutton(f, text="Also make optional subclass / supertype UMAP plots and spatial maps (may be very time consuming)",
+                                   variable=optional)
+    optional_box.pack(anchor="w", pady=(16, 0))
 
     row = ttk.Frame(f)
     row.pack(fill=tk.X, pady=(18, 0))
@@ -144,9 +154,22 @@ def choose_run_options(current="Neurons", counts=None, folder_for=None, whole_br
         n = count_of_kind()
         return n is None or n > LARGE_PROJECT_CELLS
 
+    def sync_skip(*args):
+        """Until the box has been ticked or unticked by hand, it follows the selection: ticked for a large one (the default), not for one a UMAP is
+        quick for."""
+        if not skip_touched["yes"] and not known["pending"]:
+            skip_umap.set(is_large())
+
     def show_large(*args):
-        """The large-project block is always there (so that nothing moves when the count arrives): greyed while counting, and when the selection is
-        small; active when it is large."""
+        """The large-project block is always there (so that nothing moves when the count arrives): greyed while counting, when the selection is
+        small, and while the UMAP is skipped; active when it is large and a UMAP is made."""
+        sync_skip()
+        optional_box.state(["disabled"] if skip_umap.get() else ["!disabled"])
+        if skip_umap.get():
+            large_text.set("No limit is needed without a UMAP: every cell of the selection is shown.")
+            for w in large_widgets:
+                w.state(["disabled"])
+            return
         if known["pending"]:
             large_text.set("Counting the cells in your selection...")
         elif is_large():
@@ -161,7 +184,9 @@ def choose_run_options(current="Neurons", counts=None, folder_for=None, whole_br
 
     def chosen_cap(complain=False):
         """The most cells the choices allow (None: no limit); LARGE_PROJECT_CELLS for a selection that is not large (it is not limited by it).
-        With a custom number that is not a number: None if not complaining, else the complaint and 0."""
+        With a custom number that is not a number: None if not complaining, else the complaint and 0. Without a UMAP there is no limit: None."""
+        if skip_umap.get():
+            return None
         if not is_large():
             return LARGE_PROJECT_CELLS
         cap = dict(SUBSAMPLE_CAPS).get(cap_choice.get(), "custom")
@@ -181,7 +206,7 @@ def choose_run_options(current="Neurons", counts=None, folder_for=None, whole_br
         if folder_for is None:
             return
         cap = chosen_cap()
-        folder_text.set(str(folder_for(cell_type.get(), label.get().strip(), LARGE_PROJECT_CELLS if cap == "unknown" else cap)))
+        folder_text.set(str(folder_for(cell_type.get(), label.get().strip(), LARGE_PROJECT_CELLS if cap == "unknown" else cap, not skip_umap.get())))
 
     def done(ok):
         if not ok:
@@ -193,7 +218,8 @@ def choose_run_options(current="Neurons", counts=None, folder_for=None, whole_br
         cap = chosen_cap(complain=True)
         if cap == 0:
             return
-        answer["value"] = {"cell_type": cell_type.get(), "cap": cap, "label": label.get().strip(), "optional_plots": bool(optional.get())}
+        answer["value"] = {"cell_type": cell_type.get(), "make_umap": not skip_umap.get(), "cap": cap, "label": label.get().strip(),
+                           "optional_plots": bool(optional.get()) and not skip_umap.get()}
         root.destroy()
 
     ok_button = ttk.Button(row, text="Continue", command=lambda: done(True))
@@ -225,7 +251,7 @@ def choose_run_options(current="Neurons", counts=None, folder_for=None, whole_br
     root.bind("<Escape>", lambda e: done(False))
     root.protocol("WM_DELETE_WINDOW", lambda: done(False))
     cell_type.trace_add("write", show_large)
-    for var in (cell_type, label, cap_choice, custom_cap):
+    for var in (cell_type, label, cap_choice, custom_cap, skip_umap):
         var.trace_add("write", show_folder)
     show_folder()
     root.update_idletasks()
@@ -743,38 +769,15 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
         helpers["open_3d_viewer"](abc_cache)                # (returns when that window is closed; this one is still here)
 
     def existing_all_neurons(folder):
-        """The "All neurons" dataset in `folder`, made on an earlier day (as "All neurons" or as the same run with no project name), or None."""
-        return next((folder / n for n in (ALL_NEURONS_FOLDER, ALL_NEURONS_FOLDER_UNNAMED) if (folder / n / "umap_coords.csv").exists()), None)
+        """The "All neurons" project in `folder`, made on an earlier day, or None. (A UMAP of 500,000 of the neurons, which this button used to make, is
+        a project like another: it is opened with Load Existing, and this button now makes the project of all of them.)"""
+        import abc_project
+        return folder / ALL_NEURONS_FOLDER if abc_project.read_project(folder / ALL_NEURONS_FOLDER) is not None else None
 
     def make_all_neurons(folder):
         helpers["remember_recent_output_folder"](folder)
         result["outcome"] = ("all_neurons", None, None, folder)
         root.destroy()
-
-    def offer_all_neurons():
-        """At start: if the output folder has no "All neurons" dataset yet, say what it is good for and offer to make it now."""
-        raw = folder_var.get().strip().strip('"')
-        if not raw or existing_all_neurons(Path(os.path.expanduser(raw))) is not None:
-            return
-        # (the atlas still downloading, the first time: making the dataset waits for it, so say so, or a yes looks like it starts now)
-        running = helpers.get("atlas_download_running", lambda: None)()
-        waiting = (f"The atlas is still downloading ({running}). If you say yes, making the dataset starts as soon as the download "
-                   "finishes, so keep the program open.\n\n") if running else ""
-        if messagebox.askyesno(
-                "Make the \"All neurons\" dataset?",
-                "This output folder has no \"All neurons\" dataset yet. It is well worth making once:\n\n"
-                f"  •  a UMAP of {ALL_NEURONS_CAP:,} neurons from every section of the brain atlas, with clusters, so that every neuron "
-                "type is there to browse at once;\n"
-                "  •  point at a cell, on the UMAP or on the section maps, to see what it is and where it is; pick a group to see "
-                "everywhere it lies in the brain;\n"
-                "  •  a quick way to find where to draw ROIs for a project of your own.\n\n"
-                "Making it takes a while (tens of minutes, or longer if the atlas is still downloading), once: it is saved in the output "
-                "folder, and from then on the \"Browse All Neurons\" button opens it straight away.\n\n"
-                f"{waiting}"
-                "Make it now?", parent=root):
-            folder = committed_folder()
-            if folder is not None:
-                make_all_neurons(folder)
 
     def all_neurons():
         folder = committed_folder()
@@ -786,21 +789,14 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
             required = helpers["required_cached_run_files"](existing)
             missing = [f"{label}: {path}" for label, path in required.items() if label not in RECOVERABLE and not path.exists()]
             if missing:
-                messagebox.showerror("Missing cached files", "The saved \"All neurons\" dataset is missing required cached file(s):\n\n" + "\n".join(missing), parent=root)
+                messagebox.showerror("Missing cached files", "The saved \"All neurons\" project is missing required cached file(s):\n\n" + "\n".join(missing), parent=root)
                 return
             helpers["remember_recent_output_folder"](folder)
             result["outcome"] = ("all_neurons", None, existing, folder)           # (with the folder: opened, not made)
             root.destroy()
             return
-        if not messagebox.askokcancel(
-                "Browse all neurons",
-                f"There is no \"All neurons\" dataset in this output folder yet, so one will be made now.\n\n"
-                f"It takes a pseudorandom {ALL_NEURONS_CAP:,} of the neurons (the same ones each time) from every section of the brain atlas (the whole atlas has millions), "
-                "and computes a UMAP of them, with clusters.\n\n"
-                "This can take a while (tens of minutes, or longer the first time, if the atlas is still downloading). "
-                "It is saved in the output folder, so from then on this button opens it straight away.\n\n"
-                "Proceed?", parent=root):
-            return
+        # not made yet: made now, without asking (a few seconds: see create_no_umap_project; the atlas still downloading, the first time, is waited for in
+        # a window of its own, which says so)
         make_all_neurons(folder)
 
     ttk.Separator(outer).pack(fill=tk.X, pady=(20, 14))
@@ -840,7 +836,6 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
     root.geometry(f"+{(sw - root.winfo_width()) // 2}+{(sh - root.winfo_height()) // 3}")
     bring_to_front(root)
-    root.after(600, offer_all_neurons)                      # (once the window is in front: the question goes over it)
     root.mainloop()
     # Anything of this window still waiting for the cyclic collector is freed now, here, on the main thread: freed later by a worker thread
     # (the analysis's threads call gc.collect()), Tcl ends the program ("Tcl_AsyncDelete: async handler deleted by the wrong thread").

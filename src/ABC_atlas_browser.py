@@ -6054,7 +6054,7 @@ def prompt_startup_panel(out_folder):
     the 3D viewer. (The matplotlib version of this screen was removed: the cell type is no longer asked here at all.)
 
     Returns (action, cell_type_selection, load_folder, chosen_out_folder): action is 'new_run', 'load_existing', 'own_dataset' or
-    'all_neurons' (make the "All neurons" dataset: see abc_tk_launcher.ALL_NEURONS_CAP); cell_type_selection is
+    'all_neurons' (make the "All neurons" project: see abc_tk_launcher.ALL_NEURONS_FOLDER); cell_type_selection is
     None for a new run (asked after the sections and ROIs are confirmed) and unused for 'load_existing'; load_folder is the chosen run
     folder (a Path) when action is 'load_existing', else None; chosen_out_folder is the output folder the user settled on (a Path, already
     created) — the caller should adopt it as the working directory for this session.
@@ -7257,8 +7257,8 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     host['preload_imputed'] = preload_imputed_gene_dataset
     host['umap_circle_sizes'] = UMAP_CIRCLE_SIZE_REGISTRY
     show_umap_window_tk(adata, abc_cache, imputed_state=imputed_state, adata_backed=adata_backed, rois=rois, run_folder=run_folder,
-                        ensure_imputed=ensure_imputed_gene_dataset_loaded, title=tk_title, host=host, params=tk_params,
-                        panel_zoom=panel_zoom)
+                        ensure_imputed=ensure_imputed_gene_dataset_loaded, title=tk_title, host=host, params=None if no_umap else tk_params,
+                        panel_zoom=panel_zoom)           # (a project without a UMAP has no UMAP parameters: Settings then does not offer them)
     return
 
 
@@ -7606,9 +7606,9 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
             count_state['done'] = True
 
     if all_neurons_run:
-        # Neurons from every section, a random ALL_NEURONS_CAP of them, named "All neurons": nothing to ask, and no need to count (far more than the cap).
-        from abc_tk_launcher import ALL_NEURONS_CAP, ALL_NEURONS_LABEL
-        run_options = {'cell_type': 'Neurons', 'cap': ALL_NEURONS_CAP, 'label': ALL_NEURONS_LABEL, 'optional_plots': False}
+        # Every neuron of every section, named "All neurons", with no UMAP (a project of seconds: create_no_umap_project): nothing to ask, nothing to count.
+        from abc_tk_launcher import ALL_NEURONS_LABEL
+        run_options = {'cell_type': 'Neurons', 'make_umap': False, 'cap': None, 'label': ALL_NEURONS_LABEL, 'optional_plots': False}
         count_state['done'] = True
     elif resume_run:
         # The cells, the project name and the limit are in the folder's name: nothing to ask.
@@ -7619,15 +7619,15 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
     if not (all_neurons_run or resume_run):
         try:
             from abc_tk_launcher import choose_run_options
-            def folder_for(cell_type, project_name, cap):
+            def folder_for(cell_type, project_name, cap, make_umap=True):
                 """The folder a project with these choices is saved in (as the analysis below will name it), for the options window to show."""
                 sections_part, region_part, _roi_sections = region_naming(sections_suffix, rois)
-                name = f'umap_{CELL_TYPE_SUFFIXES[cell_type]}_{sections_part}{region_part}'
+                name = f'{"umap" if make_umap else "browse"}_{CELL_TYPE_SUFFIXES[cell_type]}_{sections_part}{region_part}'
                 if sanitize_run_label(project_name):
                     name += f'_{sanitize_run_label(project_name)}'
                 counted = count_state['counts']
                 n = counted.get(cell_type) if counted else None
-                if cap is not None and n is not None and n > cap:
+                if make_umap and cap is not None and n is not None and n > cap:
                     name += f'_sub{cap}'
                 return Path(out_folder) / name
 
@@ -7679,7 +7679,7 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         # The options window said to skip the UMAP: no subsampling, preprocessing or embedding (and so no size limit): a project that is only
         # its cells, picked out of the atlas's tables (see create_no_umap_project).
         create_no_umap_project(abc_cache, out_folder, adata, section_series, imputed_state, cell_type_selection, sections_suffix, region_suffix,
-                               whole_sections_selected, rois, run_label)
+                               whole_sections_selected, rois, run_label, panel_zoom=all_neurons_run)
         return
 
     # ---------------------------------------------------------------------------

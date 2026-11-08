@@ -239,6 +239,52 @@ class SectionData:
         return data
 
 
+class CcfCells:
+    """The CCF coordinates (AP, DV, ML, mm) of every cell of the atlas, read once for all the section windows of the session (for the cell
+    tips' ML and DV, as the UMAP browser does: see its start_ccf_lookup), and the names of the CCF regions. `state`: "none" (not asked
+    for yet), "unavailable", "missing" (the files are not on this computer), "reading", "ready" or "failed"."""
+
+    def __init__(self):
+        self.state, self.xyz, self.region_names, self.names_read = "none", None, None, False
+
+    def start(self, host, abc_cache, spatial):
+        """Read the coordinates in a thread (a minute or so the first time, seconds after), if they are on this computer: see `missing`."""
+        if self.state in ("reading", "ready"):
+            return
+        if host is None or abc_cache is None or spatial is None or "load_ccf_for_cells" not in host:
+            self.state = "unavailable"
+            return
+        if core.ccf_files_missing(abc_cache):
+            self.state = "missing"
+            return
+        self.state = "reading"
+        ids = list(spatial.index)
+
+        def work():
+            try:
+                table, _shell = host["load_ccf_for_cells"](abc_cache, ids)
+                self.xyz = table[["x_ccf", "y_ccf", "z_ccf"]].to_numpy(dtype=np.float32)       # (AP, DV, ML), a row for each row of `spatial`
+                self.state = "ready"
+            except Exception as e:
+                self.state = "failed"
+                print(f"Could not read the cells' CCF coordinates (for their ML and DV): {e}", flush=True)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def names(self, abc_cache):
+        """{parcellation_index: (acronym, name, structure, division)}, read when first asked for; None if it cannot be."""
+        if not self.names_read:
+            self.names_read = True
+            try:
+                self.region_names = core.load_region_names(abc_cache)
+            except Exception as e:
+                print(f"Could not read the names of the CCF regions: {e}", flush=True)
+        return self.region_names
+
+
+CCF = CcfCells()
+
+
 class RoiLayer:
     """The regions of interest on the picture: rectangles that are drawn with the left button, and then moved by their inside, resized by
     their handles, or deleted with a right-click. They are kept in the picture's own pixels (so they follow the view), and handed back in
@@ -523,8 +569,9 @@ class SectionWindow:
     CHANNEL_COLORS = ("#e53935", "#43a047", "#4a6cff")        # the red, green and blue of a multi-gene overlay
 
     def __init__(self, data, abc_cache, spatial=None, section_series=None, adata=None, root=None, on_close=None, existing_rois=(),
-                 imputed_state=None, ensure_imputed=None, session_color_scale=None, cell_type_selection="All", navigator=None):
+                 imputed_state=None, ensure_imputed=None, session_color_scale=None, cell_type_selection="All", navigator=None, ccf_host=None):
         self.data, self.abc_cache, self.spatial, self.section_series, self.adata = data, abc_cache, spatial, section_series, adata
+        self.ccf_host = ccf_host       # {'ensure_ccf_downloaded', 'load_ccf_for_cells'} of the browser, or None (then the tip has the section's coordinates only)
         # navigator: (neighbors, move) from the window that opened this one. neighbors(label) -> (the previous section's label or None, the next's);
         # move(label, direction, actions) -> (the new section's data, its existing ROIs) or None: it takes the ROI actions of the section being left.
         self.navigator = navigator
@@ -576,6 +623,8 @@ class SectionWindow:
         self.roi = RoiLayer(self, existing_rois)
         self.roi.on_change = self.update_roi_count
         self.update_roi_count()
+        if self.ccf_host is not None and self.spatial is not None:
+            self.root.after(1500, self.start_ccf)         # (read the cells' CCF coordinates once the picture is up: not when the first tip asks)
         c = self.view.canvas
         c.bind("<Motion>", self.on_motion, add="+")
         c.bind("<Leave>", lambda e: self.clear_hover())
@@ -637,7 +686,7 @@ class SectionWindow:
 
         hov = ttk.LabelFrame(f, text="Under the pointer", padding=6)
         hov.pack(fill=tk.X, pady=(6, 0))
-        self.var_pos = tk.StringVar(f, "x = —, y = —")
+        self.var_pos = tk.StringVar(f, "MERFISH x = —, y = — mm")
         ttk.Label(hov, textvariable=self.var_pos, font=("Segoe UI", 10, "bold"), wraplength=310, justify=tk.LEFT).pack(anchor="w")
         self.var_cell = tk.StringVar(f, "Hover over a cell.")
         ttk.Label(hov, textvariable=self.var_cell, wraplength=310, justify=tk.LEFT).pack(anchor="w", pady=(4, 0))
@@ -1270,16 +1319,16 @@ class SectionWindow:
 
             threading.Thread(target=work, daemon=True).start()
 
-    def expression_text(self, idx):
-        """The hovered cell's value of each gene being shown, in the units of the Linear/Log choice (as the picture is colored)."""
+    def expression_pairs(self, idx):
+        """[(gene, value as text)] for the hovered cell: each gene being shown, in the units of the Linear/Log choice (as the picture is colored)."""
         if self.mode not in ("gene", "imputed") or not self.shown_genes:
-            return None
+            return []
         log = self.color_scale["mode"] == "log"
-        parts = []
+        pairs = []
         for gene in self.shown_genes:
             values = self.cell_expr.get((gene, self.shown_dataset))
             if values is None:
-                parts.append(f"{gene} = ...")
+                pairs.append((gene, "..."))
             elif values is False:
                 continue
             else:
@@ -1288,10 +1337,22 @@ class SectionWindow:
                     v = v if log else 2.0 ** v - 1.0
                 else:
                     v = float(core.log2p1(v)) if log else v
-                parts.append(f"{gene} = {v:.3g}" if np.isfinite(v) else f"{gene} = n/a")
-        if not parts:
+                pairs.append((gene, f"{v:.3g}" if np.isfinite(v) else "n/a"))
+        return pairs
+
+    def expression_text(self, idx):
+        """The side panel's line of the genes' values (see expression_pairs), with the units."""
+        pairs = self.expression_pairs(idx)
+        if not pairs:
             return None
-        return ", ".join(parts) + f" ({self.SCALE_UNITS[(self.shown_dataset, self.color_scale['mode'])]})"
+        return ", ".join(f"{g} = {v}" for g, v in pairs) + f" ({self.SCALE_UNITS[(self.shown_dataset, self.color_scale['mode'])]})"
+
+    def expression_rows(self, idx):
+        """The same as tip rows: one per gene (gene, value, ''), and the units under them."""
+        pairs = self.expression_pairs(idx)
+        if not pairs:
+            return []
+        return [(g, v, "") for g, v in pairs] + [("", "", self.SCALE_UNITS[(self.shown_dataset, self.color_scale['mode'])])]
 
     # ---- Find group
 
@@ -1372,7 +1433,7 @@ class SectionWindow:
             return
         x, y = pos
         z_text = core.section_z_text(self.data.label, self.abc_cache)
-        self.var_pos.set(f"x = {x:.3f}, y = {y:.3f}" + (f"\n{z_text}" if z_text else ""))
+        self.var_pos.set(f"MERFISH x = {x:.3f}, y = {y:.3f} mm" + (f"\n{z_text}" if z_text else ""))
         dist, idx = self.tree.query([x, y], distance_upper_bound=HOVER_RADIUS_MM)
         if not np.isfinite(dist):
             self.hover_idx = None
@@ -1400,34 +1461,96 @@ class SectionWindow:
         if self.cell_tip is None:
             from abc_tk_umap import CellTip, CELL_TIP_MS         # (imported here: that module is large)
             self.cell_tip = CellTip(self.root, CELL_TIP_MS)
-        self.cell_tip.pointer_on((self.data.label, idx), lambda: self.tip_rows(idx), copy_text_fn=lambda: self.tip_text(idx))
+        self.cell_tip.pointer_on((self.data.label, idx), lambda: self.tip_rows(idx), action_fn=self.tip_action)
 
     def tip_off(self):
         if self.cell_tip is not None:
             self.cell_tip.pointer_off()
 
-    def tip_lines(self, idx):
-        """The side panel's lines about the hovered cell, as they are now: its position, then its groups and expression."""
+    def tip_rows(self, idx):
+        """The tip's rows (what, number, name), as in the UMAP browser's tip: the section, the CCF region Allen gives the cell, each group level
+        (its label split into number and name), the cell's place (CCF AP, AP and DV from bregma, ML from the midline), then the genes' values."""
         if self.hover_idx != idx:
             return []
-        return self.var_pos.get().splitlines() + self.var_cell.get().splitlines()
-
-    def tip_rows(self, idx):
-        """The tip's rows (what, number, name): each of the panel's lines, a group level's split into its name and value."""
-        rows = []
-        for line in self.tip_lines(idx):
-            m = re.match(r"^([A-Za-z_ ]+?):\s+(.*)$", line)           # (position and gene lines stay whole)
-            rows.append((m.group(1), "", m.group(2)) if m else ("", "", line))
+        rows = [("Section", core.sanitize_section_token(self.data.label), "")]
+        rows += self.region_rows(idx)
+        cells = self.data.cells
+        for lv in LEVELS:
+            if lv not in cells.columns:
+                continue
+            v = str(cells[lv].iloc[idx])
+            if v == "nan":
+                continue
+            m = re.match(r"^\s*(\d+)\s*(.*)$", v)
+            rows.append((lv.capitalize(), m.group(1) if m else "", m.group(2) if m else v))
+        rows += self.coord_rows(idx)
+        rows += self.expression_rows(idx)
         return rows
 
-    def tip_text(self, idx):
-        return "\n".join(self.tip_lines(idx))
+    def region_rows(self, idx):
+        """The CCF region Allen gives the cell (the registration's own answer): its acronym and name, its structure and its division."""
+        cells = self.data.cells
+        if "parcellation_index" not in cells.columns:
+            return []
+        names = CCF.names(self.abc_cache)
+        value = cells["parcellation_index"].iloc[idx]
+        region = names.get(int(value)) if names is not None and value is not None and np.isfinite(value) else None
+        if region is None:
+            return []
+        acronym, name, structure, division = region
+        if acronym == "unassigned":
+            return [("Region", "", "unassigned (outside the CCF atlas)")]
+        rows = [("Region", acronym, name)]
+        if structure and structure not in (name, "unassigned"):
+            rows.append(("", "", f"in {structure}"))
+        if division and division not in (structure, name, "unassigned"):
+            rows.append(("Division", "", division))
+        return rows
+
+    def coord_rows(self, idx):
+        """The cell's place: its CCF AP, and approximate AP and DV from bregma and ML from the midline, from the cell's own CCF coordinates once
+        they are read; until then (or without them) the AP of its section."""
+        core.start_section_coordinate_load(self.abc_cache)
+        z, section_ap = core.section_coords(self.data.label)
+        rows = []
+        if CCF.state == "none":
+            CCF.start(self.ccf_host, self.abc_cache, self.spatial)           # (the first tip: not before, so that nothing is read while the picture is made)
+        ccf = None
+        if CCF.state == "ready" and self.data.rows is not None:
+            ccf = CCF.xyz[self.data.rows[idx]]
+        if ccf is not None and np.isfinite(ccf).all():
+            ap, ml, dv = core.paxinos_coords(float(ccf[0]), float(ccf[1]), float(ccf[2]))
+            rows += [("CCF AP", f"{ccf[0]:.2f}", "mm from the front of the CCF"),
+                     ("AP from bregma", f"{ap:+.2f}", "mm (CCF offset, approx.)"), ("ML from midline", f"{ml:+.2f}", "mm (CCF; + is right)"),
+                     ("DV from bregma", f"{dv:+.2f}", "mm (CCF offset, approx.)")]
+        elif section_ap is not None:
+            ap, _ml, _dv = core.paxinos_coords(section_ap)
+            rows += [("CCF AP", f"{section_ap:.2f}", "mm from the front of the CCF (section average)"),
+                     ("AP from bregma", f"{ap:+.2f}", "mm (CCF offset, approx., section average)")]
+            if CCF.state == "reading":
+                rows.append(("ML, DV", "", "reading the cells' CCF coordinates..."))
+        return rows
+
+    def start_ccf(self):
+        if CCF.state == "none":
+            CCF.start(self.ccf_host, self.abc_cache, self.spatial)
+
+    def tip_action(self):
+        """The tip's extra button: fetch the CCF coordinates that the ML and DV need, while they are not on this computer."""
+        if CCF.state == "missing" and self.ccf_host is not None and "ensure_ccf_downloaded" in self.ccf_host:
+            return "Get ML/DV...", self.download_ccf
+        return None
+
+    def download_ccf(self):
+        if self.ccf_host["ensure_ccf_downloaded"](self.abc_cache, parent=self.root, what="CCF coordinates of every cell (for their ML and DV)"):
+            CCF.state = "none"
+            CCF.start(self.ccf_host, self.abc_cache, self.spatial)
 
     def clear_hover(self):
         self.tip_off()
         self.hover_idx = None
         self.view.canvas.itemconfig(self.ring, state="hidden")
-        self.var_pos.set("x = —, y = —")
+        self.var_pos.set("MERFISH x = —, y = — mm")
         self.var_cell.set("Hover over a cell.")
         self.cancel_marks()
 
@@ -1601,7 +1724,7 @@ class SectionWindow:
 def prompt_subregion_selection_tk(adata, abc_cache, section_series, section_label, existing_rois=None, on_ready=None, spatial=None,
                                   initial_view=None, cell_type_selection="All", precomputed_gene_open=None, session_color_scale=None,
                                   shared_spatial_cache=None, imputed_state=None, session_view_settings=None, ensure_imputed=None,
-                                  parent=None, navigator=None, on_window=None):
+                                  parent=None, navigator=None, on_window=None, ccf_host=None):
     """The same call, and the same result, as ABC_atlas_browser.prompt_subregion_selection (the matplotlib window): the single-section ROI
     picker. Returns a list of {'action': 'add'|'edit'|'delete', ...} (empty if cancelled). The section's picture must already be cached
     (the caller makes it first, as for the matplotlib window). `ensure_imputed(imputed_state, abc_cache)`, if given, loads the imputed gene
@@ -1611,7 +1734,7 @@ def prompt_subregion_selection_tk(adata, abc_cache, section_series, section_labe
     data = SectionData.load(adata, abc_cache, section_series, spatial, section_label)
     win = SectionWindow(data, abc_cache, spatial=spatial, section_series=section_series, adata=adata, root=parent, existing_rois=existing_rois or (),
                         imputed_state=imputed_state, ensure_imputed=ensure_imputed, session_color_scale=session_color_scale,
-                        cell_type_selection=cell_type_selection, navigator=navigator)
+                        cell_type_selection=cell_type_selection, navigator=navigator, ccf_host=ccf_host)
     win.session_view_settings = session_view_settings
     if initial_view and initial_view.get("gene") and not win.var_gene.get():
         win.var_gene.set(initial_view["gene"])           # (the session's gene is in the box from the start, also in Groups: Gene then shows it)

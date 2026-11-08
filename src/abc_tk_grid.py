@@ -71,9 +71,17 @@ class ProgressWindow:
             pass
 
 
+GRID_BORDER_PX = 1 * core.GRID_CACHE_DPI / 72      # the gray frame of each thumbnail (a 1 pt line), in pixels of the grid picture
+SELECT_EXTRA_PX = 5                                # how much thicker than that frame, on screen, a picked section's red outline is
+SECTION_TIP_MS = 700
+SECTION_TIP_TEXT = ("Single click to select/deselect the entire section for the project; double-click to open the one-section view "
+                    "to choose region(s) of interest (ROI).")
+
+
 class GridWindow:
     def __init__(self, adata, abc_cache, section_series, img, layout, out_folder=None, cell_type_selection="All", imputed_state=None,
-                 ensure_imputed=None, root=None):
+                 ensure_imputed=None, root=None, ccf_host=None):
+        self.ccf_host = ccf_host        # {'ensure_ccf_downloaded', 'load_ccf_for_cells'}: the browser's, for the cells' CCF positions in the section tips
         self.adata, self.abc_cache, self.section_series = adata, abc_cache, section_series
         self.layout = layout
         self.sections = list(layout.keys())
@@ -118,10 +126,11 @@ class GridWindow:
         self.view.idle_cursor = "arrow"        # (whole sections are picked here, not exact spots: no crosshair)
         c.config(cursor="arrow")
         self.view.listeners.append(self.place_overlays)
+        self.tip, self.tip_job, self.tip_section = None, None, None      # the hint over a section (see tip_on)
         c.bind("<ButtonPress-1>", self.on_press)
         c.bind("<Double-Button-1>", self.on_double)
         c.bind("<Motion>", self.on_motion)
-        c.bind("<Leave>", lambda e: (self.var_hover.set("Point at a section."), self.set_hover(None)))
+        c.bind("<Leave>", lambda e: (self.var_hover.set("Point at a section."), self.set_hover(None), self.tip_off()))
         self.view.set_image(img)
         self.z_ready = False
         core.start_section_coordinate_load(abc_cache)
@@ -174,6 +183,17 @@ class GridWindow:
 
     # ---- the marks on the thumbnails
 
+    def z_label(self, sec):
+        """(the label over a thumbnail's top right, a shorter one for a thumbnail too small for it): '(z 6.40, AP -0.10)', the section's own z and
+        its approximate AP from bregma (see core.paxinos_coords), whatever coordinate Settings labels sections with elsewhere."""
+        z, ccf_ap = core.section_coords(sec)
+        if z is None:
+            return "", ""
+        if ccf_ap is None:
+            return f"(z {z:.2f})", f"{z:.2f}"
+        ap = core.paxinos_coords(ccf_ap)[0]
+        return f"(z {z:.2f}, AP {ap:+.2f})", f"{z:.2f}"
+
     def place_overlays(self):
         c = self.view.canvas
         cw, ch = self.view.canvas_size()
@@ -184,12 +204,13 @@ class GridWindow:
             if visible:
                 c.coords(item, x, b - 1)
                 # a thumbnail too small for the whole label (it would run over the section number above it) gets just the value
-                full = self.z_text.get(sec, "")
-                c.itemconfig(item, state="normal", text=full if (x - a) >= 140 else full.rsplit(" ", 1)[-1])
+                full, short = self.z_text.get(sec, ("", ""))
+                c.itemconfig(item, state="normal", text=full if (x - a) >= 170 else short)
             else:
                 c.itemconfig(item, state="hidden")
             if sec in self.sel_items:
                 c.coords(self.sel_items[sec], a, b, x, y)
+                c.itemconfig(self.sel_items[sec], width=max(1, round(GRID_BORDER_PX * self.view.scale + SELECT_EXTRA_PX)))
             for k, rect in enumerate(self.roi_items.get(sec, [])):
                 if k == 0:
                     c.coords(rect, a, b, x, y)
@@ -239,7 +260,44 @@ class GridWindow:
 
     # ---- clicks
 
+    def tip_on(self, sec, e):
+        """The pointer is over section `sec`: after a moment of rest, a hint says what clicking and double-clicking do. It goes when the pointer
+        moves to another section or off the sections, or a button is pressed."""
+        if sec == self.tip_section:
+            return
+        self.tip_off()
+        self.tip_section = sec
+        if sec is not None:
+            self.tip_job = self.root.after(SECTION_TIP_MS, lambda: self.tip_show(e.x_root, e.y_root))
+
+    def tip_off(self):
+        self.tip_section = None
+        if self.tip_job is not None:
+            self.root.after_cancel(self.tip_job)
+            self.tip_job = None
+        if self.tip is not None:
+            self.tip.destroy()
+            self.tip = None
+
+    def tip_show(self, x_root, y_root):
+        self.tip_job = None
+        self.tip = tk.Toplevel(self.root)
+        self.tip.wm_overrideredirect(True)
+        tk.Label(self.tip, text=SECTION_TIP_TEXT, bg="#ffffe0", relief="solid", borderwidth=1, font=("Segoe UI", 9), padx=4, pady=1,
+                 justify=tk.LEFT, wraplength=360).pack()
+        self.tip.update_idletasks()
+        w, h = self.tip.winfo_reqwidth(), self.tip.winfo_reqheight()
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        x, y = x_root + 12, y_root + 18
+        if x + w > sw:
+            x = max(x_root - w - 12, 0)
+        if y + h > sh:
+            y = max(y_root - h - 8, 0)
+        self.tip.wm_geometry(f"+{x}+{y}")
+
     def on_press(self, e):
+        self.tip_off()
+        self.tip_section = self.section_at(e.x, e.y)         # (not shown again until the pointer is on another section)
         self.view.canvas.focus_set()
         sec = self.section_at(e.x, e.y)
         if sec is None:
@@ -255,6 +313,7 @@ class GridWindow:
         self.refresh_marks(sec)
 
     def on_double(self, e):
+        self.tip_off()
         sec = self.section_at(e.x, e.y)
         if sec is None:
             return
@@ -266,6 +325,7 @@ class GridWindow:
     def on_motion(self, e):
         sec = self.section_at(e.x, e.y)
         self.set_hover(sec)
+        self.tip_on(sec, e)
         if sec is None:
             self.var_hover.set("Point at a section.")
             return
@@ -380,7 +440,7 @@ class GridWindow:
                     initial_view={"mode": self.session_view_settings["mode"], "gene": self.session_view_settings["gene"] or None},
                     session_view_settings=self.session_view_settings, cell_type_selection=self.cell_type_selection,
                     session_color_scale=self.session_color_scale, imputed_state=self.imputed_state, ensure_imputed=self.ensure_imputed,
-                    parent=self.root, navigator=(neighbors, move), on_window=window.append)
+                    parent=self.root, navigator=(neighbors, move), on_window=window.append, ccf_host=self.ccf_host)
             finally:
                 self.root.config(cursor="")
             self.apply_actions(current["section"], actions)
@@ -474,7 +534,7 @@ class GridWindow:
 
     def poll(self):
         if not self.z_ready and core.section_coordinates_ready():
-            self.z_text = {sec: core.section_z_text(sec, short=True) for sec in self.sections}
+            self.z_text = {sec: self.z_label(sec) for sec in self.sections}
             self.z_ready = True
             self.place_overlays()
         self.var_perf.set(f"view {self.view.scale / max(self.view.fit_scale(), 1e-9):.1f}x   redraw {self.view.last_draw_ms:.0f} ms")
@@ -521,12 +581,12 @@ def load_grid(adata, abc_cache, section_series):
 
 
 def prompt_section_selection_tk(adata, abc_cache, section_series, out_folder=None, cell_type_selection="All", imputed_state=None,
-                                ensure_imputed=None):
+                                ensure_imputed=None, ccf_host=None):
     """The section grid picker. Returns ("confirmed", picked sections, rois, how many sections there are) or ("cancelled",) or
     ("closed",) (the window was closed some other way). The caller turns that into what the pipeline wants, as the matplotlib picker does."""
     img, layout = load_grid(adata, abc_cache, section_series)
     win = GridWindow(adata, abc_cache, section_series, img, layout, out_folder=out_folder, cell_type_selection=cell_type_selection,
-                     imputed_state=imputed_state, ensure_imputed=ensure_imputed)
+                     imputed_state=imputed_state, ensure_imputed=ensure_imputed, ccf_host=ccf_host)
     try:
         win.root.state("zoomed")
     except tk.TclError:

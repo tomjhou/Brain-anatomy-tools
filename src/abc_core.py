@@ -61,25 +61,27 @@ SETTINGS_FILE = SCRIPT_DIR / 'viewer_settings.json'
 # the launcher's Settings button; always kept in viewer_settings.json, whether or not the viewer's own settings persist.
 #   'section': the atlas's own section coordinate (the z column of the cell metadata, mm; sections are 0.2 mm apart)
 #   'ccf_ap':  the section's position along the Allen CCF's anterior-posterior axis (mm from the front; x_ccf, the median of its cells)
-#   'paxinos': that, relative to bregma and counted positive to the front as Paxinos does: bregma_ap_mm - x_ccf. Approximate: there is no
-#              exact CCF-to-Paxinos mapping, only registrations such as Chon et al. 2019, and the bregma position used is a setting.
+#   'paxinos': that, relative to bregma and counted positive to the front as Paxinos does: bregma_ap_mm - x_ccf. Only an offset: there is no
+#              exact CCF-to-Paxinos mapping (only registrations such as Chon et al. 2019), the CCF has no skull to say how it is levelled
+#              (Paxinos puts bregma and lambda at the same height), and the bregma position used is a setting.
 Z_MODE_OPTIONS = (
-    ('section', "Section z: the atlas's own section coordinate (mm)"),
+    ('section', "Section z: this MERFISH dataset's own section coordinate (mm; not a universal coordinate)"),
     ('ccf_ap', "CCF AP: position along the Allen CCF's front-to-back axis (mm)"),
-    ('paxinos', "Paxinos AP: relative to bregma, positive toward the front (mm; approximate)"),
+    ('paxinos', "AP from bregma: positive toward the front (mm; an approximate offset, see below)"),
 )
 
 
 DEFAULT_BREGMA_CCF_AP_MM = 5.40
-# ...and its other two coordinates, for a cell's Paxinos ML and DV (paxinos_coords): the IBL's position of bregma in the CCF (ML 5.739, AP 5.400,
-# DV 0.332 mm), whose AP is the default above. No scaling between the two brains, so the values are approximate, more so far from bregma.
-BREGMA_CCF_ML_MM = 5.739
-BREGMA_CCF_DV_MM = 0.332
+# ...and its other two coordinates, for a cell's ML and DV (paxinos_coords): the IBL's position of bregma in the CCF (ML 5.739, AP 5.400,
+# DV 0.332 mm; iblatlas.atlas ALLEN_CCF_LANDMARKS_MLAPDV_UM['bregma'], the average of five experimenters' picks of the bregma voxel), whose AP is
+# the default above. Offsets only: no scaling or tilt between the two brains, so the values are approximate, more so far from bregma.
+BREGMA_CCF_ML_MM = 5.739                 # (the midline: fixed)
+DEFAULT_BREGMA_CCF_DV_MM = 0.332
 
 
-# (these settings are always kept in viewer_settings.json, whether or not the viewer's own settings persist; 'tk_section_window':
-# open the single-section window as the Tk version, abc_tk_picker.py, instead of the matplotlib one)
-COORD_SETTINGS = {'z_mode': 'section', 'bregma_ap_mm': DEFAULT_BREGMA_CCF_AP_MM, 'tk_section_window': True, 'reconstructed_coords': True}
+# (these settings are always kept in viewer_settings.json, whether or not the viewer's own settings persist)
+COORD_SETTINGS = {'z_mode': 'section', 'bregma_ap_mm': DEFAULT_BREGMA_CCF_AP_MM, 'bregma_dv_mm': DEFAULT_BREGMA_CCF_DV_MM,
+                  'reconstructed_coords': True}
 
 
 def load_coordinate_settings():
@@ -91,11 +93,16 @@ def load_coordinate_settings():
             return
         if on_disk.get('z_mode') in dict(Z_MODE_OPTIONS):
             COORD_SETTINGS['z_mode'] = on_disk['z_mode']
-        COORD_SETTINGS['tk_section_window'] = bool(on_disk.get('tk_section_window', True))
         COORD_SETTINGS['reconstructed_coords'] = bool(on_disk.get('reconstructed_coords', True))
         bregma = float(on_disk.get('bregma_ap_mm'))
         if 0.0 < bregma < 13.5:
             COORD_SETTINGS['bregma_ap_mm'] = bregma
+    except Exception:
+        pass
+    try:
+        bregma_dv = float(on_disk.get('bregma_dv_mm'))
+        if -5.0 < bregma_dv < 8.0:
+            COORD_SETTINGS['bregma_dv_mm'] = bregma_dv
     except Exception:
         pass
 
@@ -112,7 +119,7 @@ def save_coordinate_settings():
         pass
     on_disk['z_mode'] = COORD_SETTINGS['z_mode']
     on_disk['bregma_ap_mm'] = COORD_SETTINGS['bregma_ap_mm']
-    on_disk['tk_section_window'] = bool(COORD_SETTINGS['tk_section_window'])
+    on_disk['bregma_dv_mm'] = COORD_SETTINGS['bregma_dv_mm']
     on_disk['reconstructed_coords'] = bool(COORD_SETTINGS['reconstructed_coords'])
     try:
         SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -216,10 +223,10 @@ def section_z_text(section_label, abc_cache=None, wait=False, short=False):
         return ''
     unit = '' if short else ' mm'
     if mode == 'section':
-        return f"z {value:.2f}{unit}" if short else f"z = {value:.2f} mm"
+        return f"z {value:.2f}{unit}" if short else f"MERFISH section z = {value:.2f} mm"
     if mode == 'ccf_ap':
         return f"CCF AP {value:.2f}{unit}" if short else f"CCF AP = {value:.2f} mm"
-    return f"AP {value:+.2f}{unit}" if short else f"Paxinos AP = {value:+.2f} mm (approx.)"
+    return f"AP {value:+.2f}{unit}" if short else f"AP from bregma = {value:+.2f} mm (approx.)"
 
 
 def section_coords(section_label):
@@ -233,11 +240,12 @@ def section_coords(section_label):
 
 
 def paxinos_coords(ccf_ap, ccf_dv=None, ccf_ml=None):
-    """Approximate Paxinos coordinates (AP, ML, DV in mm from bregma) of a CCF position: AP positive toward the front, ML the distance from the
-    midline (either side), DV negative below bregma. ML and DV are None when their CCF coordinates are not given."""
+    """Approximate coordinates (AP, ML, DV in mm) of a CCF position, as offsets from bregma's place in the CCF (the Settings' AP and DV, and the
+    midline for ML): AP positive toward the front, ML the CCF's own left-to-right coordinate less the midline's (so positive on the right, not an
+    absolute distance), DV negative below bregma. ML and DV are None when their CCF coordinates are not given."""
     ap = COORD_SETTINGS['bregma_ap_mm'] - ccf_ap
-    ml = abs(ccf_ml - BREGMA_CCF_ML_MM) if ccf_ml is not None else None
-    dv = BREGMA_CCF_DV_MM - ccf_dv if ccf_dv is not None else None
+    ml = ccf_ml - BREGMA_CCF_ML_MM if ccf_ml is not None else None
+    dv = COORD_SETTINGS['bregma_dv_mm'] - ccf_dv if ccf_dv is not None else None
     return ap, ml, dv
 
 

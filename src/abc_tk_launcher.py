@@ -569,7 +569,7 @@ def check_for_update(root, button):
         poll()
 
     def finish(text=None, error=False):
-        button.config(text="Update…", state=tk.NORMAL)
+        button.config(text="Check for updates", state=tk.NORMAL)
         root.config(cursor="")
         if text:
             (messagebox.showerror if error else messagebox.showinfo)("Update", text, parent=root)
@@ -669,7 +669,7 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
     ttk.Label(top, text="AllenABC UMAP Explorer", font=("Segoe UI", 20, "bold")).pack(side=tk.LEFT)
     ttk.Button(top, text="Settings…", command=lambda: helpers["settings_dialog"](abc_cache)).pack(side=tk.RIGHT, anchor="n")
     if not getattr(sys, "frozen", False):                   # (the packaged .exe is not a folder from GitHub: nothing to update)
-        update_button = ttk.Button(top, text="Update…", command=lambda: check_for_update(root, update_button))
+        update_button = ttk.Button(top, text="Check for updates", command=lambda: check_for_update(root, update_button))
         update_button.pack(side=tk.RIGHT, anchor="n", padx=(0, 6))
 
         def update_found(changes):

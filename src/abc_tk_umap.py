@@ -71,7 +71,7 @@ OPACITIES = (0.15, 0.25, 0.35, 0.5, 0.75, 1.0)      # the Opacity slider's stops
 DEFAULT_OPACITY_INDEX = 5                          # (fully opaque: the dots on top hide the ones below)
 LABEL_ZOOM_CAP = 5.0               # the group numbers grow with the zoom up to this, then stay the same size
 LAYOUT_SETTLE_MS = 150             # dragging the divider (or the window's edge) changes the section pane's width many times a second: the panels are laid out and drawn again this long after it stops
-HOVER_LABEL_PX = 110               # the cell tip's table (CellTip): its first column wraps here
+HOVER_LABEL_PX = 170               # the cell tip's table (CellTip): its first column wraps here
 HOVER_GAP_PX = 8                   # the space between the cell tip's columns
 PREVIEW_ZOOM = True                # a wheel step on a plot shows the last picture scaled, and draws the view for real once the wheel is still
 ZOOM_DRAW_MS = 120
@@ -1448,7 +1448,7 @@ class UmapWindow(ExportsMixin):
         self.view_kind, self.view_token, self.view_title = "all", "all", ""
         self.hover_key = None
         self.ccf_started = False           # start_ccf_lookup has been called (by the first cell tip)
-        self.ccf_run = self.ccf_bg = None  # the cells' CCF coordinates (AP, DV, ML), for the Paxinos ML and DV of the cell tip: see start_ccf_lookup
+        self.ccf_run = self.ccf_bg = None  # the cells' CCF coordinates (AP, DV, ML), for the ML and DV of the cell tip: see start_ccf_lookup
         self.ccf_state = "none"
         self.variants = {}                 # UMAP parameter key -> (coordinates, Leiden labels), the ones already shown
         self.load_data(adata_backed, rois)
@@ -3893,14 +3893,14 @@ class UmapWindow(ExportsMixin):
         return rows
 
     def coord_rows(self, info):
-        """The cell's position: the atlas's own z of its section, and approximate Paxinos AP, ML and DV (core.paxinos_coords). From the cell's
+        """The cell's position: its CCF AP, and approximate AP and DV from bregma and ML from the midline (core.paxinos_coords). From the cell's
         own CCF coordinates once they are read (see start_ccf_lookup); until then AP only, from its section's place in the CCF."""
         sec = info["sec"]
         if sec is None:
             return []
         core.start_section_coordinate_load(self.abc_cache)
         z, section_ap = core.section_coords(sec)
-        rows = [("Atlas z", f"{z:.2f}", "mm (the section's)")] if z is not None else []
+        rows = []
         if not self.ccf_started:
             self.start_ccf_lookup()                                  # (the first cell tip: not before, so that nothing reads it while the maps are being drawn and zoomed)
         ccf = None
@@ -3910,13 +3910,15 @@ class UmapWindow(ExportsMixin):
             ccf = self.ccf_bg[info["bg_idx"]]
         if ccf is not None and np.isfinite(ccf).all():
             ap, ml, dv = core.paxinos_coords(float(ccf[0]), float(ccf[1]), float(ccf[2]))
-            rows += [("Paxinos AP", f"{ap:+.2f}", "mm from bregma (approx.)"), ("Paxinos ML", f"{ml:.2f}", "mm from the midline"),
-                     ("Paxinos DV", f"{dv:+.2f}", "mm from bregma")]
+            rows += [("CCF AP", f"{ccf[0]:.2f}", "mm from the front of the CCF"),
+                     ("AP from bregma", f"{ap:+.2f}", "mm (CCF offset, approx.)"), ("ML from midline", f"{ml:+.2f}", "mm (CCF; + is right)"),
+                     ("DV from bregma", f"{dv:+.2f}", "mm (CCF offset, approx.)")]
         elif section_ap is not None:
             ap, _ml, _dv = core.paxinos_coords(section_ap)
-            rows.append(("Paxinos AP", f"{ap:+.2f}", "mm from bregma (approx., the section's)"))
+            rows += [("CCF AP", f"{section_ap:.2f}", "mm from the front of the CCF (section average)"),
+                     ("AP from bregma", f"{ap:+.2f}", "mm (CCF offset, approx., section average)")]
             if self.ccf_state == "reading":
-                rows.append(("Paxinos ML, DV", "", "reading the cells' CCF coordinates..."))
+                rows.append(("ML, DV", "", "reading the cells' CCF coordinates..."))
         return rows
 
     def cell_swatch(self, info):
@@ -3948,13 +3950,13 @@ class UmapWindow(ExportsMixin):
             return None                                  # (no swatch, rather than no tip)
 
     def ccf_action(self):
-        """The cell tip's extra button: fetch the CCF coordinates that its Paxinos ML and DV need, while they are not on this computer."""
+        """The cell tip's extra button: fetch the CCF coordinates that its ML and DV need, while they are not on this computer."""
         if self.ccf_state == "missing" and "ensure_ccf_downloaded" in self.host:
             return "Get ML/DV...", self.download_ccf_coords
         return None
 
     def start_ccf_lookup(self):
-        """Read the CCF coordinates of the run's cells and of the section maps' other cells (for their Paxinos ML and DV), in a thread: slow the
+        """Read the CCF coordinates of the run's cells and of the section maps' other cells (for their ML and DV), in a thread: slow the
         first time (the table of every cell of the atlas: a minute or so), seconds after. Only if they are on this computer: see ccf_action."""
         self.ccf_run = self.ccf_bg = None
         self.ccf_state = "none"
@@ -3996,7 +3998,7 @@ class UmapWindow(ExportsMixin):
                         pass                                            # (a folder that cannot be written to: it is read again next time)
             except Exception as e:
                 self.ccf_state = "failed"
-                print(f"Could not read the cells' CCF coordinates (for their Paxinos ML and DV): {e}", flush=True)
+                print(f"Could not read the cells' CCF coordinates (for their ML and DV): {e}", flush=True)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -4004,7 +4006,7 @@ class UmapWindow(ExportsMixin):
         # (said when the reconstructed coordinates are in use: a table of much the same size, downloaded earlier, that this is easily taken for)
         note = ("This is a separate table from the reconstructed coordinates already downloaded: those place the cells on the section "
                 "maps, but are not CCF positions.") if core.reconstructed_in_use() else ""
-        if self.host["ensure_ccf_downloaded"](self.abc_cache, parent=self.root, what="CCF coordinates of every cell (for their Paxinos ML and DV)",
+        if self.host["ensure_ccf_downloaded"](self.abc_cache, parent=self.root, what="CCF coordinates of every cell (for their ML and DV)",
                                               note=note):
             self.start_ccf_lookup()
 

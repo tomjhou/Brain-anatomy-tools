@@ -2098,6 +2098,8 @@ class UmapWindow(ExportsMixin):
         HoverTip(show_umap_box, lambda: ("Show the UMAP beside the section maps. Off, the section maps use its room. A project of "
                                          f"{LARGE_PROJECT_CELLS:,} cells or more starts with it off." if self.has_umap_data
                                          else "This project was made without a UMAP."))
+        if not self.has_umap_data:
+            show_umap_box.state(["disabled"])                  # (a project made without a UMAP has none to show: greyed out, with the tip saying why)
         self.var_ccf = tk.BooleanVar(bars, False)
         ccf_box = ttk.Checkbutton(bars, text="CCF atlas overlay", variable=self.var_ccf, command=self.apply_ccf)
         ccf_box.grid(row=1, column=5, sticky="w", padx=(6, 6))
@@ -4889,11 +4891,6 @@ class UmapWindow(ExportsMixin):
                 done(res)
         except queue.Empty:
             pass
-        for t in self.tiles:                  # (the table of the sections' z values is read in the background: it may arrive later)
-            if t["title"].get() == t["token"]:
-                z = core.section_z_text(t["label"], self.abc_cache, wait=False, short=True)
-                if z:
-                    t["title"].set(f"{t['token']}   {z}")
         self.ticks = getattr(self, "ticks", 0) + 1
         if self.ticks % 20 == 0 and not self.busy:          # (garbage is collected here, on the Tk thread: a worker thread freeing Tk images fails)
             gc.collect()
@@ -4929,9 +4926,6 @@ class UmapWindow(ExportsMixin):
         if self.own is not None and i is not None:
             for name in self.own.numbers:
                 lines.append(f"{name}: {self.number_text(name, i)}")
-        z = core.section_z_text(sec, self.abc_cache, wait=False) if sec is not None else ""
-        if z:
-            lines.append(z)
         if i is not None and self.values is not None:
             for gene, vals in self.values:
                 if self.own is not None and self.own.is_number(gene):

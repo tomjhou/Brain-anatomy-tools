@@ -57,18 +57,12 @@ CACHE_DIR = SCRIPT_DIR / 'cache_local'
 SETTINGS_FILE = SCRIPT_DIR / 'viewer_settings.json'
 
 
-# --- Which z coordinate sections are labelled with, everywhere in the app (section panels, hover readouts, the section grid). Set from
-# the launcher's Settings button; always kept in viewer_settings.json, whether or not the viewer's own settings persist.
-#   'section': the atlas's own section coordinate (the z column of the cell metadata, mm; sections are 0.2 mm apart)
-#   'ccf_ap':  the section's position along the Allen CCF's anterior-posterior axis (mm from the front; x_ccf, the median of its cells)
-#   'paxinos': that, relative to bregma and counted positive to the front as Paxinos does: bregma_ap_mm - x_ccf. Only an offset: there is no
-#              exact CCF-to-Paxinos mapping (only registrations such as Chon et al. 2019), the CCF has no skull to say how it is levelled
-#              (Paxinos puts bregma and lambda at the same height), and the bregma position used is a setting.
-Z_MODE_OPTIONS = (
-    ('section', "Section z: this MERFISH dataset's own section coordinate (mm; not a universal coordinate)"),
-    ('ccf_ap', "CCF AP: position along the Allen CCF's front-to-back axis (mm)"),
-    ('paxinos', "AP from bregma: positive toward the front (mm; an approximate offset, see below)"),
-)
+# --- The coordinates of a section, where they are shown (the section grid, the single-section viewer's pointer readout): its MERFISH z (the z column of the
+# cell metadata, mm; sections are 0.2 mm apart; not a universal coordinate) and its approximate AP from bregma (section_z_text). The AP is the section's
+# position along the Allen CCF's anterior-posterior axis (x_ccf, the median of its cells) relative to bregma and counted positive to the front as Paxinos
+# does: bregma_ap_mm - x_ccf. Only an offset: there is no exact CCF-to-Paxinos mapping (only registrations such as Chon et al. 2019), the CCF has no skull
+# to say how it is levelled (Paxinos puts bregma and lambda at the same height), and the bregma position used is a setting (the launcher's Settings button;
+# always kept in viewer_settings.json, whether or not the viewer's own settings persist).
 
 
 DEFAULT_BREGMA_CCF_AP_MM = 5.40
@@ -80,7 +74,7 @@ DEFAULT_BREGMA_CCF_DV_MM = 0.332
 
 
 # (these settings are always kept in viewer_settings.json, whether or not the viewer's own settings persist)
-COORD_SETTINGS = {'z_mode': 'section', 'bregma_ap_mm': DEFAULT_BREGMA_CCF_AP_MM, 'bregma_dv_mm': DEFAULT_BREGMA_CCF_DV_MM,
+COORD_SETTINGS = {'bregma_ap_mm': DEFAULT_BREGMA_CCF_AP_MM, 'bregma_dv_mm': DEFAULT_BREGMA_CCF_DV_MM,
                   'reconstructed_coords': True}
 
 
@@ -91,8 +85,6 @@ def load_coordinate_settings():
             on_disk = json.load(f)
         if not isinstance(on_disk, dict):
             return
-        if on_disk.get('z_mode') in dict(Z_MODE_OPTIONS):
-            COORD_SETTINGS['z_mode'] = on_disk['z_mode']
         COORD_SETTINGS['reconstructed_coords'] = bool(on_disk.get('reconstructed_coords', True))
         bregma = float(on_disk.get('bregma_ap_mm'))
         if 0.0 < bregma < 13.5:
@@ -117,7 +109,7 @@ def save_coordinate_settings():
             on_disk = loaded
     except Exception:
         pass
-    on_disk['z_mode'] = COORD_SETTINGS['z_mode']
+    on_disk.pop('z_mode', None)                                  # (an earlier version's choice of the z coordinate to label sections with: both are shown now)
     on_disk['bregma_ap_mm'] = COORD_SETTINGS['bregma_ap_mm']
     on_disk['bregma_dv_mm'] = COORD_SETTINGS['bregma_dv_mm']
     on_disk['reconstructed_coords'] = bool(COORD_SETTINGS['reconstructed_coords'])
@@ -177,7 +169,7 @@ def _read_section_coordinates(abc_cache, with_ccf):
 def start_section_coordinate_load(abc_cache):
     """Start reading the per-section coordinate table in the background, if that hasn't been done (or the setting now needs the CCF
     part that an earlier read left out). Never raises."""
-    needs_ccf = COORD_SETTINGS['z_mode'] != 'section'
+    needs_ccf = True            # (the section maps and the grid show the AP from bregma as well as the MERFISH z, whatever Settings labels sections with)
     try:
         with_ccf = needs_ccf and not ccf_files_missing(abc_cache)
     except Exception:
@@ -201,8 +193,8 @@ def start_section_coordinate_load(abc_cache):
 
 
 def section_z_text(section_label, abc_cache=None, wait=False, short=False):
-    """The section's z in the coordinate chosen in Settings, as text ('' if it isn't known, or not yet read: `wait` makes this
-    wait for the table, which is quick after the first time). `short` leaves out the unit, for tight places."""
+    """The section's MERFISH z and its approximate AP from bregma, as text ('' if neither is known, or not yet read: `wait` makes this wait for the table, which
+    is quick after the first time; just the one that is known if only one is). `short` is for tight places."""
     if abc_cache is not None:
         start_section_coordinate_load(abc_cache)
     thread = section_coords_state['thread']
@@ -211,22 +203,16 @@ def section_z_text(section_label, abc_cache=None, wait=False, short=False):
     table = section_coords_state['table']
     if not table:
         return ''
-    mode = COORD_SETTINGS['z_mode']
     label = str(section_label)
-    if mode == 'section':
-        value = table['z'].get(label)
-    else:
-        value = table['ccf_ap'].get(label)
-        if value is not None and mode == 'paxinos':
-            value = COORD_SETTINGS['bregma_ap_mm'] - value
-    if value is None:
-        return ''
-    unit = '' if short else ' mm'
-    if mode == 'section':
-        return f"z {value:.2f}{unit}" if short else f"MERFISH section z = {value:.2f} mm"
-    if mode == 'ccf_ap':
-        return f"CCF AP {value:.2f}{unit}" if short else f"CCF AP = {value:.2f} mm"
-    return f"AP {value:+.2f}{unit}" if short else f"AP from bregma = {value:+.2f} mm (approx.)"
+    z = table['z'].get(label)
+    ccf_ap = table['ccf_ap'].get(label)
+    ap = paxinos_coords(ccf_ap)[0] if ccf_ap is not None else None
+    parts = []
+    if z is not None:
+        parts.append(f"z {z:.2f}" if short else f"MERFISH section z = {z:.2f} mm")
+    if ap is not None:
+        parts.append(f"AP {ap:+.2f}" if short else f"AP from bregma = {ap:+.2f} mm (approx.)")
+    return (", " if short else "; ").join(parts)
 
 
 def section_coords(section_label):

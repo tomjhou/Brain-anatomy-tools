@@ -342,7 +342,7 @@ from abc_core import (
     CACHE_DIR, CCF_COORDS_FILE_NAME, CCF_DIRECTORY, CCF_FILES, CCF_PARCELLATION_DIRECTORY, CCF_PARCELLATION_FILE_NAME, COORD_SETTINGS,
     DEFAULT_BREGMA_CCF_AP_MM, DEFAULT_BREGMA_CCF_DV_MM, DEFAULT_GREY_RGBA, FRAME_STATE, RECON_FILES, coordinate_frame_name,
     file_complete, reconstructed_in_use, record_run_opened as core_record_run_opened, IMPUTED_DATASET_DIRECTORY,
-    IMPUTED_DATASET_FILE_NAME, NON_NEURON_CLASS_IDS, DEFAULTS_DIR, SECTION_COL, SETTINGS_FILE, SPATIAL_CSV_CHUNK_SIZE, Z_MODE_OPTIONS,
+    IMPUTED_DATASET_FILE_NAME, NON_NEURON_CLASS_IDS, DEFAULTS_DIR, SECTION_COL, SETTINGS_FILE, SPATIAL_CSV_CHUNK_SIZE,
     build_neuron_class_colors, ccf_files_missing, class_id_to_color, ensure_spatial_load_started, extract_leading_numeric_id,
     find_gene_index, generate_and_cache_section_image, generate_section_grid_image, get_section_labels, load_annotations_aligned,
     load_coordinate_settings, load_imputed_adata, load_rois_csv, load_section_spatial_coords, metadata_file_status, multi_gene_rgb,
@@ -470,7 +470,7 @@ def save_viewer_settings(settings):
     swallowed rather than surfaced — failing to persist a preference isn't
     worth interrupting the session over."""
     to_write = {'persist_settings': bool(settings.get('persist_settings', False)),
-                'z_mode': COORD_SETTINGS['z_mode'], 'bregma_ap_mm': COORD_SETTINGS['bregma_ap_mm'], 'bregma_dv_mm': COORD_SETTINGS['bregma_dv_mm'],
+                'bregma_ap_mm': COORD_SETTINGS['bregma_ap_mm'], 'bregma_dv_mm': COORD_SETTINGS['bregma_dv_mm'],
                 'reconstructed_coords': bool(COORD_SETTINGS['reconstructed_coords'])}   # (always kept: see COORD_SETTINGS)
     if to_write['persist_settings']:
         to_write['hover_enabled'] = bool(settings.get('hover_enabled', True))
@@ -507,7 +507,8 @@ SECTION_Z_LABEL_FONTSIZE = 8    # points: the z label at the top-right of each t
 
 
 def show_coordinate_settings_dialog(abc_cache):
-    """The launcher's Settings window: which z coordinate sections are labelled with. Applies and saves on OK."""
+    """The launcher's Settings window: where bregma is in the CCF (for the AP, DV and ML from bregma), and whether cells are placed by Allen's reconstructed
+    coordinates. Applies and saves on OK."""
     import tkinter as tk
     from tkinter import ttk, messagebox
     root = tk.Tk()
@@ -517,17 +518,12 @@ def show_coordinate_settings_dialog(abc_cache):
     dlg.title("Settings")
     dlg.attributes('-topmost', True)
     dlg.resizable(False, False)
-    mode_var = tk.StringVar(dlg, COORD_SETTINGS['z_mode'])
     bregma_var = tk.StringVar(dlg, f"{COORD_SETTINGS['bregma_ap_mm']:g}")
     bregma_dv_var = tk.StringVar(dlg, f"{COORD_SETTINGS['bregma_dv_mm']:g}")
     frame = ttk.Frame(dlg, padding=14)
     frame.pack()
-    ttk.Label(frame, text="Z coordinate shown for each section\n(section labels, hover readouts and the section grid):",
-              justify=tk.LEFT).pack(anchor="w", pady=(0, 6))
-    for value, text in Z_MODE_OPTIONS:
-        ttk.Radiobutton(frame, text=text, value=value, variable=mode_var).pack(anchor="w", pady=1)
     row = ttk.Frame(frame)
-    row.pack(anchor="w", pady=(10, 0))
+    row.pack(anchor="w", pady=(0, 0))
     ttk.Label(row, text="Bregma in the CCF (mm):   AP").pack(side=tk.LEFT)
     ttk.Entry(row, textvariable=bregma_var, width=7).pack(side=tk.LEFT, padx=6)
     ttk.Label(row, text="DV").pack(side=tk.LEFT)
@@ -566,7 +562,7 @@ def show_coordinate_settings_dialog(abc_cache):
         "Hence, the conversion is approximate. The defaults, AP 5.40 mm and DV 0.332 mm (and "
         "5.739 mm for the midline, which is fixed), are the International Brain Laboratory's (IBL's) estimate of bregma in the CCF (iblatlas, "
         "the average of five experimenters' picks); set them to the bregma position of the registration you rely on (for example "
-        "Chon et al. 2019). CCF options need the CCF coordinate files (a one-time download).")).pack(
+        "Chon et al. 2019). The AP from bregma of the sections, and the cells' coordinates, need the CCF coordinate files (a one-time download).")).pack(
         anchor="w", pady=(6, 0))
     ttk.Separator(frame).pack(fill=tk.X, pady=(14, 8))
     recon_var = tk.BooleanVar(dlg, bool(COORD_SETTINGS['reconstructed_coords']))
@@ -599,11 +595,6 @@ def show_coordinate_settings_dialog(abc_cache):
     root.wait_window(dlg)
     try:
         if result['ok']:
-            mode = mode_var.get()
-            if mode != 'section' and ccf_files_missing(abc_cache) and not ensure_ccf_downloaded(abc_cache):
-                print("The CCF coordinates weren't downloaded, so sections stay labelled with the section z.")
-                mode = 'section'
-            COORD_SETTINGS['z_mode'] = mode
             COORD_SETTINGS['bregma_ap_mm'] = result['bregma']
             COORD_SETTINGS['bregma_dv_mm'] = result['bregma_dv']
             COORD_SETTINGS['reconstructed_coords'] = bool(recon_var.get())
@@ -612,7 +603,7 @@ def show_coordinate_settings_dialog(abc_cache):
     finally:
         # The window's Tk variables are freed here, on this thread, while Tk is still up: left to the garbage collector they can be freed later
         # on a background thread, which prints "main thread is not in main loop" once for each of them.
-        mode_var = bregma_var = bregma_dv_var = recon_var = dlg = frame = buttons = row = reset = None
+        bregma_var = bregma_dv_var = recon_var = dlg = frame = buttons = row = reset = None
         import gc
         gc.collect()
         root.destroy()
@@ -986,6 +977,9 @@ ATLAS_CORE_FILES = (("the cell metadata table", 'MERFISH-C57BL6J-638850', 'cell_
 # the browser needs as soon as it opens. Asked for separately (prepare_coordinate_frame) they were a second download beside the big one,
 # and the two progress bars in the console wrote over each other.
 ATLAS_RECON_LABELS = ("the reconstructed cell coordinates", "the atlas regions that go with them")
+# ...and the CCF coordinates of the cells (a third of a GB) and the CCF region names: the AP from bregma of the sections, shown in the section grid and the
+# single-section readout, is read from them, and so are the CCF atlas overlay and the cell tips' ML and DV. Fetched with the rest, not when first asked for.
+ATLAS_CCF_LABELS = ("the CCF cell coordinates", "the CCF region names")
 atlas_prefetch = {'thread': None, 'total_gb': 0.0, 'files': [], 'keys': set()}
 
 
@@ -1008,20 +1002,25 @@ def atlas_download_running():
 def start_atlas_prefetch(cache):
     """Start downloading the core atlas files that are missing, on a background thread (nothing if all are there, or offline).
     Fills atlas_prefetch with the thread and the size, and tells the user once what is going on."""
-    missing = []
+    core_files = []
     for label, directory, file_name, kind in ATLAS_CORE_FILES:
         path, size, present = metadata_file_status(cache, directory, file_name)
         if present is False:
-            missing.append((label, directory, file_name, kind, size, path))
-    if not missing:
+            core_files.append((label, directory, file_name, kind, size, path))
+    ccf = []
+    for label, (directory, file_name) in zip(ATLAS_CCF_LABELS, CCF_FILES):
+        path, size, present = metadata_file_status(cache, directory, file_name)
+        if present is False:
+            ccf.append((label, directory, file_name, 'metadata', size, path))
+    if not core_files and not ccf:
         return                     # (the reconstructed coordinates alone, a setting changed later, are asked for when needed, as before)
-    if COORD_SETTINGS['reconstructed_coords']:
-        recon = []
+    recon = []
+    if core_files and COORD_SETTINGS['reconstructed_coords']:
         for label, (directory, file_name, kind) in zip(ATLAS_RECON_LABELS, RECON_FILES):
             path, size, present = metadata_file_status(cache, directory, file_name)
             if present is False:
                 recon.append((label, directory, file_name, kind, size, path))
-        missing = recon + missing                       # (first: small, and needed as soon as the browser opens)
+    missing = recon + ccf + core_files                  # (the small ones first, needed as soon as the browser opens; the big files last)
     for _label, directory, file_name, _kind, size, path in missing:
         atlas_prefetch['files'].append((path, size))
         atlas_prefetch['keys'].add((directory, file_name))
@@ -1040,10 +1039,14 @@ def start_atlas_prefetch(cache):
     def size_text(n):
         return f"{n / 1e9:.1f} GB" if n >= 1e8 else f"{max(n / 1e6, 1):.0f} MB"
     parts = "\n".join(f"    {m[0]}: {size_text(m[4])}" if m[4] else f"    {m[0]}" for m in missing)
-    message = (f"The atlas data is not on this computer yet, so it is being downloaded now (one time only):\n\n{parts}\n\n"
-               f"That is about {total_gb:.0f} GB and can take 10 minutes or much longer, depending on the connection. Progress is shown in "
-               "the console window. You can carry on to the launch screen; opening the browser will wait for the download to finish. "
-               "Keep this program open until then: an interrupted file starts again from the beginning.")
+    if total_gb >= 1:
+        message = (f"The atlas data is not on this computer yet, so it is being downloaded now (one time only):\n\n{parts}\n\n"
+                   f"That is about {total_gb:.0f} GB and can take 10 minutes or much longer, depending on the connection. Progress is shown in "
+                   "the console window. You can carry on to the launch screen; opening the browser will wait for the download to finish. "
+                   "Keep this program open until then: an interrupted file starts again from the beginning.")
+    else:                                                       # (only the small files, such as the CCF coordinates, were missing)
+        message = (f"A little atlas data is not on this computer yet, so it is being downloaded now (one time only):\n\n{parts}\n\n"
+                   f"That is about {total_gb * 1000:.0f} MB. Progress is shown in the console window; you can carry on.")
     print("\n" + message + "\n")
     try:
         import centered_dialog                                  # (in the middle of the screen: a native box over a hidden window was partly off it on macOS)
@@ -7552,7 +7555,7 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         return loaded, get_section_labels(loaded, abc_cache)
 
     # The first time on a computer the atlas is still downloading (gigabytes, started at program start): far longer than reading it.
-    downloading = atlas_prefetch['thread'] is not None and atlas_prefetch['thread'].is_alive()
+    downloading = atlas_prefetch['thread'] is not None and atlas_prefetch['thread'].is_alive() and atlas_prefetch['total_gb'] >= 1
     if downloading:
         loading_message = (f"Waiting for the MERFISH brain atlas to finish downloading ({atlas_prefetch['total_gb']:.0f} GB, one time only).\n"
                            "This can take 10 minutes or more; see the console window for progress.")

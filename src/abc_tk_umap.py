@@ -824,12 +824,11 @@ class CellTip:
             mark.pack(side=tk.LEFT)
             draw_marker(mark, 12, 12, int(code), hexc, size=14)
             bring = swatch[4] if len(swatch) > 4 else None
+            if len(swatch) > 5 and not swatch[5]:       # (none while the UMAP is not shown: a greyed-out button looked no different on macOS)
+                bring = None
             if bring is not None:                       # (to the right of the symbol: the cell comes into view in the plots where it is out of it)
                 button = ttk.Button(top, text="Bring into view", command=bring)
                 button.pack(side=tk.LEFT, padx=(8, 0))
-                if len(swatch) > 5 and not swatch[5]:    # (greyed out while the UMAP is not shown)
-                    button.state(["disabled"])
-                    HoverTip(button, lambda: "Show the UMAP (the Show UMAP box above the section maps) to use this.")
             if token is not None and self.row_hover_fn is not None:
                 for w in (top, caption, mark):
                     w.bind("<Enter>", lambda e, t=token, c=caption: self.row_enter(t, [c]), add="+")
@@ -5393,7 +5392,7 @@ class UmapWindow(ExportsMixin):
 
     def bring_cell_into_view(self, info):
         """The tip's Bring into view: the cell is made visible in the UMAP and in its section's map, in whichever it is out of view (centered where it
-        can be); where it is in view nothing changes. Not while the UMAP is hidden (the button is greyed out then; a tip kept up may still have it)."""
+        can be); where it is in view nothing changes. Not while the UMAP is hidden (the tip has no such button then; a tip kept up may still have it)."""
         if not self.umap_shown:
             return
         i = info["umap_idx"]

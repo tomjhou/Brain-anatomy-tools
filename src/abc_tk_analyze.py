@@ -882,7 +882,6 @@ class AnalyzeWindow:
             self.var_status.set(f"{int(in_group.sum()):,} cells plotted." + note)
         else:
             xs, ys, names, cols, counts, shown_groups = [], [], [], [], [], []
-            self.hover = None
             for g in chosen:
                 m = in_group & (codes == g)
                 if not m.any() or (self.var_exclude_small.get() and m.sum() < MIN_PLOTTED_GROUP_CELLS):
@@ -896,6 +895,12 @@ class AnalyzeWindow:
             self.table = pd.DataFrame({self.v.level_names[level]: [full_of[g] for g in shown_groups], "cells": counts, f"mean {gx}": xs, f"mean {gy}": ys})
             areas = np.maximum(np.array(counts, dtype=float) / max(counts) * LARGEST_GROUP_AREA, SMALLEST_AREA) if counts else []
             ax.scatter(xs, ys, c=cols, s=areas, alpha=0.85, linewidths=0.4, edgecolors="black")
+            self.hover = {"kind": "groups", "x": np.array(xs), "y": np.array(ys), "areas": np.asarray(areas, dtype=float),
+                          "full": [full_of[g] for g in shown_groups], "counts": counts, "genes": (gx, gy), "scale": scale}
+            self.pluses = ax.scatter([], [], marker="+", c="black", s=40, linewidths=0.9, animated=True, zorder=5)
+            self.tip = ax.annotate("", xy=(0, 0), xytext=(14, 14), textcoords="offset points", fontsize=9, animated=True, zorder=6,
+                                   bbox={"boxstyle": "round,pad=0.3", "fc": "#ffffe0", "ec": "#888888"}, annotation_clip=False)
+            self.tip.set_visible(False)
             if len(xs) <= MAX_LABELED_GROUPS:
                 for x, y, n, a, c in zip(xs, ys, names, areas, cols):
                     ax.annotate(n, (x, y), xytext=(np.sqrt(a) / 2 + 2, 0), textcoords="offset points", fontsize=LABEL_FONT_SIZE,
@@ -1283,6 +1288,26 @@ class AnalyzeWindow:
             self.canvas.restore_region(self.background)
             self.hover_group = i
             self.tip.set_text(f"{h['names'][i]}\n{h['x'][i]:.3g}, {h['y'][i]:.3g}")
+            self.tip.xy = (h["x"][i], h["y"][i])
+            self.tip.set_visible(True)
+            self.ax.draw_artist(self.tip)
+            self.canvas.blit(self.fig.bbox)
+            return
+        if h.get("kind") == "groups":                             # (Per group: the group's circle under the pointer, as for a cell)
+            pts = self.ax.transData.transform(np.column_stack([h["x"], h["y"]]))
+            d2 = (pts[:, 0] - ev.x) ** 2 + (pts[:, 1] - ev.y) ** 2
+            reach = np.maximum(np.sqrt(h["areas"]) / 2 * self.fig.dpi / 72, HOVER_PX)      # (the circle's radius in pixels: its area is in points squared)
+            inside = np.flatnonzero(d2 <= reach ** 2)
+            if not len(inside):
+                self.hide_hover()
+                return
+            i = int(inside[np.argmin(d2[inside] / reach[inside] ** 2)])           # (of overlapping circles, the one whose middle is nearest, for its size)
+            self.canvas.restore_region(self.background)
+            self.hover_group = i
+            lines = [h["full"][i], f"{h['counts'][i]:,} cells"]
+            for gene, value in zip(h["genes"], (h["x"][i], h["y"][i])):
+                lines.append(f"mean {gene}: {both_scales(value, h['scale'])}")
+            self.tip.set_text("\n".join(lines))
             self.tip.xy = (h["x"][i], h["y"][i])
             self.tip.set_visible(True)
             self.ax.draw_artist(self.tip)

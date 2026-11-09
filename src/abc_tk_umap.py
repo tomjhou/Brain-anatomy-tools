@@ -51,6 +51,8 @@ LIGHT_GREY = np.array([222, 222, 222], np.uint8)
 RING = "#ff1493"
 MAX_COLORED_CATEGORIES = 400       # the distinct looks (colors x shapes): past this many groups the looks repeat; also the most centroid labels and legend rows
 TAXONOMY_LEVELS = ("class", "subclass", "supertype", "cluster")
+LINEAGE_LOOKS = ((0.95, 0.97), (0.95, 0.64), (0.55, 0.97), (0.6, 0.70), (0.80, 0.82))     # (saturation, value) of the looks a family's groups are given, with a hue step each side
+LINEAGE_HUE_STEP = 0.04
 LEVEL_NAMES = {"class": "Class", "subclass": "Subclass", "supertype": "Supertype", "cluster": "Cluster", "leiden": "Leiden", "neurotransmitter": "Neurotransmitter"}
 NOT_IN_TAXONOMY = ("leiden", "neurotransmitter")        # the levels that are not a step down from the one above (so a group's table is just its own row)
 TILE_PX = 230
@@ -1591,6 +1593,8 @@ class PointCanvas:
                 ink = "white" if is_dark(self.bgcolor) else "black"
                 self.canvas.itemconfig(self.scalebar[0], fill=ink)
                 self.canvas.itemconfig(self.scalebar[1], fill=ink)
+            for rect in self.rects:                             # (the ROI outlines too)
+                self.canvas.itemconfig(rect[0], outline="white" if is_dark(self.bgcolor) else "black")
             for item, color in self.label_color.items():
                 self.canvas.itemconfig(item, fill=ink_for(color, self.bgcolor))
 
@@ -1720,7 +1724,7 @@ class PointCanvas:
                 self.canvas.itemconfig(item, state="hidden")
 
     def add_rect(self, x0, y0, x1, y1):
-        item = self.canvas.create_rectangle(0, 0, 0, 0, outline="black", width=2, dash=dash((6, 3), 2))
+        item = self.canvas.create_rectangle(0, 0, 0, 0, outline="white" if is_dark(self.bgcolor) else "black", width=2, dash=dash((6, 3), 2))
         self.rects.append([item, x0, y0, x1, y1])
 
     def rect_width(self):
@@ -2136,11 +2140,7 @@ class UmapWindow(ExportsMixin):
         hover_box.grid(row=0, column=4, sticky="w", padx=(6, 6))
         self.hover_box = hover_box
         HoverTip(hover_box, lambda: ("When the pointer rests on a cell, dim the plots and mark every cell of its group with a red +. Off: no "
-                                     "marking, but the cell is still ringed and described in its tip (the same setting as in Settings)."
-                                     if self.umap_shown else "Hover highlight marks the cell's group in the UMAP as well as in the section maps: "
-                                                             "it is available while the UMAP is shown."))
-        if not self.umap_shown:
-            hover_box.state(["disabled"])
+                                     "marking, but the cell is still ringed and described in its tip (the same setting as in Settings)."))
         self.update_marker_slider()
         bars.columnconfigure(6, weight=1)          # (the spare width goes to an empty column on the right: the controls stay where they are)
         self.tile_scroll = tk.Canvas(left, highlightthickness=0, bg="#f4f4f4")
@@ -2215,8 +2215,8 @@ class UmapWindow(ExportsMixin):
         self.set_umap_shown(want)
 
     def set_umap_shown(self, on):
-        """Show or hide the UMAP pane. Hidden, the section maps take its room (they are laid out again for the wider pane), and Hover highlight, which
-        marks cells in the UMAP too, is greyed out."""
+        """Show or hide the UMAP pane. Hidden, the section maps take its room (they are laid out again for the wider pane), (Hover highlight keeps
+        working in the section maps)."""
         if on == self.umap_shown:
             return
         self.umap_shown = on
@@ -2224,16 +2224,15 @@ class UmapWindow(ExportsMixin):
             self.pw.insert(1, self.mid, weight=3)
         else:
             self.pw.forget(self.mid)
-        self.hover_box.state(["!disabled"] if on else ["disabled"])
         if not on:
-            self.drop_highlights()
+            self.drop_highlights()                                # (marks left on the pane that is gone)
         self.update_marker_slider()
         self.root.update_idletasks()
         self.fit_left_pane(False)
 
     def hover_on(self):
-        """Hover highlight is on: its box is ticked and the UMAP is shown (it marks the group there too)."""
-        return bool(self.var_hover.get()) and self.umap_shown
+        """Hover highlight is on: its box is ticked (it marks the group in the section maps, and in the UMAP when that is shown)."""
+        return bool(self.var_hover.get())
 
     def fit_left_pane(self, again=True):
         """The section pane gets about a third of the window (the panels fill whatever width it has). Done before the panels are made, so that they are made
@@ -2426,8 +2425,7 @@ class UmapWindow(ExportsMixin):
                 (("Save section maps", self.save_section_maps, False), ("Save UMAP", self.save_umap, False)),
                 (("Export DEGs", self.export_degs, True), ("Export expression", self.export_expression, True)),
                 (("Export coordinates", self.export_coordinates, True), ("3D in browser", self.show_3d_browser, True)),
-                (("Analyze...", self.open_analyze, False), ("Create subproject", self.analyze_subset, False)),
-                (("Close", self.close, False),))
+                (("Analyze...", self.open_analyze, False), ("Create subproject", self.analyze_subset, False)))
         for r, pair in enumerate(rows):
             for c, (text, cmd, grouped) in enumerate(pair):
                 b = ttk.Button(bar, text=text, command=cmd, style="Side.TButton")
@@ -2442,6 +2440,17 @@ class UmapWindow(ExportsMixin):
                 if text == "Create subproject":
                     HoverTip(b, lambda: "Analyze only the groups switched on in the legend: a project of its own, in a subfolder of this one, with its own "
                                         "PCA and UMAP, opened in a second window.")
+        last = ttk.Frame(bar)                                            # (the last row: Load state, Save state and Close)
+        last.grid(row=len(rows), column=0, columnspan=2, sticky="ew")
+        for c, (text, cmd) in enumerate((("Load state", self.load_state), ("Save state", self.save_state), ("Close", self.close))):
+            last.columnconfigure(c, weight=1, uniform="lastrow")
+            b = ttk.Button(last, text=text, command=cmd, style="Side.TButton")
+            b.grid(row=0, column=c, sticky="ew", padx=2, pady=2)
+            if text == "Load state":
+                HoverTip(b, lambda: "Set the panel (Color by, Group by, the groups or genes, scale, theme and the levels of the genes) as it was saved to a file.")
+            elif text == "Save state":
+                HoverTip(b, lambda: "Save the panel's settings (Color by, Group by, the groups or genes, scale, theme and the levels of the genes) to a file, to set it "
+                                    "up again later with Load state.")
         self.update_group_buttons()
 
     def analyze_subset(self):
@@ -3805,6 +3814,10 @@ class UmapWindow(ExportsMixin):
                 other = non_neuron if self.bg_under == "nonneuron" else ~non_neuron
                 ox, oy, orgb = x[other], y[other], rgb[other]
                 omk = mk[other] if mk is not None else None
+                if not self.viewer_settings.get("colorize_other_cells", True):          # (the Settings choice: the other kind is colored as a cell with no expression is
+                    zero = self.zero_color()                                            # in the gene view on the screen, so that it is as quiet as those; gray in the other views)
+                    orgb = np.tile(np.asarray(zero if zero is not None else GREY, np.uint8), (len(ox), 1))
+                    omk = None
                 ogray = (orgb == GREY).all(axis=1) | (orgb == LIGHT_GREY).all(axis=1)
                 for pick, is_gray in ((ogray, True), (~ogray, False)):
                     layer = {"x": ox[pick], "y": oy[pick], "rgb": orgb[pick], "size_mm": DOT_MM * OTHER_CELLS_DOT_RATIO, "gray": is_gray}
@@ -3903,6 +3916,24 @@ class UmapWindow(ExportsMixin):
             palette[u] = rank_color(r)
         return palette
 
+    def group_positions(self, level, n_groups):
+        """Where each group of a level is, (n_groups, 3), NaN for none: the mean position of its cells in the tissue (the section maps' x, y and the section's z, mm)
+        where the sections' cells are known, else in the UMAP. Used to tell neighbouring groups apart (see lineage_palette)."""
+        bgc = self.bg_codes(level) if self.bg else None
+        if bgc is not None and self.bg.get("z") is not None:
+            codes = bgc
+            xyz = np.column_stack([self.bg["x"], self.bg["y"], self.bg["z"]])
+        else:
+            codes = self.category_codes(level)[0]
+            xyz = np.column_stack([self.coords[:, 0], self.coords[:, 1], np.zeros(len(self.coords))])
+        ok = (codes >= 0) & np.isfinite(xyz).all(axis=1)
+        out = np.full((n_groups, 3), np.nan)
+        n = np.bincount(codes[ok], minlength=n_groups)
+        for axis in range(3):
+            total = np.bincount(codes[ok], weights=xyz[ok, axis], minlength=n_groups)
+            out[n > 0, axis] = total[n > 0] / n[n > 0]
+        return out
+
     def lineage_palette(self, level, codes, uniques, counts):
         """Colors that follow the taxonomy: the classes get the browser's hues; each group below takes its parent's hue (the parent most of its cells are in),
         shifted a little by its place among its siblings (largest first) and alternately paler or darker, so that neighbours in the taxonomy look related and
@@ -3934,14 +3965,40 @@ class UmapWindow(ExportsMixin):
                 df = df[df["n"] > 0]
                 df["j"] = df.groupby("p").cumcount()
                 df["m"] = df.groupby("p")["g"].transform("size")
-                spread = 0.16 / (depth ** 0.5 + 0.0)
-                for g, p, j, m in zip(df["g"].to_numpy(), df["p"].to_numpy(), df["j"].to_numpy(), df["m"].to_numpy()):
+                pos = self.group_positions(l, len(u))
+                families = {}
+                for g, p in zip(df["g"].to_numpy(), df["p"].to_numpy()):                 # (each family's groups, the largest first)
+                    families.setdefault(int(p), []).append(int(g))
+                for p, sibs in families.items():
                     if p < 0:                                        # (no parent: its own hue, from its rank)
-                        hsv[g] = (((j * 0.6180339887498949) % 1.0), 0.6, 0.8)
+                        for j, g in enumerate(sibs):
+                            hsv[g] = (((j * 0.6180339887498949) % 1.0), 0.6, 0.8)
                         continue
-                    h0, s0, v0 = prev_hsv[p]
-                    shift = ((j / (m - 1)) - 0.5) * spread * min(m, 6) / 6 if m > 1 else 0.0
-                    hsv[g] = ((h0 + shift) % 1.0, (0.92, 0.92, 0.58, 0.58)[j % 4], (0.97, 0.76, 0.92, 0.72)[j % 4])
+                    h0 = prev_hsv[p][0]
+                    if len(sibs) == 1:
+                        hsv[sibs[0]] = (h0, 0.92, 0.97)
+                        continue
+                    slots = [((h0 + dh) % 1.0, sat, val) for sat, val in LINEAGE_LOOKS for dh in (0.0, -LINEAGE_HUE_STEP, LINEAGE_HUE_STEP)]
+                    rgb = np.array([colorsys.hsv_to_rgb(*x) for x in slots]) * 255.0
+                    mean_r = (rgb[:, None, 0] + rgb[None, :, 0]) / 2
+                    d = rgb[:, None, :] - rgb[None, :, :]
+                    apart = np.sqrt((2 + mean_r / 256) * d[..., 0] ** 2 + 4 * d[..., 1] ** 2 + (2 + (255 - mean_r) / 256) * d[..., 2] ** 2)          # (how different two looks are)
+                    used = np.zeros(len(slots))
+                    taken = []
+                    where = pos[sibs]
+                    for k, g in enumerate(sibs):
+                        if k == 0:
+                            slot = 0
+                        else:
+                            gap = np.linalg.norm(where[:k] - where[k], axis=1)
+                            gap[~np.isfinite(gap)] = np.inf
+                            near = np.argsort(gap, kind="stable")[:3] if np.isfinite(gap).any() else np.arange(max(0, k - 3), k)
+                            # the look that differs most from the nearest ones already given (the cells that are next to each other are told apart); ties go to the least used
+                            score = apart[:, [taken[n] for n in near]].min(axis=1) - 0.5 * used
+                            slot = int(np.argmax(score))
+                        taken.append(slot)
+                        used[slot] += 1
+                        hsv[g] = slots[slot]
             prev_codes, prev_hsv = c, hsv
         palette = np.array([[int(round(x * 255)) for x in colorsys.hsv_to_rgb(*row)] for row in prev_hsv], np.uint8)
         palette[counts == 0] = GREY
@@ -4250,6 +4307,7 @@ class UmapWindow(ExportsMixin):
         scale = self.var_scale.get()
         key = (tuple(resolved), imputed, scale)
         if self.gene_cache is not None and self.gene_cache[0] == key:                   # (a legend click, or the same genes again)
+            self.apply_pending_gene_state(resolved)
             self.show_genes(resolved, imputed, scale, self.gene_cache[1])
             return
         backed = self.adata_backed if self.bg else None
@@ -4286,6 +4344,7 @@ class UmapWindow(ExportsMixin):
                 self.var_status.set(f"Could not read {', '.join(resolved)}: {res}")
                 return
             self.keep_gene_settings(self.gene_cache[0] if self.gene_cache is not None else None, key, res)
+            self.apply_pending_gene_state(resolved)
             self.gene_cache = (key, res)
             self.show_genes(resolved, imputed, scale, res)
 
@@ -5469,9 +5528,10 @@ class UmapWindow(ExportsMixin):
             return False                             # (a group none of the run's cells is in: nothing in the UMAP to relate to)
         if skip is not None:
             run_mask[skip] = False                   # (the hovered cell keeps its own ring)
-        self.umap.set_pluses((self.coords[run_mask, 0], self.coords[run_mask, 1]))
-        number = re.match(r"^\s*(\d+)", str(label))               # (the group's number is what the UMAP shows at its center: bigger while it is marked)
-        self.umap.boost_label(number.group(1) if number and level == self.level else None)
+        if self.umap_shown:
+            self.umap.set_pluses((self.coords[run_mask, 0], self.coords[run_mask, 1]))
+            number = re.match(r"^\s*(\d+)", str(label))               # (the group's number is what the UMAP shows at its center: bigger while it is marked)
+            self.umap.boost_label(number.group(1) if number and level == self.level else None)
         barr = self.bg["levels"].get(level) if self.bg else None
         for t in self.tiles:
             if not self.frame_visible(t["frame"]):
@@ -5544,6 +5604,132 @@ class UmapWindow(ExportsMixin):
         self.hover_key = None
         self.clear_highlights()
 
+    STATE_KIND = "abc_project_browser_state"
+
+    def panel_state(self):
+        """The panel's settings as a dict (see save_state): Color by, Group by, the groups typed for each level, the groups clicked off in the list and how it is
+        sorted, the genes, scale, theme and the levels of each gene's slider (what the histogram under it is colored by) and the genes switched off."""
+        ids = dict(self.ids_by_level)
+        ids[self.level] = self.var_ids.get()
+        names = core.parse_gene_names(self.var_gene.get().strip())
+        levels = {}
+        if self.gene_cache is not None and list(self.gene_cache[0][0]) == names:
+            shown = list(self.gene_cache[0][0])
+            if len(shown) == 1:
+                levels[shown[0]] = list(self.gene_levels)
+            else:
+                levels = {g: list(self.multi_levels.get(i, (0.0, 1.0))) for i, g in enumerate(shown)}
+            hidden = [shown[i] for i in sorted(self.hidden) if i < len(shown)]
+        else:
+            hidden = []
+        return {
+            "kind": self.STATE_KIND, "version": 1,
+            "project": Path(self.run_folder).name if self.run_folder is not None else "",
+            "mode": self.mode, "level": self.level, "group_numbers": ids,
+            "groups_off": sorted(self.off_groups), "group_sort": list(self.group_sort),
+            "genes": self.var_gene.get().strip(), "scale": self.var_scale.get(),
+            "theme": self.var_theme.get(), "theme_choice": self.theme_choice,
+            "translucent": bool(self.var_translucent.get()),
+            "gene_levels": levels, "genes_off": hidden,
+        }
+
+    def save_state(self):
+        """The Save state button: the panel's settings to a JSON file."""
+        import json
+        if self.busy:
+            return
+        proposed = self.host["unique_export_paths"](self.target_dir(), "browser_state", (".json",))[".json"].name
+        path = self.ask_save_path("Save the panel's state", proposed, ".json", "State file")
+        if path is None:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.panel_state(), f, indent=2)
+            self.var_status.set(f"Saved the state to {path.name} in {path.parent}.")
+        except Exception as e:
+            self.var_status.set(f"Could not save the state: {e}")
+
+    def load_state(self):
+        """The Load state button: set the panel as a file made by Save state has it."""
+        import json
+        from tkinter import filedialog
+        if self.busy:
+            return
+        folder = getattr(self, "export_dir", None)
+        if folder is None or not Path(folder).is_dir():
+            folder = self.target_dir()
+        chosen = filedialog.askopenfilename(parent=self.root, title="Load a panel state", initialdir=str(folder),
+                                            filetypes=[("State file", "*.json"), ("All files", "*.*")])
+        if not chosen:
+            return
+        try:
+            with open(chosen, encoding="utf-8") as f:
+                state = json.load(f)
+            if not isinstance(state, dict) or state.get("kind") != self.STATE_KIND:
+                raise ValueError("this is not a state file saved by Save state")
+        except Exception as e:
+            self.var_status.set(f"Could not read {Path(chosen).name}: {e}")
+            return
+        self.export_dir = Path(chosen).parent
+        self.apply_state(state, Path(chosen).name)
+
+    def apply_state(self, state, name=""):
+        """Set the panel from a state dict (see panel_state): everything is set first, then colored once. Parts that do not fit this project (a level or a gene
+        it does not have) are left as they are, or reported by the usual messages."""
+        notes = []
+        mode = state.get("mode")
+        if mode not in ("all", "single", "gene", "imputed") or (mode == "imputed" and self.own is not None):
+            notes.append("the Color by was not available here")
+            mode = self.mode
+        level = state.get("level")
+        if level not in self.levels:
+            if level is not None:
+                notes.append(f"this project has no {level} level")
+            level = self.level
+        self.ids_by_level[self.level] = self.var_ids.get()
+        self.ids_by_level.update({k: str(v) for k, v in (state.get("group_numbers") or {}).items() if k in self.levels})
+        self.level = level
+        self.var_level.set(level)
+        self.var_ids.set(self.ids_by_level.get(level, ""))
+        column, descending = (list(state.get("group_sort") or ["id", False]) + [False])[:2]
+        if column in ("id", "count", "name"):
+            self.group_sort = (column, bool(descending))
+        self.var_scale.set("linear" if state.get("scale") == "linear" else "log")
+        theme = state.get("theme")
+        self.var_theme.set(theme if theme in ("dark", "light") else self.var_theme.get())
+        self.theme_choice = state.get("theme_choice") if state.get("theme_choice") in ("dark", "light") else None
+        self.var_translucent.set(bool(state.get("translucent")))
+        self.apply_opacity()
+        self.var_gene.set(str(state.get("genes") or ""))
+        self.pending_gene_state = {"levels": {g: tuple(v) for g, v in (state.get("gene_levels") or {}).items() if isinstance(v, (list, tuple)) and len(v) == 2},
+                                   "off": set(state.get("genes_off") or [])}
+        off = set(str(g) for g in (state.get("groups_off") or []))
+        self.var_mode.set(mode)
+        self.on_mode()                                    # (colors once; asks to load the imputed genes if they are needed and not loaded)
+        if self.mode in ("all", "single") and off:
+            self.off_groups = off
+            self.recolor(keep_off=True)
+        shown = f"Loaded {name}" if name else "Loaded the state"
+        other = state.get("project")
+        if other and self.run_folder is not None and other != Path(self.run_folder).name:
+            notes.append(f"it was saved from {other}")
+        self.var_status.set(shown + (f" ({'; '.join(notes)})." if notes else "."))
+
+    def apply_pending_gene_state(self, names):
+        """The levels and the switched-off genes that Load state asked for, set once the genes it named are read (see apply_state)."""
+        pending = getattr(self, "pending_gene_state", None)
+        self.pending_gene_state = None
+        if not pending:
+            return
+        if len(names) == 1:
+            if names[0] in pending["levels"]:
+                self.gene_levels = pending["levels"][names[0]]
+        else:
+            for i, g in enumerate(names):
+                if g in pending["levels"]:
+                    self.multi_levels[i] = pending["levels"][g]
+            self.hidden = {i for i, g in enumerate(names) if g in pending["off"]}
+
     def open_settings(self):
         dialog = self.host.get("settings_dialog")
         if dialog is None or self.busy:
@@ -5553,6 +5739,7 @@ class UmapWindow(ExportsMixin):
             return
         new_params = new.pop("umap_params", None)        # (belong to this run, not to the user's preferences)
         old_colors = self.viewer_settings.get("group_colors", "cycle")
+        old_other = bool(self.viewer_settings.get("colorize_other_cells", True))
         shape_changed = new.get("gene456_shape") != self.viewer_settings.get("gene456_shape")
         size_changed = new.get("umap_circle_size") != self.viewer_settings.get("umap_circle_size")
         hover_changed = bool(new.get("hover_enabled", True)) != bool(self.viewer_settings.get("hover_enabled", True))
@@ -5565,9 +5752,9 @@ class UmapWindow(ExportsMixin):
             self.drop_highlights()
         if size_changed:                                            # (the UMAP's Cell size slider shows it: set without its own redraw, done below)
             self.umap_sliders[0].set(self.umap_size_index(self.viewer_settings.get("umap_circle_size", "Default")))
-        colors_changed = new.get("group_colors", "cycle") != old_colors
+        colors_changed = new.get("group_colors", "cycle") != old_colors or bool(new.get("colorize_other_cells", True)) != old_other
         if (size_changed or colors_changed or (shape_changed and self.mode in ("gene", "imputed"))) and not self.busy:
-            self.recolor()
+            self.recolor(keep_off=True)                # (the groups clicked off stay off)
         if new_params is not None and self.params is not None:
             self.switch_variant(new_params)
 

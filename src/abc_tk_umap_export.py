@@ -24,6 +24,7 @@ EXPORT_LEGEND_MAX_ROWS = 35
 SECTION_MAPS_FULL_WIDTH_PX = 4000            # a panel at the largest Section map size (one across) is this many pixels wide in a saved PNG; smaller sizes in proportion
 PANEL_PAD_IN, PANEL_TITLE_IN = 0.08, 0.25     # the space round a panel in a saved section map figure, and above it for its title
 PANELS_ACROSS_CHOICES = ("Auto (near-square)", "As on screen", "1", "2", "3", "4", "5", "6", "8", "10", "12")
+RESOLUTION_CHOICES = ("Standard", "High (2x)", "Very high (4x)")        # a saved section map's detail: as the Section size slider sets it, or that many times the pixels (or a number of pixels per panel)
 JPG_ARGS = {"quality": 85, "subsampling": 2, "optimize": True}      # a saved JPG: quality 85, colors at half resolution: on a section map, 2 to 4 times smaller than the PNG
 JPG_MAX_SIDE_PX = 65500                       # the JPEG format cannot hold a picture more than 65,535 pixels on a side
 SVG_PICTURE_DPI = 200                         # the pictures inside a saved SVG (the blank and gray cells): a picture costs the same however many cells it holds, so a big one loses to vector dots below about 70,000 cells
@@ -35,6 +36,28 @@ LEGEND_MAX_ROWS = 400          # the most groups a saved legend lists (the large
 
 def hexcolor(rgb):
     return "#%02x%02x%02x" % tuple(int(v) for v in rgb)
+
+
+def thinner(handles, k):
+    """Legend handles whose outlines are `k` times as wide (copies: a marker's outline is a width in points, which a legend's markerscale leaves alone)."""
+    import copy
+    out = []
+    for h in handles:
+        h = copy.copy(h)
+        if hasattr(h, "set_markeredgewidth") and k != 1.0:
+            h.set_markeredgewidth(h.get_markeredgewidth() * k)
+        out.append(h)
+    return out
+
+
+def parse_resolution(text):
+    """The choice picked or typed in the "Resolution" box: ('scale', n) for a multiple of the standard pixels (the "2x" in 'High (2x)'; 1 for Standard or
+    anything not understood), or ('px', n) for a number typed, the pixels across each panel."""
+    text = (text or "").strip().lower()
+    if text.replace(",", "").isdigit() and int(text.replace(",", "")) >= 1:
+        return "px", int(text.replace(",", ""))
+    m = re.search(r"(\d+(?:\.\d+)?)\s*x", text)
+    return "scale", (float(m.group(1)) if m and float(m.group(1)) > 0 else 1.0)
 
 
 def parse_panels_across(text):
@@ -105,7 +128,9 @@ class ExportsMixin:
 
     def ask_image_format(self, title, svg_note, panels_across=False, summary=None, parent=None):
         """"png", "jpg" or "svg", chosen in a small dialog over `parent` (the window by default; None is returned if it was cancelled or closed). The last
-        choice made in this window is offered first. `svg_note` is added under the SVG choice."""
+        choice made in this window is offered first. `svg_note` is added under the SVG choice. With `panels_across` (the section maps), the layout and the
+        resolution, which are the same whatever the format, are chosen first, and the format's own description (from `summary`, see section_map_summary)
+        is under each format."""
         import tkinter as tk
         from tkinter import ttk
         owner = parent or self.root
@@ -116,37 +141,55 @@ class ExportsMixin:
         var = tk.StringVar(dlg, getattr(self, "export_format", "png") if getattr(self, "export_format", "png") in ("png", "jpg", "svg") else "png")
         box = ttk.Frame(dlg, padding=16)
         box.pack()
-        ttk.Label(box, text="Save as:").pack(anchor="w")
-        ttk.Radiobutton(box, text="PNG: a picture", value="png", variable=var).pack(anchor="w", pady=(6, 0))
-        png_info = tk.StringVar(dlg, "")                 # (what the picture will be, under its choice; the SVG's goes at the end of its description)
-        if summary is not None:
-            ttk.Label(box, textvariable=png_info, foreground="gray30", wraplength=340, justify=tk.LEFT).pack(anchor="w", padx=(22, 0))
-        ttk.Radiobutton(box, text="JPG: a picture in a much smaller file", value="jpg", variable=var).pack(anchor="w", pady=(4, 0))
-        jpg_info = tk.StringVar(dlg, "The same picture as the PNG, compressed: typically 2 to 4 times smaller, with slight blurring and color fringes at the edges of dots and text.")
-        ttk.Label(box, textvariable=jpg_info, foreground="gray30", wraplength=340, justify=tk.LEFT).pack(anchor="w", padx=(22, 0))
-        ttk.Radiobutton(box, text="SVG: vector graphics, for editing in a drawing program", value="svg", variable=var).pack(anchor="w", pady=(4, 0))
-        svg_info = tk.StringVar(dlg, svg_note or "")
-        if svg_note or summary is not None:
-            ttk.Label(box, textvariable=svg_info, foreground="gray30", wraplength=340, justify=tk.LEFT).pack(anchor="w", padx=(22, 0))
+        jpg_base = "Compressed: typically 2 to 4 times smaller than the PNG, with slight blurring and color fringes at the edges of dots and text."
+        layout_info, panel_info, png_info, jpg_info, svg_info = (tk.StringVar(dlg, "") for _ in range(5))
+        jpg_info.set(jpg_base)
+        svg_info.set(svg_note or "")
         across = tk.StringVar(dlg, getattr(self, "export_panels_across", PANELS_ACROSS_CHOICES[0]))
-        if panels_across:                          # (section maps: how the panels are arranged in the saved picture)
+        resolution = tk.StringVar(dlg, getattr(self, "export_resolution", RESOLUTION_CHOICES[0]))
+        legend_scales = tk.BooleanVar(dlg, bool(getattr(self, "export_legend_scales", False)))
+        note = dict(foreground="gray30", wraplength=380, justify=tk.LEFT)
+        if panels_across:                          # (section maps: the arrangement and the detail, for every format)
+            ttk.Label(box, text="Layout and resolution (for every format)", font=("Segoe UI", 9, "bold")).pack(anchor="w")
             line = ttk.Frame(box)
-            line.pack(anchor="w", pady=(12, 0))
+            line.pack(anchor="w", pady=(6, 0))
             ttk.Label(line, text="Panels across:").pack(side=tk.LEFT)
             ttk.Combobox(line, textvariable=across, values=PANELS_ACROSS_CHOICES, width=18).pack(side=tk.LEFT, padx=(8, 0))
-            ttk.Label(box, text="Auto makes the panels close to a square (taller rather than wider); the legend is under them.", foreground="gray30",
-                      wraplength=340, justify=tk.LEFT).pack(anchor="w")
-            if summary is not None:                                       # (the layout and the size of each file the choice makes, updated as it is changed)
-                def refresh(*args):
-                    try:
-                        png_text, svg_text, jpg_text = summary(across.get())
-                    except Exception:
-                        png_text, svg_text, jpg_text = "", "", ""
-                    png_info.set(png_text)
-                    svg_info.set(((svg_note + " ") if svg_note else "") + svg_text)
-                    jpg_info.set("The same picture as the PNG, compressed: typically 2 to 4 times smaller, with slight blurring and color fringes at the edges of dots and text." + jpg_text)
-                across.trace_add("write", refresh)
-                refresh()
+            ttk.Label(box, textvariable=layout_info, **note).pack(anchor="w")
+            line2 = ttk.Frame(box)
+            line2.pack(anchor="w", pady=(8, 0))
+            ttk.Label(line2, text="Resolution:").pack(side=tk.LEFT)
+            ttk.Combobox(line2, textvariable=resolution, values=RESOLUTION_CHOICES, width=18).pack(side=tk.LEFT, padx=(8, 0))
+            ttk.Label(box, text="Standard: based on Section size slider.\nHigh=2x, Very high=4x.\n"
+                                "Or type a pixel width into the box.\nApplies to PNG and JPG only.", **note).pack(anchor="w")
+            ttk.Label(box, textvariable=panel_info, **note).pack(anchor="w")
+            ttk.Checkbutton(box, text="Resolution applies to the legend too", variable=legend_scales).pack(anchor="w", pady=(4, 0))
+            ttk.Label(box, text="Off: the legend keeps its Standard pixels, so it takes a smaller part of a higher-resolution picture.", **note).pack(anchor="w")
+            ttk.Separator(box).pack(fill=tk.X, pady=(12, 8))
+        ttk.Label(box, text="Save as:", font=("Segoe UI", 9, "bold") if panels_across else None).pack(anchor="w")
+        ttk.Radiobutton(box, text="PNG: a picture", value="png", variable=var).pack(anchor="w", pady=(6, 0))
+        if summary is not None:
+            ttk.Label(box, textvariable=png_info, **note).pack(anchor="w", padx=(22, 0))
+        ttk.Radiobutton(box, text="JPG: a picture in a much smaller file", value="jpg", variable=var).pack(anchor="w", pady=(4, 0))
+        ttk.Label(box, textvariable=jpg_info, **note).pack(anchor="w", padx=(22, 0))
+        ttk.Radiobutton(box, text="SVG: vector graphics, for editing in a drawing program", value="svg", variable=var).pack(anchor="w", pady=(4, 0))
+        if svg_note or summary is not None:
+            ttk.Label(box, textvariable=svg_info, **note).pack(anchor="w", padx=(22, 0))
+        if panels_across and summary is not None:                     # (what the choices make, updated as they are changed)
+            def refresh(*args):
+                try:
+                    layout_text, panels_text, picture_text, svg_text, jpg_text = summary(across.get(), resolution.get(), legend_scales.get())
+                except Exception:
+                    layout_text = panels_text = picture_text = svg_text = jpg_text = ""
+                layout_info.set(layout_text)
+                panel_info.set(panels_text)
+                png_info.set("Lossless - perfect quality but also large files.")
+                svg_info.set(((svg_note + " ") if svg_note else "") + svg_text)
+                jpg_info.set(jpg_base + jpg_text)
+            across.trace_add("write", refresh)
+            resolution.trace_add("write", refresh)
+            legend_scales.trace_add("write", refresh)
+            refresh()
         result = []
 
         def finish(value):
@@ -173,6 +216,8 @@ class ExportsMixin:
             self.export_format = choice
             if panels_across:
                 self.export_panels_across = across.get()
+                self.export_resolution = resolution.get()
+                self.export_legend_scales = bool(legend_scales.get())
         return choice
 
     def ask_export_paths(self, fmt, stem, title, parent=None):
@@ -342,39 +387,49 @@ class ExportsMixin:
                            handleheight=1.0, labelspacing=0.4, columnspacing=1.5)
         return fig
 
-    def section_map_plan(self, choice):
+    def section_map_plan(self, choice, resolution="", legend_scales=False):
         """What a saved section map will be for this choice of panels across ('auto', 'screen' or a number): the layout, and the size of the picture.
         A panel's size in the picture follows the Section size slider and nothing else (not the window or the screen): at full width it is
-        SECTION_MAPS_FULL_WIDTH_PX pixels wide, at one half of the width half of that, and so on; its shape is the shape of the panels on the screen."""
+        SECTION_MAPS_FULL_WIDTH_PX pixels wide, at one half of the width half of that, and so on; its shape is the shape of the panels on the screen. `resolution`
+        (see parse_resolution) makes the picture sharper without changing its layout or the size of anything in it: the same page, at more dots to the inch.
+        `legend_scales`: whether the legend gets the resolution too; if not, it keeps the pixels it has at Standard (so it is smaller on the page, and takes a
+        smaller part of the picture): "legend_k" is the factor its sizes on the page are multiplied by (1/scale), "band_std" its band's height at Standard."""
         dpi = self.host["SECTION_MAPS_SAVE_DPI"]
         n = len(self.tiles)
         screen_w, screen_h = self.tiles[0]["pc"].size()
         pw_px = round(SECTION_MAPS_FULL_WIDTH_PX / max(1, self.tile_cols))
         ph_px = round(pw_px * screen_h / screen_w)
         pw_in, ph_in = pw_px / dpi, ph_px / dpi
+        kind, amount = parse_resolution(resolution)
+        scale = min(max(amount if kind == "scale" else amount / pw_px, 0.1), 40.0)
+        out_dpi = dpi * scale
         legend = self.section_legend()                                  # (what the view on the screen says its colors are: a band under the panels)
         cols = section_map_columns(n, pw_in, ph_in, choice, max(1, self.tile_cols))
         rows = -(-n // cols)
         width = cols * (pw_in + PANEL_PAD_IN)
-        band_h = self.legend_band_height(legend, width)
+        band_std = self.legend_band_height(legend, width)
+        legend_k = 1.0 if legend_scales else 1.0 / scale
+        band_h = band_std * legend_k
         height = rows * (ph_in + PANEL_PAD_IN + PANEL_TITLE_IN) + band_h
-        return {"cols": cols, "rows": rows, "pw_in": pw_in, "ph_in": ph_in, "width": width, "height": height, "band_h": band_h, "legend": legend,
-                "panel_px": (pw_px, ph_px), "px": (round(width * dpi), round(height * dpi))}
+        return {"cols": cols, "rows": rows, "pw_in": pw_in, "ph_in": ph_in, "width": width, "height": height, "band_h": band_h, "band_std": band_std, "legend_k": legend_k, "legend": legend,
+                "panel_px": (round(pw_px * scale), round(ph_px * scale)), "px": (round(width * out_dpi), round(height * out_dpi)), "dpi": out_dpi, "scale": scale}
 
-    def section_map_summary(self, choice_text):
-        """(the PNG's line, the SVG's line) the save dialog shows for this choice of panels across: the layout and the size of each file."""
-        plan = self.section_map_plan(parse_panels_across(choice_text))
+    def section_map_summary(self, choice_text, resolution_text="", legend_scales=False):
+        """The texts the save dialog shows for this choice of panels across and resolution, each under what it belongs to: (the layout, which every format has;
+        the panels' pixels and the whole picture's, for the PNG and the JPG alike; the SVG's page; the JPG's warning, if it is too big)."""
+        plan = self.section_map_plan(parse_panels_across(choice_text), resolution_text, legend_scales)
         w_px, h_px = plan["px"]
         mp = w_px * h_px / 1e6
-        png = (f"{plan['cols']} panel{'s' if plan['cols'] > 1 else ''} across and {plan['rows']} down" + (", the legend under them" if plan["band_h"] else "") + ". "
-               f"Each panel is {plan['panel_px'][0]:,} x {plan['panel_px'][1]:,} pixels (set by the Section size slider, not by the window). "
-               f"The picture is {w_px:,} x {h_px:,} pixels ({mp:.0f} megapixels, about {w_px * h_px * 4 / 1e6:,.0f} MB of memory to make).")
+        layout = f"{plan['cols']} panel{'s' if plan['cols'] > 1 else ''} across and {plan['rows']} down" + (", legend below" if plan["band_h"] else "") + "."
+        panels = (f"Each panel is {plan['panel_px'][0]:,} x {plan['panel_px'][1]:,} pixels\n"
+                  + f"Overall PNG or JPG is {w_px:,} x {h_px:,} pixels.")
         if mp > 250:
-            png += " That is very large: use more panels across, or a smaller Section size."
-        svg = f"The page is {plan['width']:.1f} x {plan['height']:.1f} inches."
-        jpg = (f" This one is too big for a JPG, which can be at most {JPG_MAX_SIDE_PX:,} pixels on a side: use more panels across, or a smaller Section size."
+            panels += " That is very large: recommend using more panels across, a smaller Section size, or a lower resolution."
+        picture = ""
+        svg = f"The page is {plan['width']:.1f} x {plan['height'] - plan['band_h'] + plan['band_std']:.1f} inches; the resolution does not apply (only the gray pictures inside it have one)."
+        jpg = (f" Too big for a JPG, which can be at most {JPG_MAX_SIDE_PX:,} pixels on a side: use more panels across, a smaller Section size, or a lower resolution."
                if max(w_px, h_px) > JPG_MAX_SIDE_PX else "")
-        return png, svg, jpg
+        return layout, panels, picture, svg, jpg
 
     def gene_cmap(self):
         """The colormap of a single gene in the theme on the screen."""
@@ -421,25 +476,26 @@ class ExportsMixin:
             return 1.3
         return 0.5 + 0.26 * len(spec["rows"])
 
-    def draw_legend_band(self, fig, spec, fw, fh, band_h):
-        """The legend in the band along the bottom of the figure (band_h inches high)."""
+    def draw_legend_band(self, fig, spec, fw, fh, band_h, k=1.0):
+        """The legend in the band along the bottom of the figure (band_h inches high). `k`: everything in it (type, symbols, the colorbar) is this
+        times its usual size on the page, with the same arrangement (1/scale: the legend keeps its pixels at a higher resolution)."""
         from matplotlib.lines import Line2D
         ax = fig.add_axes([0, 0, 1, band_h / fh])
         ax.axis("off")
         if spec["kind"] == "groups":
             ncol = self.legend_grid(spec, fw)[0]
-            ax.legend(handles=spec["handles"], loc="upper left", bbox_to_anchor=(0.01, 0.98), ncol=ncol, frameon=False, fontsize=10, title=spec["title"],
-                      title_fontsize=11, handlelength=1.0, handleheight=1.0, labelspacing=0.4, columnspacing=1.5, alignment="left")
+            ax.legend(handles=thinner(spec["handles"], k), loc="upper left", bbox_to_anchor=(0.01 * k, 0.98), ncol=ncol, frameon=False, fontsize=10 * k, markerscale=k, title=spec["title"],
+                      title_fontsize=11 * k, handlelength=1.0, handleheight=1.0, labelspacing=0.4, columnspacing=1.5, alignment="left")
         elif spec["kind"] == "colorbar":
             from matplotlib.cm import ScalarMappable
             from matplotlib.colors import Normalize
-            cax = fig.add_axes([0.5 / fw, 0.45 / fh, min(0.4 * fw, 8.0) / fw, 0.2 / fh])
+            cax = fig.add_axes([0.5 * k / fw, 0.45 * k / fh, min(0.4 * fw, 8.0) * k / fw, 0.2 * k / fh])
             cb = fig.colorbar(ScalarMappable(norm=Normalize(spec["vmin"], spec["vmax"]), cmap=spec["cmap"]), cax=cax, orientation="horizontal")
-            cb.set_label(f"{spec['gene']}   ({spec['units']})", fontsize=11)
-            cb.ax.tick_params(labelsize=10)
+            cb.set_label(f"{spec['gene']}   ({spec['units']})", fontsize=11 * k)
+            cb.ax.tick_params(labelsize=10 * k)
         else:
-            ax.legend(handles=[Line2D([0], [0], marker="o", linestyle="", color=color, label=f"{g} ({name})   {rng}") for g, color, name, rng in spec["rows"]],
-                      loc="upper left", bbox_to_anchor=(0.01, 0.98), frameon=False, fontsize=10, alignment="left")
+            ax.legend(handles=thinner([Line2D([0], [0], marker="o", linestyle="", color=color, label=f"{g} ({name})   {rng}") for g, color, name, rng in spec["rows"]], k),
+                      loc="upper left", bbox_to_anchor=(0.01 * k, 0.98), frameon=False, fontsize=10 * k, markerscale=k, alignment="left")
 
     def legend_handles(self, cat, sort="id"):
         from matplotlib.lines import Line2D
@@ -525,10 +581,10 @@ class ExportsMixin:
             self.var_status.set("Save section maps cancelled.")
             return
         if fmt == "jpg":
-            big = max(self.section_map_plan(parse_panels_across(getattr(self, "export_panels_across", "")))["px"])
+            big = max(self.section_map_plan(parse_panels_across(getattr(self, "export_panels_across", "")), getattr(self, "export_resolution", ""), getattr(self, "export_legend_scales", False))["px"])
             if big > JPG_MAX_SIDE_PX:
                 self.var_status.set(f"A JPG can be at most {JPG_MAX_SIDE_PX:,} pixels on a side and this picture would be {big:,}: use more panels across, "
-                                    "a smaller Section size, or a PNG.")
+                                    "a smaller Section size, a lower resolution, or a PNG.")
                 return
         roi_only = "_ROI_only" if self.var_roi_only.get() else ""        # (the ROI only box above the panels: the name says what the maps show)
         ccf = "_CCF-overlay" if any(t["pc"].outlines for t in self.tiles) else ""        # (and the CCF atlas box)
@@ -541,10 +597,12 @@ class ExportsMixin:
             written = []
             n = len(self.tiles)
             pw_px, ph_px = self.tiles[0]["pc"].size()
-            plan = self.section_map_plan(parse_panels_across(getattr(self, "export_panels_across", "")))
-            legend, cols, rows, pw_in, ph_in, band_h = plan["legend"], plan["cols"], plan["rows"], plan["pw_in"], plan["ph_in"], plan["band_h"]
+            plan = self.section_map_plan(parse_panels_across(getattr(self, "export_panels_across", "")), getattr(self, "export_resolution", ""), getattr(self, "export_legend_scales", False))
+            legend, cols, rows, pw_in, ph_in = plan["legend"], plan["cols"], plan["rows"], plan["pw_in"], plan["ph_in"]
             pad, row_extra = PANEL_PAD_IN, PANEL_TITLE_IN
             for fmt, chosen in paths.items():             # (each format is made on its own: the SVG holds its gray cells as pictures)
+                legend_k = 1.0 if fmt == "svg" else plan["legend_k"]            # (an SVG has no resolution: its legend is as usual)
+                band_h = plan["band_std"] * legend_k
                 fig = Figure(figsize=(cols * (pw_in + pad), rows * (ph_in + pad + row_extra) + band_h))
                 FigureCanvasAgg(fig)
                 fw, fh = fig.get_size_inches()
@@ -616,10 +674,10 @@ class ExportsMixin:
                         ax.text(bx0 + um / 2000, by - 0.01 * view_mm, f"{um:g} µm" if um < 1000 else f"{um / 1000:g} mm", color=ink, fontsize=8,
                                 ha="center", va="bottom")
                 if legend is not None:
-                    self.draw_legend_band(fig, legend, fw, fh, band_h)
+                    self.draw_legend_band(fig, legend, fw, fh, band_h, legend_k)
                 self.var_status.set(f"Saving {fmt}...")
                 self.root.update()
-                fig.savefig(chosen, dpi=h["SECTION_MAPS_SAVE_DPI"], **({"pil_kwargs": JPG_ARGS} if fmt == "jpg" else {}))         # (for an SVG the dpi is that of the pictures in it)
+                fig.savefig(chosen, dpi=h["SECTION_MAPS_SAVE_DPI"] if fmt == "svg" else plan["dpi"], **({"pil_kwargs": JPG_ARGS} if fmt == "jpg" else {}))         # (for an SVG the dpi is that of the pictures in it)
                 written.append(chosen)
             folders = list(dict.fromkeys(str(p.parent) for p in written))
             self.var_status.set(f"Saved {', '.join(p.name for p in written)} to {' and '.join(folders)} "

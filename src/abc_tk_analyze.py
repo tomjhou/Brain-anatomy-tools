@@ -9,6 +9,7 @@ import hashlib
 import re
 import textwrap
 import threading
+import types
 import time
 import tkinter as tk
 from tkinter import ttk
@@ -217,49 +218,122 @@ def group_means_panel(counts_matrix, codes, n_groups):
     return (sums / np.maximum(n, 1.0)[:, None]).T.astype(np.float32)
 
 
-def group_means_imputed(path, positions, level_codes, progress, cancelled, block_genes=IMPUTED_BLOCK_GENES):
+def group_means_imputed(path, positions, level_codes, progress, cancelled, block_genes=IMPUTED_BLOCK_GENES, gene_limit=None, workers=None):
     """The mean linear expression (2**v - 1 of the stored log2 values) of every gene of the imputed file in every group, at every group type
     at once: {level: genes x groups}, or None if cancelled. `positions`: each run cell's row in the file (-1: not in it); `level_codes`:
     {level: (the group of each run cell, how many groups)}.
-    The file is stored in blocks of 50,000 cells by 5 genes, and reading is what takes the time, so only the blocks that hold run cells are read
-    (the run's cells are a few sections of the file's 87 blocks of cells), a block of genes at a time, once for all the group types."""
-    import h5py
-    import scipy.sparse as sp
+    The file is stored in blocks of 50,000 cells by 5 genes, and reading (decompressing) is what takes the time, so only the blocks that hold run cells are
+    read, a block of genes at a time, once for all the group types. Done by several helper processes when it can be (see group_means_parallel: a read of every
+    cell of the atlas takes many minutes on one core), else here. `gene_limit`: only the first genes (for tests); `workers`: how many helpers (1: none)."""
+    import imputed_means_worker as reader
+    levels = list(level_codes)
+    codes_list = [level_codes[k][0] for k in levels]
+    n_groups_list = [level_codes[k][1] for k in levels]
+    n_workers = workers if workers is not None else parallel_workers()
+    sums = False                                                 # (False: not read yet, or the helpers failed; None: cancelled)
+    if n_workers > 1:
+        try:
+            sums = group_sums_parallel(path, positions, codes_list, n_groups_list, progress, cancelled, block_genes, gene_limit, n_workers)
+        except Exception as e:
+            print(f"The parallel read of the imputed genes failed ({e}); reading them in this process instead.", flush=True)
+            sums = False
+        if sums is None:
+            return None                                          # (cancelled)
+    if sums is False:                                            # (one process: this one)
+        import h5py
+        with h5py.File(path, "r") as f:
+            n_genes = f["X"].shape[1] if gene_limit is None else min(gene_limit, f["X"].shape[1])
+        prepared = reader.prepare(positions, codes_list, n_groups_list)
+        sums = np.zeros((prepared[4], n_genes), np.float32)
+
+        def sink(g0, g1, acc):
+            sums[:, g0:g1] = acc
+
+        if not reader.read_blocks(path, prepared, reader.gene_block_list(n_genes, block_genes), sink, lambda done, of: progress(done / of), cancelled):
+            return None
     valid = np.flatnonzero(positions >= 0)
-    rows_in_file = positions[valid]
-    offsets, total = {}, 0
-    for level, (_codes, n_groups) in level_codes.items():
-        offsets[level] = total
-        total += n_groups
-    r_idx, c_idx = [], []
-    for level, (codes, _n) in level_codes.items():           # one indicator for all the types, the groups of each under those of the one before
-        c = codes[valid]
-        ok = np.flatnonzero(c >= 0)
-        r_idx.append(c[ok] + offsets[level])
-        c_idx.append(ok)
-    indicator = sp.csc_matrix((np.ones(sum(len(r) for r in r_idx)), (np.concatenate(r_idx), np.concatenate(c_idx))), shape=(total, len(valid)))
-    n_cells = np.asarray(indicator.sum(axis=1)).ravel()
+    n_cells = np.concatenate([np.bincount(c[valid][c[valid] >= 0], minlength=n) for c, n in zip(codes_list, n_groups_list)]).astype(np.float32)
+    means = (sums / np.maximum(n_cells, 1.0)[:, None]).T.astype(np.float32)           # genes x all the groups
+    out, at = {}, 0
+    for k, n in zip(levels, n_groups_list):
+        out[k] = np.ascontiguousarray(means[:, at:at + n])
+        at += n
+    return out
+
+
+def parallel_workers():
+    """How many helper processes the read of the imputed file uses: a few fewer than the cores (the window and the rest of the PC keep some), at most 8 (the disk is
+    shared); 1 (none) when this is a packaged program (it cannot run a script as a helper) or the helper script is missing."""
+    import os
+    import sys
+    if getattr(sys, "frozen", False) or not Path(__file__).with_name("imputed_means_worker.py").exists():
+        return 1
+    return max(1, min(8, (os.cpu_count() or 2) - 2))
+
+
+def group_sums_parallel(path, positions, codes_list, n_groups_list, progress, cancelled, block_genes, gene_limit, n_workers):
+    """The sums of the linear expression of each gene in each group (groups x genes), read by `n_workers` helper processes (imputed_means_worker.py), each doing
+    every Nth block of genes and writing its sums into one shared file; progress(fraction) as they go. None if cancelled; raises if a helper fails (the caller
+    then reads in this process)."""
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+    import h5py
     with h5py.File(path, "r") as f:
-        x = f["X"]
-        size, n_genes = x.chunks[0], x.shape[1]
-        block_of = rows_in_file // size
-        blocks = []
-        for b in np.unique(block_of):
-            pick = np.flatnonzero(block_of == b)
-            blocks.append((int(b) * size, min((int(b) + 1) * size, x.shape[0]), rows_in_file[pick] - int(b) * size, indicator[:, pick]))
-        sums = np.zeros((total, n_genes), np.float32)
-        for g0 in range(0, n_genes, block_genes):
+        n_genes = f["X"].shape[1] if gene_limit is None else min(gene_limit, f["X"].shape[1])
+    n_blocks = len(range(0, n_genes, block_genes))
+    n_workers = max(1, min(n_workers, n_blocks))
+    total = int(sum(n_groups_list))
+    folder = Path(tempfile.mkdtemp(prefix="abc_imputed_means_"))
+    processes = []
+    try:
+        job = {"path": np.asarray(str(path)), "n_groups": np.asarray(n_groups_list, np.int64), "positions": np.asarray(positions, np.int64),
+               "block_genes": np.asarray(block_genes)}
+        for i, codes in enumerate(codes_list):
+            job[f"codes_{i}"] = np.asarray(codes, np.int32)
+        np.savez(folder / "job.npz", **job)
+        sums_path = folder / "sums.npy"
+        mm = np.lib.format.open_memmap(sums_path, mode="w+", dtype=np.float32, shape=(total, n_genes))
+        del mm
+        flags = 0x08000000 | 0x00004000 if sys.platform == "win32" else 0         # (no console window, and below normal priority: the window stays responsive)
+        script = str(Path(__file__).with_name("imputed_means_worker.py"))
+        for k in range(n_workers):
+            err = open(folder / f"err_{k}.txt", "w")
+            processes.append((subprocess.Popen([sys.executable, script, str(folder / "job.npz"), str(sums_path), str(k), str(n_workers), str(folder / f"progress_{k}.txt")],
+                                               stdout=subprocess.DEVNULL, stderr=err, creationflags=flags), err))
+        while True:
             if cancelled():
                 return None
-            g1 = min(g0 + block_genes, n_genes)
-            acc = np.zeros((total, g1 - g0), np.float32)
-            for r0, r1, local, ind in blocks:
-                linear = np.exp2(x[r0:r1, g0:g1][local].astype(np.float32)) - 1.0
-                acc += ind @ linear
-            sums[:, g0:g1] = acc
-            progress(g1 / n_genes)
-    means = (sums / np.maximum(n_cells, 1.0)[:, None]).T.astype(np.float32)           # genes x all the groups
-    return {level: np.ascontiguousarray(means[:, offsets[level]:offsets[level] + n_groups]) for level, (_c, n_groups) in level_codes.items()}
+            done = 0
+            for k in range(n_workers):
+                try:
+                    done += int((folder / f"progress_{k}.txt").read_text() or 0)
+                except (OSError, ValueError):
+                    pass
+            progress(min(done / n_blocks, 0.999))
+            codes = [p.poll() for p, _e in processes]
+            if any(c not in (None, 0) for c in codes):
+                for _p, e in processes:
+                    e.flush()
+                message = next((t for t in ((folder / f"err_{k}.txt").read_text().strip() for k in range(n_workers)) if t), "a helper process stopped")
+                raise RuntimeError(message.splitlines()[-1][:200])
+            if all(c == 0 for c in codes):
+                break
+            time.sleep(0.3)
+        progress(1.0)
+        return np.array(np.load(sums_path, mmap_mode="r"))
+    finally:
+        for p, e in processes:
+            if p.poll() is None:
+                p.kill()
+            p.wait()
+            e.close()
+        for _ in range(25):                                      # (a killed helper lets go of its files a moment later)
+            shutil.rmtree(folder, ignore_errors=True)
+            if not folder.exists():
+                break
+            time.sleep(0.2)
 
 
 def save_means(path, data):
@@ -345,7 +419,7 @@ class AnalyzeWindow:
         self.var_genes_hint = tk.StringVar(top, "")
         self.genes_hint = ttk.Label(page, textvariable=self.var_genes_hint, foreground="#b3261e", wraplength=250, justify=tk.LEFT)     # (under the box, where it is seen; the status is at the foot of the window)
         self.var_main_only = tk.BooleanVar(top, False)
-        self.chk_main_only = ttk.Checkbutton(page, text="Only the groups in the main window", variable=self.var_main_only, command=self.update_labels)
+        self.chk_main_only = ttk.Checkbutton(page, text="Only the groups in the"+chr(10)+"main window", variable=self.var_main_only, command=self.update_labels)
         self.chk_main_only.pack(anchor="w", pady=(8, 0))
         self.var_cells_of = tk.StringVar(top, "")
         self.cells_of_label = ttk.Label(page, textvariable=self.var_cells_of, foreground="gray30", wraplength=250, justify=tk.LEFT)
@@ -360,7 +434,7 @@ class AnalyzeWindow:
         plot_box.pack(fill=tk.X, pady=(8, 0))
         ttk.Radiobutton(plot_box, text="Per cell", value="cell", variable=self.var_per, command=self.per_changed).pack(anchor="w")
         ttk.Radiobutton(plot_box, text="Per group", value="group", variable=self.var_per, command=self.per_changed).pack(anchor="w")
-        self.chk_exclude = ttk.Checkbutton(plot_box, text=f"Exclude groups with <{MIN_PLOTTED_GROUP_CELLS} cells", variable=self.var_exclude_small, command=self.redraw)
+        self.chk_exclude = ttk.Checkbutton(plot_box, text=f"Exclude groups with\n<{MIN_PLOTTED_GROUP_CELLS} cells", variable=self.var_exclude_small, command=self.redraw)
         self.chk_jitter = ttk.Checkbutton(page, text="Jitter counts", variable=self.var_jitter, command=self.redraw)
         self.chk_jitter.pack(anchor="w", pady=(6, 0))
         from abc_tk_umap import HoverTip                  # (the viewer's own tip; imported here, as that module imports this one)
@@ -408,14 +482,24 @@ class AnalyzeWindow:
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.fig = Figure(figsize=(9.0, 8.4), dpi=100)
         self.ax = self.fig.add_subplot(111)
-        self.ax.text(0.5, 0.5, "Choose groups and genes, then click Analyze.", ha="center", va="center", color="gray", transform=self.ax.transAxes)
+        self.placeholder = self.fig.text(0.5, 0.5, "Choose groups and genes, then click Analyze.", ha="center", va="center", color="gray")      # (of the figure, not the axes: they are a square with margins, off the center)
         self.ax.set_axis_off()
         self.hover = None                       # what the pointer can be over (see plot_expression, plot_selectivity)
         self.background = None
         self.last_motion = 0.0
         self.hover_group = None
         self.canvas = FigureCanvasTkAgg(self.fig, master=right)
+        self.saving = False                     # while a file is being saved (see fit_figure)
+        self.fit_job = None
+        top.bind("<Map>", self.fit_figure_soon, add="+")              # (the window appears, moves to another screen, or is resized: the figure is the pane's size)
+        top.bind("<Configure>", self.fit_figure_soon, add="+")
+        top.after(400, self.fit_figure_soon)
         self.table = None                       # the numbers of the graph on the screen (a DataFrame), for Export CSV
+        self.plot_genes = None                  # the genes of the expression plot on the screen (None for another kind), for the saved files' names
+        self.plot_level = None                  # the group type of the plot on the screen (its name, as the box says it), for the saved files' names
+        self.plot_scale = None                  # "log" or "linear": the scale of the expression plot on the screen
+        self.plot_source = None                 # "imputed_genes" or "panel_genes" for the expression plot on the screen
+        self.plot_groups = None                 # the groups of the selectivity plot on the screen (their numbers, or names where there are none), likewise
         self.last_plot = None                   # the arguments of the plot on the screen (a checkbox draws it again)
         self.cax = None
         self.legend_room = False                # the plot leaves room at the right for a legend
@@ -438,6 +522,15 @@ class AnalyzeWindow:
         self.update_labels()
         self.canvas.draw()
 
+    def file_stem(self):
+        """'analysis_graph', with the genes of an expression plot, or the groups of a selectivity plot, after it, joined with underscores
+        (analysis_graph_subclass_Gad1_Slc17a7_panel_genes, analysis_graph_subclass_123_45): the group type comes first, and an expression plot's ends with
+        imputed_genes or panel_genes and then log or linear (the scale of the axes)."""
+        names = [re.sub(r"[^\w.+-]+", "-", str(g)).strip("-") for g in (self.plot_genes or self.plot_groups or [])]
+        tail = ([self.plot_source] if self.plot_source else []) + ([self.plot_scale] if self.plot_scale else []) if self.plot_genes else []
+        level = re.sub(r"[^\w.+-]+", "-", str(self.plot_level or "")).strip("-").lower()
+        return "_".join(["analysis_graph"] + ([level] if level else []) + [n for n in names if n] + tail)
+
     def export_csv(self):
         """Save the numbers of the graph on the screen as a CSV file: per cell, one row for each cell plotted (its group and the two values, and the
         jittered positions it was drawn at); per group, one row for each group (the cells and the two means); Selectivity, one row for each gene."""
@@ -445,7 +538,7 @@ class AnalyzeWindow:
         if self.table is None:
             self.var_status.set("Click Analyze first: there is no graph to export.")
             return
-        proposed = v.host["unique_export_paths"](v.target_dir(), "analysis_graph", (".csv",))[".csv"].name
+        proposed = v.host["unique_export_paths"](v.target_dir(), self.file_stem(), (".csv",))[".csv"].name
         path = v.ask_save_path("Export the graph's data", proposed, ".csv", "CSV file", parent=self.top)
         if path is None:
             self.var_status.set("Export CSV cancelled.")
@@ -467,7 +560,7 @@ class AnalyzeWindow:
         if fmt is None:
             self.var_status.set("Save graph cancelled.")
             return
-        paths = v.ask_export_paths(fmt, "analysis_graph", "Save the graph", parent=self.top)
+        paths = v.ask_export_paths(fmt, self.file_stem(), "Save the graph", parent=self.top)
         if paths is None:
             self.var_status.set("Save graph cancelled.")
             return
@@ -475,6 +568,7 @@ class AnalyzeWindow:
         self.top.config(cursor="watch")
         self.var_status.set("Saving the graph...")
         self.top.update()
+        self.saving = True
         try:
             from abc_tk_umap_export import JPG_ARGS
             self.hide_hover()
@@ -483,6 +577,7 @@ class AnalyzeWindow:
         except Exception as e:
             self.var_status.set(f"Could not save the graph: {e}")
             print(f"Could not save the graph: {e}", flush=True)
+        self.saving = False
         self.top.config(cursor="")
 
     # ---- the boxes and the choices above the tabs
@@ -494,8 +589,8 @@ class AnalyzeWindow:
         ttk.Label(page, text="Genes from:", foreground="gray30").pack(anchor="w")          # (above the two, which would not fit beside it)
         row = ttk.Frame(page)
         row.pack(anchor="w", pady=(0, 6))
-        for value, text in (("panel", "Panel gene"), ("imputed", "Imputed gene")):
-            ttk.Radiobutton(row, text=text, value=value, variable=self.var_source[tab], command=lambda t=tab: self.source_changed(t)).pack(side=tk.LEFT, padx=(0, 10))
+        for value, text in (("panel", "Panel gene"), ("imputed", "Imputed gene")):                  # (one above the other: side by side the second was cut off)
+            ttk.Radiobutton(row, text=text, value=value, variable=self.var_source[tab], command=lambda t=tab: self.source_changed(t)).pack(anchor="w")
 
     def imputed(self, tab):
         return self.var_source[tab].get() == "imputed"
@@ -718,6 +813,11 @@ class AnalyzeWindow:
 
     def plot_expression(self, level, codes, chosen, uniques, typed, genes, values, imputed, scale, per):
         gx, gy = genes
+        self.plot_level = self.v.level_names[level]
+        self.plot_scale = "log" if scale == "log" else "linear"
+        self.plot_genes = [gx, gy]                          # (the saved graph's and CSV's names say which genes, and whether they are imputed ones)
+        self.plot_source = "imputed_genes" if imputed else "panel_genes" if self.v.own is None else None          # (a dataset of the user's own has just its genes)
+        self.plot_groups = None
         vx, vy = values
         ok = np.isfinite(vx) & np.isfinite(vy)
         position = {g: i for i, g in enumerate(chosen)}
@@ -728,6 +828,7 @@ class AnalyzeWindow:
         if self.cax is not None:
             self.cax.remove()
             self.cax = None
+        self.clear_placeholder()
         ax.clear()
         ax.set_axis_on()
         self.home_view = None                               # (the new plot's own limits are not held to the old plot's)
@@ -918,10 +1019,13 @@ class AnalyzeWindow:
 
         def poll():
             if not state["done"]:
-                self.var_status.set(f"Reading {label}: {state['progress'] * 100:.0f}%  ({time.perf_counter() - started:.0f} s)")
+                report = f"Reading {label}: {state['progress'] * 100:.0f}%  ({time.perf_counter() - started:.0f} s)"
+                self.var_status.set(report)
+                self.working.config(text="Working..."+"\n\n"+report.replace(" (the first", "\n(the first")+"\n\nClick Cancel to stop.", justify=tk.CENTER)       # (on the graph too: that is where the eye is)
                 self.top.after(300, poll)
                 return
             self.job = None
+            self.working.config(text="Working...")
             self.btn_analyze.config(text="Analyze")
             if state["error"] is not None:
                 self.var_status.set(f"Could not read the genes: {state['error']}")
@@ -953,8 +1057,13 @@ class AnalyzeWindow:
         if self.cax is not None:
             self.cax.remove()
             self.cax = None
+        self.clear_placeholder()
         ax.clear()
         ax.set_axis_on()
+        self.plot_level = self.v.level_names[level]
+        self.plot_scale = None
+        self.plot_genes = None                              # (a selectivity plot is of every gene: the names have its groups instead)
+        self.plot_groups = [(re.match(r"^\s*(\d+)", str(uniques[t])) or [None, str(uniques[t]).strip()])[1] for t in target_list(target)]
         self.home_view = None
         self.hover = None
         self.hover_group = None
@@ -1087,6 +1196,12 @@ class AnalyzeWindow:
         self.place_axes()                                         # (the tick labels change width: the margin follows)
         self.canvas.draw_idle()
 
+    def clear_placeholder(self):
+        """The text on the blank plot, before the first analysis, goes."""
+        if getattr(self, "placeholder", None) is not None:
+            self.placeholder.remove()
+            self.placeholder = None
+
     def place_axes(self):
         """The graph is a square, as big as the window allows: its side is the smaller of the room across and the room down (margins for the
         labels, and at the right for a legend when there is one)."""
@@ -1108,6 +1223,26 @@ class AnalyzeWindow:
             left, bottom, right, top = left + over[0], bottom + over[1], right + over[2], top + over[3]
 
     # ---- the pointer over a per-cell plot: the cell's group in a tip, and a plus on every cell of that group
+
+    def fit_figure(self):
+        """Make the figure the size of its pane. On a scaled screen the figure grows (by the screen's scaling) when the window first appears, after it was sized to the
+        pane, and no resize follows, so the graph and the note on it sat off center and past the edges until the window was resized. Not while a file is being
+        saved: the figure is then drawn at the file's resolution (the draw events of a save are not the pane's)."""
+        if self.saving or not self.top.winfo_exists():
+            return
+        widget = self.canvas.get_tk_widget()
+        w, h = widget.winfo_width(), widget.winfo_height()
+        if w > 1 and h > 1 and (abs(self.fig.bbox.width - w) > 2 or abs(self.fig.bbox.height - h) > 2):
+            self.canvas.resize(types.SimpleNamespace(width=w, height=h))
+
+    def fit_figure_soon(self, _event=None):
+        if self.fit_job is not None:
+            self.top.after_cancel(self.fit_job)
+        self.fit_job = self.top.after(120, self.run_fit_figure)
+
+    def run_fit_figure(self):
+        self.fit_job = None
+        self.fit_figure()
 
     def on_draw(self, _event):
         """The figure was drawn: keep it as the background the tip and the plusses are blitted onto."""

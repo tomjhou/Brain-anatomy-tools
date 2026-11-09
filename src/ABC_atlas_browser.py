@@ -414,6 +414,7 @@ DEFAULT_VIEWER_SETTINGS = {
     'hover_enabled': True,
     'gene456_shape': 'small circle',
     'umap_circle_size': 'Default',
+    'colorize_other_cells': True,   # in a neuron project the non-neurons (and in a non-neuron project the neurons) of the section maps are colored too; off: always gray
     'group_colors': 'cycle',        # 'cycle': every group colored, the look repeating past 400; 'lineage': a group's color comes from its parent's
     # Itself a setting, with a deliberately asymmetric persistence rule —
     # see load_viewer_settings/save_viewer_settings's own docstrings.
@@ -454,6 +455,8 @@ def load_viewer_settings():
             settings['gene456_shape'] = on_disk['gene456_shape']
         if on_disk.get('umap_circle_size') in UMAP_CIRCLE_SIZE_REGISTRY:
             settings['umap_circle_size'] = on_disk['umap_circle_size']
+        if 'colorize_other_cells' in on_disk:
+            settings['colorize_other_cells'] = bool(on_disk['colorize_other_cells'])
         if on_disk.get('group_colors') in ('cycle', 'lineage'):
             settings['group_colors'] = on_disk['group_colors']
     return settings
@@ -481,6 +484,7 @@ def save_viewer_settings(settings):
         to_write['gene456_shape'] = settings.get('gene456_shape', GENE456_SHAPE_DEFAULT)
         to_write['umap_circle_size'] = settings.get('umap_circle_size', UMAP_CIRCLE_SIZE_DEFAULT)
         to_write['group_colors'] = settings.get('group_colors', 'cycle')
+        to_write['colorize_other_cells'] = bool(settings.get('colorize_other_cells', True))
     try:
         SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
@@ -562,7 +566,7 @@ def build_common_settings_tab(tab):
     reset.bind("<ButtonPress>", hide_reset_tip, add="+")
     ttk.Label(frame, foreground="gray35", justify=tk.LEFT, wraplength=460, text=(
         "Offsets used to convert common coordinate framework (CCF) brain coordinates to standard bregma-centered (e.g. Paxinos) values. There is no exact mapping between Allen CCF "
-        "and Paxinos coordinates: the CCF has no skull, and is not known to be leveled with bregma and lambda at one height (it is pitched down about 5 degrees relative to a flat skull). "
+        "and Paxinos coordinates: the CCF has no skull, and is not leveled with bregma and lambda at one height (it is pitched down about 5 degrees relative to a flat skull). "
         "Hence, the conversion is approximate. The defaults are the International Brain Laboratory's (IBL's) estimate of bregma in the CCF, the average of five experimenters' picks of "
         "the bregma voxel. To use the bregma position of another registration instead (for example Chon et al. 2019), enter it here.")).pack(
         anchor="w", pady=(6, 0))
@@ -2562,7 +2566,7 @@ def ensure_ccf_downloaded(abc_cache, parent=None, files=CCF_FILES, what="CCF coo
             proc_fig.canvas.flush_events()
             time.sleep(0.05)
     finally:
-        plt.close(proc_fig)
+        close_processing_dialog(proc_fig)
         restore_cursors()
     if cancel_flag['cancelled']:
         print(f"The {what} download was cancelled; it continues in the background and will be there next time.")
@@ -3595,7 +3599,7 @@ def ensure_imputed_gene_dataset_loaded(imputed_state, abc_cache):
                 and imputed_state['adata'] is not None and not cancel_flag['cancelled']):
             record_load_duration('imputed_open_s', time.perf_counter() - open_phase_started)
     finally:
-        plt.close(proc_fig)
+        close_processing_dialog(proc_fig)
         restore_cursors()
 
     if cancel_flag['cancelled']:
@@ -4271,112 +4275,106 @@ def show_figure_blocking(fig):
 
 
 def show_processing_dialog(message):
-    """Non-blocking 'Processing...' popup with a progress bar and Cancel
-    button, for covering genuinely slow work (not just asking permission up
-    front, which just makes the user wait through two delays instead of
-    one). Does NOT start its own blocking event loop — the caller must
-    periodically call fig.canvas.flush_events() (e.g. while polling a
-    worker thread) to keep the window responsive and let a Cancel click
-    actually register, and is responsible for calling plt.close(fig) when
-    the work finishes or is cancelled.
+    """Non-blocking 'Processing...' popup (a Tk window, like the rest of the app) with a progress bar and Cancel button, for covering genuinely slow
+    work (not just asking permission up front, which just makes the user wait through two delays instead of one). Does NOT start its own blocking
+    event loop — the caller must periodically call win.canvas.flush_events() (e.g. while polling a worker thread) to keep the window responsive
+    and let a Cancel click actually register, and is responsible for calling close_processing_dialog(win) when the work finishes or is cancelled.
+    (The `canvas.flush_events` name is from when this was a matplotlib window: the callers still use it.)
 
-    Also attaches fig._set_pulse(position) (a sweeping "still working"
-    block for unmeasurable work) and fig._set_status(text) (a line under the
-    bar) for callers that want them.
+    Also attaches win._set_pulse(position) (a "still working" animation for unmeasurable work) and win._set_status(text) (a line under the bar) for
+    callers that want them.
 
-    Returns (fig, cancel_flag, set_progress): cancel_flag['cancelled']
-    becomes True once Cancel is clicked; set_progress(fraction) fills the
-    bar to `fraction` (0.0-1.0, clamped) — call it from the same place
-    that's already calling flush_events() in a loop, since set_progress
-    itself only updates the bar's geometry (via draw_idle()) rather than
-    forcing a repaint. set_progress(None) resets the bar to empty, for
-    work whose progress isn't (yet) known."""
-    # Sized to the message: wrapped here (by an estimate of how many characters
-    # fit per line) and the window made tall enough for the resulting lines,
-    # instead of a fixed size that let longer messages spill over the top edge
-    # and into the progress bar. Everything is laid out in inches from the
-    # bottom up: Cancel button, progress bar, then the text.
-    import textwrap
-    fig_w_in = 6.5
-    line_h_in = UI_BUTTON_FONTSIZE * 1.35 / 72
-    chars_per_line = max(20, int(fig_w_in * 0.9 * 72 / (UI_BUTTON_FONTSIZE * 0.55)))
-    lines = [wrapped for paragraph in message.split('\n')
-             for wrapped in (textwrap.wrap(paragraph, chars_per_line) or [''])]
-    button_bottom_in, button_h_in = 0.15, 0.45
-    status_h_in = 0.3  # one line between the Cancel button and the bar, see set_status below
-    bar_bottom_in, bar_h_in = button_bottom_in + button_h_in + status_h_in, 0.26
-    text_bottom_in = bar_bottom_in + bar_h_in + 0.2
-    fig_h_in = text_bottom_in + len(lines) * line_h_in + 0.25
-
-    fig, ax = plt.subplots(figsize=(fig_w_in, fig_h_in))
-    ax.set_position([0, 0, 1, 1])
-    ax.axis('off')
-    ax.text(0.5, (text_bottom_in + len(lines) * line_h_in / 2) / fig_h_in, '\n'.join(lines),
-            ha='center', va='center', fontsize=UI_BUTTON_FONTSIZE, linespacing=1.2,
-            transform=fig.transFigure)
-
-    progress_ax = fig.add_axes([0.1, bar_bottom_in / fig_h_in, 0.8, bar_h_in / fig_h_in])
-    progress_ax.set_xlim(0, 1)
-    progress_ax.set_ylim(0, 1)
-    progress_ax.axis('off')
-    progress_ax.add_patch(Rectangle((0, 0), 1, 1, facecolor='lightgray', edgecolor='gray', linewidth=1))
-    progress_fill = Rectangle((0, 0), 0, 1, facecolor='steelblue', edgecolor='none')
-    progress_ax.add_patch(progress_fill)
-
-    def set_progress(fraction):
-        progress_fill.set_x(0.0)
-        progress_fill.set_width(0.0 if fraction is None else max(0.0, min(1.0, fraction)))
-        fig.canvas.draw_idle()
-
-    def set_pulse(position):
-        """Indeterminate "still working" animation, for work whose progress
-        can't be measured: a short block sweeping back and forth along the
-        bar. `position` increases without bound (call it with a steadily
-        growing number); each +2 is one full there-and-back sweep. Unlike
-        set_progress(None) (an empty bar, which reads as stuck), this
-        visibly moves without claiming any amount of completion."""
-        block = 0.25
-        along = 1.0 - abs((position % 2.0) - 1.0)  # triangle wave, 0 -> 1 -> 0
-        progress_fill.set_x(along * (1.0 - block))
-        progress_fill.set_width(block)
-        fig.canvas.draw_idle()
-
-    status_text = ax.text(0.5, (button_bottom_in + button_h_in + status_h_in / 2) / fig_h_in, '',
-                          ha='center', va='center', fontsize=UI_BUTTON_FONTSIZE * 0.8, color='0.3',
-                          transform=fig.transFigure)
-
-    def set_status(text):
-        """Short one-line detail under the bar (e.g. "Downloading: 3.2 of
-        50.2 GB"). Like set_progress, only updates the artist; the caller's
-        flush_events() loop does the repaint."""
-        status_text.set_text(text)
-        fig.canvas.draw_idle()
-
+    Returns (win, cancel_flag, set_progress): cancel_flag['cancelled'] becomes True once Cancel is clicked (or the window is closed);
+    set_progress(fraction) fills the bar to `fraction` (0.0-1.0, clamped); set_progress(None) resets the bar to empty, for work whose progress
+    isn't (yet) known."""
+    import tkinter as tk
+    from tkinter import ttk
+    own_root = None
+    parent = getattr(tk, '_default_root', None)
+    try:
+        if parent is not None:
+            parent.winfo_exists()
+    except tk.TclError:
+        parent = None
+    if parent is None:
+        own_root = parent = tk.Tk()
+        own_root.withdraw()
+    top = tk.Toplevel(parent)
+    top.title("Processing")
+    top.attributes('-topmost', True)
+    top.resizable(False, False)
     cancel_flag = {'cancelled': False}
 
-    def on_cancel(event):
+    def on_cancel():
         cancel_flag['cancelled'] = True
 
-    cancel_ax = fig.add_axes([0.35, button_bottom_in / fig_h_in, 0.3, button_h_in / fig_h_in])
-    cancel_button = Button(cancel_ax, 'Cancel')
-    cancel_button.label.set_fontsize(UI_BUTTON_FONTSIZE)
-    cancel_button.on_clicked(on_cancel)
-    # Keep the Button alive beyond this function's scope (see the note on
-    # this same bug elsewhere in this file) by hanging it off the figure,
-    # which the caller holds a reference to until it closes it.
-    fig._cancel_button_ref = cancel_button
-    # Extras beyond the (fig, cancel_flag, set_progress) return contract that
-    # every existing caller unpacks; reached only by callers that want them.
-    fig._set_pulse = set_pulse
-    fig._set_status = set_status
+    top.protocol("WM_DELETE_WINDOW", on_cancel)
+    frame = ttk.Frame(top, padding=(20, 16, 20, 14))
+    frame.pack()
+    ttk.Label(frame, text=message, justify='center', wraplength=460).pack(pady=(0, 12))
+    bar = ttk.Progressbar(frame, mode='determinate', length=440, maximum=1000)
+    bar.pack()
+    status = tk.StringVar(top, "")
+    ttk.Label(frame, textvariable=status, foreground='gray35').pack(pady=(6, 10))
+    ttk.Button(frame, text="Cancel", command=on_cancel).pack()
+    top.bind('<Escape>', lambda e: on_cancel())
 
-    fig.canvas.manager.set_window_title("Processing")
-    center_figure_window(fig)
-    raise_figure_window(fig)
-    fig.canvas.manager.show()
-    fig.canvas.draw_idle()
-    fig.canvas.flush_events()
-    return fig, cancel_flag, set_progress
+    animating = {'on': False}
+
+    def set_progress(fraction):
+        if animating['on']:
+            bar.stop()
+            bar.configure(mode='determinate')
+            animating['on'] = False
+        bar['value'] = 0 if fraction is None else 1000 * max(0.0, min(1.0, fraction))
+
+    def set_pulse(position):
+        """Indeterminate "still working" animation, for work whose progress can't be measured: a block sweeping along the bar. It moves by itself while the
+        caller keeps pumping events (the `position` is no longer needed)."""
+        if not animating['on']:
+            bar.configure(mode='indeterminate')
+            bar.start(15)
+            animating['on'] = True
+
+    def set_status(text):
+        status.set(text)
+
+    class Window:
+        pass
+
+    win = Window()
+    win._set_pulse = set_pulse
+    win._set_status = set_status
+    win._top, win._own_root = top, own_root
+
+    class Canvas:
+        @staticmethod
+        def flush_events():
+            try:
+                top.update()
+            except tk.TclError:
+                pass                                             # (closed while polling)
+
+    win.canvas = Canvas()
+    top.update_idletasks()
+    w, h = top.winfo_reqwidth(), top.winfo_reqheight()
+    top.geometry(f"+{max(0, (top.winfo_screenwidth() - w) // 2)}+{max(0, (top.winfo_screenheight() - h) // 3)}")
+    top.lift()
+    top.update()
+    return win, cancel_flag, set_progress
+
+
+def close_processing_dialog(win):
+    """Close the window made by show_processing_dialog (and the hidden root it had to make, if there was no window to hang it on)."""
+    try:
+        win._top.destroy()
+    except Exception:
+        pass
+    if getattr(win, '_own_root', None) is not None:
+        try:
+            win._own_root.destroy()
+        except Exception:
+            pass
 
 
 def run_with_loading_window(message, work, show_after_s=0.4):
@@ -5386,7 +5384,7 @@ def ensure_umap_variant_csv(adata, params, run_folder):
             proc_fig.canvas.flush_events()
             time.sleep(0.05)
     finally:
-        plt.close(proc_fig)
+        close_processing_dialog(proc_fig)
         restore_cursors()
     if not job['done']:
         return None, "UMAP recalculation cancelled (it will finish in the background and be cached)."
@@ -5432,6 +5430,10 @@ def build_viewer_settings_tab(tab, current_settings, umap_params=None, n_cells=N
         tk.Radiobutton(colors_frame, text=text, value=value, variable=colors_var, anchor='w', justify='left').pack(fill='x', padx=6)
     colors_frame.pack(fill='x', padx=12, pady=(0, 6))
 
+    other_var = tk.BooleanVar(tab, value=bool(current_settings.get('colorize_other_cells', True)))
+    tk.Checkbutton(tab, text="Colorize non-neurons in neuron project and neurons in non-neuron project", variable=other_var, anchor='w', justify='left',
+                   wraplength=420).pack(fill='x', padx=12, pady=(0, 6))
+
     persist_var = tk.BooleanVar(tab, value=current_settings['persist_settings'])
     tk.Checkbutton(
         tab, text="Remember these settings across sessions", variable=persist_var, anchor='w',
@@ -5476,6 +5478,7 @@ def build_viewer_settings_tab(tab, current_settings, umap_params=None, n_cells=N
             'gene456_shape': shape_var.get(),
             'umap_circle_size': size_var.get(),
             'group_colors': colors_var.get(),
+            'colorize_other_cells': other_var.get(),
             'persist_settings': persist_var.get(),
         }
         if chosen_umap_params is not None:

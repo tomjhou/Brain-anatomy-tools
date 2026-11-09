@@ -371,6 +371,7 @@ class AnalyzeWindow:
         self.v = viewer
         self.top = top = tk.Toplevel(viewer.root)
         top.title("Analyze")
+        top.protocol("WM_DELETE_WINDOW", self.hide)         # (closed, it is only hidden: opened again, it has its settings and graph as they were)
         height = min(1020, top.winfo_screenheight() - 90)
         width = min(height - 61 + 316, top.winfo_screenwidth() - 40)      # (the graph's pane, right of the 300 px of controls and under the toolbar, is a square)
         top.geometry(f"{width}x{height}")
@@ -1256,6 +1257,17 @@ class AnalyzeWindow:
         if self.hover is not None:
             self.pluses.set_offsets(np.empty((0, 2)))
             self.tip.set_visible(False)
+
+    def hide(self):
+        """The window's close box: the window is hidden, not closed, so that Analyze... brings it back as it was (it goes with the project browser)."""
+        self.hide_hover()
+        self.pan_start = None
+        self.top.withdraw()
+
+    def show(self):
+        self.top.deiconify()
+        self.top.lift()
+        self.top.focus_force()
 
     def hide_hover(self):
         if self.hover is None or self.hover_group is None or self.background is None:

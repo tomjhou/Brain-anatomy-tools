@@ -4451,11 +4451,12 @@ class UmapWindow(ExportsMixin):
         return m
 
     def open_analyze(self):
-        """The Analyze button: a window to plot genes against each other, per cell or per group."""
+        """The Analyze button: a window to plot genes against each other, per cell or per group. Its close box only hides it: opened again, it is as it
+        was (settings, graph and view)."""
         win = getattr(self, "analyze_window", None)
         try:
             if win is not None and win.top.winfo_exists():
-                win.top.lift()
+                win.show()
                 return
         except tk.TclError:
             pass

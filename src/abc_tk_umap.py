@@ -60,6 +60,8 @@ BLINK_PAUSE_MS = 1000              # a highlighted cell (its ring or white dot) 
 BLINK_ON_MS, BLINK_OFF_MS = 450, 250       # ...shown this long, hidden this long, over and over (until another cell is highlighted or it is cleared)
 MIN_TILE_PX = 50
 ROI_LINE_PX = {8: 2, 7: 2, 6: 2, 5: 3, 4: 4, 3: 5, 2: 6, 1: 8}      # (more across than that, as a fit can have: 2)        # the ROI outline's line width at each Section size stop (panels across): thicker as the sections grow
+if sys.platform == "darwin":   # (macOS measures in points, each two pixels on a Retina screen, so the Windows widths came out about twice as thick)
+    ROI_LINE_PX = {8: 1, 7: 1, 6: 1, 5: 2, 4: 2, 3: 3, 2: 3, 1: 4}
 TILE_COLUMNS = (0, 8, 7, 6, 5, 4, 3, 2, 1)    # the Section size slider's stops: how many panels fit across the pane (1/8 of its width ... all of it); 0: the
                                               # size that shows every section in the pane at once, as large as that allows (see fit_tiles)
 FIT_STOP = TILE_COLUMNS.index(0)

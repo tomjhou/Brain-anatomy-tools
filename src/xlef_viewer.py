@@ -3505,11 +3505,12 @@ class XlefViewer:
         self.list_bar = ttk.Frame(left)
         self.list_bar.pack(fill=tk.X, padx=4, pady=(4, 0))
         ttk.Button(self.list_bar, text="Open...", command=self.ask_open).pack(side=tk.LEFT)
-        self.save_button = ttk.Button(self.list_bar, text="Save", command=self.save_annotations, state=tk.DISABLED)
+        self.save_button = ttk.Button(self.list_bar, text="Save all", command=self.save_annotations, state=tk.DISABLED)
         self.save_button.pack(side=tk.LEFT, padx=(4, 0))
-        Tooltip(self.save_button, "Write all unsaved changes ("
+        Tooltip(self.save_button, "Write all unsaved changes in every open project ("
                                   "marked with a red * in the list) into LAS X's files, "
-                                  "keeping a backup of the original version. Nothing is saved until you click this.")
+                                  "keeping a backup of the original version. Nothing is saved until you click this. "
+                                  "To save just one project, right-click it in the list.")
         # The List / Thumbnails toggle: real buttons, the one showing filled in (as the Open dialog's toggle), since ttk's flat Toolbutton
         # style looks like a label on Windows.
         self.view_mode = tk.StringVar(value=self.settings.get("view_mode", "list"))
@@ -4078,7 +4079,7 @@ class XlefViewer:
         run(app_update.check, root, then=lambda ok, value: (self.status.config(text=""), checked(ok, value)))
 
     def quit(self):
-        if not self.unsaved_ok("Closing the viewer", "Close anyway?"):
+        if not self.saved_or_discarded():
             return
         self._save_settings()
         self.generation += 1
@@ -4445,23 +4446,28 @@ class XlefViewer:
         return changed
 
     def close_project(self, pid, ask=True):
-        """Close one open project (asking first if any of its images or folders have unsaved changes)."""
+        """Close one open project. With unsaved changes in it (or images dragged between it and another project), asking first: Save
+        (that project, and any linked to it by a dragged image, see _linked_projects; closed if everything was saved) or Cancel."""
         if pid not in self.projects:
             return
-        items = self._project_items(pid)
-        crossing = [i for i in self.home if self.tree.exists(i) and (self.home[i] == pid) != (self._project_of(i) == pid)
-                    and i not in self.deleted]
-        if ask and crossing:
-            messagebox.showinfo("Close project", f"Images were dragged between {self.projects[pid]['name']} and another project. Save "
-                                                 "those moves, or undo them, before closing it.", parent=self.root)
-            return
         changed = self._unsaved_names(pid)
-        if ask and changed and not messagebox.askyesno(
-                "Unsaved changes", f"{', '.join(changed[:5])}{' and more' if len(changed) > 5 else ''} "
-                                   f"{'has' if len(changed) == 1 else 'have'} unsaved changes.\n\nClosing "
-                                   f"{self.projects[pid]['name']} discards them. Close anyway?",
-                icon="warning", default="no", parent=self.root):
-            return
+        linked = self._linked_projects([pid]) - {pid}
+        if ask and (changed or linked):
+            name = self.projects[pid]["name"]
+            names = (f"{', '.join(changed[:5])}{' and more' if len(changed) > 5 else ''} "
+                     f"{'has' if len(changed) == 1 else 'have'} unsaved changes" if changed
+                     else f"Images were dragged between {name} and another project")
+            also = (f"\n\nImages were dragged between {name} and {', '.join(self.projects[p]['name'] for p in linked)}: "
+                    f"saving saves {'that project' if len(linked) == 1 else 'those projects'} too." if linked else "")
+            if ask_choice(self.root, "Unsaved changes", f"{names}.{also}\n\nSave before closing {name}?",
+                          [("Save", "save"), ("Cancel", None)]) != "save":
+                return
+            self.save_annotations([pid], closing={pid})
+            if pid in self.projects and (self._unsaved_names(pid) or self._linked_projects([pid]) - {pid}):
+                return                  # (not all saved: its confirmation cancelled, or a file could not be written)
+            if pid not in self.projects:
+                return                  # (closed already: its files changed, and it was not read again)
+        items = self._project_items(pid)
         closing = {self.entries[i] for i in items if i in self.entries}
         if self.img is not None and self.img.entry in closing:
             self._close_image()
@@ -7124,14 +7130,30 @@ class XlefViewer:
             a.color = color
             self._changed()
 
-    def save_annotations(self):
-        """The Save button: write every change not saved yet into LAS X's files (only ever when it is clicked): edited annotations, color
+    def _linked_projects(self, pids):
+        """`pids` and every project linked to them by an image dragged between projects (both ends are saved together: each one's
+        list refers to it)."""
+        only = set(pids)
+        while True:
+            more = {p for i, home in self.home.items() if self.tree.exists(i) and (pid := self._project_of(i)) != home
+                    and {pid, home} & only for p in (pid, home) if p in self.projects} - only
+            if not more:
+                return only
+            only |= more
+
+    def save_annotations(self, pids=None, closing=()):
+        """The Save all button (or, with `pids`, "Save project" in a project's right-click menu, or closing a project: just those
+        projects, and any linked to them, see _linked_projects): write every change not saved yet into LAS X's files (only ever when it
+        is clicked): edited annotations, color
         maps, contrast and flips (into each image's .xlif) and renames (the Name in the .xlif / .xlcf; with "Also rename the files and folders on disk" in Settings,
         the files and folders too, see plan_disk_rename), the list's order (dragged, deleted: see _save_structure). Each changed file is
-        backed up first (BACKUP_SUFFIX)."""
+        backed up first (BACKUP_SUFFIX). Projects whose files changed are read again, except those in `closing` (just closed)."""
+        only = self._linked_projects(self.projects if pids is None else pids)
         items = [(i, o) for i, o in list(self.entries.items()) + list(self.folders.items())
-                 + [(pid, p.get("root")) for pid, p in self.projects.items()] if o is not None and o.unsaved]
-        if not items and not self.deleted:
+                 + [(pid, p.get("root")) for pid, p in self.projects.items()]
+                 if o is not None and o.unsaved and (i if i in self.projects else self._project_of(i)) in only]
+        deleted = {i: e for i, e in self.deleted.items() if self.home.get(i) in only}
+        if not items and not deleted:
             return
         notes = [(i, o) for i, o in items if o.annotations_changed]
         maps = [(i, o) for i, o in items if isinstance(o, ImageEntry) and o.luts_changed]
@@ -7139,11 +7161,11 @@ class XlefViewer:
         flips = [(i, o) for i, o in items if isinstance(o, ImageEntry) and o.flip_changed]
         renames = [(i, o) for i, o in items if o.name != o.saved_name]
         on_disk = bool(renames) and self.settings.get("rename_files", False)
-        away = [o for i, o in self.entries.items() if self.home.get(i) not in (None, self._project_of(i))]
+        away = [o for i, o in self.entries.items() if self.home.get(i) not in (None, self._project_of(i)) and self.home[i] in only]
         reordered = any(getattr(o, "order_changed", False) for _, o in items)
-        structure = reordered or bool(self.deleted)
-        if not self.save_warned or self.deleted or away:
-            n_del, n_away = len(self.deleted), len(away)
+        structure = reordered or bool(deleted)
+        if not self.save_warned or deleted or away:
+            n_del, n_away = len(deleted), len(away)
             what = ([f"the annotations of {len(notes)} image{'s' * (len(notes) != 1)}"] if notes else []) + \
                    ([f"the color maps of {len(maps)} image{'s' * (len(maps) != 1)}"] if maps else []) + \
                    ([f"the contrast of {len(ranges)} image{'s' * (len(ranges) != 1)}"] if ranges else []) + \
@@ -7152,7 +7174,7 @@ class XlefViewer:
                     if renames else []) + (["the new order of the list"] if reordered else [])
             extra = ((f"\n\n{n_away} image{'s' * (n_away != 1)} dragged into another project move{'s' * (n_away == 1)} there, files "
                       "and all." if away else "")
-                     + (f"\n\nDeleted: {', '.join(e.name for e in list(self.deleted.values())[:5])}"
+                     + (f"\n\nDeleted: {', '.join(e.name for e in list(deleted.values())[:5])}"
                         f"{' and more' if n_del > 5 else ''}. Their files go to the Recycle Bin (on a network drive, which has "
                         f"none: into a \"Deleted by XLEF viewer\" folder in the experiment's folder)." if n_del else ""))
             if not messagebox.askokcancel(
@@ -7199,7 +7221,7 @@ class XlefViewer:
             self.slide_gen += 1
             time.sleep(0.3)
         if structure:
-            touched, binned, aside = self._save_structure(failed)
+            touched, binned, aside = self._save_structure(failed, only)
         if renames and on_disk:
             ordered = ([r for r in renames if isinstance(r[1], ImageEntry)] +          # (images first, then folders, deepest first)
                        sorted([r for r in renames if isinstance(r[1], FolderEntry)], key=lambda r: -self._tree_depth(r[0])))
@@ -7241,7 +7263,8 @@ class XlefViewer:
         for pid in [p for p in self.projects if p in reread]:      # (paths or contents changed: read those experiments again)
             path = self.projects[pid]["path"]
             self.close_project(pid, ask=False)
-            self.open_xlef(path, offer_pyramids=False)
+            if pid not in closing:
+                self.open_xlef(path, offer_pyramids=False)
 
     # --- the cloud after a name: what it means, and downloading full resolution
 
@@ -7443,6 +7466,8 @@ class XlefViewer:
             if "root" in self.projects[pid] and self.pyramid_job is None and self._pyramid_candidates(pid)[0]:
                 menu.add_command(label=f"Make pyramids for {self.projects[pid]['name']}...",
                                  command=lambda: self.make_pyramids(pid))
+            menu.add_command(label=f"Save project {self.projects[pid]['name']}", command=lambda: self.save_annotations([pid]),
+                             state=tk.NORMAL if self._unsaved_names(pid) else tk.DISABLED)
             menu.add_command(label=f"Close project {self.projects[pid]['name']}", command=lambda: self.close_project(pid))
 
     def _item_menu(self, item, x_root, y_root):
@@ -7819,17 +7844,19 @@ class XlefViewer:
         self.status.config(text=f"Moved {obj.name}: not saved yet (Save writes the new order"
                                 + (", and moves its files into that project" if away else "") + "; Ctrl+Z undoes it)")
 
-    def _save_structure(self, failed):
+    def _save_structure(self, failed, only=None):
         """Save, for the list's order: images dragged into another project move there, files and all (see plan_move_image); each
         folder and project whose contents or their order changed gets its list of references rewritten (see children_text); deleted
         images go to the Recycle Bin (on a drive that has none, a network drive, into a "Deleted by XLEF viewer" folder of their
-        experiment instead). Returns the projects to read again, and how many images were deleted where (bin, folder)."""
+        experiment instead). Only in the projects `only` (None: all; it must include both ends of any image dragged between projects,
+        see _linked_projects). Returns the projects to read again, and how many images were deleted where (bin, folder)."""
+        only = set(self.projects) if only is None else only
         touched, binned, kept_aside = set(), 0, 0
         old_path = {}           # ImageEntry -> its .xlif's path before it moved (how the list it left still refers to it)
         # 1. images into another project: their files first (a container then refers only to what is really there)
         for item, entry in list(self.entries.items()):
             pid, home = self._project_of(item), self.home.get(item)
-            if pid is None or home is None or pid == home:
+            if pid is None or home is None or pid == home or pid not in only:
                 continue
             touched |= {pid, home}
             try:
@@ -7851,7 +7878,7 @@ class XlefViewer:
         # 2. the lists of references
         written = set()
         for item, obj in list(self.folders.items()) + [(pid, p.get("root")) for pid, p in self.projects.items()]:
-            if obj is None:
+            if obj is None or (item if item in self.projects else self._project_of(item)) not in only:
                 continue
             shown = self._shown_children(item)
             if shown == obj.children:
@@ -7869,7 +7896,7 @@ class XlefViewer:
             except Exception as err:
                 failed.append(f"the list of {obj.name}: {err}")
         # 3. deleted images, once nothing refers to them
-        for item, entry in list(self.deleted.items()):
+        for item, entry in [(i, e) for i, e in self.deleted.items() if self.home.get(i) in only]:
             parent = next((k for k, o in [(p, self._container(p)) for p in self.projects] + list(self.folders.items())
                            if o is not None and entry.xlif_path in (getattr(c, "xlif_path", None) for c in o.children)), None)
             if parent is not None:          # (its list was not rewritten: it stays)
@@ -7892,15 +7919,24 @@ class XlefViewer:
                 failed.append(f"deleting {entry.name}: {err}")
         return touched - {None}, binned, kept_aside
 
-    def unsaved_ok(self, doing, question):
-        """True if there are no unsaved changes (renames, annotations), or the user agrees to lose them (nothing is ever saved without
-        Save)."""
-        changed = [o.name for o in self._all_objects() if o.unsaved] + [e.name + " (deleted)" for e in self.deleted.values()]
+    def _all_unsaved_names(self):
+        return [o.name for o in self._all_objects() if o.unsaved] + [e.name + " (deleted)" for e in self.deleted.values()]
+
+    def saved_or_discarded(self):
+        """Before closing the viewer: True if there are no unsaved changes (renames, annotations, ...), or the user chose Save (and
+        everything was saved: see save_annotations) or Don't save. False for Cancel, or if Save left something unsaved (its own
+        confirmation cancelled, or a file that could not be written: the viewer stays open to show what)."""
+        changed = self._all_unsaved_names()
         if not changed:
             return True
         names = ", ".join(changed[:5]) + (f" and {len(changed) - 5} more" if len(changed) > 5 else "")
-        return messagebox.askyesno("Unsaved changes",
-                                   f"{names} {'has' if len(changed) == 1 else 'have'} unsaved changes.\n\n{doing} discards them. {question}", icon="warning", default="no", parent=self.root)
+        answer = ask_choice(self.root, "Unsaved changes",
+                            f"{names} {'has' if len(changed) == 1 else 'have'} unsaved changes.\n\nSave them before closing?",
+                            [("Save", "save"), ("Don't save", "discard"), ("Cancel", None)])
+        if answer == "save":
+            self.save_annotations()
+            return not self._all_unsaved_names()
+        return answer == "discard"
 
     def _draw_scale_bar(self):
         self._each_canvas(self._draw_scale_bar_here)

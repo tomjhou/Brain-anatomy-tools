@@ -88,7 +88,8 @@ MOVING_PAUSE = 0.25          # s without a wheel click or drag before the view c
 FINER_CROP_BYTES = 32e6      # a compressed plane is decoded whole anyway: a view of it is kept finer than the zoom needs (up to full resolution)
                              # while it takes no more than this per channel, so that zooming further in needs no new reading
 DETAIL_BANDS = 10            # a sharp view is read in this many bands (top to bottom), each drawn as it comes (see XlefViewer.redraw)
-BAND_DRAW_INTERVAL = 0.2     # s: the bands that came in are drawn at most this often (drawing must not hold up the reading)
+BAND_DRAW_INTERVAL = 0.2     # s: the bands that came in are drawn at most this often (and at most a quarter of the time: drawing
+                             # must hold up neither the reading nor the next wheel click)
 READ_BUDGET = 0.3            # s: a sharper picture expected to take longer than this to read counts as slow (see XlefViewer._slow)
 LEVEL_BUDGET = 1.0           # s: the same for the pyramid's whole sharper copy (read in the background, the preview shown meanwhile)
 RELAXED_ENLARGE = 2.5        # then the preview may be shown enlarged up to this much (preview pixels on screen) before reading
@@ -2406,15 +2407,16 @@ def _weights(n_in, n_out, method):
 def enlarge(rgb, w, h, method="mitchell"):
     """An RGB uint8 array enlarged to w x h (a PIL image), the way ENLARGE_METHODS names: each output pixel a weighted sum of the 4 x 4
     nearest input pixels (cubic or Gaussian weights), done as two matrix products per color (rows, then columns), which is fast
-    (~10-25 ms for a 1200 x 800 view). Bilinear and hard pixels come from Pillow."""
+    (~10-25 ms for a 1200 x 800 view, 35-100 ms at full screen). Bilinear and hard pixels come from Pillow."""
     if method not in _KERNELS:
         return Image.fromarray(rgb).resize((w, h), Image.NEAREST if method == "nearest" else Image.BILINEAR)
     rows, cols = _weights(rgb.shape[0], h, method), _weights(rgb.shape[1], w, method)
-    a = rgb.astype(np.float32)
-    out = np.empty((h, w, 3), np.uint8)
-    for c in range(3):
-        out[..., c] = np.clip(rows @ a[..., c] @ cols.T + 0.5, 0, 255)
-    return Image.fromarray(out)
+    a = np.moveaxis(rgb, 2, 0).astype(np.float32)            # (3, rows, columns): each color one matrix product of each kind
+    o = rows @ a @ cols.T
+    o += 0.5                                                 # (in place: at full screen each pass over the result is ~10 ms)
+    np.clip(o, 0, 255, out=o)
+    b = o.astype(np.uint8)
+    return Image.merge("RGB", [Image.fromarray(b[c]) for c in range(3)])
 
 
 def nice_length(um):
@@ -3498,6 +3500,8 @@ class XlefViewer:
             self.enlarge_method = "mitchell"
         self.asking_download = False         # (the download question is open: see _full_res_allowed)
         self.moving_until, self.rest_job = 0.0, None     # (see _moving)
+        self.fast_now = self.fast_shown = False          # (bilinear stood in for the chosen method: in the picture being made, on show)
+        self.drawing_bands = False                       # (a sharp view's bands being drawn as they come in: the fast way)
         self.folders = {}            # list item -> FolderEntry (the list's folders; images are in self.entries)
         self.item_cloud = set()      # list items of images with online-only files (a cloud after the name)
         self.rename_job = self.rename_box = None
@@ -6166,16 +6170,22 @@ class XlefViewer:
         self.rest_job = self.root.after(int(MOVING_PAUSE * 1000) + 20, self._at_rest)
 
     def _at_rest(self):
+        """Drawn once more the way chosen in Settings, only if bilinear stood in for it in the picture on show: zoomed out, or not
+        enlarged, the picture is the same either way (redrawing it anyway held up the next wheel click: ~100 ms at full screen)."""
         self.rest_job = None
-        if self.img is not None and self.enlarge_method in _KERNELS and not self.drag:
+        if self.img is not None and self.fast_shown and not self.drag:
             self.redraw()                   # (from the pixels already here: nothing is read again)
 
     def _draw_method(self):
-        """How zoomed-in pixels are enlarged: as chosen in Settings (bilinear while moving, for speed); with the pixel grid shown, as
+        """How zoomed-in pixels are enlarged: as chosen in Settings (bilinear while moving, or for a sharp view's bands as they come in,
+        for speed); with the pixel grid shown, as
         squares of one color each, filling the grid's cells."""
         if self.pixel_grid:
             return "nearest"
-        return "bilinear" if time.monotonic() < self.moving_until and self.enlarge_method in _KERNELS else self.enlarge_method
+        if (time.monotonic() < self.moving_until or self.drawing_bands) and self.enlarge_method in _KERNELS:
+            self.fast_now = True            # (to be drawn again once at rest: see _at_rest)
+            return "bilinear"
+        return self.enlarge_method
 
     def _mix_sig(self):
         """What the mixed colours depend on: each channel on/off, its levels and its colour map, and the panels (see _mix)."""
@@ -6554,6 +6564,7 @@ class XlefViewer:
         if self._flipped():
             ims = [im.transpose(Image.FLIP_LEFT_RIGHT) for im in ims]
             left = self.canvas_size()[0] - left - ims[0].width
+        self.fast_shown, self.fast_now = self.fast_now, False
         self.last_view = (ims, left, top, self.canvas_size(), self.panel_cols)
         self.last_view_rgb = ims[0]
         self.photos = [ImageTk.PhotoImage(im, master=self.root) for im in ims]
@@ -8163,9 +8174,18 @@ class XlefViewer:
                     key, arrays, rows = data
                     self.detail_partial = {"key": key, "arrays": arrays, "rows": rows}
                     self.hires_progress = rows / (key[5] - key[3])
-                    if time.monotonic() - getattr(self, "band_drawn", 0) >= BAND_DRAW_INTERVAL:
+                    if time.monotonic() - getattr(self, "band_drawn", 0) >= getattr(self, "band_gap", BAND_DRAW_INTERVAL):
+                        # (the bands that are in, over the blurrier picture: enlarged the fast way, the finished view as chosen; and
+                        # at most a quarter of the time spent drawing them, so that a wheel click isn't kept waiting: at full
+                        # screen a drawing takes ~100 ms)
+                        t = time.monotonic()
+                        self.drawing_bands = True
+                        try:
+                            self.redraw(preview_only=True)
+                        finally:
+                            self.drawing_bands = False
                         self.band_drawn = time.monotonic()
-                        self.redraw(preview_only=True)          # (the bands that are in, over the blurrier picture)
+                        self.band_gap = max(BAND_DRAW_INTERVAL, 3 * (self.band_drawn - t))
                 elif kind == "detail" and gen == self.generation and not self.drag:
                     # (kept for this view, joined to what was kept of it before, and mixed with the sliders as they are NOW)
                     key, arrays, place, smooth, *flag = data

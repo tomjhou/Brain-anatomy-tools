@@ -120,6 +120,67 @@ def _set_window_app_id(hwnd, app_id):
         release(store)
 
 
+LOG_EDITOR = "TextEdit" if sys.platform == "darwin" else "Notepad" if sys.platform == "win32" else "a text editor"
+
+
+def open_log_folder(path):
+    """The log's folder in Windows Explorer (or Finder), the log selected."""
+    import subprocess
+    path = os.path.normpath(path)
+    if sys.platform == "win32":
+        subprocess.Popen(f'explorer /select,"{path}"')
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", path])
+    else:
+        subprocess.Popen(["xdg-open", os.path.dirname(path)])
+
+
+def open_log_in_editor(path):
+    """The log in Notepad (TextEdit on macOS, the default text editor elsewhere)."""
+    import subprocess
+    if sys.platform == "win32":
+        subprocess.Popen(["notepad.exe", path])
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", "-e", path])
+    else:
+        subprocess.Popen(["xdg-open", path])
+
+
+def show_error(parent, title, message, path):
+    """An error message box with buttons that open the log `path`: its folder (the log selected), or the log itself in a text editor."""
+    import tkinter as tk
+    from tkinter import ttk
+    dlg = tk.Toplevel(parent)
+    dlg.title(title)
+    dlg.resizable(False, False)
+    if parent is not None and parent.winfo_viewable():
+        dlg.transient(parent)
+    body = ttk.Frame(dlg, padding=14)
+    body.pack(fill=tk.BOTH, expand=True)
+    top = ttk.Frame(body)
+    top.pack(fill=tk.X)
+    try:
+        ttk.Label(top, image="::tk::icons::error").pack(side=tk.LEFT, anchor=tk.N, padx=(0, 12))
+    except tk.TclError:
+        pass
+    ttk.Label(top, text=message, wraplength=520, justify=tk.LEFT).pack(side=tk.LEFT, anchor=tk.W)
+    bar = ttk.Frame(body)
+    bar.pack(fill=tk.X, pady=(14, 0))
+    ok = ttk.Button(bar, text="OK", command=dlg.destroy)
+    ok.pack(side=tk.RIGHT, padx=(6, 0))
+    ttk.Button(bar, text=f"Open log in {LOG_EDITOR}", command=lambda: open_log_in_editor(path)).pack(side=tk.RIGHT, padx=(6, 0))
+    ttk.Button(bar, text="Open log folder", command=lambda: open_log_folder(path)).pack(side=tk.RIGHT, padx=(6, 0))
+    ok.focus_set()
+    dlg.bind("<Return>", lambda e: dlg.destroy())
+    dlg.bind("<Escape>", lambda e: dlg.destroy())
+    dlg.lift()
+    dlg.attributes("-topmost", True)
+    dlg.after(300, lambda: dlg.winfo_exists() and dlg.attributes("-topmost", False))
+    dlg.grab_set()
+    dlg.wait_window()
+    return dlg
+
+
 def use_windowless_log(program, title):
     """Started with pythonw.exe there is no console (nor from a macOS app, which says so with JHOULAB_WINDOWLESS=1): send what would have
     been printed to a log file, and show errors (uncaught ones, and the first in a Tk callback) in a message box that names the log.
@@ -142,11 +203,11 @@ def use_windowless_log(program, title):
         shown.append(True)
         try:
             import tkinter
-            from tkinter import messagebox
             own = None if tkinter._default_root is not None else tkinter.Tk()
             if own is not None:
                 own.withdraw()
-            messagebox.showerror(title, f"{title} hit an error:\n\n{kind.__name__}: {value}\n\nThe details are in\n{path}")
+            show_error(tkinter._default_root, title, f"{title} hit an error:\n\n{kind.__name__}: {value}\n\nThe details are in\n{path}",
+                       path)
             if own is not None:
                 own.destroy()
         except Exception:

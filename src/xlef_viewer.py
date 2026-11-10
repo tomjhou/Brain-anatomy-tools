@@ -570,6 +570,40 @@ def load_entry(path):
     return folder
 
 
+TiffSample = collections.namedtuple("TiffSample", "page sample")
+TiffSample.__doc__ = """Where one channel of an image is when its channels are the colours (samples) of one RGB TIFF: sample `sample` of
+each pixel, of page `page` (None: the file's image). LAS X stores e.g. a slide's "Sample Overview" so."""
+
+
+def _rgb_samples(entry, frames, dims, descs):
+    """Channels stored as the colours of one TIFF (one <Frame> per layer, not per channel; each pixel holds every channel: the x
+    dimension's BytesInc spans them all, each channel's BytesInc is where in the pixel it is): every channel gets that file, and its
+    sample (TiffSample in entry.pages)."""
+    nch = len(descs)
+    if nch < 2 or not frames or len(frames) != entry.nz or any(re.search(r"--c\d+", f.lower()) for f in frames):
+        return
+    try:
+        x_inc = int(dims["1"].get("BytesInc"))
+        at = [int(cd.get("BytesInc") or 0) for cd in descs]
+    except (KeyError, TypeError, ValueError):
+        return
+    size = x_inc // nch
+    if size < 1 or x_inc != size * nch or sorted(at) != [k * size for k in range(nch)]:
+        return
+    for z in range(entry.nz):
+        f = entry.files.get((z, 0))
+        if f is None:
+            continue
+        for c in range(nch):
+            entry.files[(z, c)] = f
+            entry.pages[(z, c)] = TiffSample(None, at[c] // size)
+
+
+def _sample(a, sample):
+    """One colour of an RGB image's array: its samples last (rows, columns, samples), or first (samples, rows, columns)."""
+    return a[..., sample] if a.ndim == 3 and a.shape[-1] <= 4 else a[sample]
+
+
 def _ome_pages(entry, element, dims, descs, base_dir):
     """The other way LAS X stores an image: all its channels (and z planes) as the pages of one OME-TIFF, named by <OMETiffBlock
     File=... Offset=... Size=...> (or a few such blocks, each a part of the data). Which page holds which channel comes from the
@@ -709,6 +743,7 @@ def _image_entry(name, path, element, image, base_dir, lif=None):
         c = int(mc.group(1)) if mc else k % nch
         z = int(mz.group(1)) if mz else (k // nch if len(frames) > nch else 0)
         entry.files[(z, c)] = fpath
+    _rgb_samples(entry, frames, dims, descs)
     if lif is not None:              # (in a .lif or .lifext: its data block in that file)
         lif_path, block, size = lif
         entry.lif_block, entry.read_only, entry.full_bytes = block, True, size
@@ -1756,7 +1791,7 @@ class OpenImage:
         key = (z, c)
         if key not in self.compressed:
             path = self.entry.files.get(key)
-            self.compressed[key] = bool(path) and self.entry.pages.get(key) is None and tiff_compression(path) not in (None, "none")
+            self.compressed[key] = bool(path) and not isinstance(self.entry.pages.get(key), (int, RawPlane)) and tiff_compression(path) not in (None, "none")
         return self.compressed[key]
 
     def overview_step(self):
@@ -2101,6 +2136,8 @@ def memmap_plane(path, page=None):
     """A plane through a memory map: a TIFF's image (or an OME-TIFF's page), or a channel in a .lof or .lif."""
     if isinstance(page, RawPlane):
         return np.memmap(path, page.dtype, "r", raw_start(path, page), page.shape)
+    if isinstance(page, TiffSample):
+        return _sample(tifffile.memmap(path, mode="r", page=page.page), page.sample)
     return tifffile.memmap(path, mode="r", page=page)
 
 
@@ -2111,6 +2148,8 @@ def read_whole(path, page=None):
             fh.seek(raw_start(path, page))
             n = page.shape[0] * page.shape[1]
             return np.frombuffer(fh.read(n * page.dtype.itemsize), page.dtype, n).reshape(page.shape)
+    if isinstance(page, TiffSample):
+        return _sample(tifffile.imread(path, key=page.page or 0), page.sample)
     return tifffile.imread(path) if page is None else tifffile.imread(path, key=page)
 
 
@@ -5662,7 +5701,7 @@ class XlefViewer:
         may come from LAS X's 8-bit pyramid), only near the pixel's value."""
         img = self.img
         p = img.planes.get((self.z, c))
-        if p is not None and not self.loading:
+        if p is not None and not self.loading and y < p.shape[0] and x < p.shape[1]:
             return int(p[y, x]), True
         best = None
         partial = getattr(self, "detail_partial", None)

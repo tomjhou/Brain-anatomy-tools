@@ -173,6 +173,15 @@ def show_error(parent, title, message, path):
     ok.focus_set()
     dlg.bind("<Return>", lambda e: dlg.destroy())
     dlg.bind("<Escape>", lambda e: dlg.destroy())
+    try:            # (centred over the program's window, on its monitor: left to itself, Windows may put it on the main monitor)
+        if parent is not None and parent.winfo_viewable():
+            dlg.update_idletasks()
+            w, h = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
+            x = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
+            y = parent.winfo_rooty() + max(0, (parent.winfo_height() - h) // 3)
+            dlg.geometry(f"+{x}+{y}")
+    except tk.TclError:
+        pass
     dlg.lift()
     dlg.attributes("-topmost", True)
     dlg.after(300, lambda: dlg.winfo_exists() and dlg.attributes("-topmost", False))

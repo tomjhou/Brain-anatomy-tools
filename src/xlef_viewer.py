@@ -3128,10 +3128,11 @@ class ThumbGrid(ttk.Frame):
 
     GAP, NAME_H = 8, 30
 
-    def __init__(self, parent, on_click, size=THUMB_SIZE, on_menu=None, on_drop=None, name_tip=None):
+    def __init__(self, parent, on_click, size=THUMB_SIZE, on_menu=None, on_drop=None, name_tip=None, is_unsaved=None):
         super().__init__(parent)
         self.on_click, self.size, self.on_menu, self.on_drop = on_click, size, on_menu, on_drop
         self.name_tip, self.tip = name_tip, None     # (name_tip(item): the note on an image's tile or a heading (its list item), or None)
+        self.is_unsaved = is_unsaved  # (is_unsaved(item): a red * after its name or heading, as in the list: see place_unsaved_marks)
         self.press = None         # (a thumbnail pressed: (item, x, y, dragging yet); dropped on another: on_drop(item, target, after))
         self.canvas = tk.Canvas(self, highlightthickness=0, background=PAL["grid"], takefocus=True)
         sb = ttk.Scrollbar(self, orient=tk.VERTICAL, command=self.canvas.yview)
@@ -3303,6 +3304,36 @@ class ThumbGrid(ttk.Frame):
         if col:
             y += tile_h + self.GAP
         c.configure(scrollregion=(0, 0, width, y))
+        self.place_unsaved_marks()
+
+    def place_unsaved_marks(self):
+        """A red * just after the name of each image, folder or project with unsaved changes (as in the list). A name may wrap (an
+        image's is centred under its tile): the * follows its last line, found from the character Tk draws at that line's left end."""
+        c = self.canvas
+        c.delete("unsaved")
+        if self.is_unsaved is None:
+            return
+        for row in self.rows:
+            item = row[1] if row[0] == "image" else row[2]
+            tag = f"name:{item}" if row[0] == "image" else f"proj:{item}" if row[0] == "project" else f"fold:{item}"
+            t = c.find_withtag(tag)
+            if not t or not self.is_unsaved(item):
+                continue
+            t = t[0]
+            box = c.bbox(t)
+            if not box:
+                continue
+            text = c.itemcget(t, "text")
+            font = tkfont.Font(font=c.itemcget(t, "font"))
+            line_h = font.metrics("linespace")
+            start = int(c.index(t, f"@{box[0] + 1},{box[3] - line_h // 2}"))       # (the last line's first character)
+            last = font.measure(text[start:].strip())
+            if row[0] == "image":
+                right = c.coords(t)[0] + last / 2
+            else:
+                right = box[0] + 1 + last
+            c.create_text(right + 1, box[3] - line_h // 2, anchor=tk.W, text="*", fill=PAL["warn"],
+                                 font=("Segoe UI", 12, "bold"), tags=("unsaved",) + tuple(g for g in c.gettags(t) if g != tag))
 
     def _draw_picture(self, item, x=None, y=None):
         c = self.canvas
@@ -3590,7 +3621,8 @@ class XlefViewer:
         self.tree.bind("<Double-Button-1>", lambda e: self._cancel_rename_job(), add="+")
         self.thumb_grid = ThumbGrid(tree_frame, on_click=self.select_item, on_menu=lambda item, x, y: self._item_menu(item, x, y),
                                     on_drop=self._grid_drop,
-                                    name_tip=self._grid_tip_text)
+                                    name_tip=self._grid_tip_text, is_unsaved=self._is_unsaved)
+        self.grid_marks_job = None   # (the grid's red *s redrawn once, after a change to what is unsaved: see _place_unsaved_mark)
         self.thumb_gen = 0           # bumped for each experiment opened: thumbnails made for an earlier one are dropped
         self.thumbs_started = False
         self._tree_tag_colors()
@@ -4486,7 +4518,8 @@ class XlefViewer:
 
     def close_project(self, pid, ask=True):
         """Close one open project. With unsaved changes in it (or images dragged between it and another project), asking first: Save
-        (that project, and any linked to it by a dragged image, see _linked_projects; closed if everything was saved) or Cancel."""
+        (that project, and any linked to it by a dragged image, see _linked_projects; closed if everything was saved), Don't save
+        (closed as it is, the linked projects read again from their files), or Cancel."""
         if pid not in self.projects:
             return
         changed = self._unsaved_names(pid)
@@ -4496,10 +4529,20 @@ class XlefViewer:
             names = (f"{', '.join(changed[:5])}{' and more' if len(changed) > 5 else ''} "
                      f"{'has' if len(changed) == 1 else 'have'} unsaved changes" if changed
                      else f"Images were dragged between {name} and another project")
+            those, its = ("that project", "its") if len(linked) == 1 else ("those projects", "their")
             also = (f"\n\nImages were dragged between {name} and {', '.join(self.projects[p]['name'] for p in linked)}: "
-                    f"saving saves {'that project' if len(linked) == 1 else 'those projects'} too." if linked else "")
-            if ask_choice(self.root, "Unsaved changes", f"{names}.{also}\n\nSave before closing {name}?",
-                          [("Save", "save"), ("Cancel", None)]) != "save":
+                    f"saving saves {those} too, and not saving reloads {those} from {its} files, losing {its} unsaved changes."
+                    if linked else "")
+            answer = ask_choice(self.root, "Unsaved changes", f"{names}.{also}\n\nSave before closing {name}?",
+                                [("Save", "save"), ("Don't save", "discard"), ("Cancel", None)])
+            if answer is None:
+                return
+            if answer == "discard":     # (the linked projects read again: a dragged image can't stay half-moved)
+                paths = [self.projects[p]["path"] for p in self.projects if p in linked]
+                for p in [pid, *linked]:
+                    self.close_project(p, ask=False)
+                for path in paths:
+                    self.open_xlef(path, offer_pyramids=False)
                 return
             self.save_annotations([pid], closing={pid})
             if pid in self.projects and (self._unsaved_names(pid) or self._linked_projects([pid]) - {pid}):
@@ -4665,6 +4708,8 @@ class XlefViewer:
         """A red * at the end of the row's name while an image, folder or project has unsaved changes (the list can't color part of a
         row, so it is a label laid over the list, moved with the row as the progress bars are). On a name too long for the list, it
         sits at the list's right edge, over the name's cut-off end. The pointer on it: a note saying what isn't saved (_unsaved_tip)."""
+        if self.grid_marks_job is None:         # (and the thumbnail grid's, all at once)
+            self.grid_marks_job = self.root.after_idle(self._place_grid_marks)
         mark = self.unsaved_marks.get(item)
         if not self.tree.exists(item) or not self._is_unsaved(item):
             if mark is not None:
@@ -4691,6 +4736,10 @@ class XlefViewer:
             mark.place_forget()                 # (no room at all in a very narrow list)
             return
         mark.place(x=left, y=y + (h - mark.winfo_reqheight()) // 2)
+
+    def _place_grid_marks(self):
+        self.grid_marks_job = None
+        self.thumb_grid.place_unsaved_marks()
 
     def _fill_tree(self, parent, folder):
         """The folder's images and sub-folders, in LAS X's order (the order its file lists them in, which dragging changes)."""

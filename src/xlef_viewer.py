@@ -3548,6 +3548,8 @@ class XlefViewer:
             self.dnd_files = None
         self.root.title("XLEF viewer")
         self.settings = self._load_settings()
+        self.settings.pop("drive_choices", None)          # (kept by an earlier version: the answers are for one session now)
+        self.drive_choices = {}      # this session's answers about slow drives: location -> "optimize" or "normal" (see _ask_about_slow_drives)
         if "recent_files" not in self.settings:       # (settings written before there was a recent list)
             self.settings["recent_files"] = [self.settings["last_file"]] if self.settings.get("last_file") else []
         self.settings.pop("last_file", None)
@@ -4068,13 +4070,13 @@ class XlefViewer:
         measured = SPEED.describe()
         ttk.Label(box, text="Measured: " + ("; ".join(measured) if measured else "nothing yet (it is measured as a project opens)"),
                   style="Muted.TLabel", justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
-        choices = self.settings.get("drive_choices", {})
+        choices = self.drive_choices
         if choices:
             row = ttk.Frame(box)
             row.pack(anchor=tk.W, pady=(4, 0))
             said = ttk.Label(row, style="Muted.TLabel", text="Slow drives: " + "; ".join(
                 f"{where.upper() or '(this computer)'} {'optimized' if c == 'optimize' else 'read normally'}"
-                for where, c in sorted(choices.items())))
+                for where, c in sorted(choices.items())) + " (until the viewer is closed)")
             said.pack(side=tk.LEFT)
 
             def forget():
@@ -6637,7 +6639,7 @@ class XlefViewer:
 
     def _drive_choice(self, path):
         """What was chosen when asked about the slow drive (or network share) `path` is on: "optimize", "normal", or None."""
-        return self.settings.get("drive_choices", {}).get(SPEED.location(path))
+        return self.drive_choices.get(SPEED.location(path))
 
     def _measured_slow(self, where):
         """The drive or network share `where` (see StorageSpeed.location), as measured, counts as slow (by a typical sharper copy,
@@ -6648,8 +6650,9 @@ class XlefViewer:
     def _ask_about_slow_drives(self):
         """A drive (or network share) that an open project is on was measured as slow: say so, once, and ask whether to optimize
         for it (the preview shown enlarged further before a sharper picture is read: see _read_plan), read it normally anyway (it
-        may be a hiccup: then a fast drive is read as fast), or test it again. The answer is remembered for that drive (Settings:
-        forgotten with "Ask again about slow drives"); closing the question leaves it optimized, and asks again next time."""
+        may be a hiccup: then a fast drive is read as fast), or test it again. Asked once a session: the answer holds for that drive
+        until the viewer is closed (Settings: forgotten sooner with "Ask again about slow drives"); closing the question leaves the
+        drive optimized."""
         if self.settings.get("reading", "auto") != "auto" or getattr(self, "asking_slow", False):
             return
         if getattr(self, "speed_window", None) is not None:
@@ -6677,8 +6680,7 @@ class XlefViewer:
             finally:
                 self.asking_slow = False
             if answer in ("optimize", "normal"):
-                self.settings.setdefault("drive_choices", {})[where] = answer
-                self._save_settings()
+                self.drive_choices[where] = answer
                 if answer == "normal" and self.img is not None:
                     self.redraw()
             elif answer == "retest":
@@ -6706,9 +6708,8 @@ class XlefViewer:
         threading.Thread(target=work, daemon=True).start()
 
     def _forget_drive_choices(self):
-        self.settings.pop("drive_choices", None)
+        self.drive_choices.clear()
         self.__dict__.pop("slow_asked", None)
-        self._save_settings()
         self.redraw()
 
     def _want_sharp_level(self, img):

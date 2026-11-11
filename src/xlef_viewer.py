@@ -84,9 +84,13 @@ THUMB_CACHE = (os.path.join(os.path.expanduser("~"), "Library", "Caches", "JhouL
 RIGHT_CLICKS = ("<Button-2>", "<Button-3>") if sys.platform == "darwin" else ("<Button-3>",)
 SHORTCUT = "Command" if sys.platform == "darwin" else "Control"
 MAX_RECENT = 20
-SMOOTH_ZOOM_NOTE = ("On: every step of the mouse wheel is drawn, one after another. Off: steps that come while one is being\n"
-                    "drawn are drawn together, as one jump (quicker, on a large screen, but less smooth).")
-WHEEL_QUEUE = 4              # zoom steps that may wait to be drawn; more wheel clicks make them larger (see on_wheel)
+SMOOTH_ZOOM_NOTE = ("On: the zoom glides from one wheel click to the next, through pictures made from the one on screen\n"
+                    "(a little blurry while moving), sharpened when the zoom stops. Off: each click is drawn as one jump\n"
+                    "(clicks that come while one is being drawn are drawn together).")
+ZOOM_GLIDE = 0.05            # s: time constant of the zoom's glide to where the wheel clicks have asked for (see XlefViewer._glide_frame)
+ZOOM_LAND = 0.008            # the glide jumps the rest of the way once within this (log) distance of it: 0.8%, a few pixels at the edges
+ZOOM_SETTLE = 0.12           # s after the glide ends, with no click meanwhile, before the view is drawn properly (sharp pixels, reads)
+ZOOM_STEP = 1.25             # zoom per wheel click
 MOVING_PAUSE = 0.25          # s without a wheel click or drag before the view counts as at rest (see XlefViewer._moving)
 FINER_CROP_BYTES = 32e6      # a compressed plane is decoded whole anyway: a view of it is kept finer than the zoom needs (up to full resolution)
                              # while it takes no more than this per channel, so that zooming further in needs no new reading
@@ -2452,6 +2456,14 @@ def composite(arrays, luts):
     return out
 
 
+def mix_panels(arrays, luts, panels):
+    """composite() once per canvas: all channels together (panels == [None]), or each channel in `panels` on its own (separated)."""
+    if panels == [None]:
+        return [composite(arrays, luts)]
+    return [composite([a if i == c else None for i, a in enumerate(arrays)], [t if i == c else None for i, t in enumerate(luts)])
+            for c in panels]
+
+
 # How pixels are drawn when the view is zoomed in past them (one image pixel bigger than one screen pixel). Compared on section 17 at
 # 16x: bilinear turns a bright pixel into a plus; Lanczos rings; B-spline and wide Gaussians dim small bright spots. Mitchell-Netravali
 # is round, with almost no ringing.
@@ -3586,7 +3598,10 @@ class XlefViewer:
             self.enlarge_method = "mitchell"
         self.asking_download = False         # (the download question is open: see _full_res_allowed)
         self.moving_until, self.rest_job = 0.0, None     # (see _moving)
-        self.wheel_queue, self.wheel_job = [], None      # (zoom steps waiting to be drawn: see _wheel_step)
+        self.glide, self.glide_job = None, None          # (the zoom gliding to where the wheel asked: see on_wheel, _glide_frame)
+        self.base_view = None                            # (the last picture drawn properly, and the view it is of: see _put)
+        self.backdrop, self.backdrop_busy = None, False  # (the whole section, mixed, at about the fit view's size: see _backdrop_for)
+        self.glide_photos = []                           # (one canvas-sized PhotoImage per canvas, reused for the glide's pictures)
         self.fast_now = self.fast_shown = False          # (bilinear stood in for the chosen method: in the picture being made, on show)
         self.drawing_bands = False                       # (a sharp view's bands being drawn as they come in: the fast way)
         self.folders = {}            # list item -> FolderEntry (the list's folders; images are in self.entries)
@@ -3953,10 +3968,7 @@ class XlefViewer:
 
     def _mix(self, arrays, luts):
         """The channels' arrays mixed into one RGB picture per canvas: all of them together, or (separated) each on its own."""
-        if self.panel_channels == [None]:
-            return [composite(arrays, luts)]
-        return [composite([a if i == c else None for i, a in enumerate(arrays)], [t if i == c else None for i, t in enumerate(luts)])
-                for c in self.panel_channels]
+        return mix_panels(arrays, luts, self.panel_channels)
 
     def _draw_panel_label(self):
         """Separated: the channel's number and name at the top left of its panel, in its color."""
@@ -4022,7 +4034,7 @@ class XlefViewer:
 
         def set_smooth():
             self.settings["smooth_zoom"] = smooth.get()
-            self.wheel_queue.clear()
+            self._stop_glide()
             self._save_settings()
         ttk.Checkbutton(box, text="Prioritize zoom smoothness over pure speed", variable=smooth, command=set_smooth).pack(anchor=tk.W)
         ttk.Label(box, text=SMOOTH_ZOOM_NOTE, style="Muted.TLabel", justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
@@ -5204,12 +5216,13 @@ class XlefViewer:
                 self._keep_image(self.img)
             else:
                 self.img.close()
+        self._stop_glide()
         self.img = None
         self._show_loaded()
         self.photo = None
         self.flip_one.set(False)
         self.flip_one_check.configure(state=tk.DISABLED)        # (no section shown)
-        self.last_view_rgb = None
+        self.last_view_rgb = self.base_view = None
         self.shrunk.clear()
         self.selected = self.ann_drag = self.hover_ann = None
         self._each_canvas(lambda: self.canvas.delete("all"))
@@ -5623,6 +5636,7 @@ class XlefViewer:
     def fit(self, redraw=True):
         if not self.img:
             return
+        self._stop_glide()
         self.scale = 0
         self.pixel_grid = False
         self.cx, self.cy = self.img.entry.width / 2, self.img.entry.height / 2
@@ -5634,6 +5648,12 @@ class XlefViewer:
         """Zoom to `scale`, keeping the image point under screen point (sx, sy) (default: the centre) in place."""
         if not self.img:
             return
+        self._stop_glide()
+        if self._set_zoom(scale, sx, sy):
+            self.schedule_redraw(0)
+
+    def _set_zoom(self, scale, sx=None, sy=None):
+        """The view's geometry for zoom_to, not drawn: True if it changed (False at the zoom limit already)."""
         cw, ch = self.canvas_size()
         sx = cw / 2 if sx is None else sx
         sy = ch / 2 if sy is None else sy
@@ -5647,9 +5667,8 @@ class XlefViewer:
         self.cx = ix - (sx - cw / 2) / self.scale
         self.cy = iy - (sy - ch / 2) / self.scale
         self.clamp_view()
-        if np.allclose((self.scale, self.cx, self.cy), before, rtol=0, atol=1e-6):
-            return          # (already at the zoom limit: a redraw would only blink, blurry then sharp again)
-        self.schedule_redraw(0)
+        # (already at the zoom limit: a redraw would only blink, blurry then sharp again)
+        return not np.allclose((self.scale, self.cx, self.cy), before, rtol=0, atol=1e-6)
 
     def screen_to_image(self, sx, sy):
         cw, ch = self.canvas_size()
@@ -5757,6 +5776,7 @@ class XlefViewer:
     def on_resize(self):
         if self.photo is None and getattr(self, "canvas_message", ""):
             self.show_message(self.canvas_message)          # (kept in the middle)
+        self._stop_glide()
         if self.img:
             at_fit = abs(self.scale - self.fit_scale) < 1e-9
             self.clamp_view()
@@ -5769,8 +5789,9 @@ class XlefViewer:
         return self.settings.get("smooth_zoom", True)
 
     def on_wheel(self, event, delta=None):
-        """A wheel click: one zoom step. Smooth zoom (Settings): queued (see _wheel_step), so that every step is drawn, however
-        fast the clicks come; else taken at once, and clicks that come while a step is drawn are drawn together, as one jump."""
+        """A wheel click: one zoom step. Smooth zoom (Settings): the zoom glides there (see _glide_frame), through pictures made from
+        the one on screen, and the clicks that come meanwhile move where it glides to; else taken at once, and clicks that come while
+        a step is drawn are drawn together, as one jump."""
         d = event.delta if delta is None else delta
         if not self._smooth_zoom():
             if d > 0 and self.img is not None and self.scale >= MAX_ZOOM - 1e-9:
@@ -5783,50 +5804,226 @@ class XlefViewer:
                 self.schedule_redraw(0)
                 return
             self._moving()
-            self.zoom_to(self.scale * (1.25 ** wheel_notches(d)), event.x, event.y)
+            self.zoom_to(self.scale * (ZOOM_STEP ** wheel_notches(d)), event.x, event.y)
             return
-        if self.wheel_queue:
-            n = wheel_notches(d)
-            if n * self.wheel_queue[-1][0] < 0:
-                self.wheel_queue.clear()        # (turned the other way: the steps still waiting are dropped, this one taken at once)
-            elif len(self.wheel_queue) >= WHEEL_QUEUE:
-                for step in self.wheel_queue:   # (far behind: the steps waiting made larger, all alike, not one jump at the end)
-                    step[0] += n / len(self.wheel_queue)
-                return
-            if self.wheel_queue:
-                self.wheel_queue.append([n, event.x, event.y])
-                return
-        if d > 0 and self.img is not None and self.scale >= MAX_ZOOM - 1e-9:
-            if not self.pixel_grid:             # (at the largest zoom already: show the pixels' edges instead)
+        if self.img is None:
+            return
+        g = self.glide
+        goal = g["target"] if g is not None else self.scale
+        if d > 0 and goal >= MAX_ZOOM - 1e-9:
+            if g is None and not self.pixel_grid:   # (at the largest zoom already: show the pixels' edges instead)
                 self.pixel_grid = True
                 self.schedule_redraw(0)
             return
-        if d < 0 and self.pixel_grid:           # (back from the grid: the same zoom, smooth again)
+        if d < 0 and self.pixel_grid:               # (back from the grid: the same zoom, smooth again)
             self.pixel_grid = False
             self.schedule_redraw(0)
             return
-        self.wheel_queue.append([wheel_notches(d), event.x, event.y])
-        if self.wheel_job is None:
-            self.wheel_job = self.root.after(0, self._wheel_step)     # (not drawn here: clicks waiting meanwhile are queued first)
-
-    def _wheel_step(self):
-        """The next zoom step waiting, drawn and painted at once (not left to a redraw that clicks coming in meanwhile would put off,
-        so that two or three steps were shown as one jump); then the next, after the clicks that came in while it was drawn are queued."""
-        self.wheel_job = None
-        if not self.wheel_queue:
+        target = min(max(goal * ZOOM_STEP ** wheel_notches(d), self.fit_scale), MAX_ZOOM)
+        if not self._can_glide():
+            self._moving()
+            self.zoom_to(target, event.x, event.y)
             return
-        n, x, y = self.wheel_queue[0]
-        self._moving()
-        self.zoom_to(self.scale * (1.25 ** n), x, y)
-        if self.redraw_job:
+        if g is None and abs(target - self.scale) < 1e-9:
+            return
+        if self.redraw_job:                         # (the drawing at the end of a glide just ended: not yet, the zoom moves on)
             self.root.after_cancel(self.redraw_job)
-            self._redraw_job()
-            self.root.update_idletasks()        # (on screen now: Tk paints when idle, and the next step's timer came first, so a
-                                                # step or two were drawn but never shown, and the zoom jumped)
-        if self.wheel_queue:                    # (cleared meanwhile: turned the other way, or another image)
-            self.wheel_queue.pop(0)
-        if self.wheel_queue:
-            self.wheel_job = self.root.after(1, self._wheel_step)
+            self.redraw_job = None
+        if g is None:
+            self.glide = {"target": target, "x": event.x, "y": event.y, "img": self.img, "t": time.perf_counter() - 1 / 60,
+                          "frames": 0, "start": time.perf_counter()}
+            self._backdrop()                        # (made in the background if not here yet: for zooming out)
+            self.glide_job = self.root.after(0, self._glide_frame)
+        else:
+            g.update(target=target, x=event.x, y=event.y)
+
+    def _can_glide(self):
+        """A glide's pictures can be made from the one on screen (see _put): one there, of this image, for each canvas, at this size."""
+        b = self.base_view
+        return (b is not None and self.img is not None and b["img"] is self.img and len(b["ims"]) == len(self.canvases)
+                and b["size"] == self.canvas_size())
+
+    def _stop_glide(self):
+        """The glide given up where it is (a drag, fit, another image, the window resized, ...), and the view drawn properly there."""
+        if self.glide_job is not None:
+            self.root.after_cancel(self.glide_job)
+            self.glide_job = None
+        if self.glide is not None:
+            self.glide = None
+            self.schedule_redraw(0)
+
+    def _glide_frame(self):
+        """One picture of the glide: the zoom taken a step closer to where the clicks asked for (exponentially, ZOOM_GLIDE), the
+        picture on screen scaled to it (see _draw_glide) and painted at once; then the next, until it is there. The view is drawn
+        properly ZOOM_SETTLE after that, unless another click comes first."""
+        self.glide_job = None
+        g = self.glide
+        if g is None:
+            return
+        if g["img"] is not self.img or not self._can_glide():
+            self._stop_glide()
+            return
+        start = time.perf_counter()
+        dt, g["t"] = min(start - g["t"], 0.1), start      # (at most 0.1 s: after a pause, e.g. the window busy, no jump)
+        target = g["target"]
+        scale = target * (self.scale / target) ** float(np.exp(-dt / ZOOM_GLIDE))
+        done = abs(np.log(scale / target)) < ZOOM_LAND
+        self._moving()
+        moved = self._set_zoom(target if done else scale, g["x"], g["y"])
+        times = self._draw_glide() if moved else {}
+        drawn = time.perf_counter()
+        self.root.update_idletasks()                      # (on screen now: Tk paints when idle, and the next frame's timer comes first)
+        g["frames"] += 1
+        if TRACE_PATH:
+            last, self.last_frame_at = getattr(self, "last_frame_at", None), time.perf_counter()
+            trace(f"  glide frame {g['frames']}: zoom {self.scale:.3f} -> {target:.3f}, ms: "
+                  + ", ".join(f"{k} {v:.0f}" for k, v in times.items())
+                  + f", paint {(self.last_frame_at - drawn) * 1000:.0f} (frame {(self.last_frame_at - start) * 1000:.0f}"
+                  + (f", {(start - last) * 1000:.0f} since the last" if last and start - last < 1 else "") + ")")
+        if done or not moved:
+            if TRACE_PATH:
+                trace(f"  glide done: {g['frames']} frames in {(time.perf_counter() - g['start']) * 1000:.0f} ms")
+            self.glide = None
+            self.schedule_redraw(int(ZOOM_SETTLE * 1000))
+        else:
+            self.glide_job = self.root.after(1, self._glide_frame)
+
+    def _draw_glide(self):
+        """The view now, made from the last picture drawn properly (base_view: scaled and moved to this zoom; never from another
+        glide picture, which would blur more at every frame), over the whole section at about the fit view's size where that picture
+        doesn't reach (zooming out: see _backdrop); one canvas-sized picture per canvas, put into the PhotoImage kept for it. Returns
+        the time of each part (ms), for tracing."""
+        b = self.base_view
+        cw, ch = self.canvas_size()
+        e = self.img.entry
+        t0 = time.perf_counter()
+        times = {}
+        # Each picture placed as (ax, bx, ay, by): its pixel (u, v) = (ax * X + bx, ay * Y + by) at screen point (X, Y) of the view
+        # now (unflipped).
+        a = b["scale"] / self.scale
+        base_map = (a, (self.cx - b["cx"] - cw / 2 / self.scale) * b["scale"] + cw / 2 - b["left"],
+                    a, (self.cy - b["cy"] - ch / 2 / self.scale) * b["scale"] + ch / 2 - b["top"])
+        W, H = b["ims"][0].size
+        base_rect = self._glide_rect(base_map, W, H, cw, ch)
+        image_rect = (max(0, round(-self.cx * self.scale + cw / 2)), max(0, round(-self.cy * self.scale + ch / 2)),
+                      min(cw, round((e.width - self.cx) * self.scale + cw / 2)), min(ch, round((e.height - self.cy) * self.scale + ch / 2)))
+        bd = None
+        if base_rect is None or (base_rect[0] > image_rect[0] or base_rect[1] > image_rect[1] or base_rect[2] < image_rect[2]
+                                 or base_rect[3] < image_rect[3]):
+            bd = self._backdrop()               # (the picture on screen doesn't cover the image in view: zooming out)
+        if not hasattr(self, "canvas_rgb"):
+            self.canvas_rgb = tuple(v // 256 for v in self.root.winfo_rgb(self.canvas.cget("background")))
+        frames = []
+        for k, im in enumerate(b["ims"]):
+            frame = Image.new("RGB", (cw, ch), self.canvas_rgb)
+            if bd is not None and k < len(bd["ims"]):
+                fx, fy = bd["f"]
+                bmap = (1 / (self.scale * fx), self.cx / fx - cw / 2 / (self.scale * fx),
+                        1 / (self.scale * fy), self.cy / fy - ch / 2 / (self.scale * fy))
+                self._glide_paste(frame, bd["ims"][k], bmap, cw, ch)
+                t0 = self._lap(times, "backdrop", t0)
+            self._glide_paste(frame, im, base_map, cw, ch, base_rect)
+            t0 = self._lap(times, "scale", t0)
+            if self._flipped():
+                frame = frame.transpose(Image.FLIP_LEFT_RIGHT)
+                t0 = self._lap(times, "flip", t0)
+            frames.append(frame)
+        photos = self.glide_photos
+        for k, frame in enumerate(frames):
+            if k < len(photos) and (photos[k].width(), photos[k].height()) == frame.size:
+                photos[k].paste(frame)
+            elif k < len(photos):
+                photos[k] = ImageTk.PhotoImage(frame, master=self.root)
+            else:
+                photos.append(ImageTk.PhotoImage(frame, master=self.root))
+        t0 = self._lap(times, "photo", t0)
+
+        def draw():
+            c = self.canvas
+            c.delete("all")
+            c.create_image(0, 0, anchor=tk.NW, image=photos[self.drawing_panel])
+            self._draw_panel_label()
+            self._draw_annotations()
+            self._draw_scale_bar()
+            self._draw_load_note()
+            self._draw_hires_note_here()
+        self._each_canvas(draw)
+        self._lap(times, "canvas", t0)
+        return times
+
+    @staticmethod
+    def _lap(times, part, since):
+        """(For _draw_glide's tracing) the time since `since` added to times[part], in ms; returns now."""
+        now = time.perf_counter()
+        times[part] = times.get(part, 0.0) + (now - since) * 1000
+        return now
+
+    @staticmethod
+    def _glide_rect(m, W, H, cw, ch):
+        """Where a W x H picture placed by m = (ax, bx, ay, by) (see _draw_glide) falls on a cw x ch canvas, in whole pixels:
+        (X0, Y0, X1, Y1), or None if not at all."""
+        ax, bx, ay, by = m
+        X0, X1 = max(0, round(-bx / ax)), min(cw, round((W - bx) / ax))
+        Y0, Y1 = max(0, round(-by / ay)), min(ch, round((H - by) / ay))
+        return (X0, Y0, X1, Y1) if X1 > X0 and Y1 > Y0 else None
+
+    @classmethod
+    def _glide_paste(cls, frame, im, m, cw, ch, rect=None):
+        """Picture `im`, placed by m (see _draw_glide), scaled into the part of `frame` it covers (bilinear)."""
+        rect = rect or cls._glide_rect(m, im.width, im.height, cw, ch)
+        if rect is None:
+            return
+        ax, bx, ay, by = m
+        X0, Y0, X1, Y1 = rect
+        box = (min(max(ax * X0 + bx, 0), im.width), min(max(ay * Y0 + by, 0), im.height),
+               min(max(ax * X1 + bx, 0), im.width), min(max(ay * Y1 + by, 0), im.height))
+        if box[2] - box[0] <= 0 or box[3] - box[1] <= 0:
+            return
+        frame.paste(im.resize((X1 - X0, Y1 - Y0), Image.BILINEAR, box=box), (X0, Y0))
+
+    def _backdrop(self):
+        """The whole section (this layer), mixed as shown, at about the fit view's size: what a glide shows where the picture on screen
+        doesn't reach, zooming out. Made in the background when not here yet or out of date (the sliders, the panels), not while the
+        image is loading: {"key", "ims" (a PIL image per canvas), "f" (image pixels per its pixel, across and down)}. The one here is
+        given if it is of this image and layer, even out of date (its colors are put right by the drawing at the end), else None."""
+        img = self.img
+        if img is None:
+            return None
+        key = (id(img), self.z, img.ov_step, self._mix_sig(), self.canvas_size())
+        bd = self.backdrop
+        if (bd is None or bd["key"] != key) and not self.backdrop_busy and not self.loading:
+            self._make_backdrop(key)
+        return bd if bd is not None and bd["key"][:3] == key[:3] else None
+
+    def _make_backdrop(self, key):
+        """See _backdrop: made from the previews in memory (nothing is read), in a thread."""
+        img, z, e = self.img, self.z, self.img.entry
+        luts = make_luts(e.channels, self.ch_settings)
+        ovs = [img.overviews.get((z, c)) if luts[c] is not None else None for c in range(len(luts))]
+        if not any(o is not None for o in ovs) or any(lut is not None and o is None for lut, o in zip(luts, ovs)):
+            return
+        s, panels, (cw, ch) = img.ov_step, list(self.panel_channels), key[4]
+        fit = min(cw / e.width, ch / e.height)
+        self.backdrop_busy = True
+
+        def work():
+            started = time.perf_counter()
+            try:
+                rows, cols = next(o.shape for o in ovs if o is not None)
+                bw, bh = min(cols, max(1, round(e.width * fit))), min(rows, max(1, round(e.height * fit)))
+                arrays = [o if o is None or (bw, bh) == (cols, rows) else
+                          np.asarray(Image.fromarray(np.ascontiguousarray(o)).resize((bw, bh), Image.BOX)) for o in ovs]
+                self.backdrop = {"key": key, "ims": [Image.fromarray(rgb) for rgb in mix_panels(arrays, luts, panels)],
+                                 "f": (s * cols / bw, s * rows / bh)}
+                if TRACE_PATH:
+                    trace(f"  glide backdrop made: {bw}x{bh}, {(time.perf_counter() - started) * 1000:.0f} ms")
+            except Exception as ex:
+                if TRACE_PATH:
+                    trace(f"  glide backdrop failed: {ex!r}")
+            finally:
+                self.backdrop_busy = False
+
+        threading.Thread(target=work, daemon=True).start()
 
     def on_press(self, event):
         self.canvas.focus_set()
@@ -5863,6 +6060,8 @@ class XlefViewer:
             self._draw_annotations()
 
     def pan_start(self, event):
+        if self.glide is not None:
+            self._stop_glide()
         self.drag = (event.x, event.y, self.cx, self.cy)
 
     def pan_move(self, event):
@@ -6120,10 +6319,12 @@ class XlefViewer:
             # at once instead of drawing the blurrier overview first and reading the files again (that blinked).
             (i0, j0, i1, j1), place = self._detail_rect(step, level)
             key = (id(self.img), self.z, i0, j0, i1, j1, step, place)
+            t0 = time.perf_counter()
             self._use_region(step, need)          # (a full-resolution region kept from before, if one covers this view)
             fin = self._interim_level(level, step, need)
             if fin is not None:
                 self._use_region(fin[1], need)    # (else the pyramid's finest level, read ahead for this layer: shown while it is decoded)
+            self._tick("find kept", t0)
             cache = self.detail_cache
             if cache is not None and cache["key"] != key and self._kept_covers(step, need):
                 # The new view lies within the sharp pixels already here, at the detail it needs (zooming in, or panning within
@@ -6157,6 +6358,7 @@ class XlefViewer:
                 left, top, w, h = place
                 if (cols, rows) != (i1 - i0, j1 - j0):      # (a pyramid level drops the last partial block at the right and bottom edges)
                     w, h = max(1, round(cols * s * self.scale)), max(1, round(rows * s * self.scale))
+                t0 = time.perf_counter()
                 if cols > w and rows > h:
                     # Zoomed out: shrink each channel to the screen size first (averaging, Pillow handles 16-bit), so that the slow part,
                     # mixing the channels, works on only as many pixels as are shown. The shrunk channels are kept for this view, so a
@@ -6170,8 +6372,14 @@ class XlefViewer:
                             crop[c] = self.shrunk[key]
                     for key in [k for k in self.shrunk if k[:-1] != view]:
                         del self.shrunk[key]
-                self._show(self._mix(crop, luts), left, top, w, h, smooth=self.scale * s < 1,
-                           overlay=[self._detail_overlay(luts), self._partial_overlay(luts)])
+                t0 = self._tick("shrink", t0)
+                rgbs = self._mix(crop, luts)
+                t0 = self._tick("mix", t0)
+                sharp = self._detail_overlay(luts)              # (times itself: "sharp mix", "sharp scale")
+                t0 = time.perf_counter()
+                overlay = [sharp, self._partial_overlay(luts)]
+                self._tick("bands", t0)
+                self._show(rgbs, left, top, w, h, smooth=self.scale * s < 1, overlay=overlay)
         if not detail:
             if not preview_only:
                 self.detail_pending = False
@@ -6328,7 +6536,7 @@ class XlefViewer:
         self.rest_job = self.root.after(int(MOVING_PAUSE * 1000) + 20, self._at_rest)
 
     def _held_back(self):
-        """While the wheel is zooming (smooth zoom, see _wheel_step): sharper pixels coming in for an earlier view aren't drawn
+        """While the wheel is zooming (smooth zoom, see _glide_frame): sharper pixels coming in for an earlier view aren't drawn
         between two steps (a drawing more, ~100 ms at full screen: that gap twice the others), but once at rest (see _at_rest)."""
         if self._smooth_zoom() and time.monotonic() < self.moving_until:
             self.owed_redraw = True
@@ -6340,9 +6548,13 @@ class XlefViewer:
         enlarged, the picture is the same either way (redrawing it anyway held up the next wheel click: ~100 ms at full screen);
         or if sharper pixels came in while zooming and were held back (see _held_back)."""
         self.rest_job = None
+        if self.glide is not None:
+            return                          # (still gliding: a frame took longer than MOVING_PAUSE)
         owed, self.owed_redraw = getattr(self, "owed_redraw", False), False
         if self.img is not None and (self.fast_shown or owed) and not self.drag:
             self.redraw()                   # (from the pixels already here: nothing is read again)
+        if self.img is not None and self._smooth_zoom():
+            self._backdrop()                # (for the next zoom out, made in the background if out of date)
 
     def _draw_method(self):
         """How zoomed-in pixels are enlarged: as chosen in Settings (bilinear while moving, or for a sharp view's bands as they come in,
@@ -6373,9 +6585,13 @@ class XlefViewer:
         if not on or any(arrays[c] is None for c in on):
             return None
         sig = self._mix_sig()
+        t0 = time.perf_counter()
         if cache.get("sig") != sig:            # (mixed once per slider setting, not on every wheel click)
             cache["rgb"] = self._mix([a if luts[c] is not None else None for c, a in enumerate(arrays)], luts)
             cache["sig"] = sig
+            t0 = self._tick("sharp mix", t0)
+            if TRACE_PATH:
+                trace(f"  sharp pixels mixed: {arrays[on[0]].shape[1]}x{arrays[on[0]].shape[0]} at step {st}, {len(on)} channels")
         rgbs = cache["rgb"]
         rows, cols = rgbs[0].shape[:2]
         x0, y0 = i0 * st, j0 * st                           # (image pixel of rgb[0, 0])
@@ -6391,6 +6607,7 @@ class XlefViewer:
             part = np.ascontiguousarray(rgb[b0:b1, a0:a1])
             ims.append(enlarge(part, w, h, self._draw_method()) if w > a1 - a0 or h > b1 - b0       # (zoomed in past the pixels)
                        else Image.fromarray(part).resize((w, h), Image.BILINEAR))
+        self._tick("sharp scale", t0)
         return ims, round((x0 + a0 * st - self.cx) * self.scale + cw / 2), round((y0 + b0 * st - self.cy) * self.scale + ch / 2)
 
     def _slow(self, seconds, budget=READ_BUDGET):
@@ -6807,28 +7024,53 @@ class XlefViewer:
         """rgbs: one RGB array per canvas (see _mix), all of this view. overlay: sharper pixels to lay on top, (images, x, y), or a list
         of such (or None), each over the ones before."""
         ims = []
+        t0 = time.perf_counter()
         for k, rgb in enumerate(rgbs):
             im = Image.fromarray(rgb)
             if im.size != (w, h):           # (smooth: shrinking; else zoomed in past the pixels: enlarged as chosen in Settings)
                 im = im.resize((w, h), Image.BILINEAR) if smooth else enlarge(rgb, w, h, self._draw_method())
+            t0 = self._tick("enlarge", t0)
             for ov in (overlay if isinstance(overlay, list) else [overlay]):
                 if ov is not None and k < len(ov[0]):           # (sharper pixels on top, where there are some for this view)
                     sharp, ox, oy = ov[0][k], ov[1], ov[2]
                     im.paste(sharp, (ox - left, oy - top))
+            t0 = self._tick("paste", t0)
             ims.append(im)
         self._put(ims, left, top)
 
+    def _tick(self, stage, since):
+        """Tracing (XLEF_TRACE): the time since `since` added to `stage` of the drawing being timed (written by _put); returns now."""
+        now = time.perf_counter()
+        if TRACE_PATH:
+            st = self.__dict__.setdefault("stage_ms", {})
+            st[stage] = st.get(stage, 0.0) + (now - since) * 1000
+        return now
+
     def _put(self, ims, left, top):
         """The finished pictures of the view (PIL images, one per canvas), at (left, top) on each, with the pixel grid, the channel's
-        name (separated), the annotations, scale bar and notes. Flip left-right: mirrored here, and placed mirrored."""
+        name (separated), the annotations, scale bar and notes. Flip left-right: mirrored here, and placed mirrored. Kept unmirrored,
+        with the view they are of, as the picture the zoom's glide is made from (base_view, see _draw_glide). A PhotoImage of the
+        same size as the new picture is reused (pasted into: ~20 ms less at full screen than making a new one)."""
+        self.base_view = {"ims": ims, "left": left, "top": top, "scale": self.scale, "cx": self.cx, "cy": self.cy,
+                          "size": self.canvas_size(), "img": self.img}
         if self._flipped():
             ims = [im.transpose(Image.FLIP_LEFT_RIGHT) for im in ims]
             left = self.canvas_size()[0] - left - ims[0].width
         self.fast_shown, self.fast_now = self.fast_now, False
         self.last_view = (ims, left, top, self.canvas_size(), self.panel_cols)
         self.last_view_rgb = ims[0]
-        self.photos = [ImageTk.PhotoImage(im, master=self.root) for im in ims]
+        t0 = time.perf_counter()
+        old = getattr(self, "photos", None) or []
+        photos = []
+        for k, im in enumerate(ims):
+            if k < len(old) and (old[k].width(), old[k].height()) == im.size:
+                old[k].paste(im)
+                photos.append(old[k])
+            else:
+                photos.append(ImageTk.PhotoImage(im, master=self.root))
+        self.photos = photos
         self.photo = self.photos[0]
+        t0 = self._tick("photo", t0)
 
         def draw():
             c = self.canvas
@@ -6843,6 +7085,11 @@ class XlefViewer:
             self._draw_hires_note_here()      # (still waiting for the sharper view: the note stays over the new picture)
         self._each_canvas(draw)
         self._update_status()
+        self._tick("canvas", t0)
+        if TRACE_PATH:
+            st, self.stage_ms = getattr(self, "stage_ms", {}), {}
+            trace(f"  drawn {ims[0].width}x{ims[0].height} x{len(ims)}, zoom {self.scale:.3f}, ms: "
+                  + ", ".join(f"{k} {v:.0f}" for k, v in st.items()) + f" (total {sum(st.values()):.0f})")
 
     def _load_note(self):
         """While an image's channels are still arriving: "Loading channel 2 of 4..." (the picture is not complete yet); else ""."""
@@ -8430,6 +8677,8 @@ class XlefViewer:
                     self.redraw()
                     self._update_cursor()
                     self._start_overview_prefetch()
+                    if self._smooth_zoom():
+                        self._backdrop()        # (for the first zoom out: made in the background)
                 elif kind == "detail_band" and gen == self.generation and not self.drag:
                     key, arrays, rows = data
                     self.detail_partial = {"key": key, "arrays": arrays, "rows": rows}

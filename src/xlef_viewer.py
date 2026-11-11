@@ -101,6 +101,7 @@ READ_BUDGET = 0.3            # s: a sharper picture expected to take longer than
 LEVEL_BUDGET = 1.0           # s: the same for the pyramid's whole sharper copy (read in the background, the preview shown meanwhile)
 RELAXED_ENLARGE = 2.5        # then the preview may be shown enlarged up to this much (preview pixels on screen) before reading
 PROBE_INTERVAL = 600         # s: a storage location's speed is measured again after this long (see StorageSpeed)
+PROBE_ROUNDS = 3             # a storage location is timed this many times, the middle result kept (see StorageSpeed.probe)
 PROBE_MIN_BYTES = 32 << 20   # a file is timed only if at least this large (its middle then rarely in Windows' file cache)
 DRIVE_SEARCH_SECONDS = 4     # File > Test drive speed: how long to look through a drive's folders for a large file to time it with
 Z_SETTLE_MS = 150            # ms the z slider must rest before the plane it is on is read
@@ -2009,6 +2010,7 @@ class StorageSpeed:
     def __init__(self):
         self.lock = threading.Lock()
         self.found = {}              # location -> {"latency": s, "rate": bytes/s, "when": time.time()}
+        self.measured = 0            # (one more for each measurement: the viewer then sees whether to ask about a slow drive)
         self.probing = set()
 
     @staticmethod
@@ -2041,7 +2043,8 @@ class StorageSpeed:
 
     def probe(self, path):
         """Measure the location of `path` (a large file, stored on this computer or the network: not an online-only one, whose read
-        would download it): 3 reads of 4 KB (the wait per request) and one of 4 MB (the rate), at random places in its middle."""
+        would download it): timed PROBE_ROUNDS times (see time_file) and the middle of each kept, so that one hiccup (a drive
+        waking up, a virus scanner busy on a new computer) doesn't make a fast drive count as slow."""
         where = self.location(path)
         with self.lock:
             if where in self.probing:
@@ -2050,9 +2053,7 @@ class StorageSpeed:
         try:
             if os.path.getsize(path) < PROBE_MIN_BYTES or is_online_only(path):
                 return
-            latency, rate = self.time_file(path)
-            with self.lock:
-                self.found[where] = {"latency": latency, "rate": rate, "when": time.time()}
+            self.test(path, PROBE_ROUNDS)
         except OSError:
             pass
         finally:
@@ -2080,15 +2081,15 @@ class StorageSpeed:
         finally:
             os.close(fd)
 
-    def test(self, path, times=3):
-        """File > Test drive speed: where `path` is, timed `times` times (see time_file) and the middle of each kept, so that one
-        hiccup (a drive waking up, a virus scanner busy on a new computer) doesn't decide it; it replaces what was measured before.
-        Returns that {"latency", "rate", "when"}; OSError if the file can't be read."""
+    def test(self, path, times=PROBE_ROUNDS):
+        """Where `path` is, timed `times` times (see time_file) and the middle of each kept (see probe; also File > Test drive
+        speed): it replaces what was measured before. Returns that {"latency", "rate", "when"}; OSError if the file can't be read."""
         runs = [self.time_file(path) for _ in range(times)]
         e = {"latency": sorted(r[0] for r in runs)[len(runs) // 2], "rate": sorted(r[1] for r in runs)[len(runs) // 2],
              "when": time.time()}
         with self.lock:
             self.found[self.location(path)] = e
+            self.measured += 1
         return e
 
     def describe(self):
@@ -4067,6 +4068,21 @@ class XlefViewer:
         measured = SPEED.describe()
         ttk.Label(box, text="Measured: " + ("; ".join(measured) if measured else "nothing yet (it is measured as a project opens)"),
                   style="Muted.TLabel", justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
+        choices = self.settings.get("drive_choices", {})
+        if choices:
+            row = ttk.Frame(box)
+            row.pack(anchor=tk.W, pady=(4, 0))
+            said = ttk.Label(row, style="Muted.TLabel", text="Slow drives: " + "; ".join(
+                f"{where.upper() or '(this computer)'} {'optimized' if c == 'optimize' else 'read normally'}"
+                for where, c in sorted(choices.items())))
+            said.pack(side=tk.LEFT)
+
+            def forget():
+                self._forget_drive_choices()
+                said.config(text="Slow drives: asked about again when next measured")
+                ask.config(state=tk.DISABLED)
+            ask = ttk.Button(row, text="Ask again about slow drives", command=forget)
+            ask.pack(side=tk.LEFT, padx=(8, 0))
         box = ttk.LabelFrame(body, text="Memory for previews", padding=(10, 6))
         box.pack(fill=tk.X, pady=(10, 0))
         row = ttk.Frame(box)
@@ -6610,11 +6626,90 @@ class XlefViewer:
         self._tick("sharp scale", t0)
         return ims, round((x0 + a0 * st - self.cx) * self.scale + cw / 2), round((y0 + b0 * st - self.cy) * self.scale + ch / 2)
 
-    def _slow(self, seconds, budget=READ_BUDGET):
-        """Whether a read expected to take `seconds` (None: not known) is slow enough to be put off (Settings: "Reading", see
-        READ_BUDGET): "Automatic" by the measured speed, else always ("Save reading") or never ("Always the sharpest")."""
+    def _slow(self, seconds, budget=READ_BUDGET, path=None):
+        """Whether a read expected to take `seconds` (None: not known) from where `path` is is slow enough to be put off (Settings:
+        "Reading", see READ_BUDGET): "Automatic" by the measured speed (unless asked about a slow drive, "Read normally" was
+        chosen for it: see _ask_about_slow_drives), else always ("Save reading") or never ("Always the sharpest")."""
         mode = self.settings.get("reading", "auto")
+        if mode == "auto" and path is not None and self._drive_choice(path) == "normal":
+            return False
         return mode == "save" or (mode == "auto" and seconds is not None and seconds > budget)
+
+    def _drive_choice(self, path):
+        """What was chosen when asked about the slow drive (or network share) `path` is on: "optimize", "normal", or None."""
+        return self.settings.get("drive_choices", {}).get(SPEED.location(path))
+
+    def _measured_slow(self, where):
+        """The drive or network share `where` (see StorageSpeed.location), as measured, counts as slow (by a typical sharper copy,
+        32 MB in 12 reads, as in _speed_note); False if not measured."""
+        e = SPEED.found.get(where)
+        return e is not None and e["latency"] * 12 + 32e6 / e["rate"] > LEVEL_BUDGET
+
+    def _ask_about_slow_drives(self):
+        """A drive (or network share) that an open project is on was measured as slow: say so, once, and ask whether to optimize
+        for it (the preview shown enlarged further before a sharper picture is read: see _read_plan), read it normally anyway (it
+        may be a hiccup: then a fast drive is read as fast), or test it again. The answer is remembered for that drive (Settings:
+        forgotten with "Ask again about slow drives"); closing the question leaves it optimized, and asks again next time."""
+        if self.settings.get("reading", "auto") != "auto" or getattr(self, "asking_slow", False):
+            return
+        if getattr(self, "speed_window", None) is not None:
+            return                          # (File > Test drive speed's window shows it: asked once that is closed)
+        asked = self.__dict__.setdefault("slow_asked", set())
+        for pid, proj in list(self.projects.items()):
+            where = SPEED.location(proj["path"])
+            if where in asked or self._drive_choice(proj["path"]) is not None or not self._measured_slow(where):
+                continue
+            asked.add(where)
+            e = SPEED.found[where]
+            name = where.upper() or "this computer's drive"
+            self.asking_slow = True
+            try:
+                answer = ask_choice(self.root, "Slow storage", (
+                    f"Reading from {name} is slow: {e['latency'] * 1000:.0f} ms per read, {e['rate'] / 1e6:.0f} MB/s "
+                    f"(measured {PROBE_ROUNDS} times just now, the middle result kept).\n\n"
+                    f"Optimize the viewer for it? Then, as you zoom in, the preview is shown enlarged up to {RELAXED_ENLARGE:g} times "
+                    "before a sharper picture is read, and then only the part in view, so zooming stays quick; the picture is a "
+                    "little softer at in-between zooms.\n\n"
+                    f"If {name} is usually fast, this may have been a hiccup: test it again, or read it normally."),
+                    [("Optimize", "optimize", "Recommended for a slow network share or a USB drive"),
+                     ("Read normally", "normal", "The sharpest picture as soon as you zoom in, however long it takes"),
+                     ("Test again", "retest", f"Time {name} once more")])
+            finally:
+                self.asking_slow = False
+            if answer in ("optimize", "normal"):
+                self.settings.setdefault("drive_choices", {})[where] = answer
+                self._save_settings()
+                if answer == "normal" and self.img is not None:
+                    self.redraw()
+            elif answer == "retest":
+                self._retest_drive(pid, where)
+            return                          # (one question at a time: another slow drive is asked about at the next measurement)
+
+    def _retest_drive(self, pid, where):
+        """The slow-drive question's Test again: the drive timed once more in the background; still slow, it is asked about again."""
+        f = next((f for e in self._entries_of(pid).values() for f in e.all_files()
+                  if f and _size_or_0(f) >= PROBE_MIN_BYTES and not is_online_only(f)), None)
+        if f is None:
+            return
+        name = where.upper() or "the drive"
+        self.status.config(text=f"Testing {name} again ...")
+
+        def work():
+            try:
+                e = SPEED.test(f)
+                text = (f"{name} tested again: {e['latency'] * 1000:.0f} ms per read, {e['rate'] / 1e6:.0f} MB/s, "
+                        + ("still slow" if self._measured_slow(where) else "fast"))
+            except OSError as err:
+                text = f"{name} couldn't be tested again: {err}"
+            self.results.put(("progress", self.generation, text))      # (the status line, from the Tk loop)
+        self.slow_asked.discard(where)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _forget_drive_choices(self):
+        self.settings.pop("drive_choices", None)
+        self.__dict__.pop("slow_asked", None)
+        self._save_settings()
+        self.redraw()
 
     def _want_sharp_level(self, img):
         """When an image opens with its small preview: read the pyramid's sharper copy whole now, or not (the usual): its part in
@@ -6658,7 +6753,7 @@ class XlefViewer:
         if level_helps:
             level, n = pyr[0], len(img.entry.channels)
             f = level.files.get((self.z, 0)) or level.files.get((0, 0))
-            slow = self._slow(SPEED.estimate(f, level.width * level.height * n, 3 * n) if f else None, LEVEL_BUDGET)
+            slow = self._slow(SPEED.estimate(f, level.width * level.height * n, 3 * n) if f else None, LEVEL_BUDGET, f)
             if not slow:
                 return (pyr[1], level) if step >= pyr[1] else (step, None)
             if self.scale * shown <= RELAXED_ENLARGE:
@@ -6677,7 +6772,7 @@ class XlefViewer:
         if f is None:
             return False
         nbytes = (j1 - j0) * ((i1 - i0 - 1) * step + 1) * 2 * len(need)
-        return self._slow(SPEED.estimate(f, nbytes, (j1 - j0) * len(need), READ_THREADS))
+        return self._slow(SPEED.estimate(f, nbytes, (j1 - j0) * len(need), READ_THREADS), path=f)
 
     def _probe_speed(self, entry):
         """Measure, in the background, the storage of this image's full-resolution files if it is due (see StorageSpeed)."""
@@ -6696,6 +6791,8 @@ class XlefViewer:
         if e is None:
             return f"Speed of {where} not measured yet (it is as a project opens)"
         speed = f"{e['latency'] * 1000:.0f} ms per read, {e['rate'] / 1e6:.0f} MB/s"
+        if self._drive_choice(path) == "normal" and self._measured_slow(SPEED.location(path)):
+            return f"Slow storage ({where} measured at {speed}), read normally as you chose (Settings: Ask again about slow drives)"
         if self._slow(SPEED.estimate(path, 32e6, 12), LEVEL_BUDGET):
             return (f"Slow storage ({where} measured at {speed}): previews are shown enlarged up to {RELAXED_ENLARGE:g} times\n"
                     "before sharper pictures are read")
@@ -6758,6 +6855,7 @@ class XlefViewer:
             state["stop"] = True
             self.speed_window = None
             dlg.destroy()
+            self.root.after(0, self._ask_about_slow_drives)
         dlg.protocol("WM_DELETE_WINDOW", close)
         dlg.geometry(f"+{self.root.winfo_rootx() + 160}+{self.root.winfo_rooty() + 120}")
 
@@ -8736,6 +8834,9 @@ class XlefViewer:
                         self.show_message(data)         # (in the picture's place too: else "Loading channel 1 of 4..." stays on a black screen)
         except queue.Empty:
             pass
+        if SPEED.measured != getattr(self, "speed_seen", 0):
+            self.speed_seen = SPEED.measured
+            self.root.after(0, self._ask_about_slow_drives)       # (not from inside this loop: the question waits for an answer)
         self.root.after(30, self._poll_results)
 
     def save_view(self):

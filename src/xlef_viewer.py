@@ -4209,8 +4209,30 @@ class XlefViewer:
 
     def updates_found(self, changes):
         """The check at launch found newer commits: the Check for updates menu becomes "Updates available (n)", its item "See the n new
-        changes and update..." (the same dialog: it lists the changes and asks)."""
+        changes and update...", and the same dialog (it lists the changes and asks) comes up at once, without waiting for a click."""
         self._update_menu_label(len(changes))
+        self._offer_update(changes)
+
+    def _offer_update(self, changes):
+        """updates_found's question: over any dialog that is open (the open dialog is, at launch: see _on_top), but put off while
+        the viewer's own question about a slow drive, or File > Test drive speed's window, is up, so that the two don't pile up."""
+        if getattr(self, "updating", False):
+            return
+        if getattr(self, "asking_slow", False) or getattr(self, "speed_window", None) is not None:
+            self.root.after(1000, lambda: self._offer_update(changes))
+            return
+        self.update_app(changes)
+
+    def _on_top(self):
+        """The window a question goes over: the dialog that has the input (e.g. the open dialog, shown at launch), else the main
+        window; a question over the main window would be hidden behind that dialog, and its answer blocked."""
+        try:
+            top = self.root.grab_current()
+            if top is not None and top.winfo_exists():
+                return top
+        except (tk.TclError, KeyError):
+            pass
+        return self.root
 
     def _update_menu_label(self, n):
         """The update menu's name and its item's: n new changes found on GitHub (0: none, or updated: "Check for updates" again)."""
@@ -4221,9 +4243,9 @@ class XlefViewer:
             self.menubar.entryconfigure(self.update_menu_index, label="Check for updates")
             self.update_menu.entryconfigure(0, label="Check GitHub now...")
 
-    def update_app(self):
+    def update_app(self, changes=None):
         """Update > Update from GitHub: looks for newer commits (in a thread: the network), says what is new, and on a yes pulls them and
-        offers to restart the viewer."""
+        offers to restart the viewer. changes: those already found (by the check at launch): not looked for again."""
         if getattr(self, "updating", False):
             return
         self.updating = True
@@ -4253,7 +4275,7 @@ class XlefViewer:
             self.updating = False
             self.root.config(cursor="")
             if text:
-                (messagebox.showerror if error else messagebox.showinfo)("Update", text, parent=self.root)
+                (messagebox.showerror if error else messagebox.showinfo)("Update", text, parent=self._on_top())
 
         def checked(ok, value):
             if not ok:
@@ -4264,7 +4286,7 @@ class XlefViewer:
             shown = "\n".join("  • " + line for line in value[:12]) + (f"\n  ... and {len(value) - 12} more" if len(value) > 12 else "")
             self.root.config(cursor="")
             if not messagebox.askyesno("Update", f"{len(value)} new change{'s' if len(value) != 1 else ''} on GitHub:\n\n{shown}\n\n"
-                                       "Download them now?", parent=self.root):
+                                       "Download them now?", parent=self._on_top()):
                 return finish()
             self.status.config(text="Updating ...")
             self.root.config(cursor="watch")
@@ -4276,17 +4298,27 @@ class XlefViewer:
                 return finish(value, True)
             self._update_menu_label(0)
             finish()
-            if messagebox.askyesno("Update", "Updated. The new version runs after the viewer restarts.\n\nRestart it now?", parent=self.root):
-                self.quit()
-                try:
-                    self.root.winfo_exists()            # (still there: closing was cancelled, e.g. unsaved changes)
-                except tk.TclError:
-                    app_update.relaunch()
+            top = self._on_top()
+            if messagebox.askyesno("Update", "Updated. The new version runs after the viewer restarts.\n\nRestart it now?", parent=top):
+                if top is not self.root:                # (a dialog is open, e.g. the open dialog: closed first, as if cancelled, and
+                    top.destroy()                       # the restart left until it has returned)
+                    self.root.after(100, restart)
+                else:
+                    restart()
+
+        def restart():
+            self.quit()
+            try:
+                self.root.winfo_exists()                # (still there: closing was cancelled, e.g. unsaved changes)
+            except tk.TclError:
+                app_update.relaunch()
 
         try:
             root = app_update.repo_root()
         except app_update.UpdateError as e:
             return finish(str(e), True)
+        if changes:
+            return checked(True, list(changes))
         self.status.config(text="Checking GitHub for updates ...")
         self.root.config(cursor="watch")
         run(app_update.check, root, then=lambda ok, value: (self.status.config(text=""), checked(ok, value)))
@@ -4326,7 +4358,10 @@ class XlefViewer:
             filetypes=[("Leica experiment", "*.xlef *.xlif *.lif"), ("All files", "*.*")],
             columns=[("name", "Experiment", 280, "w", True), ("images", "Images", 70, "e", False), ("pyramid", "Pyramid", 80, "w", False),
                      ("folder", "Folder", 420, "w", True), ("when", "Modified", 130, "w", False)],
-            details=details, on_remove=self.remove_recent, drop=self.dnd_files is not None)
+            details=details, on_remove=self.remove_recent, drop=self.dnd_files is not None,
+            heading_tips={"pyramid": "A pyramid is a set of lower-resolution copies of each image, made by LAS X. When zoomed out, the "
+                                     "viewer shows these smaller copies instead of reading the full-resolution image, so it displays much "
+                                     "faster at low magnification.\n\nYes: every image has one. No: none do. \"5 of 29\": only some."})
         if result:
             path, from_list = result
             if from_list and not os.path.isfile(path):

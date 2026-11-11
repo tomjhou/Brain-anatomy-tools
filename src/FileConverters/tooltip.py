@@ -72,9 +72,12 @@ class Tooltip:
             self.widget.configure(cursor="arrow")
         except tk.TclError:
             self.cursor = None
+        self.place()
+
+    def place(self):
+        """The note below the widget and the pointer, on its monitor."""
         below = max(self.widget.winfo_rooty() + self.widget.winfo_height() + 4, self.widget.winfo_pointery() + self.CURSOR_HEIGHT)
-        place_on_monitor(self.tip, self.widget.winfo_rootx(), below, avoid_y=self.widget.winfo_rooty())   # (below the widget and
-        # the pointer, on its monitor)
+        place_on_monitor(self.tip, self.widget.winfo_rootx(), below, avoid_y=self.widget.winfo_rooty())
 
     def hide(self, event=None):
         if self.job:
@@ -89,3 +92,44 @@ class Tooltip:
             except tk.TclError:
                 pass
             self.cursor = None
+
+
+class HeadingTips(Tooltip):
+    """Notes for some of a ttk.Treeview's column headings: tips {column key: text}, each shown when the pointer rests on that heading
+    (a Treeview's headings are not widgets of their own, so a Tooltip can't be put on one)."""
+
+    def __init__(self, tree, tips, delay=500, wraplength=320):
+        self.widget, self.tips, self.delay, self.tip, self.job = tree, dict(tips), delay, None, None
+        self.wraplength, self.cursor, self.text, self.column = wraplength, None, "", None
+        tree.bind("<Motion>", self.moved, add="+")
+        tree.bind("<Leave>", self.left, add="+")
+        tree.bind("<ButtonPress>", self.hide, add="+")
+
+    def column_at(self, x, y):
+        """The key of the column whose heading is at (x, y) in the tree, or None (not on a heading)."""
+        if self.widget.identify_region(x, y) != "heading":
+            return None
+        col = self.widget.identify_column(x)            # ("#2": the second column shown)
+        try:
+            return self.widget.column(col, "id")
+        except tk.TclError:
+            return None
+
+    def moved(self, event):
+        col = self.column_at(event.x, event.y)
+        if col == self.column:
+            return
+        self.column = col
+        self.hide()
+        if col in self.tips:
+            self.text = self.tips[col]
+            self.job = self.widget.after(self.delay, self.show)
+
+    def left(self, event=None):
+        self.column = None
+        self.hide()
+
+    def place(self):
+        """The note below the heading row, at the pointer, on its monitor."""
+        x, y = self.widget.winfo_pointerx(), self.widget.winfo_pointery()
+        place_on_monitor(self.tip, x, y + self.CURSOR_HEIGHT, avoid_y=y)

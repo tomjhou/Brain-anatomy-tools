@@ -1,6 +1,6 @@
 """A reusable "open a saved file" dialog for Tk programs: a toggle at the top picks one of two panels, and Open acts on the panel that is showing.
 
-  Recent <things>       a list of the recently used files (with optional extra columns, filled in by a background thread), double-click opens
+  Recent <things>       a list of the recently used files (with optional extra columns, filled in by a background thread), double-click opens, a heading sorts
   Browse for a <thing>  a "Choose file" button, a box for a typed or pasted path, and an area a file can be dragged onto from Explorer
 
 The module knows nothing about any program: it is given the recent paths and a few optional callbacks, and returns what was chosen. It does not
@@ -16,11 +16,13 @@ Dragging needs tkinterdnd2 and a window made with it (TkinterDnD.Tk); without th
 """
 import os
 import queue
+import re
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from color_button import ColorButton
+from tooltip import HeadingTips
 
 SELECTED_BG = "#2f6fd4"      # the toggle button of the panel showing
 IDLE_BG = "#e8e8e8"
@@ -28,8 +30,15 @@ IDLE_HOVER_BG = "#d8d8d8"
 DEFAULT_COLUMNS = (("name", "File", 280, "w", True), ("folder", "Folder", 400, "w", True))
 
 
+def sort_key(text):
+    """How the list sorts a cell: numbers by their value, the rest by its letters, ignoring case ("9 of 10" before "10 of 10", "2026-05-24
+    20:42" by date and time, "Image 2" before "Image 10")."""
+    parts = re.split(r"(\d+(?:\.\d+)?)", text.replace(",", "").lower())
+    return [(0, float(p), "") if i % 2 else (1, 0.0, p) for i, p in enumerate(parts) if p]
+
+
 def ask_open_file(parent, recent, *, title="Open", noun="file", filetypes=(("All files", "*.*"),), columns=DEFAULT_COLUMNS, details=None,
-                  on_remove=None, allow_delete=False, delete_note="", drop=True, initial_dir=None):
+                  on_remove=None, allow_delete=False, delete_note="", drop=True, initial_dir=None, heading_tips=None):
     """Show the dialog over `parent` and wait for it. Returns (path, from_list) for the file chosen (from_list: it was picked in the list, not
     typed, browsed for or dropped), or None if the dialog was cancelled.
 
@@ -45,7 +54,8 @@ def ask_open_file(parent, recent, *, title="Open", noun="file", filetypes=(("All
     allow_delete  show a "Delete file" button: the file is deleted from the disk, after asking
     delete_note   a few words after the Delete button's text, e.g. "raw files remain intact"
     drop          allow a file to be dragged in from Windows Explorer (if tkinterdnd2 and the window allow it)
-    initial_dir   where the Browse dialog starts (default: the folder of the newest recent file)"""
+    initial_dir   where the Browse dialog starts (default: the folder of the newest recent file)
+    heading_tips  {column key: text}: a note shown when the pointer rests on that column's heading (what the column means)"""
     paths = list(recent)
     a_noun = ("an " if noun[:1].lower() in "aeiou" else "a ") + noun          # ("an experiment", "a project")
     dlg = tk.Toplevel(parent)
@@ -98,9 +108,39 @@ def ask_open_file(parent, recent, *, title="Open", noun="file", filetypes=(("All
     keys = [c[0] for c in columns]
     detail_keys = [k for k in keys if k not in ("name", "folder")]
     tree = ttk.Treeview(recent_panel, columns=keys, show="headings", selectmode="browse", height=min(max(len(paths), 4), 12))
+    headings = {c[0]: c[1] for c in columns}
+    order = {"key": None, "down": False}            # (the column the list is sorted by: None, the recent order, newest first)
+
+    def sort_by(key):
+        """A heading clicked: the list sorted by that column; clicked again, the other way; a third time, back to the recent order."""
+        if order["key"] != key:
+            order["key"], order["down"] = key, False
+        elif not order["down"]:
+            order["down"] = True
+        else:
+            order["key"] = None
+        resort()
+
+    def resort():
+        key = order["key"]
+        rows = list(range(len(paths)))
+        if key is not None:
+            blank = [i for i in rows if tree.exists(str(i)) and tree.set(str(i), key) in ("", "...")]
+            rows = sorted((i for i in rows if i not in blank), key=lambda i: sort_key(tree.set(str(i), key)) if tree.exists(str(i)) else (),
+                          reverse=order["down"]) + blank       # (not known yet, or empty: last, either way)
+        for n, i in enumerate(i for i in rows if tree.exists(str(i))):
+            tree.move(str(i), "", n)
+        for k, text in headings.items():
+            tree.heading(k, text=text + (("  ▼" if order["down"] else "  ▲") if k == key else ""))
+        sel = tree.selection()
+        if sel:
+            tree.see(sel[0])
+
     for key, heading, width, anchor, stretch in columns:
-        tree.heading(key, text=heading)
+        tree.heading(key, text=heading, command=lambda k=key: sort_by(k))
         tree.column(key, width=width, anchor=anchor, stretch=stretch)
+    if heading_tips:
+        HeadingTips(tree, heading_tips)
 
     def row_values(path, fill):
         return tuple(os.path.basename(path) if k == "name" else os.path.dirname(path) if k == "folder" else fill for k in keys)
@@ -122,21 +162,26 @@ def ask_open_file(parent, recent, *, title="Open", noun="file", filetypes=(("All
         threading.Thread(target=read_details, daemon=True).start()
 
         def show_details():
+            changed = False
             try:
                 while True:
                     i, values = found.get_nowait()
                     if tree.exists(str(i)):
                         for k in detail_keys:
                             tree.set(str(i), k, values.get(k, ""))
+                        changed = True
             except queue.Empty:
                 pass
             except tk.TclError:
                 return                                   # (the dialog was closed)
+            if changed and order["key"] in detail_keys:
+                resort()                                 # (sorted by a detail still coming in: the new ones put in their place)
             if dlg.winfo_exists():
                 dlg.after(100, show_details)
         dlg.after(50, show_details)
     tree.pack(fill=tk.BOTH, expand=True)
-    ttk.Label(recent_panel, text=f"Double-click {a_noun}, or select it and click Open.", foreground=hint).pack(anchor="w", pady=(4, 0))
+    ttk.Label(recent_panel, text=f"Double-click {a_noun}, or select it and click Open. Click a heading to sort by it (again: the other way; a third time: "
+                                    "the recent order).", foreground=hint, wraplength=760, justify=tk.LEFT).pack(anchor="w", pady=(4, 0))
     if paths:
         tree.selection_set("0")
         tree.focus("0")

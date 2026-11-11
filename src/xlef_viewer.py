@@ -94,6 +94,8 @@ READ_BUDGET = 0.3            # s: a sharper picture expected to take longer than
 LEVEL_BUDGET = 1.0           # s: the same for the pyramid's whole sharper copy (read in the background, the preview shown meanwhile)
 RELAXED_ENLARGE = 2.5        # then the preview may be shown enlarged up to this much (preview pixels on screen) before reading
 PROBE_INTERVAL = 600         # s: a storage location's speed is measured again after this long (see StorageSpeed)
+PROBE_MIN_BYTES = 32 << 20   # a file is timed only if at least this large (its middle then rarely in Windows' file cache)
+DRIVE_SEARCH_SECONDS = 4     # File > Test drive speed: how long to look through a drive's folders for a large file to time it with
 Z_SETTLE_MS = 150            # ms the z slider must rest before the plane it is on is read
 HIRES_NOTE_DELAY = 0.5       # s of waiting for a sharper view before "Loading full resolution..." is shown over the image
 KEPT_IMAGES_PERCENT = 50      # share of the computer's memory (%) for the pictures of recently viewed and preloaded images, which
@@ -2039,24 +2041,9 @@ class StorageSpeed:
                 return
             self.probing.add(where)
         try:
-            size = os.path.getsize(path)
-            if size < 32 << 20 or is_online_only(path):
+            if os.path.getsize(path) < PROBE_MIN_BYTES or is_online_only(path):
                 return
-            fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
-            try:
-                def timed(n):
-                    os.lseek(fd, random.randrange(size // 5, size * 4 // 5 - n), os.SEEK_SET)
-                    t, got = time.perf_counter(), 0
-                    while got < n:
-                        chunk = os.read(fd, n - got)
-                        if not chunk:
-                            break
-                        got += len(chunk)
-                    return time.perf_counter() - t
-                latency = sorted(timed(4096) for _ in range(3))[1]
-                rate = (4 << 20) / max(timed(4 << 20) - latency, 1e-4)
-            finally:
-                os.close(fd)
+            latency, rate = self.time_file(path)
             with self.lock:
                 self.found[where] = {"latency": latency, "rate": rate, "when": time.time()}
         except OSError:
@@ -2065,6 +2052,38 @@ class StorageSpeed:
             with self.lock:
                 self.probing.discard(where)
 
+    @staticmethod
+    def time_file(path):
+        """(seconds per read request, bytes per second) of where `path` is (a file of PROBE_MIN_BYTES or more): the middle of 3 reads
+        of 4 KB, and one of 4 MB, at random places in the middle of the file. OSError if it can't be read."""
+        size = os.path.getsize(path)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        try:
+            def timed(n):
+                os.lseek(fd, random.randrange(size // 5, size * 4 // 5 - n), os.SEEK_SET)
+                t, got = time.perf_counter(), 0
+                while got < n:
+                    chunk = os.read(fd, n - got)
+                    if not chunk:
+                        break
+                    got += len(chunk)
+                return time.perf_counter() - t
+            latency = sorted(timed(4096) for _ in range(3))[1]
+            return latency, (4 << 20) / max(timed(4 << 20) - latency, 1e-4)
+        finally:
+            os.close(fd)
+
+    def test(self, path, times=3):
+        """File > Test drive speed: where `path` is, timed `times` times (see time_file) and the middle of each kept, so that one
+        hiccup (a drive waking up, a virus scanner busy on a new computer) doesn't decide it; it replaces what was measured before.
+        Returns that {"latency", "rate", "when"}; OSError if the file can't be read."""
+        runs = [self.time_file(path) for _ in range(times)]
+        e = {"latency": sorted(r[0] for r in runs)[len(runs) // 2], "rate": sorted(r[1] for r in runs)[len(runs) // 2],
+             "when": time.time()}
+        with self.lock:
+            self.found[self.location(path)] = e
+        return e
+
     def describe(self):
         """For Settings: what has been measured, e.g. ["M:  4 ms per read, 25 MB/s"]."""
         return [f"{where.upper() or '(this folder)'}  {e['latency'] * 1000:.0f} ms per read, {e['rate'] / 1e6:.0f} MB/s"
@@ -2072,6 +2091,70 @@ class StorageSpeed:
 
 
 SPEED = StorageSpeed()
+
+DRIVE_KINDS = {2: "removable", 3: "local", 4: "network", 6: "RAM disk"}      # (Windows' GetDriveTypeW; 5, a CD/DVD drive: not tested)
+_SKIP_DIRS = {"windows", "$recycle.bin", "system volume information", "program files", "program files (x86)", "programdata",
+              "$windows.~bt", "$windows.~ws", "recovery", "appdata"}
+
+
+def lettered_drives():
+    """The drives to test (File > Test drive speed): [(root, kind)], e.g. [("C:\\", "local"), ("M:\\", "network")]; on a Mac or
+    Linux (no drive letters: one storage location, as StorageSpeed counts them), [("/", "this computer")]."""
+    if sys.platform != "win32":
+        return [("/", "this computer")]
+    import ctypes
+    mask, drives = ctypes.windll.kernel32.GetLogicalDrives(), []
+    for k in range(26):
+        if mask >> k & 1:
+            root = f"{chr(65 + k)}:\\"
+            kind = DRIVE_KINDS.get(ctypes.windll.kernel32.GetDriveTypeW(root))
+            if kind is not None:
+                drives.append((root, kind))
+    return drives
+
+
+def timing_files(root, prefer=(), deadline=None):
+    """Files to time a drive with (see StorageSpeed.time_file): of PROBE_MIN_BYTES or more, stored on this computer (not
+    online-only: reading one would download it). First those in `prefer` (the open projects' files) on that drive, largest first;
+    then any found looking through the drive's folders (the shallowest first, system folders skipped) until `deadline`
+    (time.monotonic()): one of 1 GB or more at once, the others after, largest first. A generator: the next is tried if one
+    can't be read."""
+    where = StorageSpeed.location(root)
+    mine = sorted({f for f in prefer if f and StorageSpeed.location(f) == where}, key=lambda f: -_size_or_0(f))
+    for f in mine:
+        if _size_or_0(f) >= PROBE_MIN_BYTES and not is_online_only(f):
+            yield f
+    found, dirs, mine = [], collections.deque([root]), set(mine)
+    while dirs and (deadline is None or time.monotonic() < deadline):
+        try:
+            with os.scandir(dirs.popleft()) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        for d in entries:
+            try:
+                st = d.stat(follow_symlinks=False)          # (Windows: from the folder's listing, no more asking)
+                attrs = getattr(st, "st_file_attributes", 0)
+                if attrs & (0x2 | 0x4 | 0x400 | _CLOUD_ONLY_ATTRS):    # hidden, system, a link, online-only
+                    continue
+                if d.is_dir(follow_symlinks=False):
+                    if d.name.lower() not in _SKIP_DIRS and not d.name.startswith("."):
+                        dirs.append(d.path)
+                elif st.st_size >= PROBE_MIN_BYTES and d.path not in mine:
+                    if st.st_size >= 1 << 30:
+                        yield d.path
+                    else:
+                        found.append((st.st_size, d.path))
+            except OSError:
+                continue
+    yield from (f for _, f in sorted(found, reverse=True))
+
+
+def _size_or_0(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
 
 
 READ_THREADS = 8
@@ -3546,6 +3629,7 @@ class XlefViewer:
         fm.add_command(label="Save view as PNG...", command=self.save_view)
         fm.add_command(label=PYRAMID_MENU, command=self.make_pyramids_command)
         self.pyramid_menu_index = fm.index("end")
+        fm.add_command(label="Test drive speed...", command=self.test_drive_speed)
         fm.add_separator()
         fm.add_command(label="Quit", command=self.quit)
         menu.add_cascade(label="File", menu=fm)
@@ -6029,6 +6113,7 @@ class XlefViewer:
             level, step = fin
             self.sharp_level = level
         self.generation += 1
+        self.read_sig = self._prefetch_sig()          # (the view this read is for: see "detail" in _poll_results)
         self.detail_pending = True           # (an hourglass until the sharper view is in)
         self.hires_progress = None
         self.hires_label = ("Loading full resolution..." if step == 1 else "Loading a sharper image...") if level is None             else "Loading a sharper view..."
@@ -6315,6 +6400,98 @@ class XlefViewer:
             return (f"Slow storage ({where} measured at {speed}): previews are shown enlarged up to {RELAXED_ENLARGE:g} times\n"
                     "before sharper pictures are read")
         return f"Fast storage ({where} measured at {speed}): sharper pictures are read as soon as you zoom in"
+
+    def test_drive_speed(self):
+        """File > Test drive speed: every lettered drive timed now (see StorageSpeed.test), each in a row of a window as it is done:
+        how fast, and whether the viewer counts it as slow; what was measured before is replaced (a drive measured as slow by a
+        hiccup, e.g. as a project first opened on a new computer, is put right without restarting). A drive is timed by reading
+        bits of a large file on it: the open projects' first, else one found in its folders (see timing_files)."""
+        if getattr(self, "speed_window", None) is not None and self.speed_window.winfo_exists():
+            self.speed_window.lift()
+            return
+        drives = lettered_drives()
+        prefer = [f for e in self.entries.values() for f in e.all_files() if f]
+        before = {where: dict(e) for where, e in SPEED.found.items()}
+        rows, state = [], {"now": None, "finished": False, "stop": False}
+
+        def work():
+            for root, kind in drives:
+                if state["stop"]:
+                    break
+                state["now"] = root
+                e, note = None, "No file of 32 MB or more found on it to time it with"
+                for f in timing_files(root, prefer, time.monotonic() + DRIVE_SEARCH_SECONDS):
+                    try:
+                        e, note = SPEED.test(f), None
+                        break
+                    except OSError:
+                        continue
+                rows.append((root, kind, e, note))
+            state["finished"] = True
+
+        dlg = self.speed_window = tk.Toplevel(self.root)
+        dlg.title("Drive speed")
+        dlg.transient(self.root)
+        body = ttk.Frame(dlg, padding=14)
+        body.pack(fill=tk.BOTH, expand=True)
+        label = ttk.Label(body, text="Testing ...")
+        label.pack(anchor=tk.W)
+        cols = ("drive", "kind", "wait", "rate", "verdict", "before")
+        tree = ttk.Treeview(body, columns=cols, show="headings", height=min(max(len(drives), 3), 12), selectmode="none")
+        for c, text, w in zip(cols, ("Drive", "Kind", "Wait per read", "Transfer rate", "The viewer counts it as", "Measured before"),
+                              (60, 80, 100, 100, 170, 200)):
+            tree.heading(c, text=text, anchor=tk.W)
+            tree.column(c, width=w, anchor=tk.W, stretch=c == "before")
+        tree.pack(fill=tk.BOTH, expand=True, pady=(8, 8))
+        mode = self.settings.get("reading", "auto")
+        ttk.Label(body, style="Muted.TLabel", justify=tk.LEFT, text=(
+            "Each drive is timed 3 times, reading bits of a large file on it, and the middle result kept. It replaces what was\n"
+            "measured before: slow storage gets the preview enlarged further before sharper pictures are read."
+            + ("" if mode == "auto" else f"\nNow in Settings: {READING_MODES[mode]} (the speed isn't used)"))).pack(anchor=tk.W)
+        buttons = ttk.Frame(body)
+        buttons.pack(fill=tk.X, pady=(10, 0))
+        again = ttk.Button(buttons, text="Test again", state=tk.DISABLED, command=lambda: (close(), self.test_drive_speed()))
+        again.pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(buttons, text="Close", command=lambda: close()).pack(side=tk.RIGHT)
+
+        def close():
+            state["stop"] = True
+            self.speed_window = None
+            dlg.destroy()
+        dlg.protocol("WM_DELETE_WINDOW", close)
+        dlg.geometry(f"+{self.root.winfo_rootx() + 160}+{self.root.winfo_rooty() + 120}")
+
+        def fmt(e):
+            return (f"{e['latency'] * 1000:.1f} ms" if e["latency"] < 0.01 else f"{e['latency'] * 1000:.0f} ms",
+                    f"{e['rate'] / 1e6:,.0f} MB/s")
+        shown = [0]
+
+        def poll():
+            if not dlg.winfo_exists():
+                return
+            while shown[0] < len(rows):
+                root, kind, e, note = rows[shown[0]]
+                shown[0] += 1
+                where = StorageSpeed.location(root)
+                old = before.get(where)
+                was = "not measured" if old is None else "%s, %s" % fmt(old)
+                if e is None:
+                    tree.insert("", tk.END, values=(root.rstrip("\\") or root, kind, "", "", note, was))
+                    continue
+                slow = SPEED.estimate(root, 32e6, 12) > LEVEL_BUDGET
+                tree.insert("", tk.END, values=(root.rstrip("\\") or root, kind, *fmt(e), "slow" if slow else "fast", was))
+            if not state["finished"]:
+                label.config(text=f"Testing {state['now'] or ''} ...  ({len(rows)} of {len(drives)} drives done)")
+                self.root.after(150, poll)
+                return
+            tested = sum(e is not None for _, _, e, _ in rows)
+            label.config(text=f"Tested {tested} of {len(drives)} drive{'s' * (len(drives) != 1)}.")
+            self.status.config(text=f"Drive speed tested: {tested} drive{'s' * (tested != 1)}")
+            again.config(state=tk.NORMAL)
+            if self.img is not None:
+                self.redraw()               # (a drive found fast now: the sharper view is read now, not put off)
+        threading.Thread(target=work, daemon=True).start()
+        poll()
 
     def _prefetch_sig(self):
         """What a layer read ahead depends on: the image, the layer shown, and the view. Any change ends the reading."""
@@ -8199,6 +8376,13 @@ class XlefViewer:
                     rgb = self._mix([a if lut is not None else None for a, lut in zip(arrays, luts)], luts)
                     self.detail_cache = {"key": key, "arrays": arrays, "rgb": rgb,          # (mixed once: reused while zooming)
                                          "sig": self._mix_sig()}
+                    if self._prefetch_sig() != getattr(self, "read_sig", None):
+                        # (the view moved on while this was read, to one that needs no read of its own, e.g. zoomed out to the fit
+                        # view: drawn where it falls in the view on show now, not where it was for (a "bounce" back in))
+                        self.redraw(preview_only=True)
+                        self.detail_pending = False
+                        self._update_cursor()
+                        continue
                     self._show(rgb, *place, smooth)
                     if interim:
                         self.status.config(text=self.interim_status)

@@ -90,6 +90,7 @@ SMOOTH_ZOOM_NOTE = ("On: the zoom glides from one wheel click to the next, throu
 ZOOM_GLIDE = 0.05            # s: time constant of the zoom's glide to where the wheel clicks have asked for (see XlefViewer._glide_frame)
 ZOOM_LAND = 0.008            # the glide jumps the rest of the way once within this (log) distance of it: 0.8%, a few pixels at the edges
 ZOOM_SETTLE = 0.12           # s after the glide ends, with no click meanwhile, before the view is drawn properly (sharp pixels, reads)
+KEPT_OVERLAYS = 4            # at most this many sharp views kept in memory drawn over the preview at once (see _sharp_kept)
 ZOOM_STEP = 1.25             # zoom per wheel click
 MOVING_PAUSE = 0.25          # s without a wheel click or drag before the view counts as at rest (see XlefViewer._moving)
 FINER_CROP_BYTES = 32e6      # a compressed plane is decoded whole anyway: a view of it is kept finer than the zoom needs (up to full resolution)
@@ -5131,8 +5132,12 @@ class XlefViewer:
         go first, the oldest first: the previews always stay."""
         if cache is None or self.img is None or not any(a is not None for a in cache["arrays"]):
             return
-        self.regions.append({"entry": self.img.entry, "key": cache["key"], "arrays": cache["arrays"],
-                             "bytes": sum(a.nbytes for a in cache["arrays"] if a is not None)})
+        r = {"entry": self.img.entry, "key": cache["key"], "arrays": cache["arrays"],
+             "bytes": sum(a.nbytes for a in cache["arrays"] if a is not None)}
+        if cache.get("rgb") is not None:            # (mixed already: kept too, for drawing it while zooming out, see _sharp_kept)
+            r["rgb"], r["sig"] = cache["rgb"], cache.get("sig")
+            r["bytes"] += sum(a.nbytes for a in r["rgb"])
+        self.regions.append(r)
         self._trim_regions()
 
     def _trim_regions(self):
@@ -5152,7 +5157,7 @@ class XlefViewer:
             r = self.regions[k]
             if r["entry"] is not self.img.entry:
                 continue
-            cache = {"key": (id(self.img),) + tuple(r["key"][1:]), "arrays": r["arrays"]}
+            cache = {"key": (id(self.img),) + tuple(r["key"][1:]), "arrays": r["arrays"], "rgb": r.get("rgb"), "sig": r.get("sig")}
             if self._kept_covers(step, channels, cache):
                 del self.regions[k]
                 self._stash_region(self.detail_cache)
@@ -5931,6 +5936,13 @@ class XlefViewer:
             bd = self._backdrop()               # (the picture on screen doesn't cover the image in view: zooming out)
         if not hasattr(self, "canvas_rgb"):
             self.canvas_rgb = tuple(v // 256 for v in self.root.winfo_rgb(self.canvas.cget("background")))
+        sharp = []
+        if bd is not None:
+            for kept in self._sharp_kept(mixed_only=True):
+                if kept.get("pil_sig") != kept["sig"]:          # (made into pictures once, not at every frame)
+                    kept["pil"], kept["pil_sig"] = [[Image.fromarray(rgb)] for rgb in kept["rgb"]], kept["sig"]   # (and halved copies)
+                sharp.append(kept)
+            t0 = self._lap(times, "find kept", t0)
         frames = []
         for k, im in enumerate(b["ims"]):
             frame = Image.new("RGB", (cw, ch), self.canvas_rgb)
@@ -5940,6 +5952,22 @@ class XlefViewer:
                         1 / (self.scale * fy), self.cy / fy - ch / 2 / (self.scale * fy))
                 self._glide_paste(frame, bd["ims"][k], bmap, cw, ch)
                 t0 = self._lap(times, "backdrop", t0)
+            if bd is not None:
+                for kept in sharp:              # (zooming out: the sharp views kept, e.g. from the way in, over the backdrop)
+                    if k < len(kept["pil"]):
+                        _, _, i0, j0, _, _, st, _ = kept["key"]
+                        # (from a copy halved n times, no larger than needed: shrinking the full one at every frame took ~30 ms)
+                        n = min(6, max(0, int(np.log2(1 / max(self.scale * st, 1e-9)))))
+                        levels = kept["pil"][k]
+                        while len(levels) <= n:
+                            levels.append(levels[-1].reduce(2))
+                        f = st * 2 ** n
+                        kmap = (1 / (self.scale * f), (self.cx - cw / 2 / self.scale) / f - i0 * st / f,
+                                1 / (self.scale * f), (self.cy - ch / 2 / self.scale) / f - j0 * st / f)
+                        rect = self._glide_rect(kmap, levels[n].width, levels[n].height, cw, ch)
+                        for strip in self._outside(rect, base_rect):        # (only where the picture on screen won't cover it)
+                            self._glide_paste(frame, levels[n], kmap, cw, ch, strip)
+                t0 = self._lap(times, "kept", t0)
             self._glide_paste(frame, im, base_map, cw, ch, base_rect)
             t0 = self._lap(times, "scale", t0)
             if self._flipped():
@@ -5975,6 +6003,21 @@ class XlefViewer:
         now = time.perf_counter()
         times[part] = times.get(part, 0.0) + (now - since) * 1000
         return now
+
+    @staticmethod
+    def _outside(rect, hole):
+        """The parts of rect (X0, Y0, X1, Y1) outside `hole` (or all of it, if hole is None): up to 4 strips (top, bottom, left,
+        right); none if rect is None."""
+        if rect is None:
+            return []
+        if hole is None:
+            return [rect]
+        X0, Y0, X1, Y1 = rect
+        h0, k0, h1, k1 = max(hole[0], X0), max(hole[1], Y0), min(hole[2], X1), min(hole[3], Y1)
+        if h1 <= h0 or k1 <= k0:
+            return [rect]
+        strips = [(X0, Y0, X1, k0), (X0, k1, X1, Y1), (X0, k0, h0, k1), (h1, k0, X1, k1)]
+        return [r for r in strips if r[2] > r[0] and r[3] > r[1]]
 
     @staticmethod
     def _glide_rect(m, W, H, cw, ch):
@@ -6393,9 +6436,11 @@ class XlefViewer:
                 t0 = self._tick("shrink", t0)
                 rgbs = self._mix(crop, luts)
                 t0 = self._tick("mix", t0)
-                sharp = self._detail_overlay(luts)              # (times itself: "sharp mix", "sharp scale")
+                # (the sharp pixels in memory for this view, the last sharp view's and those kept from before, e.g. read on the
+                # way in: zooming out, they are drawn at once, where the preview alone would be blurrier)
+                sharp = [self._detail_overlay(luts, k) for k in self._sharp_kept()]     # (times itself: "sharp mix", "sharp scale")
                 t0 = time.perf_counter()
-                overlay = [sharp, self._partial_overlay(luts)]
+                overlay = sharp + [self._partial_overlay(luts)]
                 self._tick("bands", t0)
                 self._show(rgbs, left, top, w, h, smooth=self.scale * s < 1, overlay=overlay)
         if not detail:
@@ -6590,12 +6635,16 @@ class XlefViewer:
         return (tuple((s["on"], s["lo"], s["hi"]) for s in self.ch_settings), tuple(c.lut for c in self.img.entry.channels),
                 tuple(self.panel_channels))
 
-    def _detail_overlay(self, luts):
-        """While a new view waits for its sharp pixels: the sharp pixels of the last sharp view, for the part of it still on screen,
-        scaled to the new view: (PIL image, canvas x, canvas y), to lay over the zoomed-out picture; or None. Zooming in, they cover the
-        whole new view; zooming out or panning, part of it. (Not when a channel shown now wasn't read for it: it would lack that color.)"""
-        cache = self.detail_cache
-        if cache is None or cache["key"][0] != id(self.img) or cache["key"][1] != self.z:
+    def _detail_overlay(self, luts, cache=None):
+        """While a new view waits for its sharp pixels: the sharp pixels of the last sharp view (or of `cache`, a kept region of this
+        image: see _sharp_kept), for the part of it still on screen, scaled to the new view: (PIL image, canvas x, canvas y), to lay
+        over the zoomed-out picture; or None. Zooming in, they cover the whole new view; zooming out or panning, part of it. (Not when
+        a channel shown now wasn't read for it: it would lack that color.)"""
+        if cache is None:
+            cache = self.detail_cache
+            if cache is None or cache["key"][0] != id(self.img):
+                return None
+        if cache["key"][1] != self.z:
             return None
         _, _, i0, j0, i1, j1, st, _ = cache["key"]
         arrays = cache["arrays"]
@@ -6627,6 +6676,29 @@ class XlefViewer:
                        else Image.fromarray(part).resize((w, h), Image.BILINEAR))
         self._tick("sharp scale", t0)
         return ims, round((x0 + a0 * st - self.cx) * self.scale + cw / 2), round((y0 + b0 * st - self.cy) * self.scale + ch / 2)
+
+    def _sharp_kept(self, mixed_only=False):
+        """The sharp pixels in memory to draw over the preview for the view now: the last sharp view's, and the kept regions of this
+        image and layer (views read before, e.g. on the way in) that are in view and sharper than the preview, the finest
+        KEPT_OVERLAYS of them; the coarsest first, each to be laid over the ones before (the last sharp view last of those as fine).
+        mixed_only: only those whose colors are mixed for the sliders as they are now (the glide's pictures mix nothing)."""
+        img, out = self.img, []
+        sig = self._mix_sig() if mixed_only else None
+        c = self.detail_cache
+        if c is not None and c["key"][0] == id(img) and c["key"][1] == self.z and (not mixed_only or c.get("sig") == sig):
+            out.append(c)
+        vx0, vy0, vx1, vy1 = self._view_corners()
+        for r in self.regions:
+            if r["entry"] is not img.entry or r["key"][1] != self.z or r["key"][6] >= img.ov_step:
+                continue
+            if mixed_only and (r.get("rgb") is None or r.get("sig") != sig):
+                continue
+            _, _, i0, j0, i1, j1, st, _ = r["key"]
+            rows, cols = next(a.shape for a in r["arrays"] if a is not None)
+            if i0 * st < vx1 and (i0 + cols) * st > vx0 and j0 * st < vy1 and (j0 + rows) * st > vy0:
+                out.append(r)
+        out.sort(key=lambda k: (-k["key"][6], k is c))
+        return out[-KEPT_OVERLAYS:]
 
     def _slow(self, seconds, budget=READ_BUDGET, path=None):
         """Whether a read expected to take `seconds` (None: not known) from where `path` is is slow enough to be put off (Settings:

@@ -84,6 +84,9 @@ THUMB_CACHE = (os.path.join(os.path.expanduser("~"), "Library", "Caches", "JhouL
 RIGHT_CLICKS = ("<Button-2>", "<Button-3>") if sys.platform == "darwin" else ("<Button-3>",)
 SHORTCUT = "Command" if sys.platform == "darwin" else "Control"
 MAX_RECENT = 20
+SMOOTH_ZOOM_NOTE = ("On: every step of the mouse wheel is drawn, one after another. Off: steps that come while one is being\n"
+                    "drawn are drawn together, as one jump (quicker, on a large screen, but less smooth).")
+WHEEL_QUEUE = 4              # zoom steps that may wait to be drawn; more wheel clicks make them larger (see on_wheel)
 MOVING_PAUSE = 0.25          # s without a wheel click or drag before the view counts as at rest (see XlefViewer._moving)
 FINER_CROP_BYTES = 32e6      # a compressed plane is decoded whole anyway: a view of it is kept finer than the zoom needs (up to full resolution)
                              # while it takes no more than this per channel, so that zooming further in needs no new reading
@@ -3583,6 +3586,7 @@ class XlefViewer:
             self.enlarge_method = "mitchell"
         self.asking_download = False         # (the download question is open: see _full_res_allowed)
         self.moving_until, self.rest_job = 0.0, None     # (see _moving)
+        self.wheel_queue, self.wheel_job = [], None      # (zoom steps waiting to be drawn: see _wheel_step)
         self.fast_now = self.fast_shown = False          # (bilinear stood in for the chosen method: in the picture being made, on show)
         self.drawing_bands = False                       # (a sharp view's bands being drawn as they come in: the fast way)
         self.folders = {}            # list item -> FolderEntry (the list's folders; images are in self.entries)
@@ -3641,6 +3645,7 @@ class XlefViewer:
         um = tk.Menu(menu, tearoff=0)
         um.add_command(label="Check GitHub now...", command=self.update_app)
         menu.add_cascade(label="Check for updates", menu=um)
+        self.update_menu, self.update_menu_index = um, menu.index("end")
         self.root.config(menu=menu)
         self.menubar = menu
         if not getattr(sys, "frozen", False):                 # (the packaged .exe is not a folder from GitHub: nothing to update)
@@ -4011,6 +4016,16 @@ class XlefViewer:
             self.redraw()                   # (drawn again at once: from the pixels already here)
         for value, text in ENLARGE_METHODS.items():
             ttk.Radiobutton(box, text=text, value=value, variable=method, command=set_method).pack(anchor=tk.W)
+        box = ttk.LabelFrame(body, text="Zooming", padding=(10, 6))
+        box.pack(fill=tk.X, pady=(10, 0))
+        smooth = tk.BooleanVar(dlg, self._smooth_zoom())
+
+        def set_smooth():
+            self.settings["smooth_zoom"] = smooth.get()
+            self.wheel_queue.clear()
+            self._save_settings()
+        ttk.Checkbutton(box, text="Prioritize zoom smoothness over pure speed", variable=smooth, command=set_smooth).pack(anchor=tk.W)
+        ttk.Label(box, text=SMOOTH_ZOOM_NOTE, style="Muted.TLabel", justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
         box = ttk.LabelFrame(body, text="Renaming", padding=(10, 6))
         box.pack(fill=tk.X, pady=(10, 0))
         on_disk = tk.BooleanVar(dlg, self.settings.get("rename_files", False))
@@ -4162,12 +4177,18 @@ class XlefViewer:
             self.normal_geometry = self.root.geometry()
 
     def updates_found(self, changes):
-        """The check at launch found newer commits: an "Updates available" menu at the end of the menu bar, which goes through the same dialog as
-        Check for updates (it lists the changes and asks)."""
-        n = len(changes)
-        menu = tk.Menu(self.menubar, tearoff=0)
-        menu.add_command(label=f"See the {n} new change{'s' if n != 1 else ''} and update...", command=self.update_app)
-        self.menubar.add_cascade(label=f"Updates available ({n})", menu=menu)
+        """The check at launch found newer commits: the Check for updates menu becomes "Updates available (n)", its item "See the n new
+        changes and update..." (the same dialog: it lists the changes and asks)."""
+        self._update_menu_label(len(changes))
+
+    def _update_menu_label(self, n):
+        """The update menu's name and its item's: n new changes found on GitHub (0: none, or updated: "Check for updates" again)."""
+        if n:
+            self.menubar.entryconfigure(self.update_menu_index, label=f"Updates available ({n})")
+            self.update_menu.entryconfigure(0, label=f"See the {n} new change{'s' if n != 1 else ''} and update...")
+        else:
+            self.menubar.entryconfigure(self.update_menu_index, label="Check for updates")
+            self.update_menu.entryconfigure(0, label="Check GitHub now...")
 
     def update_app(self):
         """Update > Update from GitHub: looks for newer commits (in a thread: the network), says what is new, and on a yes pulls them and
@@ -4206,6 +4227,7 @@ class XlefViewer:
         def checked(ok, value):
             if not ok:
                 return finish(value, True)
+            self._update_menu_label(len(value))
             if not value:
                 return finish("You have the newest version.")
             shown = "\n".join("  • " + line for line in value[:12]) + (f"\n  ... and {len(value) - 12} more" if len(value) > 12 else "")
@@ -4221,6 +4243,7 @@ class XlefViewer:
             self.status.config(text="")
             if not ok:
                 return finish(value, True)
+            self._update_menu_label(0)
             finish()
             if messagebox.askyesno("Update", "Updated. The new version runs after the viewer restarts.\n\nRestart it now?", parent=self.root):
                 self.quit()
@@ -5741,8 +5764,38 @@ class XlefViewer:
                 self.fit(redraw=False)
             self.schedule_redraw()
 
+    def _smooth_zoom(self):
+        """Settings: "Prioritize zoom smoothness over pure speed" (on unless switched off)."""
+        return self.settings.get("smooth_zoom", True)
+
     def on_wheel(self, event, delta=None):
+        """A wheel click: one zoom step. Smooth zoom (Settings): queued (see _wheel_step), so that every step is drawn, however
+        fast the clicks come; else taken at once, and clicks that come while a step is drawn are drawn together, as one jump."""
         d = event.delta if delta is None else delta
+        if not self._smooth_zoom():
+            if d > 0 and self.img is not None and self.scale >= MAX_ZOOM - 1e-9:
+                if not self.pixel_grid:
+                    self.pixel_grid = True
+                    self.schedule_redraw(0)
+                return
+            if d < 0 and self.pixel_grid:
+                self.pixel_grid = False
+                self.schedule_redraw(0)
+                return
+            self._moving()
+            self.zoom_to(self.scale * (1.25 ** wheel_notches(d)), event.x, event.y)
+            return
+        if self.wheel_queue:
+            n = wheel_notches(d)
+            if n * self.wheel_queue[-1][0] < 0:
+                self.wheel_queue.clear()        # (turned the other way: the steps still waiting are dropped, this one taken at once)
+            elif len(self.wheel_queue) >= WHEEL_QUEUE:
+                for step in self.wheel_queue:   # (far behind: the steps waiting made larger, all alike, not one jump at the end)
+                    step[0] += n / len(self.wheel_queue)
+                return
+            if self.wheel_queue:
+                self.wheel_queue.append([n, event.x, event.y])
+                return
         if d > 0 and self.img is not None and self.scale >= MAX_ZOOM - 1e-9:
             if not self.pixel_grid:             # (at the largest zoom already: show the pixels' edges instead)
                 self.pixel_grid = True
@@ -5752,8 +5805,28 @@ class XlefViewer:
             self.pixel_grid = False
             self.schedule_redraw(0)
             return
+        self.wheel_queue.append([wheel_notches(d), event.x, event.y])
+        if self.wheel_job is None:
+            self.wheel_job = self.root.after(0, self._wheel_step)     # (not drawn here: clicks waiting meanwhile are queued first)
+
+    def _wheel_step(self):
+        """The next zoom step waiting, drawn and painted at once (not left to a redraw that clicks coming in meanwhile would put off,
+        so that two or three steps were shown as one jump); then the next, after the clicks that came in while it was drawn are queued."""
+        self.wheel_job = None
+        if not self.wheel_queue:
+            return
+        n, x, y = self.wheel_queue[0]
         self._moving()
-        self.zoom_to(self.scale * (1.25 ** wheel_notches(d)), event.x, event.y)
+        self.zoom_to(self.scale * (1.25 ** n), x, y)
+        if self.redraw_job:
+            self.root.after_cancel(self.redraw_job)
+            self._redraw_job()
+            self.root.update_idletasks()        # (on screen now: Tk paints when idle, and the next step's timer came first, so a
+                                                # step or two were drawn but never shown, and the zoom jumped)
+        if self.wheel_queue:                    # (cleared meanwhile: turned the other way, or another image)
+            self.wheel_queue.pop(0)
+        if self.wheel_queue:
+            self.wheel_job = self.root.after(1, self._wheel_step)
 
     def on_press(self, event):
         self.canvas.focus_set()
@@ -6254,11 +6327,21 @@ class XlefViewer:
             self.root.after_cancel(self.rest_job)
         self.rest_job = self.root.after(int(MOVING_PAUSE * 1000) + 20, self._at_rest)
 
+    def _held_back(self):
+        """While the wheel is zooming (smooth zoom, see _wheel_step): sharper pixels coming in for an earlier view aren't drawn
+        between two steps (a drawing more, ~100 ms at full screen: that gap twice the others), but once at rest (see _at_rest)."""
+        if self._smooth_zoom() and time.monotonic() < self.moving_until:
+            self.owed_redraw = True
+            return True
+        return False
+
     def _at_rest(self):
         """Drawn once more the way chosen in Settings, only if bilinear stood in for it in the picture on show: zoomed out, or not
-        enlarged, the picture is the same either way (redrawing it anyway held up the next wheel click: ~100 ms at full screen)."""
+        enlarged, the picture is the same either way (redrawing it anyway held up the next wheel click: ~100 ms at full screen);
+        or if sharper pixels came in while zooming and were held back (see _held_back)."""
         self.rest_job = None
-        if self.img is not None and self.fast_shown and not self.drag:
+        owed, self.owed_redraw = getattr(self, "owed_redraw", False), False
+        if self.img is not None and (self.fast_shown or owed) and not self.drag:
             self.redraw()                   # (from the pixels already here: nothing is read again)
 
     def _draw_method(self):
@@ -8351,7 +8434,9 @@ class XlefViewer:
                     key, arrays, rows = data
                     self.detail_partial = {"key": key, "arrays": arrays, "rows": rows}
                     self.hires_progress = rows / (key[5] - key[3])
-                    if time.monotonic() - getattr(self, "band_drawn", 0) >= getattr(self, "band_gap", BAND_DRAW_INTERVAL):
+                    if self._held_back():
+                        pass
+                    elif time.monotonic() - getattr(self, "band_drawn", 0) >= getattr(self, "band_gap", BAND_DRAW_INTERVAL):
                         # (the bands that are in, over the blurrier picture: enlarged the fast way, the finished view as chosen; and
                         # at most a quarter of the time spent drawing them, so that a wheel click isn't kept waiting: at full
                         # screen a drawing takes ~100 ms)
@@ -8379,7 +8464,8 @@ class XlefViewer:
                     if self._prefetch_sig() != getattr(self, "read_sig", None):
                         # (the view moved on while this was read, to one that needs no read of its own, e.g. zoomed out to the fit
                         # view: drawn where it falls in the view on show now, not where it was for (a "bounce" back in))
-                        self.redraw(preview_only=True)
+                        if not self._held_back():
+                            self.redraw(preview_only=True)
                         self.detail_pending = False
                         self._update_cursor()
                         continue

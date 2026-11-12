@@ -50,6 +50,32 @@ class _LeicaZeroTagFilter(logging.Filter):
 
 logging.getLogger("tifffile").addFilter(_LeicaZeroTagFilter())
 
+QUESTIONS = {"open": 0}       # the viewer's message boxes on the screen now: the automatic update waits for them (see XlefViewer._auto_blocked)
+
+
+class _CountedMessagebox:
+    """tkinter.messagebox, counting the boxes on the screen in QUESTIONS. (A native box runs Tk's loop while it waits, so the automatic
+    update's steps still run under it, and no Tk grab shows that it is there.)"""
+
+    def __init__(self, real):
+        self._real = real
+
+    def __getattr__(self, name):
+        f = getattr(self._real, name)
+        if not (callable(f) and name.startswith(("show", "ask"))):
+            return f
+
+        def counted(*args, **kwargs):
+            QUESTIONS["open"] += 1
+            try:
+                return f(*args, **kwargs)
+            finally:
+                QUESTIONS["open"] -= 1
+        return counted
+
+
+messagebox = _CountedMessagebox(messagebox)
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "FileConverters"))
 from open_file_dialog import ask_open_file
 import leica_luts           # (LAS X's colour maps, sampled: see lut_table)
@@ -1123,6 +1149,8 @@ def _write_text(path, new_text, bom):
 ELEMENT_NAME = re.compile(r'(<Element\b[^>]*?\bName=")([^"]*)(")')
 OPEN_WITH_PROGID = "JhouLab.BrainAnatomyTools.XlefViewer.File"     # as in register_file_types.ps1
 OPEN_WITH_CLASSES = r"Software\Classes"                             # (under HKEY_CURRENT_USER; for tests: another key)
+AUTO_UPDATE_NOTE = ("Applies to all the Brain-anatomy-tools apps on this computer. If an experiment is open, the viewer doesn't restart:\n"
+                    "the new version runs the next time it starts. Off: the menu only says that updates are available.")
 OPEN_WITH_NOTE = ("Add: allows user to open with XLEF viewer by right-clicking .xlef, .xlif or .lif files in Windows Explorer.\n"
                   "The viewer adds (or repairs) this itself when it starts, unless you remove it here.")
 
@@ -4236,6 +4264,13 @@ class XlefViewer:
                                                                                                                     pady=(2, 0))
         if sys.platform == "win32" and not getattr(sys, "frozen", False):
             self._open_with_box(pages["Files"])
+        if not getattr(sys, "frozen", False):           # (the packaged .exe is not a folder from GitHub: nothing to update)
+            box = ttk.LabelFrame(pages["Files"], text="Updates", padding=(10, 6))
+            box.pack(fill=tk.X, pady=(10, 0))
+            auto = tk.BooleanVar(dlg, app_update.auto_update_enabled())
+            ttk.Checkbutton(box, text="Download updates automatically at start-up, then restart", variable=auto,
+                            command=lambda: app_update.set_auto_update(auto.get())).pack(anchor=tk.W)
+            ttk.Label(box, text=AUTO_UPDATE_NOTE, style="Muted.TLabel", justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
         ttk.Button(outer, text="Close", command=dlg.destroy).pack(anchor=tk.E, pady=(10, 0))
         dlg.bind("<Escape>", lambda e: dlg.destroy())
         tabs.select(pages.get(self.settings.get("settings_tab"), pages["Display"]))
@@ -4402,19 +4437,76 @@ class XlefViewer:
 
     def updates_found(self, changes):
         """The check at launch found newer commits: the Check for updates menu becomes "Updates available (n)", its item "See the n new
-        changes and update...", and the same dialog (it lists the changes and asks) comes up at once, without waiting for a click."""
+        changes and update...". With "Download updates automatically" on (app_update's setting, shared by the apps), they are then
+        downloaded with no question, and the viewer restarts if nothing is open (see _start_auto_update); with it off, the menu is all
+        that says so (no dialog)."""
+        self.update_count = len(changes)
         self._update_menu_label(len(changes))
-        self._offer_update(changes)
+        if app_update.auto_update_enabled():
+            self._start_auto_update()
 
-    def _offer_update(self, changes):
-        """updates_found's question: over any dialog that is open (the open dialog is, at launch: see _on_top), but put off while
-        the viewer's own question about a slow drive, or File > Test drive speed's window, is up, so that the two don't pile up."""
-        if getattr(self, "updating", False):
+    def _start_auto_update(self):
+        app_update.AutoUpdate(self.root, {"busy": lambda: getattr(self, "updating", False), "blocked": self._auto_blocked,
+                                          "status": self._auto_status, "keep_open": self._auto_keep_open,
+                                          "restart": self._auto_restart}).start()
+
+    def _auto_blocked(self):
+        """True while a question or a window of the viewer's is up (the update waits for it): a message box, a dialog that has the input
+        (but not the open dialog shown at launch: restarting under it loses nothing, and it comes back), the question about a slow
+        drive, Test drive speed's window, or Settings."""
+        if QUESTIONS["open"] or getattr(self, "asking_slow", False):
+            return True
+        for name in ("speed_window", "settings_window"):
+            w = getattr(self, name, None)
+            try:
+                if w is not None and w.winfo_exists():
+                    return True
+            except tk.TclError:
+                pass
+        top = self._on_top()
+        return top is not self.root and not getattr(self, "open_dialog_up", False)
+
+    def _auto_keep_open(self):
+        """Why not to restart now, or None: an open experiment (its view, and any unsaved renames or annotations, would be lost: they are
+        never ended by an update), or pyramids being made. The update is then in place, and runs the next time the viewer starts."""
+        if getattr(self, "pyramid_job", None) is not None:
+            return "pyramids are being made"
+        if self.projects:
+            return "an experiment is open"
+        return None
+
+    def _auto_status(self, text):
+        """AutoUpdate's news, on the update menu: "Updating..." (the item disabled meanwhile, so that a second download can't start),
+        "Updated: restart to use it" (the item then restarts the viewer), or None: back to "Updates available (n)"."""
+        if text is None:
+            self.update_menu.entryconfigure(0, state=tk.NORMAL, command=self.update_app)
+            self._update_menu_label(getattr(self, "update_count", 0))
             return
-        if getattr(self, "asking_slow", False) or getattr(self, "speed_window", None) is not None:
-            self.root.after(1000, lambda: self._offer_update(changes))
-            return
-        self.update_app(changes)
+        self.menubar.entryconfigure(self.update_menu_index, label=text)
+        if text == "Updating...":
+            self.update_menu.entryconfigure(0, label="Downloading the update...", state=tk.DISABLED)
+        else:
+            self.update_menu.entryconfigure(0, label="Restart the viewer now", state=tk.NORMAL,
+                                            command=lambda: self._restart_over(self._on_top()))
+
+    def _auto_restart(self):
+        self._restart_over(self._on_top())
+
+    def _restart_over(self, top):
+        """Ends this run (as File > Quit does: unsaved changes are asked about first) and starts the viewer again. A dialog that has the
+        input (the open dialog, at launch) is closed first, as if cancelled, and the rest left until it has returned."""
+        if top is not self.root:
+            top.destroy()
+            self.root.after(100, self._restart)
+        else:
+            self._restart()
+
+    def _restart(self):
+        self.quit()
+        try:
+            self.root.winfo_exists()                # (still there: closing was cancelled, e.g. unsaved changes)
+        except tk.TclError:
+            app_update.relaunch()
 
     def _on_top(self):
         """The window a question goes over: the dialog that has the input (e.g. the open dialog, shown at launch), else the main
@@ -4493,18 +4585,7 @@ class XlefViewer:
             finish()
             top = self._on_top()
             if messagebox.askyesno("Update", "Updated. The new version runs after the viewer restarts.\n\nRestart it now?", parent=top):
-                if top is not self.root:                # (a dialog is open, e.g. the open dialog: closed first, as if cancelled, and
-                    top.destroy()                       # the restart left until it has returned)
-                    self.root.after(100, restart)
-                else:
-                    restart()
-
-        def restart():
-            self.quit()
-            try:
-                self.root.winfo_exists()                # (still there: closing was cancelled, e.g. unsaved changes)
-            except tk.TclError:
-                app_update.relaunch()
+                self._restart_over(top)
 
         try:
             root = app_update.repo_root()
@@ -4546,7 +4627,21 @@ class XlefViewer:
             when = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(path)))
             n = count_images(path)
             return {"images": str(n), "pyramid": pyramid_note(path, n), "when": when}
-        result = ask_open_file(
+        self.open_dialog_up = True                  # (the automatic update may restart the viewer under this dialog: see _auto_blocked)
+        try:
+            result = self._ask_open_file(details)
+        finally:
+            self.open_dialog_up = False
+        if result:
+            path, from_list = result
+            if from_list and not os.path.isfile(path):
+                messagebox.showerror("Can't open", f"This experiment no longer exists:\n{path}", parent=self.root)
+                self.remove_recent(path)
+                return
+            self.open_xlef(path)
+
+    def _ask_open_file(self, details):
+        return ask_open_file(
             self.root, self.settings["recent_files"], title="Open a Leica experiment", noun="experiment",
             filetypes=[("Leica experiment", "*.xlef *.xlif *.lif"), ("All files", "*.*")],
             columns=[("name", "Experiment", 280, "w", True), ("images", "Images", 70, "e", False), ("pyramid", "Pyramid", 80, "w", False),
@@ -4555,13 +4650,6 @@ class XlefViewer:
             heading_tips={"pyramid": "A pyramid is a set of lower-resolution copies of each image, made by LAS X. When zoomed out, the "
                                      "viewer shows these smaller copies instead of reading the full-resolution image, so it displays much "
                                      "faster at low magnification.\n\nYes: every image has one. No: none do. \"5 of 29\": only some."})
-        if result:
-            path, from_list = result
-            if from_list and not os.path.isfile(path):
-                messagebox.showerror("Can't open", f"This experiment no longer exists:\n{path}", parent=self.root)
-                self.remove_recent(path)
-                return
-            self.open_xlef(path)
 
     def open_xlef(self, path, offer_pyramids=True):
         path = os.path.normpath(path)

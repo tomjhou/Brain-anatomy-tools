@@ -3683,6 +3683,17 @@ def ensure_imputed_gene_dataset_loaded(imputed_state, abc_cache):
     should leave whatever was selected before unchanged in that case."""
     if imputed_state['adata'] is not None:
         return True
+    shown = imputed_state.get('progress_win')
+    if shown is not None:
+        # Asked again while the first ask is still waiting (its window pumps the app's events, so another click on Imputed Gene gets here): one
+        # progress window is enough. The one that is showing is brought forward, and nothing starts a second.
+        try:
+            shown._top.deiconify()
+            shown._top.lift()
+            shown._top.focus_force()
+            return False
+        except Exception:
+            imputed_state['progress_win'] = None                # (it is gone: carry on and show a new one)
     if imputed_state['load_thread'] is None:
         already_cached = is_data_file_cached(
             abc_cache, IMPUTED_DATASET_DIRECTORY, IMPUTED_DATASET_FILE_NAME,
@@ -3713,6 +3724,11 @@ def ensure_imputed_gene_dataset_loaded(imputed_state, abc_cache):
     proc_fig, cancel_flag, set_progress = show_processing_dialog(
         "Loading imputed gene dataset (first use this session; this can take a while)..."
     )
+    imputed_state['progress_win'] = proc_fig
+    try:
+        proc_fig._top.grab_set()          # (the rest of the app waits for it: a second click on Imputed Gene would open a second window and leave this one frozen)
+    except Exception:
+        pass
     try:
         # What can be measured, and what can't:
         #  - Download (first use only): the file grows on disk as it
@@ -3767,6 +3783,7 @@ def ensure_imputed_gene_dataset_loaded(imputed_state, abc_cache):
                 and imputed_state['adata'] is not None and not cancel_flag['cancelled']):
             record_load_duration('imputed_open_s', time.perf_counter() - open_phase_started)
     finally:
+        imputed_state['progress_win'] = None
         close_processing_dialog(proc_fig)
         restore_cursors()
 

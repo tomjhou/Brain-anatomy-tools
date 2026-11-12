@@ -696,7 +696,7 @@ def check_for_update(root, button, changes=None, helpers=None):
         finish()
         downloading = (helpers or {}).get("atlas_download_running", lambda: None)()
         if downloading:
-            # (restarting would end the download of the atlas, and the file it is on would start again from its beginning: so no restart is offered)
+            # (restarting would pause the download of the atlas until the next start: so no restart is offered while it is going)
             with question():
                 messagebox.showinfo("Update", "Updated. The new version runs the next time the browser starts.\n\n"
                                     f"The atlas is still downloading ({downloading}), so the browser is not restarted now: that would stop the "
@@ -919,7 +919,7 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
                 leave = messagebox.askyesno(
                     "The atlas is still downloading",
                     f"The atlas data is still downloading ({running}).\n\n"
-                    "Exiting now stops the download, and the file it was on starts again from the beginning next time.\n\n"
+                    "Exiting now pauses the download: it continues from where it stopped the next time the program is started.\n\n"
                     "Exit anyway?", icon="warning", default="no", parent=root)
             if not leave:
                 return

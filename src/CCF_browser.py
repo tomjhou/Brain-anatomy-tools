@@ -305,12 +305,22 @@ ABC_ATLAS_ACCESS = 'abc_atlas_access @ https://github.com/alleninstitute/abc_atl
 _abc_atlas_access_problem = None      # why it could not be installed, once that has been tried (it is not tried again in the same run)
 
 
+def _make_downloads_resumable():
+    """The atlas downloads continue where they stopped (see resumable_download.py); never a reason to fail."""
+    try:
+        import resumable_download
+        resumable_download.install()
+    except Exception as e:
+        print(f"Resumable downloads are not available ({e}).")
+
+
 def import_project_cache():
     """AbcProjectCache from the Allen Institute's abc_atlas_access, installing that first if it is missing (it comes from GitHub, not PyPI).
     Raises ImportError, saying why, if it cannot be had; only the first failure tries to install."""
     global _abc_atlas_access_problem
     try:
         from abc_atlas_access.abc_atlas_cache.abc_project_cache import AbcProjectCache
+        _make_downloads_resumable()
         return AbcProjectCache
     except ImportError:
         pass
@@ -320,6 +330,7 @@ def import_project_cache():
         importlib.invalidate_caches()
         try:
             from abc_atlas_access.abc_atlas_cache.abc_project_cache import AbcProjectCache
+            _make_downloads_resumable()
             return AbcProjectCache
         except ImportError:
             _abc_atlas_access_problem = (f"abc_atlas_access could not be installed (pip said {result.returncode}); install it by hand with  "

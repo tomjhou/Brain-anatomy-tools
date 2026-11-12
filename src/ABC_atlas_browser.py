@@ -1041,6 +1041,8 @@ def offer_atlas_release_update(cache):
 
 
 import botocore.exceptions
+import resumable_download                  # (the atlas downloads continue where they stopped: see resumable_download.py)
+resumable_download.install()
 import_mark('botocore')
 startup_note("Libraries loaded. Looking for the ABC atlas download...")
 download_base = choose_atlas_cache_location()
@@ -1116,16 +1118,13 @@ atlas_prefetch = {'thread': None, 'total_gb': 0.0, 'files': [], 'keys': set()}
 
 def atlas_download_running():
     """While the download started by start_atlas_prefetch is still going: how far it has got, as text ("3.1 of 9.1 GB"); else None. (For the
-    launch screen's Exit: closing the program stops the download, and a file cut short is downloaded again from the start.)"""
+    launch screen's Exit: closing the program stops the download, which continues from where it stopped when the program is started again.)"""
     thread = atlas_prefetch['thread']
     if thread is None or not thread.is_alive():
         return None
     got = 0
     for path, _size in atlas_prefetch['files']:
-        try:
-            got += path.stat().st_size if path is not None else 0
-        except OSError:
-            pass
+        got += resumable_download.downloaded_bytes(path) if path is not None else 0
     total = atlas_prefetch['total_gb']
     return f"{got / 1e9:.1f} of {total:.1f} GB" if total else "under way"
 
@@ -1133,8 +1132,8 @@ def atlas_download_running():
 def update_before_download():
     """On a first install, with "Download updates automatically" on, before the atlas download starts: looks on GitHub for newer commits of these
     apps (waiting at most a few seconds: the launch screen looks again, without waiting) and, if there are some, downloads them and restarts, with no
-    question. A restart after the download has started would stop it, and the file it was on would start again from its beginning; before it,
-    nothing is lost. With the setting off, nothing is done here (the launch screen only says that an update is available)."""
+    question. A restart after the download has started only pauses it (it continues from where it stopped, see resumable_download.py), but before it
+    nothing is interrupted at all. With the setting off, nothing is done here (the launch screen only says that an update is available)."""
     if getattr(sys, 'frozen', False):
         return
     try:
@@ -1181,7 +1180,15 @@ def start_atlas_prefetch(cache):
         path, size, present = metadata_file_status(cache, directory, file_name)
         if present is False:
             ccf.append((label, directory, file_name, 'metadata', size, path))
-    if not core_files and not ccf:
+    # The imputed gene dataset (about 50 GB) is not fetched at start-up unless a download of it was begun and cut short (the program closed, a
+    # crash, the network lost): what is on the disk then is the start of it (a .part file: see resumable_download.py), and it is offered to continue.
+    resume = None
+    imputed_path, imputed_size, imputed_present = metadata_file_status(cache, IMPUTED_DATASET_DIRECTORY, IMPUTED_DATASET_FILE_NAME)
+    if imputed_present is False and imputed_path is not None and imputed_size:
+        have = resumable_download.downloaded_bytes(imputed_path)
+        if have > 0:
+            resume = (imputed_path, imputed_size, have)
+    if not core_files and not ccf and resume is None:
         return                     # (the reconstructed coordinates alone, a setting changed later, are asked for when needed, as before)
     recon = []
     if core_files and COORD_SETTINGS['reconstructed_coords']:
@@ -1190,11 +1197,29 @@ def start_atlas_prefetch(cache):
             if present is False:
                 recon.append((label, directory, file_name, kind, size, path))
     missing = recon + ccf + core_files                  # (the small ones first, needed as soon as the browser opens; the big files last)
+    update_before_download()                      # (asked first, before anything is downloaded)
+    only_resume = False
+    if resume is not None:
+        path, size, have = resume
+        try:
+            import centered_dialog
+            go_on = centered_dialog.ask_yes_no(
+                "Continue the imputed gene download?",
+                f"An earlier download of the imputed gene dataset was interrupted: {have / 1e9:.1f} of {size / 1e9:.1f} GB is on this computer.\n\n"
+                f"Continue it now? The remaining {(size - have) / 1e9:.1f} GB downloads in the background (progress is shown in the console window), "
+                "and you can carry on meanwhile; Imputed Gene waits for it.\n\n"
+                "If you choose No, nothing is lost: it continues when you choose Imputed Gene, or you are asked again the next time the program starts.")
+        except Exception:
+            go_on = False                                       # (no GUI to ask on: left until Imputed Gene is chosen)
+        if go_on:
+            only_resume = not missing
+            missing.append(("the imputed gene dataset (continued)", IMPUTED_DATASET_DIRECTORY, IMPUTED_DATASET_FILE_NAME, 'data', size, path))
+    if not missing:
+        return
     for _label, directory, file_name, _kind, size, path in missing:
         atlas_prefetch['files'].append((path, size))
         atlas_prefetch['keys'].add((directory, file_name))
     total_gb = sum(m[4] or 0 for m in missing) / 1e9
-    update_before_download()                      # (a restart after the download has started would stop it: asked first)
     atlas_prefetch['total_gb'] = total_gb
 
     def work():
@@ -1206,6 +1231,10 @@ def start_atlas_prefetch(cache):
     atlas_prefetch['thread'] = threading.Thread(target=work, daemon=True)
     atlas_prefetch['thread'].start()
 
+    if only_resume:                                             # (the question just asked was the notice)
+        print(f"Continuing the imputed gene download in the background ({resume[2] / 1e9:.1f} of {resume[1] / 1e9:.1f} GB is here already).")
+        return
+
     def size_text(n):
         return f"{n / 1e9:.1f} GB" if n >= 1e8 else f"{max(n / 1e6, 1):.0f} MB"
     parts = "\n".join(f"    {m[0]}: {size_text(m[4])}" if m[4] else f"    {m[0]}" for m in missing)
@@ -1213,7 +1242,7 @@ def start_atlas_prefetch(cache):
         message = (f"The atlas data is not on this computer yet, so it is being downloaded now (one time only):\n\n{parts}\n\n"
                    f"That is about {total_gb:.0f} GB and can take 10 minutes or much longer, depending on the connection. Progress is shown in "
                    "the console window. You can carry on to the launch screen; opening the browser will wait for the download to finish. "
-                   "Keep this program open until then: an interrupted file starts again from the beginning.")
+                   "If the program is closed or the connection is lost, the download continues from where it stopped the next time.")
     else:                                                       # (only the small files, such as the CCF coordinates, were missing)
         message = (f"A little atlas data is not on this computer yet, so it is being downloaded now (one time only):\n\n{parts}\n\n"
                    f"That is about {total_gb * 1000:.0f} MB. Progress is shown in the console window; you can carry on.")
@@ -2723,10 +2752,7 @@ def ensure_ccf_downloaded(abc_cache, parent=None, files=CCF_FILES, what="CCF coo
         while not outcome['done'] and not cancel_flag['cancelled']:
             got = 0
             for _d, _f, _size, local_path in missing:
-                try:
-                    got += local_path.stat().st_size if local_path is not None else 0
-                except OSError:
-                    pass
+                got += resumable_download.downloaded_bytes(local_path) if local_path is not None else 0
             if total_bytes:
                 set_progress(min(1.0, got / total_bytes))
                 proc_fig._set_status(f"{got / 1e6:.0f} of {total_bytes / 1e6:.0f} MB  "
@@ -3698,7 +3724,9 @@ def ensure_imputed_gene_dataset_loaded(imputed_state, abc_cache):
         already_cached = is_data_file_cached(
             abc_cache, IMPUTED_DATASET_DIRECTORY, IMPUTED_DATASET_FILE_NAME,
         )
-        if already_cached is not True:
+        already_downloading = (atlas_download_running() is not None
+                               and (IMPUTED_DATASET_DIRECTORY, IMPUTED_DATASET_FILE_NAME) in atlas_prefetch['keys'])    # (continued at start-up: it was asked then)
+        if already_cached is not True and not already_downloading:
             try:
                 import centered_dialog
                 confirmed = centered_dialog.ask_yes_no(
@@ -3749,15 +3777,13 @@ def ensure_imputed_gene_dataset_loaded(imputed_state, abc_cache):
         set_progress(0.0)
         while thread.is_alive() and not cancel_flag['cancelled']:
             elapsed = time.perf_counter() - loop_started
-            try:
-                size = local_path.stat().st_size if local_path is not None else None
-            except OSError:
-                size = 0
-            if expected_bytes and size is not None and size < expected_bytes:
+            size = resumable_download.downloaded_bytes(local_path) if local_path is not None else None
+            note = resumable_download.status_note(local_path) if local_path is not None else None
+            if expected_bytes and size is not None and (size < expected_bytes or (note and not local_path.exists())):
                 if opened_from_complete_file is None:
                     opened_from_complete_file = False
                 proc_fig._set_status(
-                    f"Downloading: {size / 1e9:.1f} of {expected_bytes / 1e9:.1f} GB  ({elapsed:.0f} s)")
+                    f"Downloading: {size / 1e9:.1f} of {expected_bytes / 1e9:.1f} GB  ({elapsed:.0f} s)" + (f"; {note}" if note else ""))
                 set_progress(size / expected_bytes)
             else:
                 if open_phase_started is None:

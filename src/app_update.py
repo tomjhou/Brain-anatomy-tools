@@ -26,6 +26,7 @@ API = f"https://api.github.com/repos/{REPO}"
 HOME = f"https://github.com/{REPO}"
 VERSION_FILE = os.path.join("src", "version.txt")       # (in the top folder)
 STAGING = ".update-download"                            # (in the top folder while an update is unpacked; gone afterwards)
+declined_at_start = False                               # the user said no to the update question asked before the atlas download (so the launch screen does not ask again)
 _pending = {}                                           # top folder -> (version installed or None, version to install), from check()
 
 

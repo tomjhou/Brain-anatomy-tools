@@ -1001,6 +1001,50 @@ def atlas_download_running():
     return f"{got / 1e9:.1f} of {total:.1f} GB" if total else "under way"
 
 
+def offer_update_before_download():
+    """On a first install, before the atlas download starts: looks on GitHub for newer commits of these apps (waiting at most a few seconds: the
+    launch screen looks again, without waiting) and, if there are some, asks whether to update and restart first. A restart later would stop
+    the download, and the file it was on would start again from its beginning; before it, nothing is lost."""
+    if getattr(sys, 'frozen', False):
+        return
+    try:
+        import app_update
+        import centered_dialog
+        folder = app_update.repo_root()
+        found = {}
+
+        def look():
+            try:
+                found['changes'] = app_update.check(folder)
+            except Exception:
+                pass
+        thread = threading.Thread(target=look, daemon=True)
+        thread.start()
+        thread.join(15)
+        changes = found.get('changes')
+        if not changes:
+            return
+        shown = "\n".join("  • " + line for line in changes[:12]) + (f"\n  ... and {len(changes) - 12} more" if len(changes) > 12 else "")
+        if not centered_dialog.ask_yes_no(
+                "Update before downloading?",
+                f"{len(changes)} new change{'s' if len(changes) != 1 else ''} on GitHub:\n\n{shown}\n\nThe atlas download (it is large) has not started yet. "
+                "Updating now, and restarting, means the download is not interrupted later by a restart.\n\nUpdate and restart now?"):
+            app_update.declined_at_start = True
+            return
+        print("Updating...")
+        try:
+            app_update.pull(folder)
+        except app_update.UpdateError as e:
+            centered_dialog.info("Update", f"The update could not be applied:\n\n{e}\n\nThe browser carries on with this version.")
+            app_update.declined_at_start = True
+            return
+        print("Updated: restarting.")
+        from abc_tk_launcher import restart
+        restart()
+    except Exception as e:
+        print(f"Could not check for updates before the download ({type(e).__name__}: {e}).")
+
+
 def start_atlas_prefetch(cache):
     """Start downloading the core atlas files that are missing, on a background thread (nothing if all are there, or offline).
     Fills atlas_prefetch with the thread and the size, and tells the user once what is going on."""
@@ -1027,6 +1071,7 @@ def start_atlas_prefetch(cache):
         atlas_prefetch['files'].append((path, size))
         atlas_prefetch['keys'].add((directory, file_name))
     total_gb = sum(m[4] or 0 for m in missing) / 1e9
+    offer_update_before_download()                      # (a restart after the download has started would stop it: asked first)
     atlas_prefetch['total_gb'] = total_gb
 
     def work():

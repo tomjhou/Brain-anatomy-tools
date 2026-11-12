@@ -2587,9 +2587,11 @@ def _cubic(B, C):
 _KERNELS = {"mitchell": _cubic(1 / 3, 1 / 3), "bicubic": _cubic(0, 0.5), "gaussian": lambda x: np.exp(-0.5 * (x / 0.5) ** 2)}
 
 
-def _taps(n_in, n_out, kernel):
-    """For each of n_out output pixels along one axis: the 4 input pixels it is made of and their weights (summing to 1)."""
-    x = (np.arange(n_out) + 0.5) * (n_in / n_out) - 0.5            # (where each output pixel's centre falls in the input)
+def _taps(n_in, n_out, kernel, a0=0.0, a1=None):
+    """For each of n_out output pixels along one axis: the 4 input pixels it is made of and their weights (summing to 1). The output
+    spans input a0..a1 (pixel edges, fractions too: see XlefViewer._geom); all of it by default."""
+    a1 = n_in if a1 is None else a1
+    x = a0 + (np.arange(n_out) + 0.5) * ((a1 - a0) / n_out) - 0.5   # (where each output pixel's centre falls in the input)
     idx = np.floor(x).astype(int)[:, None] + np.arange(-1, 3)[None, :]
     w = kernel(x[:, None] - idx).astype(np.float32)
     w /= w.sum(axis=1, keepdims=True)
@@ -2597,22 +2599,27 @@ def _taps(n_in, n_out, kernel):
 
 
 @functools.lru_cache(maxsize=16)
-def _weights(n_in, n_out, method):
-    """The (n_out, n_in) matrix that resamples one axis (mostly zeros: 4 weights per row). Kept: redraws at one zoom (a slider, a
-    channel) reuse it."""
-    idx, w = _taps(n_in, n_out, _KERNELS[method])
+def _weights(n_in, n_out, method, a0=0.0, a1=None):
+    """The (n_out, n_in) matrix that resamples one axis (mostly zeros: 4 weights per row), over input a0..a1 (see _taps). Kept:
+    redraws at one zoom (a slider, a channel) reuse it."""
+    idx, w = _taps(n_in, n_out, _KERNELS[method], a0, a1)
     m = np.zeros((n_out, n_in), np.float32)
     np.add.at(m, (np.repeat(np.arange(n_out), 4), idx.ravel()), w.ravel())       # (add: at the edges taps repeat a pixel)
     return m
 
 
-def enlarge(rgb, w, h, method="mitchell"):
+def enlarge(rgb, w, h, method="mitchell", box=None):
     """An RGB uint8 array enlarged to w x h (a PIL image), the way ENLARGE_METHODS names: each output pixel a weighted sum of the 4 x 4
     nearest input pixels (cubic or Gaussian weights), done as two matrix products per color (rows, then columns), which is fast
-    (~10-25 ms for a 1200 x 800 view, 35-100 ms at full screen). Bilinear and hard pixels come from Pillow."""
+    (~10-25 ms for a 1200 x 800 view, 35-100 ms at full screen). Bilinear and hard pixels come from Pillow. box: the part of the array
+    (x0, y0, x1, y1, fractions of a pixel too) that becomes the w x h picture; all of it by default."""
     if method not in _KERNELS:
-        return Image.fromarray(rgb).resize((w, h), Image.NEAREST if method == "nearest" else Image.BILINEAR)
-    rows, cols = _weights(rgb.shape[0], h, method), _weights(rgb.shape[1], w, method)
+        return Image.fromarray(rgb).resize((w, h), Image.NEAREST if method == "nearest" else Image.BILINEAR, box=box)
+    if box is None:
+        box = (0.0, 0.0, rgb.shape[1], rgb.shape[0])
+    q = lambda v: round(float(v), 4)          # (so that redraws of one view find the matrices made for it: see _weights)
+    rows = _weights(rgb.shape[0], h, method, q(box[1]), q(box[3]))
+    cols = _weights(rgb.shape[1], w, method, q(box[0]), q(box[2]))
     a = np.moveaxis(rgb, 2, 0).astype(np.float32)            # (3, rows, columns): each color one matrix product of each kind
     o = rows @ a @ cols.T
     o += 0.5                                                 # (in place: at full screen each pass over the result is ~10 ms)
@@ -3037,14 +3044,18 @@ class RangeSlider(tk.Canvas):
                 self.command(lo, hi)
 
 
+THUMB_FILES = (".npz", ".npz.tmp", ".png", ".png.tmp")     # this viewer's files in THUMB_CACHE (.tmp: one cut off mid-write; .png:
+                                                             # the old kind, colored when saved: see _old_thumb_path)
+
+
 def thumb_cache_size():
     """(number of thumbnails, bytes) saved in THUMB_CACHE."""
     count = size = 0
     try:
         with os.scandir(THUMB_CACHE) as it:
             for f in it:
-                if f.is_file() and f.name.endswith(".png"):
-                    count += 1
+                if f.is_file() and f.name.endswith(THUMB_FILES):
+                    count += f.name.endswith((".npz", ".png"))
                     size += f.stat().st_size
     except OSError:
         pass
@@ -3052,10 +3063,14 @@ def thumb_cache_size():
 
 
 def clear_thumb_cache():
-    """Delete the saved thumbnails (only this viewer's .png files in THUMB_CACHE): they are made again as they are needed."""
+    """Delete the saved thumbnails (only this viewer's files in THUMB_CACHE): they are made again as they are needed."""
+    _remove_thumb_files(THUMB_FILES)
+
+
+def _remove_thumb_files(endings):
     try:
         with os.scandir(THUMB_CACHE) as it:
-            names = [f.path for f in it if f.is_file() and f.name.endswith((".png", ".png.tmp"))]     # (.tmp: one cut off mid-write)
+            names = [f.path for f in it if f.is_file() and f.name.endswith(endings)]
     except OSError:
         return
     for path in names:
@@ -3065,15 +3080,29 @@ def clear_thumb_cache():
             pass
 
 
+def _old_thumb_path(entry, size):
+    """Where an earlier version saved the thumbnail of `entry`: a colored picture, named by its contrast too. Used only when the image's
+    files are online-only (so that no new one can be made without downloading them): it shows every channel, as it was then."""
+    h = hashlib.sha1(f"{size}|lasx-contrast|{'|'.join(f'{c.lut}:{c.black}-{c.white}' for c in entry.channels)}".encode())
+    for f in entry.all_files():
+        st = os.stat(f)
+        h.update(f"{os.path.normcase(f)}|{st.st_size}|{st.st_mtime_ns}".encode())
+    if entry.lif_block:
+        h.update(f"|{entry.lif_block}".encode())
+    return os.path.join(THUMB_CACHE, h.hexdigest() + ".png")
+
+
 def _thumb_cache_path(entry, size):
-    """Where the thumbnail of `entry` is cached: named by its files' paths, sizes and dates (os.stat only: no download)."""
-    h = hashlib.sha1(f"{size}|lasx-contrast|{'|'.join(f'{c.lut}:{c.black}-{c.white}' for c in entry.channels)}".encode())     # (the second part changes whenever thumbnails are drawn differently)
+    """Where the thumbnail of `entry` is cached: named by its files' paths, sizes and dates (os.stat only: no download). What is saved
+    is each channel's small grey picture (see thumb_arrays): contrast, colors and channel switches are applied when it is shown, so
+    they don't change it."""
+    h = hashlib.sha1(f"{size}|channels-1".encode())     # (the second part changes whenever thumbnails are saved differently)
     for f in entry.all_files():
         st = os.stat(f)
         h.update(f"{os.path.normcase(f)}|{st.st_size}|{st.st_mtime_ns}".encode())
     if entry.lif_block:              # (the images of a .lif share its one file)
         h.update(f"|{entry.lif_block}".encode())
-    return os.path.join(THUMB_CACHE, h.hexdigest() + ".png")
+    return os.path.join(THUMB_CACHE, h.hexdigest() + ".npz")
 
 
 PYRAMID_GAMMA = 1.8      # LAS X's 8-bit pyramid levels: level = 255 * (original / max) ** (1 / 1.8) (measured 2026-10-29: fit 1.804,
@@ -3126,19 +3155,35 @@ def _thumb_source(entry, size):
     return None, "cloud"
 
 
-def make_thumbnail(entry, size=THUMB_SIZE, preview=None):
-    """(PIL image, "ok"), or (None, "cloud") when the files are online-only (they are NOT read), or (None, "none").
+def _shrink(a, size):
+    """A channel's array shrunk to fit `size` (longest side; smoothly: bilinear), keeping its type (uint8 or uint16)."""
+    h, w = a.shape
+    scale = size / max(h, w)
+    if scale >= 1:
+        return np.ascontiguousarray(a)
+    small = Image.fromarray(a.astype(np.float32)).resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.BILINEAR)
+    out = np.rint(np.asarray(small))
+    kind = a.dtype if a.dtype in (np.uint8, np.uint16) else np.dtype(np.uint16)
+    return np.clip(out, 0, np.iinfo(kind).max).astype(kind)
+
+
+def thumb_arrays(entry, size=THUMB_SIZE, preview=None):
+    """(each channel's small array, at most `size` on its longest side, "ok"), or (None, "cloud") when the files are online-only (they are
+    NOT read), or (None, "none"). Saved in THUMB_CACHE, and read from there next time.
     Made from the image's preview if it is in memory (`preview`: each channel's array of layer 0, at any step: nothing is read), else
     from the smallest fitting level of LAS X's pyramid if there is one (a few KB per channel), else from every n-th row and column
-    of the image itself, and shown with the image's contrast (LAS X's, or as changed in the viewer), as the main view first shows it."""
+    of the image itself."""
     if entry.problem or not entry.files or not entry.width:
         return None, "none"
+    n = len(entry.channels)
     try:
         cache = _thumb_cache_path(entry, size)
         if os.path.isfile(cache):
             try:
-                return Image.open(cache).convert("RGB"), "ok"
-            except OSError:                     # (a broken one, e.g. cut short by an older version: deleted and made again)
+                with open(cache, "rb") as fh, np.load(fh) as z:  # (the file opened here: so that it is closed, and can be deleted,
+                    arrays = [z[f"c{c}"] for c in range(n)]       # even when np.load fails on it)
+                return arrays, "ok"
+            except Exception:                                   # (a broken one, e.g. cut short (zipfile.BadZipFile): deleted and made again)
                 try:
                     os.remove(cache)
                 except OSError:
@@ -3156,7 +3201,7 @@ def make_thumbnail(entry, size=THUMB_SIZE, preview=None):
         step = max(1, max(preview[0].shape) // size)
         arrays = [np.ascontiguousarray(a[::step, ::step]) for a in preview]
     else:
-        step = max(1, max(source.width, source.height) // size)       # (rounded down: the resize below makes it exactly `size`)
+        step = max(1, max(source.width, source.height) // size)       # (rounded down: _shrink below makes it exactly `size`)
     for c, f in enumerate(files or []):
         if f is None:
             arrays.append(None)
@@ -3177,17 +3222,35 @@ def make_thumbnail(entry, size=THUMB_SIZE, preview=None):
         if source is not entry and small.dtype == np.uint8:      # a pyramid level: back to the image's own values
             small = pyramid_to_original(small, entry.channels[len(arrays)].max_value)
         arrays.append(small)
-    luts = make_luts(entry.channels, [{"on": True, "lo": c.black, "hi": c.white} for c in entry.channels])
-    im = Image.fromarray(composite(arrays, luts))
-    im.thumbnail((size, size), Image.BILINEAR)
+    shape = next((a.shape for a in arrays if a is not None), None)
+    if shape is None or len(arrays) != n:
+        return None, "none"
+    arrays = [_shrink(a if a is not None else np.zeros(shape, np.uint16), size) for a in arrays]
     try:
         os.makedirs(THUMB_CACHE, exist_ok=True)
         tmp = cache + ".tmp"                    # (written whole first, then renamed: an exit mid-write leaves no broken thumbnail)
-        im.save(tmp, format="PNG")
+        with open(tmp, "wb") as out:
+            np.savez_compressed(out, **{f"c{c}": a for c, a in enumerate(arrays)})
         os.replace(tmp, cache)
     except OSError:
         pass
-    return im, "ok"
+    return arrays, "ok"
+
+
+def make_thumbnail(entry, size=THUMB_SIZE, preview=None, shown=None):
+    """(PIL image, "ok"), or (None, "cloud") / (None, "none"): see thumb_arrays, whose channels are colored and mixed here with the image's
+    contrast (LAS X's, or as changed in the viewer) and colors, as the main view shows it. shown: None (every channel), or per channel
+    whether it is drawn: the viewer's channel switches, for images of the same channels as the one on show (see XlefViewer._thumb_shown)."""
+    arrays, state = thumb_arrays(entry, size, preview)
+    if arrays is None and state == "cloud":
+        try:
+            return Image.open(_old_thumb_path(entry, size)).convert("RGB"), "ok"
+        except Exception:                       # (none saved by an earlier version, or broken)
+            pass
+    if arrays is None:
+        return None, state
+    luts = make_luts(entry.channels, [{"on": shown is None or shown[c], "lo": ch.black, "hi": ch.white} for c, ch in enumerate(entry.channels)])
+    return Image.fromarray(composite(arrays, luts)), "ok"
 
 
 SLIDE_HEIGHT = 260       # the slide overview's height above the list, screen pixels
@@ -3848,6 +3911,8 @@ class XlefViewer:
                                     name_tip=self._grid_tip_text, is_unsaved=self._is_unsaved)
         self.grid_marks_job = None   # (the grid's red *s redrawn once, after a change to what is unsaved: see _place_unsaved_mark)
         self.thumb_gen = 0           # bumped for each experiment opened: thumbnails made for an earlier one are dropped
+        self.thumb_mask = None       # (channel names, on/off) while some of the shown image's channels are off: see _thumb_shown
+        self.key_level = {}          # sharp views read from a pyramid level: their pixels' size (see _origin)
         self.thumbs_started = False
         self._tree_tag_colors()
         ttk.Label(left, text="☁ = online-only in OneDrive (asks before downloading files over 50 MB)", style="Link.TLabel").pack(anchor=tk.W, padx=4)
@@ -5292,7 +5357,7 @@ class XlefViewer:
 
         def make(item, entry, preview):
             try:
-                image, state = make_thumbnail(entry, preview=preview)
+                image, state = make_thumbnail(entry, preview=preview, shown=self._thumb_shown(entry))
             except Exception:
                 image, state = None, "none"
             self.results.put(("thumb", gen, (item, image, state)))
@@ -5557,6 +5622,7 @@ class XlefViewer:
                 self.img.close()
         self._stop_glide()
         self.img = None
+        self.root.after_idle(self._update_thumb_mask)  # (once the next image, if any, is shown: its channels and switches)
         self._show_loaded()
         self.photo = None
         self.flip_one.set(False)
@@ -5830,6 +5896,29 @@ class XlefViewer:
             return
         self.ch_settings[i][key] = value
         self.schedule_redraw()
+        if key == "on":
+            self._update_thumb_mask()
+
+    def _thumb_shown(self, entry, mask=False):
+        """Which channels the thumbnail of `entry` draws: the channel switches (on/off) of the image on show, if `entry` has the same
+        channels (they carry over to it when it is opened: see show_entry); else None, every channel. (Read by the thumbnail threads:
+        thumb_mask is replaced whole, never changed in place.) mask: thumb_mask as it was earlier."""
+        m = self.thumb_mask if mask is False else mask
+        if m is None or tuple(c.name for c in entry.channels) != m[0]:
+            return None
+        return m[1]
+
+    def _update_thumb_mask(self):
+        """After a channel was switched on or off, or another image shown: thumb_mask, and the thumbnails it changes (those of the
+        images with the channels of the old mask or the new one) made again."""
+        old, new = self.thumb_mask, None
+        if self.img is not None and len(self.ch_settings) == len(self.img.entry.channels) and not all(st["on"] for st in self.ch_settings):
+            new = (tuple(c.name for c in self.img.entry.channels), tuple(st["on"] for st in self.ch_settings))
+        if new == old:
+            return
+        self.thumb_mask = new
+        names = {m[0] for m in (old, new) if m is not None}
+        self._refresh_thumbnails([i for i, e in self.entries.items() if tuple(c.name for c in e.channels) in names])
 
     def _set_lo_hi(self, i, lo, hi):
         """A slider moved: the image's contrast changed (an unsaved change: Save writes it into its .xlif; Undo takes back the whole
@@ -6271,15 +6360,16 @@ class XlefViewer:
             if bd is not None:
                 for kept in sharp:              # (zooming out: the sharp views kept, e.g. from the way in, over the backdrop)
                     if k < len(kept["pil"]):
-                        _, _, i0, j0, _, _, st, _ = kept["key"]
+                        st = kept["key"][6]
+                        x0, y0 = self._origin(kept["key"])
                         # (from a copy halved n times, no larger than needed: shrinking the full one at every frame took ~30 ms)
                         n = min(6, max(0, int(np.log2(1 / max(self.scale * st, 1e-9)))))
                         levels = kept["pil"][k]
                         while len(levels) <= n:
                             levels.append(levels[-1].reduce(2))
                         f = st * 2 ** n
-                        kmap = (1 / (self.scale * f), (self.cx - cw / 2 / self.scale) / f - i0 * st / f,
-                                1 / (self.scale * f), (self.cy - ch / 2 / self.scale) / f - j0 * st / f)
+                        kmap = (1 / (self.scale * f), (self.cx - cw / 2 / self.scale) / f - x0 / f,
+                                1 / (self.scale * f), (self.cy - ch / 2 / self.scale) / f - y0 / f)
                         rect = self._glide_rect(kmap, levels[n].width, levels[n].height, cw, ch)
                         for strip in self._outside(rect, base_rect):        # (only where the picture on screen won't cover it)
                             self._glide_paste(frame, levels[n], kmap, cw, ch, strip)
@@ -6544,6 +6634,65 @@ class XlefViewer:
         self.redraw_job = None
         self.redraw()
 
+    def _geom(self, x0, y0, st, cols, rows):
+        """Where an array of cols x rows pixels, each st image pixels across, its top-left edge at image point (x0, y0) (fractions too:
+        see _origin), falls on the canvas, exactly: (left, top, w, h, box), the whole canvas pixels it covers (on the canvas only) and
+        the part of the array (box: x0, y0, x1, y1 in its pixels, fractions too) that is scaled onto them; None if none of it is on
+        the canvas. Every drawing is placed this way, as the zoom's glide places its frames: rounding each one's position and size to
+        whole pixels moved the picture by up to a pixel as a zoom settled (the preview, then the sharp view, rounded differently)."""
+        cw, ch = self.canvas_size()
+        k = st * self.scale                                     # (canvas pixels per array pixel)
+        X0, Y0 = (x0 - self.cx) * self.scale + cw / 2, (y0 - self.cy) * self.scale + ch / 2
+        X1, Y1 = X0 + cols * k, Y0 + rows * k
+        left, top = max(0, int(np.ceil(X0 - 1e-6))), max(0, int(np.ceil(Y0 - 1e-6)))
+        right, bottom = min(cw, int(np.floor(X1 + 1e-6))), min(ch, int(np.floor(Y1 + 1e-6)))
+        if right <= left or bottom <= top:
+            return None
+        box = (min(max((left - X0) / k, 0.0), cols), min(max((top - Y0) / k, 0.0), rows),
+               min(max((right - X0) / k, 0.0), cols), min(max((bottom - Y0) / k, 0.0), rows))
+        if box[2] <= box[0] or box[3] <= box[1]:
+            return None
+        return left, top, right - left, bottom - top, box
+
+    def _scaled(self, rgb, geom, smooth):
+        """The part geom's box names of an RGB array, scaled to geom's size: shrunk smoothly (bilinear), or enlarged as chosen in
+        Settings; just cut out when that is all it takes (at 100%, on whole pixels)."""
+        _, _, w, h, (a0, b0, a1, b1) = geom
+        if all(abs(v - round(v)) < 1e-6 for v in (a0, b0, a1, b1)) and (round(a1 - a0), round(b1 - b0)) == (w, h):
+            return Image.fromarray(np.ascontiguousarray(rgb[round(b0):round(b1), round(a0):round(a1)]))
+        if smooth:
+            return Image.fromarray(rgb).resize((w, h), Image.BILINEAR, box=(a0, b0, a1, b1))
+        return enlarge(rgb, w, h, self._draw_method(), (a0, b0, a1, b1))
+
+    def _origin(self, key):
+        """The image point of the top-left edge of a sharp view's (or kept region's) array, `key` its key. A pixel read as every
+        st-th pixel of the full-resolution files is the one at the top-left corner of the st x st block it stands for: its middle is
+        half a pixel in, not half a block, so the array lies (st - 1) / 2 image pixels up and left of the blocks. A pyramid level's
+        pixel (read at the level's own step) is the whole block's (see _note_level)."""
+        _, _, i0, j0, _, _, st, _ = key
+        off = (self.key_level.get((key[0],) + tuple(key[2:]), 1) - st) / 2
+        return i0 * st + off, j0 * st + off
+
+    def _note_level(self, key, level_step):
+        """A sharp view's key, read from a pyramid level whose pixels are each level_step image pixels (see _origin); the same view of
+        other layers (read ahead: see _start_prefetch) shares it."""
+        self.key_level[(key[0],) + tuple(key[2:])] = level_step
+        while len(self.key_level) > 1000:
+            del self.key_level[next(iter(self.key_level))]
+
+    def _key_geom(self, key, arrays):
+        """_geom for a sharp view's arrays (of `key`)."""
+        a = next((a for a in arrays if a is not None), None)
+        if a is None:
+            return None
+        x0, y0 = self._origin(key)
+        return self._geom(x0, y0, key[6], a.shape[1], a.shape[0])
+
+    def _ov_offset(self):
+        """(See _origin) for the previews: none if they come from the pyramid; else, read as every ov_step-th pixel, (1 - ov_step) / 2."""
+        img = self.img
+        return 0.0 if img.pyramid is not None else (1 - img.ov_step) / 2
+
     def _view_rect(self, step):
         """The visible part of the image, in units of `step` image pixels (i0, j0, i1, j1: columns/rows of a [::step, ::step] array),
         and where it goes on the canvas (left, top, width, height)."""
@@ -6718,8 +6867,9 @@ class XlefViewer:
                 arrays = [a if luts[c] is not None else None for c, a in enumerate(cache["arrays"])]
                 if TRACE_PATH:
                     trace("  the kept sharp view is exactly this view: drawn from it")
-                if any(a is not None for a in arrays):
-                    self._show(self._mix(arrays, luts), *place, smooth=self.scale * step < 1)
+                geom = self._key_geom(key, arrays)
+                if any(a is not None for a in arrays) and geom is not None:
+                    self._show(self._mix(arrays, luts), geom, smooth=self.scale * step < 1)
                 need = [c for c in need if cache["arrays"][c] is None]
                 if not need:
                     self.detail_pending = False
@@ -6729,26 +6879,28 @@ class XlefViewer:
                 ovs = [None] * n                  # (skip the overview: the sharp view stays while the missing channel is read)
         if any(o is not None for o in ovs):
             (i0, j0, i1, j1), place = self._view_rect(s)
-            if i1 > i0 and j1 > j0:
-                crop = [o[j0:j1, i0:i1] if o is not None else None for o in ovs]
-                rows, cols = next(a.shape for a in crop if a is not None)
-                left, top, w, h = place
-                if (cols, rows) != (i1 - i0, j1 - j0):      # (a pyramid level drops the last partial block at the right and bottom edges)
-                    w, h = max(1, round(cols * s * self.scale)), max(1, round(rows * s * self.scale))
+            crop = [o[j0:j1, i0:i1] if o is not None else None for o in ovs] if i1 > i0 and j1 > j0 else []
+            shape = next((a.shape for a in crop if a is not None), None)
+            off = self._ov_offset()
+            geom = self._geom(i0 * s + off, j0 * s + off, s, shape[1], shape[0]) if shape is not None and min(shape) > 0 else None
+            if geom is not None:
+                rows, cols = shape
+                left, top, w, h, box = geom
                 t0 = time.perf_counter()
                 if cols > w and rows > h:
                     # Zoomed out: shrink each channel to the screen size first (averaging, Pillow handles 16-bit), so that the slow part,
                     # mixing the channels, works on only as many pixels as are shown. The shrunk channels are kept for this view, so a
                     # redraw for a slider, or for the next channel arriving, shrinks nothing again.
-                    view = (id(self.img), self.z, i0, j0, i1, j1, w, h)
+                    view = (id(self.img), self.z, i0, j0, i1, j1, left, top, w, h, tuple(round(v, 4) for v in box))
                     for c, a in enumerate(crop):
                         if a is not None:
                             key = view + (c,)
                             if key not in self.shrunk:
-                                self.shrunk[key] = np.asarray(Image.fromarray(np.ascontiguousarray(a)).resize((w, h), Image.BOX))
+                                self.shrunk[key] = np.asarray(Image.fromarray(np.ascontiguousarray(a)).resize((w, h), Image.BOX, box=box))
                             crop[c] = self.shrunk[key]
                     for key in [k for k in self.shrunk if k[:-1] != view]:
                         del self.shrunk[key]
+                    geom = (left, top, w, h, (0.0, 0.0, float(w), float(h)))       # (shrunk to the picture already)
                 t0 = self._tick("shrink", t0)
                 rgbs = self._mix(crop, luts)
                 t0 = self._tick("mix", t0)
@@ -6758,7 +6910,7 @@ class XlefViewer:
                 t0 = time.perf_counter()
                 overlay = sharp + [self._partial_overlay(luts)]
                 self._tick("bands", t0)
-                self._show(rgbs, left, top, w, h, smooth=self.scale * s < 1, overlay=overlay)
+                self._show(rgbs, geom, smooth=self.scale * s < 1, overlay=overlay)
         if not detail:
             if not preview_only:
                 self.detail_pending = False
@@ -6786,6 +6938,8 @@ class XlefViewer:
             trace(f"  read started (generation {gen}): layer {z + 1}, step {step}, {'pyramid level' if level is not None else 'full-resolution files'}")
         (i0, j0, i1, j1), place = self._detail_rect(step, level)
         key = (id(img), z, i0, j0, i1, j1, step, place)
+        if level is not None:
+            self._note_level(key, round(img.entry.width / level.width))
         smooth = self.scale * step < 1
 
         self._stash_partial()
@@ -6899,6 +7053,7 @@ class XlefViewer:
             return None
         rect, place = self._detail_rect(fin[1], fin[0])
         z, img = self.z, self.img
+        self._note_level((id(img), z) + tuple(rect) + (fin[1], place), fin[1])      # (the quick look: the level at its own step)
         where = f"Layer {z + 1} of {img.entry.nz}; " if img.entry.nz > 1 else ""
         self.interim_status = (f"{where}reading this view at {_resolution_text(step)}; the {_resolution_text(fin[1])} "
                                f"pyramid copy is shown meanwhile ...")
@@ -6977,21 +7132,18 @@ class XlefViewer:
                 trace(f"  sharp pixels mixed: {arrays[on[0]].shape[1]}x{arrays[on[0]].shape[0]} at step {st}, {len(on)} channels")
         rgbs = cache["rgb"]
         rows, cols = rgbs[0].shape[:2]
-        x0, y0 = i0 * st, j0 * st                           # (image pixel of rgb[0, 0])
-        cw, ch = self.canvas_size()
+        x0, y0 = self._origin(cache["key"])                 # (image point of rgb[0, 0]'s top-left edge)
         vx0, vy0, vx1, vy1 = self._view_corners()
-        a0, b0 = max(0, int((vx0 - x0) // st)), max(0, int((vy0 - y0) // st))
-        a1, b1 = min(cols, int(-(-(vx1 - x0) // st))), min(rows, int(-(-(vy1 - y0) // st)))
+        a0, b0 = max(0, int((vx0 - x0) // st) - 2), max(0, int((vy0 - y0) // st) - 2)       # (the part in view, and 2 pixels more for
+        a1, b1 = min(cols, int(-(-(vx1 - x0) // st)) + 2), min(rows, int(-(-(vy1 - y0) // st)) + 2)     # the enlarging's taps)
         if a1 <= a0 or b1 <= b0:
             return None
-        w, h = max(1, round((a1 - a0) * st * self.scale)), max(1, round((b1 - b0) * st * self.scale))
-        ims = []
-        for rgb in rgbs:                                    # (one per canvas)
-            part = np.ascontiguousarray(rgb[b0:b1, a0:a1])
-            ims.append(enlarge(part, w, h, self._draw_method()) if w > a1 - a0 or h > b1 - b0       # (zoomed in past the pixels)
-                       else Image.fromarray(part).resize((w, h), Image.BILINEAR))
+        geom = self._geom(x0 + a0 * st, y0 + b0 * st, st, a1 - a0, b1 - b0)
+        if geom is None:
+            return None
+        ims = [self._scaled(np.ascontiguousarray(rgb[b0:b1, a0:a1]), geom, self.scale * st < 1) for rgb in rgbs]   # (one per canvas)
         self._tick("sharp scale", t0)
-        return ims, round((x0 + a0 * st - self.cx) * self.scale + cw / 2), round((y0 + b0 * st - self.cy) * self.scale + ch / 2)
+        return ims, geom[0], geom[1]
 
     def _sharp_kept(self, mixed_only=False):
         """The sharp pixels in memory to draw over the preview for the view now: the last sharp view's, and the kept regions of this
@@ -7155,13 +7307,14 @@ class XlefViewer:
         return step, None
 
     def _slow_full(self, step, need):
-        """Reading the view at `step` from the full-resolution files would be slow (see _slow)."""
-        (i0, j0, i1, j1), _ = self._view_rect(step)
+        """The full-resolution files are on slow storage (see _slow): judged by the drive, by a typical sharper copy (32 MB in 12 reads),
+        as Settings and the project's note say ("Fast storage: sharper pictures are read as soon as you zoom in"), not by this view's
+        read. (Judged by the view's own read, a large window on a fast drive counted as slow: at 29% on a 2560 x 1440 screen a view is
+        ~80 MB, over READ_BUDGET, so the preview stood in, with only the middle sharp, from the view before.)"""
         f = self.img.entry.files.get((self.z, need[0])) if need else None
         if f is None:
             return False
-        nbytes = (j1 - j0) * ((i1 - i0 - 1) * step + 1) * 2 * len(need)
-        return self._slow(SPEED.estimate(f, nbytes, (j1 - j0) * len(need), READ_THREADS), path=f)
+        return self._slow(SPEED.estimate(f, 32e6, 12), LEVEL_BUDGET, f)
 
     def _probe_speed(self, entry):
         """Measure, in the background, the storage of this image's full-resolution files if it is due (see StorageSpeed)."""
@@ -7485,11 +7638,11 @@ class XlefViewer:
             new = self._mix([a[p["mixed"]:rows] if a is not None and luts[c] is not None else None for c, a in enumerate(arrays)], luts)
             p["rgb"] = new if p["rgb"] is None else [np.concatenate([old, part]) for old, part in zip(p["rgb"], new)]
             p["mixed"] = rows
-        cw, ch = self.canvas_size()
-        w, h = max(1, round((i1 - i0) * st * self.scale)), max(1, round(rows * st * self.scale))
-        ims = [enlarge(rgb, w, h, self._draw_method()) if w > rgb.shape[1] or h > rgb.shape[0]
-               else Image.fromarray(rgb).resize((w, h), Image.BILINEAR) for rgb in p["rgb"]]
-        return ims, round((i0 * st - self.cx) * self.scale + cw / 2), round((j0 * st - self.cy) * self.scale + ch / 2)
+        x0, y0 = self._origin(p["key"])
+        geom = self._geom(x0, y0, st, p["rgb"][0].shape[1], rows)
+        if geom is None:
+            return None
+        return [self._scaled(rgb, geom, self.scale * st < 1) for rgb in p["rgb"]], geom[0], geom[1]
 
     def _kept_covers(self, step, channels, cache=None):
         """The kept sharp pixels (detail_cache, or `cache`) cover all of the image that is in view, at `step` or finer, for these
@@ -7507,15 +7660,14 @@ class XlefViewer:
         x0, y0 = i0 * st, j0 * st
         return x0 <= vx0 and y0 <= vy0 and x0 + cols * st >= min(vx1, e.width - st) and y0 + rows * st >= min(vy1, e.height - st)
 
-    def _show(self, rgbs, left, top, w, h, smooth, overlay=None):
-        """rgbs: one RGB array per canvas (see _mix), all of this view. overlay: sharper pixels to lay on top, (images, x, y), or a list
-        of such (or None), each over the ones before."""
+    def _show(self, rgbs, geom, smooth, overlay=None):
+        """rgbs: one RGB array per canvas (see _mix), all of this view, placed by geom (see _geom). overlay: sharper pixels to lay on
+        top, (images, x, y), or a list of such (or None), each over the ones before."""
         ims = []
+        left, top = geom[0], geom[1]
         t0 = time.perf_counter()
         for k, rgb in enumerate(rgbs):
-            im = Image.fromarray(rgb)
-            if im.size != (w, h):           # (smooth: shrinking; else zoomed in past the pixels: enlarged as chosen in Settings)
-                im = im.resize((w, h), Image.BILINEAR) if smooth else enlarge(rgb, w, h, self._draw_method())
+            im = self._scaled(rgb, geom, smooth)    # (smooth: shrinking; else zoomed in past the pixels: enlarged as chosen in Settings)
             t0 = self._tick("enlarge", t0)
             for ov in (overlay if isinstance(overlay, list) else [overlay]):
                 if ov is not None and k < len(ov[0]):           # (sharper pixels on top, where there are some for this view)
@@ -8183,13 +8335,16 @@ class XlefViewer:
             self.slide_gen += 1                 # (a picture still being made with the old contrast is dropped)
             self._make_slide_picture()
         if self.thumbs_started:
-            gen = self.thumb_gen
+            gen, mask = self.thumb_gen, self.thumb_mask
 
             def work():
                 for item in items:
                     if item is not None and gen == self.thumb_gen:
+                        entry = self.entries.get(item)
+                        if entry is None or self._thumb_shown(entry) != self._thumb_shown(entry, mask):
+                            continue            # (its channels were switched since: a newer refresh makes it)
                         try:
-                            image, state = make_thumbnail(self.entries[item], preview=self._preview_arrays(self.entries[item]))
+                            image, state = make_thumbnail(entry, preview=self._preview_arrays(entry), shown=self._thumb_shown(entry, mask))
                         except Exception:
                             image, state = None, "none"
                         self.results.put(("thumb", gen, (item, image, state)))
@@ -9205,7 +9360,9 @@ class XlefViewer:
                         self.detail_pending = False
                         self._update_cursor()
                         continue
-                    self._show(rgb, *place, smooth)
+                    geom = self._key_geom(key, arrays)
+                    if geom is not None:
+                        self._show(rgb, geom, smooth)
                     if interim:
                         self.status.config(text=self.interim_status)
                         self._start_prefetch(self.interim_level)           # (the same quick look of the other layers, nearest first)

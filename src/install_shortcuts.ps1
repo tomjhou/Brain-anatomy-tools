@@ -9,6 +9,7 @@ param([string]$Desktop = [Environment]::GetFolderPath("Desktop"),
       [string]$Pinned = (Join-Path $env:APPDATA "Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"),
       [string]$UninstallCopy = (Join-Path $env:LOCALAPPDATA "JhouLab\uninstall"),
       [string]$RegistryKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\JhouLab.BrainAnatomyTools",
+      [string]$Classes = "HKCU:\Software\Classes",          # (for tests: where register_file_types.ps1 writes)
       [switch]$NoStartMenuRestart)   # (for tests: leave the Start menu alone)
 
 $ErrorActionPreference = "Stop"
@@ -110,6 +111,9 @@ foreach ($app in $apps) {
     }
 }
 [ShortcutAppId]::Notify($null)
+
+# Right-click a Leica file (.xlef, .xlif, .lif) > Open with > Leica xlef viewer
+& (Join-Path $here "register_file_types.ps1") -Bat (Join-Path $top "run-xlef-viewer.bat") -Icon $apps[0].IconCopy -Classes $Classes
 
 # An entry in Settings > Apps (for this user; no administrator needed), whose Uninstall runs uninstall_apps.ps1. It runs a copy kept
 # outside the repository, so that it still removes the shortcuts and the entry itself if the repository folder was deleted first.

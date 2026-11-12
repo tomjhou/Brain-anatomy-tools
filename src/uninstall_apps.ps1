@@ -1,6 +1,7 @@
 # Undoes INSTALL_APPS_WINDOWS.bat, and offers to remove what the programs made: run by UNINSTALL_APPS_WINDOWS.bat, or by Uninstall in Windows' Settings >
 # Apps (which runs a copy of this file kept in %LOCALAPPDATA%\JhouLab\uninstall, so that it works even after the repository folder was deleted).
-# Removed without asking: the desktop and Start menu shortcuts, the icon copies, the logs, the xlef viewer's thumbnails and the Settings entry.
+# Removed without asking: the desktop and Start menu shortcuts, the icon copies, the logs, the xlef viewer's thumbnails, the Settings entry
+# and the xlef viewer's place under Open with for Leica files.
 # Asked one by one (Enter = no): the .venv, the browsers' caches and settings in src, the xlef viewer's settings, the ABC atlas download.
 # Never touched: projects, images, the ABC browser's output folders, the repository's own files, Python itself, taskbar pins (unpin those by hand).
 param([string]$Repo,                                   # the repository's top folder (may be gone)
@@ -9,7 +10,9 @@ param([string]$Repo,                                   # the repository's top fo
       [string]$JhouLab = (Join-Path $env:LOCALAPPDATA "JhouLab"),
       [string]$XlefSettings = (Join-Path $HOME ".xlef_viewer_settings.json"),
       [string]$RegistryKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\JhouLab.BrainAnatomyTools",
-      [string]$Answers)                                # (for tests: the answers to the questions, e.g. "ynyn", instead of asking)
+      [string]$Classes = "HKCU:\Software\Classes",          # (for tests: another key)
+      [string]$FileProgId = "JhouLab.BrainAnatomyTools.XlefViewer.File",     # as in register_file_types.ps1
+      [string]$Answers)                               # (for tests: the answers to the questions, e.g. "ynyn", instead of asking)
 
 $ErrorActionPreference = "Stop"
 if ($Repo) { $Repo = [IO.Path]::GetFullPath($Repo).TrimEnd('\') }   # (UNINSTALL_APPS_WINDOWS.bat passes "...\Brain-anatomy-tools\.")
@@ -79,6 +82,16 @@ foreach ($name in $Shortcuts) {
 Remove-Path $StartMenu "the Start menu folder"
 foreach ($sub in @("icons", "logs", "xlef_viewer_thumbs")) { Remove-Path (Join-Path $JhouLab $sub) "$JhouLab\$sub" }
 if (Test-Path $RegistryKey) { Remove-Item $RegistryKey -Recurse; Write-Host "  Removed the entry in Settings > Apps" }
+# The xlef viewer under Open with for Leica files (register_file_types.ps1: here itself, as that file may be gone with the repository)
+$progKey = Join-Path $Classes $FileProgId
+if (Test-Path $progKey) {
+    Remove-Item $progKey -Recurse
+    foreach ($ext in @(".xlef", ".xlif", ".lif")) {
+        $with = Join-Path $Classes "$ext\OpenWithProgids"
+        if (Test-Path $with) { Remove-ItemProperty -Path $with -Name $FileProgId -ErrorAction SilentlyContinue }
+    }
+    Write-Host "  Removed the xlef viewer from Open with for Leica files"
+}
 
 # --- Asked about: larger things, or ones that would take time to get back
 Write-Host ""

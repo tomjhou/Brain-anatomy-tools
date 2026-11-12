@@ -84,9 +84,8 @@ THUMB_CACHE = (os.path.join(os.path.expanduser("~"), "Library", "Caches", "JhouL
 RIGHT_CLICKS = ("<Button-2>", "<Button-3>") if sys.platform == "darwin" else ("<Button-3>",)
 SHORTCUT = "Command" if sys.platform == "darwin" else "Control"
 MAX_RECENT = 20
-SMOOTH_ZOOM_NOTE = ("On: the zoom glides from one wheel click to the next, through pictures made from the one on screen\n"
-                    "(a little blurry while moving), sharpened when the zoom stops. Off: each click is drawn as one jump\n"
-                    "(clicks that come while one is being drawn are drawn together).")
+SMOOTH_ZOOM_NOTE = ("On: zoom glides smoothly. Off: zoom jumps in discrete steps\n"
+                    "(slightly faster to render, but usually doesn't feel as nice).")
 ZOOM_GLIDE = 0.05            # s: time constant of the zoom's glide to where the wheel clicks have asked for (see XlefViewer._glide_frame)
 ZOOM_LAND = 0.008            # the glide jumps the rest of the way once within this (log) distance of it: 0.8%, a few pixels at the edges
 ZOOM_SETTLE = 0.12           # s after the glide ends, with no click meanwhile, before the view is drawn properly (sharp pixels, reads)
@@ -185,6 +184,7 @@ THEMES = {
              "off_white": "#9a9a9a", "off_line": "#666666"},
 }
 PAL = dict(THEMES["dark"])
+SETTINGS_TABS = ("Display", "Files", "Speed and memory")     # the Settings window's tabs (see XlefViewer.open_settings)
 SETTINGS_NAME = "Settings…" if sys.platform == "darwin" else "⚙ Settings"     # (the Settings button: see where it is made)
 
 
@@ -212,6 +212,9 @@ def style_theme(root, name, native):
         style.map("TCheckbutton", indicatorbackground=[("disabled", p["bg"]), ("active", p["idle_hover"])])
         style.configure("TRadiobutton", indicatorbackground=p["field"], indicatorforeground=p["fg"])
         style.configure("TLabelframe", bordercolor="#555555")
+        style.configure("TNotebook", background=p["bg"], bordercolor="#555555")
+        style.configure("TNotebook.Tab", background=p["idle"], foreground=p["fg"], bordercolor="#555555", padding=(10, 3))
+        style.map("TNotebook.Tab", background=[("selected", p["bg"]), ("active", p["idle_hover"])])
         style.configure("TScrollbar", background=p["idle"], troughcolor=p["field"], arrowcolor=p["fg"], bordercolor="#444444")
         style.configure("TEntry", fieldbackground=p["field"], foreground=p["field_fg"])
         style.configure("TSeparator", background="#555555")
@@ -304,6 +307,12 @@ def size_text(n_bytes):
     """A file size for people: "640 MB", or from 1,000 MB on "1.4 GB"."""
     mb = n_bytes / 1e6
     return f"{mb:,.0f} MB" if mb < 999.5 else f"{mb / 1e3:,.1f} GB"
+
+
+def ram_text(n_bytes):
+    """An amount of memory for people, in the units RAM is sold in and Task Manager shows (1 GB = 2**30 bytes): "512 MB", "191.7 GB"."""
+    mb = n_bytes / 2 ** 20
+    return f"{mb:,.0f} MB" if mb < 1023.5 else f"{mb / 1024:,.1f} GB"
 
 
 @functools.lru_cache(maxsize=None)
@@ -1112,25 +1121,58 @@ def _write_text(path, new_text, bom):
 
 
 ELEMENT_NAME = re.compile(r'(<Element\b[^>]*?\bName=")([^"]*)(")')
+OPEN_WITH_PROGID = "JhouLab.BrainAnatomyTools.XlefViewer.File"     # as in register_file_types.ps1
+OPEN_WITH_CLASSES = r"Software\Classes"                             # (under HKEY_CURRENT_USER; for tests: another key)
+OPEN_WITH_NOTE = ("Right-click a .xlef, .xlif or .lif file in Explorer, then Open with > Leica xlef viewer. To open them with a\n"
+                  "double-click, choose Open with > Choose another app > Leica xlef viewer once, with \"Always\" (Windows leaves that to you).\n"
+                  "For this Windows user only; INSTALL_APPS_WINDOWS.bat does the same. After moving the viewer's folder, add it again.")
+
+
+def open_with_command():
+    """What Explorer's Open with > Leica xlef viewer runs (see register_file_types.ps1), or None: not listed (or not Windows)."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, rf"{OPEN_WITH_CLASSES}\{OPEN_WITH_PROGID}\shell\open\command") as k:
+            return winreg.QueryValue(k, None) or None
+    except (ImportError, OSError):
+        return None
+
+
+def viewer_bat():
+    """run-xlef-viewer.bat, in the folder above this file's."""
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "run-xlef-viewer.bat")
+
+
+def set_open_with(remove=False):
+    """Lists this viewer under Open with for Leica files (or, remove: takes it away again), by register_file_types.ps1. Returns
+    (ok, what it said)."""
+    import subprocess
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "register_file_types.ps1")
+    args = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script,
+            "-Classes", "HKCU:\\" + OPEN_WITH_CLASSES]
+    args += ["-Remove"] if remove else ["-Bat", viewer_bat()]
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, str(e)
+    return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
 THUMB_CACHE_NOTE = ("Kept in {folder},\n"
                     "so that they show at once next time. Cleared, they are made again as they are needed (reading the images).")
-PREVIEW_MEMORY_NOTE = ("For the pictures of the images viewed recently, and of the ones loaded in the background so that they\n"
-                       "open at once; what they leave free keeps the full-resolution views zoomed into before, so that\n"
-                       "going back to one needs no reading (these go first when the pictures need the room).\n"
-                       "Memory is only taken as images are loaded.")
+PREVIEW_MEMORY_NOTE = ("Holds previews of recently viewed images, and of ones loaded in the background so they open at once.\n"
+                       "Any room the previews don't need keeps sharp views you zoomed into before, so returning to them needs no reading\n"
+                       "(these are dropped first when previews need the space). Memory is only used as images are loaded.")
 RENAME_NOTE = ("Off: a rename changes only the name LAS X shows (in its .xlif / .xlcf).\n"
                "On: the image's .xlif and channel TIFFs, or the folder, get the new name too.")
-READING_MODES = {"auto": "Automatic (by how fast the files can be read)", "sharp": "Always the sharpest",
+READING_MODES = {"auto": "Automatic (based on file read speed)", "sharp": "Always the sharpest",
                  "save": "Save reading (for a slow connection)"}
-READING_NOTE = ("Automatic: if reading a sharper picture would take more than a moment (by the speed measured for that drive or\n"
-                "network share, not by its kind), the preview is shown enlarged up to 2.5 times first, and then only the part\n"
-                "in view of a sharper copy is read. Where reading is quick, the sharpest picture is read at once.\n"
+READING_NOTE = (f"Automatic: on slower drives or network shares (speed < {32 / LEVEL_BUDGET:.0f} MB/s), images at middle zoom levels\n"     # (as _measured_slow)
+                "may show at lower resolution to reduce disk reads. On fast drives, sharp pictures are read at once.\n"
                 "Always the sharpest: read as soon as more detail would show. Save reading: always the slower-connection way.")
-FLIP_NOTE = ("On: Save writes it into the section's .xlif, in a field of this viewer's own (JhouXlefViewer), so it goes\n"
-             "with the files to other computers. LAS X keeps such a field when it saves the file again (tried with\n"
-             "LAS X 6.2), but this isn't guaranteed: a future version of LAS X could drop it, or object to it.\n"
-             "Off: it is kept on this computer only (for each section's .xlif path), and LAS X's files are left as they are.\n"
-             "Either way, a flip already saved in a section's .xlif is shown.")
+FLIP_NOTE = ("On: flip/mirror status is saved into the section's metadata (.xlif) in a custom field, so it goes\n"
+             "with the files to other computers. LAS X keeps this field when it saves (tested with LAS X 6.2), but doesn't read it.\n"
+             "Off: flip status is kept on this computer only, and LAS X's files are unmodified.")
 BAD_NAME_CHARS = '\\/:*?"<>|'
 
 
@@ -4004,9 +4046,10 @@ class XlefViewer:
     # --- settings window, color theme
 
     def open_settings(self):
-        """The Settings window: the color theme (applied at once), zoomed-in pixels, whether renaming also renames files on disk,
-        whether "Flip this section" is saved into LAS X's files, when sharper pictures are read, and the memory for previews.
-        Remembered."""
+        """The Settings window, in tabs (see SETTINGS_TABS; the one last looked at comes up): Display (the color theme, applied at
+        once, zoomed-in pixels, zooming), Files (whether renaming also renames files on disk, whether "Flip this section" is saved
+        into LAS X's files, Explorer's Open with) and Speed and memory (when sharper pictures are read, the memory for previews,
+        saved thumbnails). Remembered."""
         if getattr(self, "settings_window", None) is not None and self.settings_window.winfo_exists():
             self.settings_window.lift()
             return
@@ -4015,14 +4058,21 @@ class XlefViewer:
         dlg.transient(self.root)
         dlg.resizable(False, False)
         dlg.geometry(f"+{self.root.winfo_rootx() + 200}+{self.root.winfo_rooty() + 120}")
-        body = ttk.Frame(dlg, padding=12)
-        body.pack(fill=tk.BOTH, expand=True)
+        outer = ttk.Frame(dlg, padding=12)
+        outer.pack(fill=tk.BOTH, expand=True)
+        tabs = ttk.Notebook(outer)
+        tabs.pack(fill=tk.BOTH, expand=True)
+        pages = {}
+        for name in SETTINGS_TABS:
+            pages[name] = ttk.Frame(tabs, padding=(10, 0, 10, 10))
+            tabs.add(pages[name], text=name)
+        body = pages["Display"]
         box = ttk.LabelFrame(body, text="Color theme", padding=(10, 6))
-        box.pack(fill=tk.X)
+        box.pack(fill=tk.X, pady=(10, 0))
         choice = tk.StringVar(dlg, self.theme)
         for value, text in (("dark", "Dark"), ("light", "Light")):
             ttk.Radiobutton(box, text=text, value=value, variable=choice, command=lambda: self.apply_theme(choice.get())).pack(anchor=tk.W)
-        box = ttk.LabelFrame(body, text="Zoomed-in pixels", padding=(10, 6))
+        box = ttk.LabelFrame(body, text="Pixel appearance past 100% zoom", padding=(10, 6))
         box.pack(fill=tk.X, pady=(10, 0))
         method = tk.StringVar(dlg, self.enlarge_method)
 
@@ -4042,6 +4092,7 @@ class XlefViewer:
             self._save_settings()
         ttk.Checkbutton(box, text="Prioritize zoom smoothness over pure speed", variable=smooth, command=set_smooth).pack(anchor=tk.W)
         ttk.Label(box, text=SMOOTH_ZOOM_NOTE, style="Muted.TLabel", justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
+        body = pages["Files"]
         box = ttk.LabelFrame(body, text="Renaming", padding=(10, 6))
         box.pack(fill=tk.X, pady=(10, 0))
         on_disk = tk.BooleanVar(dlg, self.settings.get("rename_files", False))
@@ -4057,6 +4108,7 @@ class XlefViewer:
         ttk.Checkbutton(box, text="Save it in a custom field of LAS X's files", variable=in_files,
                         command=lambda: self.set_flip_in_files(in_files.get())).pack(anchor=tk.W)
         ttk.Label(box, text=FLIP_NOTE, style="Muted.TLabel", justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
+        body = pages["Speed and memory"]
         box = ttk.LabelFrame(body, text="Reading sharper pictures", padding=(10, 6))
         box.pack(fill=tk.X, pady=(10, 0))
         reading = tk.StringVar(dlg, self.settings.get("reading", "auto"))
@@ -4102,7 +4154,9 @@ class XlefViewer:
             if value != old:                # (opening Settings stores nothing: the default stays the default)
                 self.settings["preview_memory_percent"] = value
                 self._save_settings()
-            amount.config(text=f"% of this computer's memory ({size_text(self.kept_limit())})")
+            total = total_memory()
+            amount.config(text=f"% of this computer's RAM ({ram_text(total)}) = {ram_text(self.kept_limit())}" if total else
+                          f"% of this computer's RAM (not known: {ram_text(self.kept_limit())} used)")
             if value > old and self.preload_full:
                 self._projects_changed()    # (the background loader goes on with the sections it left out)
             elif value < old:
@@ -4138,8 +4192,77 @@ class XlefViewer:
         show_saved()
         ttk.Label(box, text=THUMB_CACHE_NOTE.format(folder=THUMB_CACHE), style="Muted.TLabel", justify=tk.LEFT).pack(anchor=tk.W,
                                                                                                                     pady=(2, 0))
-        ttk.Button(body, text="Close", command=dlg.destroy).pack(anchor=tk.E, pady=(10, 0))
+        if sys.platform == "win32" and not getattr(sys, "frozen", False):
+            self._open_with_box(pages["Files"])
+        ttk.Button(outer, text="Close", command=dlg.destroy).pack(anchor=tk.E, pady=(10, 0))
         dlg.bind("<Escape>", lambda e: dlg.destroy())
+        tabs.select(pages.get(self.settings.get("settings_tab"), pages["Display"]))
+
+        def tab_changed(event=None):
+            name = tabs.tab(tabs.select(), "text")
+            if self.settings.get("settings_tab") != name:
+                self.settings["settings_tab"] = name
+                self._save_settings()
+        tabs.bind("<<NotebookTabChanged>>", tab_changed)
+        self._keep_on_screen(dlg)
+
+    def _keep_on_screen(self, win):
+        """`win` (a new dialog) moved up or left as far as needed to be all on its monitor's work area (the taskbar left clear), its
+        title bar too; put at the top if it is taller than that."""
+        win.update_idletasks()
+        x, y = win.winfo_rootx(), win.winfo_rooty()
+        try:
+            x, y = (int(v) for v in win.geometry().split("+")[1:3])
+        except (ValueError, IndexError, AttributeError):
+            pass
+        left, top, right, bottom = monitor_area(win, x + 10, y + 10)
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        title = 40                                          # (the title bar and frame, which the requested size leaves out)
+        nx = max(left, min(x, right - w - 16))
+        ny = max(top, min(y, bottom - h - title))
+        if (nx, ny) != (x, y):
+            win.geometry(f"+{nx}+{ny}")
+
+    def _open_with_box(self, body):
+        """Settings: "Opening Leica files from Explorer": whether this viewer is under Open with for them, with a button to list it
+        there (or to point it here again, when it was listed from another folder) and one to take it away."""
+        box = ttk.LabelFrame(body, text="Opening Leica files from Explorer", padding=(10, 6))
+        box.pack(fill=tk.X, pady=(10, 0))
+        row = ttk.Frame(box)
+        row.pack(anchor=tk.W, fill=tk.X)
+        add = ttk.Button(row)
+        remove = ttk.Button(row, text='Remove from "Open with"')
+        said = ttk.Label(row, style="Muted.TLabel")
+
+        def show():
+            command = open_with_command()
+            here = command is not None and os.path.normcase(viewer_bat()) in os.path.normcase(command)
+            if command is None:
+                state, text = 'Not listed under "Open with"', 'Add to "Open with"'
+            elif here:
+                state, text = 'Listed under "Open with"', "Add again"
+            else:
+                state, text = 'Listed under "Open with", but for a viewer in another folder', "Use this viewer"
+            said.config(text=state)
+            add.config(text=text)
+            remove.config(state=tk.NORMAL if command is not None else tk.DISABLED)
+
+        def change(undo):
+            self.root.config(cursor="watch")
+            box.update_idletasks()
+            ok, out = set_open_with(remove=undo)
+            self.root.config(cursor="")
+            if not ok:
+                messagebox.showerror("Open with", "Windows' file types could not be changed:\n\n" + (out or "(no message)"),
+                                     parent=box.winfo_toplevel())
+            show()
+        add.config(command=lambda: change(False))
+        remove.config(command=lambda: change(True))
+        add.pack(side=tk.LEFT)
+        remove.pack(side=tk.LEFT, padx=(6, 0))
+        said.pack(side=tk.LEFT, padx=(8, 0))
+        show()
+        ttk.Label(box, text=OPEN_WITH_NOTE, style="Muted.TLabel", justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
 
     def _tree_tag_colors(self):
         self.tree.tag_configure("cloud", foreground=PAL["link"])
@@ -8778,7 +8901,7 @@ class XlefViewer:
 
     def _preload_full_text(self):
         n = sum(1 for e in self.preload_full if e not in self.kept_images and not (self.img is not None and self.img.entry is e))
-        return (f"⚠ The memory for previews ({size_text(self.kept_limit())}) is full: {n} more section"
+        return (f"⚠ The memory for previews ({ram_text(self.kept_limit())}) is full: {n} more section"
                 f"{'s were' if n != 1 else ' was'} not preloaded. It can be increased in {SETTINGS_NAME}.")
 
     def _preload_full_note(self):

@@ -19,6 +19,7 @@ if errorlevel 1 (
 
 echo.
 echo Done. The desktop shortcuts can be opened directly or dragged to the taskbar. They are also in the Start menu,
-echo under "Brain anatomy tools".
+echo under "Brain anatomy tools". To open a Leica file ^(.xlef, .xlif, .lif^) in the viewer, right-click it, then
+echo Open with ^> Leica xlef viewer.
 echo.
 pause

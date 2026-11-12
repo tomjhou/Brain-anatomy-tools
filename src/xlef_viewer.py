@@ -1123,9 +1123,9 @@ def _write_text(path, new_text, bom):
 ELEMENT_NAME = re.compile(r'(<Element\b[^>]*?\bName=")([^"]*)(")')
 OPEN_WITH_PROGID = "JhouLab.BrainAnatomyTools.XlefViewer.File"     # as in register_file_types.ps1
 OPEN_WITH_CLASSES = r"Software\Classes"                             # (under HKEY_CURRENT_USER; for tests: another key)
-OPEN_WITH_NOTE = ("Right-click a .xlef, .xlif or .lif file in Explorer, then Open with > Leica xlef viewer. To open them with a\n"
-                  "double-click, choose Open with > Choose another app > Leica xlef viewer once, with \"Always\" (Windows leaves that to you).\n"
-                  "For this Windows user only; INSTALL_APPS_WINDOWS.bat does the same. After moving the viewer's folder, add it again.")
+OPEN_WITH_NOTE = ("Add: allows user to open with XLEF viewer by right-clicking .xlef, .xlif or .lif files in Windows Explorer.\n"
+                  "INSTALL_APPS_WINDOWS.bat does the same. If the viewer's folder is moved, click 'Repair' here\n"
+                  "(or run INSTALL_APPS_WINDOWS.bat again).")
 
 
 def open_with_command():
@@ -1136,6 +1136,25 @@ def open_with_command():
             return winreg.QueryValue(k, None) or None
     except (ImportError, OSError):
         return None
+
+
+OPEN_WITH_EXTENSIONS = (".xlef", ".xlif", ".lif")                    # as in register_file_types.ps1
+
+
+def open_with_missing():
+    """The file types (of OPEN_WITH_EXTENSIONS) whose Open with list doesn't have this viewer's entry."""
+    try:
+        import winreg
+    except ImportError:
+        return list(OPEN_WITH_EXTENSIONS)
+    missing = []
+    for ext in OPEN_WITH_EXTENSIONS:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, rf"{OPEN_WITH_CLASSES}\{ext}\OpenWithProgids") as k:
+                winreg.QueryValueEx(k, OPEN_WITH_PROGID)
+        except OSError:
+            missing.append(ext)
+    return missing
 
 
 def viewer_bat():
@@ -1161,8 +1180,9 @@ def set_open_with(remove=False):
 THUMB_CACHE_NOTE = ("Kept in {folder},\n"
                     "so that they show at once next time. Cleared, they are made again as they are needed (reading the images).")
 PREVIEW_MEMORY_NOTE = ("Holds previews of recently viewed images, and of ones loaded in the background so they open at once.\n"
-                       "Any room the previews don't need keeps sharp views you zoomed into before, so returning to them needs no reading\n"
-                       "(these are dropped first when previews need the space). Memory is only used as images are loaded.")
+                       "Any room the previews don't need keeps sharp views you zoomed into before,\n"
+                       "so returning to them needs no reading (these are dropped first when previews need the space).\n"
+                       "Memory is only used as images are loaded.")
 RENAME_NOTE = ("Off: a rename changes only the name LAS X shows (in its .xlif / .xlcf).\n"
                "On: the image's .xlif and channel TIFFs, or the folder, get the new name too.")
 READING_MODES = {"auto": "Automatic (based on file read speed)", "sharp": "Always the sharpest",
@@ -4102,10 +4122,10 @@ class XlefViewer:
             self._save_settings()
         ttk.Checkbutton(box, text="Also rename the files and folders on disk", variable=on_disk, command=set_on_disk).pack(anchor=tk.W)
         ttk.Label(box, text=RENAME_NOTE, style="Muted.TLabel", justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
-        box = ttk.LabelFrame(body, text="Flip this section", padding=(10, 6))
+        box = ttk.LabelFrame(body, text="Section flip status", padding=(10, 6))
         box.pack(fill=tk.X, pady=(10, 0))
         in_files = tk.BooleanVar(dlg, self._flip_in_files())
-        ttk.Checkbutton(box, text="Save it in a custom field of LAS X's files", variable=in_files,
+        ttk.Checkbutton(box, text="Saved in a custom field of LAS X's files", variable=in_files,
                         command=lambda: self.set_flip_in_files(in_files.get())).pack(anchor=tk.W)
         ttk.Label(box, text=FLIP_NOTE, style="Muted.TLabel", justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
         body = pages["Speed and memory"]
@@ -4237,14 +4257,18 @@ class XlefViewer:
         def show():
             command = open_with_command()
             here = command is not None and os.path.normcase(viewer_bat()) in os.path.normcase(command)
+            missing = open_with_missing() if here else []
+            needed = True
             if command is None:
                 state, text = 'Not listed under "Open with"', 'Add to "Open with"'
-            elif here:
-                state, text = 'Listed under "Open with"', "Add again"
-            else:
-                state, text = 'Listed under "Open with", but for a viewer in another folder', "Use this viewer"
+            elif not here:
+                state, text = 'Listed under "Open with", but for a viewer in another folder', "Repair"
+            elif missing:                   # (taken off some of the file types since, e.g. by another program's installer)
+                state, text = f'Listed under "Open with", but not for {", ".join(missing)} files', "Repair"
+            else:                           # (nothing to do: the button greyed out)
+                state, text, needed = 'Listed under "Open with"', 'Add to "Open with"', False
             said.config(text=state)
-            add.config(text=text)
+            add.config(text=text, state=tk.NORMAL if needed else tk.DISABLED)
             remove.config(state=tk.NORMAL if command is not None else tk.DISABLED)
 
         def change(undo):

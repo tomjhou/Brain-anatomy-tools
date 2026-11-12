@@ -579,6 +579,56 @@ SECTION_Z_LABEL_FONTSIZE = 8    # points: the z label at the top-right of each t
 
 
 
+def show_slow_startup_help(parent):
+    """The window the Settings window's "Slow start-up?" button opens: how to tell Windows' virus scanner to skip the Python environment's folder.
+    Start-up can take 30 s instead of 2 s when it scans the many library files as they are read (startup_timing.log shows it: every import slow, the
+    network stages normal). Windows only."""
+    import tkinter as tk
+    from tkinter import ttk
+    top = tk.Toplevel(parent)
+    top.title("Slow start-up")
+    top.transient(parent.winfo_toplevel())
+    top.resizable(False, False)
+    frame = ttk.Frame(top, padding=14)
+    frame.pack(fill=tk.BOTH)
+    ttk.Label(frame, justify=tk.LEFT, wraplength=480, text=(
+        "Windows' virus scanner may be checking the program's many library files each time they are read, which can make the start take 30 "
+        "seconds or more instead of 2 to 3. Telling it to skip the folder below makes the start fast again. To do that:\n\n"
+        "1.  Click Open Windows Security (or search the Start menu for Windows Security).\n"
+        "2.  Choose Virus & threat protection, then under \"Virus & threat protection settings\" click Manage settings.\n"
+        "3.  Scroll down to Exclusions and click Add or remove exclusions (Windows asks for permission).\n"
+        "4.  Click Add an exclusion, choose Folder, and paste this folder (use Copy):")).pack(anchor="w")
+    env_folder = str(Path(sys.prefix))
+    row = ttk.Frame(frame)
+    row.pack(fill=tk.X, pady=(8, 0))
+    entry = ttk.Entry(row)
+    entry.insert(0, env_folder)
+    entry.state(["readonly"])
+    entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+    def copy_folder():
+        top.clipboard_clear()
+        top.clipboard_append(env_folder)
+        copy_button.config(text="Copied")
+
+    def open_security():
+        try:
+            os.startfile("windowsdefender://threatsettings")
+        except OSError:
+            pass                                                # (another antivirus, or not available: the Start menu search above)
+
+    copy_button = ttk.Button(row, text="Copy", command=copy_folder, width=8)
+    copy_button.pack(side=tk.LEFT, padx=(6, 0))
+    ttk.Button(row, text="Open Windows Security", command=open_security).pack(side=tk.LEFT, padx=(6, 0))
+    ttk.Label(frame, foreground="gray35", justify=tk.LEFT, wraplength=480, text=(
+        "The folder holds only the program's libraries (Python packages). The scanner then skips it, so exclude it only if you are comfortable "
+        "with that. With another antivirus program, add the same folder to its exclusions.")).pack(anchor="w", pady=(10, 0))
+    ttk.Button(frame, text="Close", command=top.destroy).pack(anchor="e", pady=(10, 0))
+    top.update_idletasks()
+    px, py = parent.winfo_rootx(), parent.winfo_rooty()
+    top.geometry(f"+{px + 20}+{py + 20}")
+
+
 def build_common_settings_tab(tab):
     """The "Common" tab of the Settings window (what the launcher and the project browser share): where bregma is in the CCF (for the AP, DV and ML from
     bregma), and whether cells are placed by Allen's reconstructed coordinates. Fills the frame `tab`; returns read(), which gives the values as a dict
@@ -662,6 +712,12 @@ def build_common_settings_tab(tab):
         "Checked: updates are downloaded when the program starts, and it restarts to use them (not while the atlas is still downloading). "
         "Unchecked: the launch screen only says that an update is available, and the Check for updates button asks. Applies to all the apps "
         "on this computer.")).pack(anchor="w", pady=(2, 0))
+    if os.name == "nt" and not getattr(sys, 'frozen', False):
+        ttk.Separator(frame).pack(fill=tk.X, pady=(14, 8))
+        slow_row = ttk.Frame(frame)
+        slow_row.pack(anchor="w")
+        ttk.Button(slow_row, text="Slow start-up?...", command=lambda: show_slow_startup_help(tab)).pack(side=tk.LEFT)
+        ttk.Label(slow_row, foreground="gray35", text="  If the program sometimes takes 30 seconds or more to start.").pack(side=tk.LEFT)
 
     def read():
         try:

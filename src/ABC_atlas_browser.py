@@ -61,8 +61,40 @@ _STARTUP_T0 = time.perf_counter()
 
 def startup_note(message):
     """One line on the console while the app is starting up, with the seconds since it started: the first window can take a while to appear
-    (the libraries are large), and a silent console looks like a hang."""
-    print(f"[{time.perf_counter() - _STARTUP_T0:5.1f}s] {message}", flush=True)
+    (the libraries are large), and a silent console looks like a hang. Kept for record_startup_timing."""
+    now = time.perf_counter() - _STARTUP_T0
+    _STARTUP_NOTES.append((now, message))
+    print(f"[{now:5.1f}s] {message}", flush=True)
+
+
+_STARTUP_NOTES = []
+_STARTUP_STAGES = (("Libraries loaded", "libraries"), ("Atlas download:", "find atlas"), ("Online:", "internet check"), ("Atlas manifest ready", "manifest"),
+                   ("Opening the launch screen", "setup"))
+
+
+def record_startup_timing():
+    """Append one line to cache_local/startup_timing.log: when this start was, how long it took to the launch window being up, and how long each stage took
+    (libraries, finding the atlas, the internet check, the atlas manifest, the rest of the setup, the window). The start can take 2 s one time and 30 s another
+    (cold files, antivirus, the network): this says which stage it was. Once per program run; the last 300 lines are kept; never raises."""
+    if getattr(record_startup_timing, "done", False):
+        return
+    record_startup_timing.done = True
+    try:
+        total = time.perf_counter() - _STARTUP_T0
+        stages, last = [], _STARTUP_NOTES[0][0] if _STARTUP_NOTES else 0.0
+        for at, message in _STARTUP_NOTES[1:]:
+            label = next((name for prefix, name in _STARTUP_STAGES if message.startswith(prefix)), None)
+            if label is not None:
+                stages.append(f"{label} {at - last:.1f}")
+                last = at
+        stages.append(f"window {total - last:.1f}")
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')}  total {total:5.1f} s  [{', '.join(stages)}]\n"
+        path = CACHE_DIR / 'startup_timing.log'
+        old = path.read_text(encoding='utf-8').splitlines(keepends=True) if path.exists() else []
+        path.write_text(''.join((old + [line])[-300:]), encoding='utf-8')
+        print(f"Start-up took {total:.1f} s ({', '.join(stages)}); logged to {path}.", flush=True)
+    except Exception as e:
+        print(f"Could not write the start-up timing log: {e}", flush=True)
 
 
 def _make_windows_dpi_aware():
@@ -6171,6 +6203,7 @@ def prompt_startup_panel(out_folder):
         'open_3d_viewer': open_3d_viewer_launcher,
         'settings_dialog': show_coordinate_settings_dialog,
         'atlas_download_running': atlas_download_running,
+        'launch_screen_shown': record_startup_timing,
     })
     if outcome is None:
         print("No selection made; exiting.")

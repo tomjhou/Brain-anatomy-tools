@@ -925,6 +925,7 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
     root.geometry(f"+{(sw - root.winfo_width()) // 2}+{(sh - root.winfo_height()) // 3}")
     bring_to_front(root)
+    root.after(50, helpers.get("launch_screen_shown", lambda: None))           # (the window is up: the start-up time is logged)
     root.mainloop()
     # Anything of this window still waiting for the cyclic collector is freed now, here, on the main thread: freed later by a worker thread
     # (the analysis's threads call gc.collect()), Tcl ends the program ("Tcl_AsyncDelete: async handler deleted by the wrong thread").

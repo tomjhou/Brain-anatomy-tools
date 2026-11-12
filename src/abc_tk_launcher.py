@@ -583,7 +583,7 @@ QUESTIONS = {"open": 0}          # the launcher's own questions on the screen no
 
 @contextlib.contextmanager
 def question():
-    """Around a messagebox question: while it is up, the update question is put off (see UpdateOffer)."""
+    """Around a messagebox question: while it is up, the automatic update waits for it (see start_auto_update)."""
     QUESTIONS["open"] += 1
     try:
         yield
@@ -591,27 +591,39 @@ def question():
         QUESTIONS["open"] -= 1
 
 
-class UpdateOffer:
-    """The question about the updates the check at launch found: asked as soon as no other question of the launcher is up and the button is
-    not busy (a check or an update the user started). A class with a method that is scheduled again, not a function that schedules itself: such a
-    function is a reference cycle that keeps the window alive after it is closed until the cyclic collector frees it on whichever thread runs it,
-    and Tcl then ends the program (see app_update.UpdateWatch)."""
+def start_auto_update(root, button, helpers):
+    """With "Download updates automatically" on (the Settings window's Common tab), the updates the check at launch found are downloaded without a
+    question, and the browser restarts (see app_update.AutoUpdate, which the other apps use too). It waits while a dialog has the input or a question
+    is up, does nothing while the button is busy (the user's own check), and does not restart while the atlas is downloading: that would stop the
+    download. The button then says "Updated: restart to use it"."""
+    import app_update
 
-    def __init__(self, root, button, changes, helpers):
-        self.root, self.button, self.changes, self.helpers = root, button, changes, helpers
-
-    def try_now(self):
+    def blocked():
+        if QUESTIONS["open"]:
+            return True
         try:
-            if not self.root.winfo_exists():
-                return                                      # (the launch screen was closed meanwhile: nothing to ask)
-            if str(self.button.cget("state")) == "disabled":
-                return                                      # (busy: the user started a check or an update)
-            if QUESTIONS["open"]:
-                self.root.after(1000, self.try_now)
-                return
-        except tk.TclError:
-            return
-        check_for_update(self.root, self.button, self.changes, self.helpers)
+            top = root.grab_current()
+            return top is not None and top is not root and top.winfo_exists()
+        except (tk.TclError, KeyError):
+            return False
+
+    def status(text):
+        button.config(text=text or getattr(button, "idle_text", "Check for updates"), state=tk.DISABLED if text == "Updating..." else tk.NORMAL)
+        if text and text != "Updating...":
+            button.idle_text = text
+
+    def restart_now():
+        root.destroy()
+        restart()
+
+    app_update.AutoUpdate(root, {
+        "busy": lambda: str(button.cget("state")) == "disabled",
+        "blocked": blocked,
+        "status": status,
+        "keep_open": lambda: ("the atlas is still downloading (" + helpers["atlas_download_running"]() + "), and restarting would stop it")
+                      if (helpers or {}).get("atlas_download_running", lambda: None)() else None,
+        "restart": restart_now,
+    }).start()
 
 
 def check_for_update(root, button, changes=None, helpers=None):
@@ -745,19 +757,14 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
         update_button.pack(side=tk.RIGHT, anchor="n", padx=(0, 6))
 
         def update_found(changes):
-            """The check at launch found newer commits: the Check for updates button becomes the Update available one (same dialog)."""
+            """The check at launch found newer commits: the Check for updates button becomes the Update available one (its dialog lists them and asks).
+            With "Download updates automatically" on they are downloaded at once instead, without a question, and the browser restarts; with it off
+            nothing else is shown."""
             update_button.idle_text = f"Update available ({len(changes)} change{'s' if len(changes) != 1 else ''})"
             if str(update_button.cget("state")) != "disabled":
                 update_button.config(text=update_button.idle_text)
-            offer(changes)
-
-        def offer(changes):
-            """The same dialog as the button's comes up at once, over any dialog that is open; not while the button is busy (a check or an update
-            is under way: the user started it)."""
-            if str(update_button.cget("state")) == "disabled":
-                return
-            if not app_update.declined_at_start:            # (not again, if the question before the atlas download was answered No)
-                UpdateOffer(root, update_button, changes, helpers).try_now()
+            if app_update.auto_update_enabled():
+                start_auto_update(root, update_button, helpers)
         import app_update
         app_update.watch_for_update(root, update_found)
 

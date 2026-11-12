@@ -582,7 +582,7 @@ SECTION_Z_LABEL_FONTSIZE = 8    # points: the z label at the top-right of each t
 def build_common_settings_tab(tab):
     """The "Common" tab of the Settings window (what the launcher and the project browser share): where bregma is in the CCF (for the AP, DV and ML from
     bregma), and whether cells are placed by Allen's reconstructed coordinates. Fills the frame `tab`; returns read(), which gives the values as a dict
-    {'bregma_ap_mm', 'bregma_dv_mm', 'reconstructed_coords'}, or raises ValueError with the message to show when an entry is not acceptable."""
+    {'bregma_ap_mm', 'bregma_dv_mm', 'reconstructed_coords', 'auto_update'}, or raises ValueError with the message to show when an entry is not acceptable."""
     import tkinter as tk
     from tkinter import ttk
     bregma_var = tk.StringVar(tab, f"{COORD_SETTINGS['bregma_ap_mm']:g}")
@@ -654,6 +654,14 @@ def build_common_settings_tab(tab):
     ttk.Label(frame, foreground="gray35", justify=tk.LEFT, wraplength=460, text=(
         "May be more biologically accurate: it corrects possible tissue distortions in the raw coordinates, and the CCF atlas then lines "
         "up with the cells. One-time download (about 260 MB); applies to the next run you open.")).pack(anchor="w", pady=(2, 0))
+    ttk.Separator(frame).pack(fill=tk.X, pady=(14, 8))
+    import app_update
+    auto_var = tk.BooleanVar(tab, app_update.auto_update_enabled())
+    ttk.Checkbutton(frame, text="Download updates automatically", variable=auto_var).pack(anchor="w")
+    ttk.Label(frame, foreground="gray35", justify=tk.LEFT, wraplength=460, text=(
+        "Checked: updates are downloaded when the program starts, and it restarts to use them (not while the atlas is still downloading). "
+        "Unchecked: the launch screen only says that an update is available, and the Check for updates button asks. Applies to all the apps "
+        "on this computer.")).pack(anchor="w", pady=(2, 0))
 
     def read():
         try:
@@ -663,7 +671,7 @@ def build_common_settings_tab(tab):
                 raise ValueError
         except ValueError:
             raise ValueError("Enter bregma's position as numbers of mm: AP between 0 and 13.5, DV between -5 and 8.")
-        return {'bregma_ap_mm': bregma, 'bregma_dv_mm': bregma_dv, 'reconstructed_coords': bool(recon_var.get())}
+        return {'bregma_ap_mm': bregma, 'bregma_dv_mm': bregma_dv, 'reconstructed_coords': bool(recon_var.get()), 'auto_update': bool(auto_var.get())}
 
     return read
 
@@ -1066,15 +1074,17 @@ def atlas_download_running():
     return f"{got / 1e9:.1f} of {total:.1f} GB" if total else "under way"
 
 
-def offer_update_before_download():
-    """On a first install, before the atlas download starts: looks on GitHub for newer commits of these apps (waiting at most a few seconds: the
-    launch screen looks again, without waiting) and, if there are some, asks whether to update and restart first. A restart later would stop
-    the download, and the file it was on would start again from its beginning; before it, nothing is lost."""
+def update_before_download():
+    """On a first install, with "Download updates automatically" on, before the atlas download starts: looks on GitHub for newer commits of these
+    apps (waiting at most a few seconds: the launch screen looks again, without waiting) and, if there are some, downloads them and restarts, with no
+    question. A restart after the download has started would stop it, and the file it was on would start again from its beginning; before it,
+    nothing is lost. With the setting off, nothing is done here (the launch screen only says that an update is available)."""
     if getattr(sys, 'frozen', False):
         return
     try:
         import app_update
-        import centered_dialog
+        if not app_update.auto_update_enabled():
+            return
         folder = app_update.repo_root()
         found = {}
 
@@ -1089,25 +1099,17 @@ def offer_update_before_download():
         changes = found.get('changes')
         if not changes:
             return
-        shown = "\n".join("  • " + line for line in changes[:12]) + (f"\n  ... and {len(changes) - 12} more" if len(changes) > 12 else "")
-        if not centered_dialog.ask_yes_no(
-                "Update before downloading?",
-                f"{len(changes)} new change{'s' if len(changes) != 1 else ''} on GitHub:\n\n{shown}\n\nThe atlas download (it is large) has not started yet. "
-                "Updating now, and restarting, means the download is not interrupted later by a restart.\n\nUpdate and restart now?"):
-            app_update.declined_at_start = True
-            return
-        print("Updating...")
+        print(f"{len(changes)} new change(s) on GitHub: updating before the atlas download starts...")
         try:
             app_update.pull(folder)
         except app_update.UpdateError as e:
-            centered_dialog.info("Update", f"The update could not be applied:\n\n{e}\n\nThe browser carries on with this version.")
-            app_update.declined_at_start = True
+            print(f"The update could not be applied ({e}); carrying on with this version.")
             return
         print("Updated: restarting.")
         from abc_tk_launcher import restart
         restart()
     except Exception as e:
-        print(f"Could not check for updates before the download ({type(e).__name__}: {e}).")
+        print(f"Could not update before the download ({type(e).__name__}: {e}).")
 
 
 def start_atlas_prefetch(cache):
@@ -1136,7 +1138,7 @@ def start_atlas_prefetch(cache):
         atlas_prefetch['files'].append((path, size))
         atlas_prefetch['keys'].add((directory, file_name))
     total_gb = sum(m[4] or 0 for m in missing) / 1e9
-    offer_update_before_download()                      # (a restart after the download has started would stop it: asked first)
+    update_before_download()                      # (a restart after the download has started would stop it: asked first)
     atlas_prefetch['total_gb'] = total_gb
 
     def work():
@@ -5646,7 +5648,10 @@ def prompt_viewer_settings_dialog(parent_window, current_settings, umap_params=N
                 messagebox.showerror("Settings", str(problem), parent=dialog)
                 return
         result['value'] = result.pop(viewer_tab)
-        COORD_SETTINGS.update(result.pop(common_tab))
+        common = result.pop(common_tab)
+        import app_update
+        app_update.set_auto_update(common.pop('auto_update'))         # (not a coordinate setting: kept by the updater, for all the apps)
+        COORD_SETTINGS.update(common)
         dialog.destroy()
 
     def on_cancel():

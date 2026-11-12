@@ -26,7 +26,6 @@ API = f"https://api.github.com/repos/{REPO}"
 HOME = f"https://github.com/{REPO}"
 VERSION_FILE = os.path.join("src", "version.txt")       # (in the top folder)
 STAGING = ".update-download"                            # (in the top folder while an update is unpacked; gone afterwards)
-declined_at_start = False                               # the user said no to the update question asked before the atlas download (so the launch screen does not ask again)
 _pending = {}                                           # top folder -> (version installed or None, version to install), from check()
 
 
@@ -285,3 +284,102 @@ class UpdateWatch:
             return
         if value:
             self.show(value)
+
+
+# --- the setting: update automatically (one for all the apps on this computer)
+
+SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".brain_anatomy_tools_settings.json")
+
+
+def _read_settings():
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def auto_update_enabled():
+    """The "Download updates automatically at start-up, then restart" setting, shared by the apps (checked unless it was cleared)."""
+    return bool(_read_settings().get("auto_update", True))
+
+
+def set_auto_update(on):
+    """Saves the setting (best effort: a folder that cannot be written to leaves it as it was)."""
+    data = _read_settings()
+    data["auto_update"] = bool(on)
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass
+
+
+class AutoUpdate:
+    """With the setting on, at launch, once watch_for_update has found changes: downloads them without a dialog, then restarts the app. Every
+    app gives it its own hooks, so that the same logic serves them all:
+      busy()        -> True while the user has started an update of their own (nothing is done then);
+      blocked()     -> True while a dialog has the input (the update waits: it would end the dialog's window);
+      status(text)  -> shows `text` where the app says an update is available (a button, a menu), or restores the usual text for None;
+      keep_open()   -> None, or why the app must not be restarted now (the atlas is downloading): it stays as it is, the new version runs at the next start;
+      restart()     -> ends this run and starts the app again.
+    A class with methods that are scheduled again, not a function that schedules itself: such a function is a reference cycle that keeps the window
+    alive after it is closed (see UpdateWatch)."""
+
+    def __init__(self, root, hooks):
+        self.root, self.hooks = root, hooks
+        self.thread = None
+        self.result = queue.Queue()
+        self.pulled = False
+
+    def start(self):
+        self.root.after(1000, self.step)
+
+    def step(self):
+        try:
+            if not self.root.winfo_exists():
+                return                                          # (the window was closed meanwhile: nothing to do)
+            hooks = self.hooks
+            if self.thread is None:
+                if hooks["busy"]():
+                    return                                      # (the user's own check or update is under way)
+                if hooks["blocked"]():
+                    self.root.after(1000, self.step)
+                    return
+                hooks["status"]("Updating...")
+                self.thread = threading.Thread(target=self.work, daemon=True)
+                self.thread.start()
+            elif not self.pulled:
+                try:
+                    ok, value = self.result.get_nowait()
+                except queue.Empty:
+                    self.root.after(300, self.step)
+                    return
+                if not ok:
+                    print(f"The automatic update could not be applied: {value}")
+                    hooks["status"](None)
+                    return
+                self.pulled = True
+            if self.pulled:
+                if hooks["blocked"]():
+                    self.root.after(1000, self.step)            # (a dialog came up while it was downloading: restarting waits for it)
+                    return
+                reason = hooks["keep_open"]()
+                if reason:
+                    hooks["status"]("Updated: restart to use it")
+                    print(f"Updated. Not restarting now: {reason}. The new version runs the next time the app starts.")
+                    return
+                hooks["restart"]()
+                return
+            self.root.after(300, self.step)
+        except Exception as e:
+            print(f"The automatic update stopped: {type(e).__name__}: {e}")
+
+    def work(self):
+        try:
+            self.result.put((True, pull(repo_root())))
+        except UpdateError as e:
+            self.result.put((False, str(e)))
+        except Exception as e:
+            self.result.put((False, f"{type(e).__name__}: {e}"))

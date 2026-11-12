@@ -68,6 +68,12 @@ def startup_note(message):
 
 
 _STARTUP_NOTES = []
+_IMPORT_MARKS = []
+
+
+def import_mark(name):
+    """Called right after a library is imported during start-up: the seconds since the start, so that record_startup_timing can say how long each took."""
+    _IMPORT_MARKS.append((time.perf_counter() - _STARTUP_T0, name))
 _STARTUP_STAGES = (("Libraries loaded", "libraries"), ("Atlas download:", "find atlas"), ("Online:", "internet check"), ("Atlas manifest ready", "manifest"),
                    ("Opening the launch screen", "setup"))
 
@@ -88,7 +94,11 @@ def record_startup_timing():
                 stages.append(f"{label} {at - last:.1f}")
                 last = at
         stages.append(f"window {total - last:.1f}")
-        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')}  total {total:5.1f} s  [{', '.join(stages)}]\n"
+        imports, last = [], _STARTUP_NOTES[0][0] if _STARTUP_NOTES else 0.0
+        for at, name in _IMPORT_MARKS:
+            imports.append(f"{name} {at - last:.2f}")
+            last = at
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')}  total {total:5.1f} s  [{', '.join(stages)}]  imports: {', '.join(imports)}\n"
         path = CACHE_DIR / 'startup_timing.log'
         old = path.read_text(encoding='utf-8').splitlines(keepends=True) if path.exists() else []
         path.write_text(''.join((old + [line])[-300:]), encoding='utf-8')
@@ -340,11 +350,21 @@ if not RUNNING_PACKAGED:
 
 startup_note("Loading the libraries (numpy, pandas, scanpy, matplotlib, ...). The first start after a reboot is the slowest.")
 import numpy as np
+import_mark('numpy')
 import pandas as pd
-import scanpy as sc
-import anndata
+import_mark('pandas')
+# The scientific libraries scanpy loads are imported (and timed) one by one first, and scanpy itself last: scanpy loads all of them, and when it came first
+# it was charged for what it loaded (so the start-up log showed it as nearly all of the time, and the later imports as free).
+import scipy.sparse
+import scipy.stats
+import scipy.spatial
+import_mark('scipy')
+import h5py
+import_mark('h5py')
 from PIL import Image
+import_mark('PIL')
 import matplotlib
+import_mark('matplotlib')
 # Every window in this app is built on Tk: its sizing (compute_figsize_for_
 # screen_height, normalize_tk_scaling), blitting, cursors and dialogs all
 # assume the TkAgg backend. Without this, matplotlib picks whichever backend
@@ -352,6 +372,7 @@ import matplotlib
 # scaling then makes every window open too large. Must come before pyplot.
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
+import_mark('pyplot')
 import matplotlib.colors as mcolors
 from matplotlib.widgets import Button, TextBox
 from matplotlib.patches import Rectangle, Circle
@@ -366,10 +387,12 @@ from matplotlib.path import Path as MplPath
 
 from abc_atlas_access.abc_atlas_cache.abc_project_cache import AbcProjectCache
 from abc_atlas_access.abc_atlas_cache.cloud_cache import OutdatedManifestWarning
+import_mark('abc_atlas_access')
 
 # The data and rendering layer lives in abc_core.py (importable without starting this app); everything moved there is imported back
 # under its own name, so the rest of this file is unchanged. Must come after the library check and the matplotlib setup above.
 import abc_project
+import_mark('abc_project')
 from abc_core import (
     BREGMA_CCF_ML_MM,
     CACHE_DIR, CCF_COORDS_FILE_NAME, CCF_DIRECTORY, CCF_FILES, CCF_PARCELLATION_DIRECTORY, CCF_PARCELLATION_FILE_NAME, COORD_SETTINGS,
@@ -382,6 +405,15 @@ from abc_core import (
     render_gene_expression_array, render_section_level_array, sanitize_section_token, save_coordinate_settings,
     scatter_gray_then_colored, sorted_sections_descending, start_section_coordinate_load, write_run_statistics,
 )
+import_mark('abc_core')
+import anndata
+import_mark('anndata')
+import sklearn.utils
+import_mark('sklearn')
+import numba
+import_mark('numba')
+import scanpy as sc
+import_mark('scanpy (the rest)')
 
 
 
@@ -945,6 +977,7 @@ def offer_atlas_release_update(cache):
 
 
 import botocore.exceptions
+import_mark('botocore')
 startup_note("Libraries loaded. Looking for the ABC atlas download...")
 download_base = choose_atlas_cache_location()
 startup_note(f"Atlas download: {download_base}. Checking the internet connection...")

@@ -1124,8 +1124,7 @@ ELEMENT_NAME = re.compile(r'(<Element\b[^>]*?\bName=")([^"]*)(")')
 OPEN_WITH_PROGID = "JhouLab.BrainAnatomyTools.XlefViewer.File"     # as in register_file_types.ps1
 OPEN_WITH_CLASSES = r"Software\Classes"                             # (under HKEY_CURRENT_USER; for tests: another key)
 OPEN_WITH_NOTE = ("Add: allows user to open with XLEF viewer by right-clicking .xlef, .xlif or .lif files in Windows Explorer.\n"
-                  "INSTALL_APPS_WINDOWS.bat does the same. If the viewer's folder is moved, click 'Repair' here\n"
-                  "(or run INSTALL_APPS_WINDOWS.bat again).")
+                  "The viewer adds (or repairs) this itself when it starts, unless you remove it here.")
 
 
 def open_with_command():
@@ -1139,6 +1138,7 @@ def open_with_command():
 
 
 OPEN_WITH_EXTENSIONS = (".xlef", ".xlif", ".lif")                    # as in register_file_types.ps1
+AUTO_OPEN_WITH = True        # at startup, list the viewer under Open with if it isn't (see XlefViewer._keep_open_with; tests: False)
 
 
 def open_with_missing():
@@ -1155,6 +1155,18 @@ def open_with_missing():
         except OSError:
             missing.append(ext)
     return missing
+
+
+def open_with_status():
+    """Where Explorer's Open with stands for this viewer: ("none", []) not listed; ("elsewhere", []) listed for a viewer in another
+    folder; ("partly", missing extensions) listed here but taken off some file types; ("ok", []) listed here for all of them."""
+    command = open_with_command()
+    if command is None:
+        return "none", []
+    if os.path.normcase(viewer_bat()) not in os.path.normcase(command):
+        return "elsewhere", []
+    missing = open_with_missing()
+    return ("partly", missing) if missing else ("ok", [])
 
 
 def viewer_bat():
@@ -3731,6 +3743,8 @@ class XlefViewer:
         self.menubar = menu
         if not getattr(sys, "frozen", False):                 # (the packaged .exe is not a folder from GitHub: nothing to update)
             app_update.watch_for_update(self.root, self.updates_found)      # (in the background: nothing waits for it, and it is silent unless there is news)
+        if AUTO_OPEN_WITH and sys.platform == "win32" and not getattr(sys, "frozen", False):
+            self.root.after(3000, self._keep_open_with)     # (once the window is up: see _keep_open_with)
 
         panes = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         panes.pack(fill=tk.BOTH, expand=True)
@@ -4243,6 +4257,29 @@ class XlefViewer:
         if (nx, ny) != (x, y):
             win.geometry(f"+{nx}+{ny}")
 
+    def _keep_open_with(self):
+        """At startup: this viewer listed under Explorer's Open with for Leica files, silently (added if it isn't, repaired if it
+        points to a viewer in another folder or was taken off a file type), unless it was removed in Settings (remembered:
+        "open_with_auto"). Done in the background (PowerShell takes a second or two); only a failure is shown."""
+        if not self.settings.get("open_with_auto", True) or open_with_status()[0] == "ok":
+            return
+        self.open_with_result = queue.Queue()
+        result = self.open_with_result
+        threading.Thread(target=lambda: result.put(set_open_with()), daemon=True).start()
+        self.root.after(500, self._open_with_done)
+
+    def _open_with_done(self):
+        """_keep_open_with's answer, from the Tk loop (a method, not a closure scheduling itself: see app_update.UpdateWatch)."""
+        try:
+            ok, out = self.open_with_result.get_nowait()
+        except queue.Empty:
+            self.root.after(500, self._open_with_done)
+            return
+        if not ok:
+            messagebox.showerror("Open with", "The viewer could not be added to Explorer's \"Open with\" for Leica files:\n\n"
+                                 + (out or "(no message)") + "\n\nSettings > Files can try again, or turn this off.",
+                                 parent=self._on_top())
+
     def _open_with_box(self, body):
         """Settings: "Opening Leica files from Explorer": whether this viewer is under Open with for them, with a button to list it
         there (or to point it here again, when it was listed from another folder) and one to take it away."""
@@ -4255,23 +4292,24 @@ class XlefViewer:
         said = ttk.Label(row, style="Muted.TLabel")
 
         def show():
-            command = open_with_command()
-            here = command is not None and os.path.normcase(viewer_bat()) in os.path.normcase(command)
-            missing = open_with_missing() if here else []
+            status, missing = open_with_status()
             needed = True
-            if command is None:
+            if status == "none":
                 state, text = 'Not listed under "Open with"', 'Add to "Open with"'
-            elif not here:
+            elif status == "elsewhere":
                 state, text = 'Listed under "Open with", but for a viewer in another folder', "Repair"
-            elif missing:                   # (taken off some of the file types since, e.g. by another program's installer)
+            elif status == "partly":        # (taken off some of the file types since, e.g. by another program's installer)
                 state, text = f'Listed under "Open with", but not for {", ".join(missing)} files', "Repair"
             else:                           # (nothing to do: the button greyed out)
                 state, text, needed = 'Listed under "Open with"', 'Add to "Open with"', False
             said.config(text=state)
             add.config(text=text, state=tk.NORMAL if needed else tk.DISABLED)
-            remove.config(state=tk.NORMAL if command is not None else tk.DISABLED)
+            remove.config(state=tk.NORMAL if status != "none" else tk.DISABLED)
 
         def change(undo):
+            # (remembered: removed, it is not added again at startup; added or repaired, it is kept up to date again)
+            self.settings["open_with_auto"] = not undo
+            self._save_settings()
             self.root.config(cursor="watch")
             box.update_idletasks()
             ok, out = set_open_with(remove=undo)

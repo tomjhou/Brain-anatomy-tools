@@ -116,6 +116,9 @@ download it again.
   (`~/Library/Logs/JhouLab` on a Mac), and errors are shown in a message box.
 - Updating: a git clone updates with git. A folder unzipped from GitHub knows its version from `src/version.txt`, which GitHub fills in
   when it makes the ZIP; see `src/app_update.py`.
+- Branches: `main` is the validated version, and what ZIP downloads and updates follow. New work is committed to `experimental`, and
+  `main` is brought up to it only after testing (`git switch main`, `git merge --ff-only experimental`, `git push`). A git clone updates from the
+  branch it has checked out, so a machine used for coding stays on `experimental` (`git fetch`, `git switch experimental`) and sees new work at once.
 
 ### Running from the source in your own Python
 

@@ -78,6 +78,11 @@ for /f "delims=" %%W in ('call "%VENV_PYTHON%" -c "import sys,platform;print(pla
 echo so it will be rebuilt with one of those.
 :venv_remove
 echo.
+REM A program running from the environment (the atlas browser, the CCF browser, ...) would crash when its files were deleted, and deleting a folder whose
+REM files are open can leave it half-deleted. So it is not rebuilt while any is running: see venv_in_use.ps1 (it writes the ids of the programs, if any).
+set "VENV_BUSY="
+for /f "delims=" %%P in ('powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0venv_in_use.ps1" "%VENV_DIR%" 2^>nul') do set "VENV_BUSY=%%P"
+if defined VENV_BUSY goto :venv_in_use
 rmdir /s /q "%VENV_DIR%"
 :venv_make
 if not exist "%VENV_PYTHON%" (
@@ -92,5 +97,13 @@ if not exist "%VENV_PYTHON%" (
   )
   "%VENV_PYTHON%" -m pip install --quiet --upgrade pip >nul 2>&1
 )
+set "PYTHON_CMD=%VENV_PYTHON%"
+exit /b 0
+
+:venv_in_use
+echo The virtual environment in %VENV_DIR% needs to be rebuilt, but programs are running from it right now ^(process %VENV_BUSY%^),
+echo and deleting it would crash them. It is used as it is this time. To rebuild it, close the atlas browser, the CCF browser and
+echo any other of these programs, and start this one again.
+echo.
 set "PYTHON_CMD=%VENV_PYTHON%"
 exit /b 0

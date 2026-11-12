@@ -3027,7 +3027,7 @@ def clear_thumb_cache():
     """Delete the saved thumbnails (only this viewer's .png files in THUMB_CACHE): they are made again as they are needed."""
     try:
         with os.scandir(THUMB_CACHE) as it:
-            names = [f.path for f in it if f.is_file() and f.name.endswith(".png")]
+            names = [f.path for f in it if f.is_file() and f.name.endswith((".png", ".png.tmp"))]     # (.tmp: one cut off mid-write)
     except OSError:
         return
     for path in names:
@@ -3108,7 +3108,13 @@ def make_thumbnail(entry, size=THUMB_SIZE, preview=None):
     try:
         cache = _thumb_cache_path(entry, size)
         if os.path.isfile(cache):
-            return Image.open(cache).convert("RGB"), "ok"
+            try:
+                return Image.open(cache).convert("RGB"), "ok"
+            except OSError:                     # (a broken one, e.g. cut short by an older version: deleted and made again)
+                try:
+                    os.remove(cache)
+                except OSError:
+                    pass
         if preview is not None and all(a is not None for a in preview) and max(preview[0].shape) >= size:
             source, files = None, None
         else:
@@ -3148,7 +3154,9 @@ def make_thumbnail(entry, size=THUMB_SIZE, preview=None):
     im.thumbnail((size, size), Image.BILINEAR)
     try:
         os.makedirs(THUMB_CACHE, exist_ok=True)
-        im.save(cache)
+        tmp = cache + ".tmp"                    # (written whole first, then renamed: an exit mid-write leaves no broken thumbnail)
+        im.save(tmp, format="PNG")
+        os.replace(tmp, cache)
     except OSError:
         pass
     return im, "ok"

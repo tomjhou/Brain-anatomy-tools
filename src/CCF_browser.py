@@ -66,7 +66,7 @@ ensure_libraries({'numpy': 'numpy', 'pandas': 'pandas', 'PIL': 'pillow'})
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import tkinter as tk  # noqa: E402
-from tkinter import filedialog, messagebox, ttk  # noqa: E402
+from tkinter import colorchooser, filedialog, messagebox, ttk  # noqa: E402
 from PIL import Image, ImageTk  # noqa: E402
 
 startup_note("Libraries loaded.")
@@ -2875,10 +2875,59 @@ class CCFBrowser:
             color, shape = slot.styles[index % len(slot.styles)]
             variable = tk.BooleanVar(value=old.get(label, True))
             slot.visible[label] = variable
-            tk.Checkbutton(frame, text=f"{SHAPE_SYMBOLS[shape]} {label} ({points.totals[index]:,})",
-                           variable=variable, fg=hex_color(color),
-                           command=lambda s=slot: self.visibility_changed(s)).pack(side='left', padx=4)
+            check = tk.Checkbutton(frame, text=f"{SHAPE_SYMBOLS[shape]} {label} ({points.totals[index]:,})",
+                                   variable=variable, fg=hex_color(color),
+                                   command=lambda s=slot: self.visibility_changed(s))
+            check.pack(side='left', padx=4)
+            for ev in RIGHT_CLICKS:
+                check.bind(ev, lambda e, s=slot, i=index: self.choose_group_color(s, i))
         self.visibility_changed(slot, refresh=False)
+
+    def choose_group_color(self, slot, index):
+        """Right click on a group's checkbox: a small window to change that group's symbol, its color and its shape (until the app is closed: it is
+        not saved)."""
+        slot_index = index % len(slot.styles)
+        color, shape = slot.styles[slot_index]
+        label = slot.points.group_labels[index] if slot.points is not None else ''
+        state = {'color': tuple(int(c) for c in color[:3])}
+        win = tk.Toplevel(self.root)
+        win.title(f"Symbol of {label}")
+        win.transient(self.root)
+        win.resizable(False, False)
+        body = ttk.Frame(win, padding=10)
+        body.pack()
+        row = ttk.Frame(body)
+        row.pack(anchor='w')
+        ttk.Label(row, text="Color:").pack(side='left')
+        swatch = tk.Button(row, width=8, bg=hex_color(state['color'], 1.0), activebackground=hex_color(state['color'], 1.0), relief='solid', bd=1)
+        swatch.pack(side='left', padx=6)
+
+        def pick_color():
+            chosen = colorchooser.askcolor(color=hex_color(state['color'], 1.0), title=f"Color of {label}", parent=win)
+            if chosen and chosen[0] is not None:
+                state['color'] = tuple(int(round(c)) for c in chosen[0])
+                swatch.configure(bg=hex_color(state['color'], 1.0), activebackground=hex_color(state['color'], 1.0))
+
+        swatch.configure(command=pick_color)
+        shape_var = tk.StringVar(value=shape)
+        shapes = ttk.LabelFrame(body, text="Shape", padding=(8, 4))
+        shapes.pack(fill='x', pady=(10, 0))
+        for i, name in enumerate(GROUP_SHAPES):
+            ttk.Radiobutton(shapes, text=f"{SHAPE_SYMBOLS[name]}  {name}", value=name, variable=shape_var).grid(row=i // 3, column=i % 3, sticky='w', padx=6, pady=2)
+
+        def apply():
+            slot.styles[slot_index] = (state['color'], shape_var.get())
+            win.destroy()
+            self.rebuild_toggles(slot)
+            self.refresh_all()
+
+        buttons = ttk.Frame(body)
+        buttons.pack(anchor='e', pady=(10, 0))
+        ttk.Button(buttons, text="OK", command=apply).pack(side='left', padx=4)
+        ttk.Button(buttons, text="Cancel", command=win.destroy).pack(side='left')
+        win.bind('<Return>', lambda e: apply())
+        win.bind('<Escape>', lambda e: win.destroy())
+        win.grab_set()
 
     def toggle_all(self, slot):
         """Switch every group of the slot off if all are on, otherwise all on."""

@@ -5,8 +5,8 @@ program closed or crashed, the network went away) leaves a file that is there bu
 deletes it and starts from the first byte. For the 50 GB imputed dataset that can be an hour or more lost.
 
 install() replaces the library's S3 download method (for every cache, whoever makes it) with download_file() here:
-- a big file (100 MB or more) is fetched in pieces of 32 MB, eight at a time, each over its own connection: one connection to the server
-  carries only a few MB/s, however fast the link, and eight carry several times that. The finished pieces are listed in "<name>.part.json", so
+- a big file (100 MB or more) is fetched in pieces of 32 MB, sixteen at a time, each over its own connection: one connection to the server
+  carries only a few MB/s, however fast the link, and sixteen carry several times that. The finished pieces are listed in "<name>.part.json", so
   a later ask does only the pieces that were not finished (and a .part file from the one-stream version is continued: its whole pieces count);
 - the file is written to "<name>.part" beside its final name, and only moved to that name, and recorded as downloaded, once it is whole and
   its hash is right: nothing else (the library, the program's checks) ever sees a half-written file under the real name;
@@ -31,7 +31,7 @@ CHUNK = 1 << 20
 RETRY_FIRST_S = 5                # the wait after the first failure, doubled each time up to RETRY_MAX_S
 RETRY_MAX_S = 60
 GIVE_UP_S = 2 * 3600             # no byte for this long: stop (the next ask of the file continues from the same place)
-WORKERS = 8                      # connections at once for a big file (the library's S3 client allows 10)
+WORKERS = 16                     # connections at once for a big file
 SEGMENT = 32 * 1000 * 1000       # bytes in a piece: a piece is what is done again if the program stops in the middle of it
 PARALLEL_MIN = 100 * 1000 * 1000  # files smaller than this are fetched in one stream
 HASH_ATTEMPTS = 2                # whole downloads whose hash was wrong, before giving up
@@ -235,11 +235,30 @@ def _sequential(self, bar, part, key, total, note_key, say, last_progress_box):
             time.sleep(1)
 
 
+def _client_for(cache):
+    """The S3 client the pieces use: the library's own allows ten connections at a time (boto's default), so for more a sibling client with room for WORKERS
+    (same bucket access, so the same anonymous or signed requests) is made. Anything else (no boto client, a failure) uses the cache's."""
+    client = cache.s3_client
+    try:
+        if type(client).__module__.startswith("botocore"):
+            import boto3
+            from botocore import UNSIGNED
+            from botocore.client import Config
+            kwargs = {"max_pool_connections": WORKERS + 2}
+            if not getattr(cache, "_auth_required", False):
+                kwargs["signature_version"] = UNSIGNED
+            return boto3.client("s3", config=Config(**kwargs))
+    except Exception:
+        pass
+    return client
+
+
 def _parallel(self, bar, part, key, total, note_key, say, last_progress_box):
     """Downloads `part` in pieces of SEGMENT bytes, WORKERS at a time, each its own connection (one connection to the server runs at a fraction of
     what the link can carry). The pieces that are finished are listed in the .part.json file beside it, so a later ask does only the rest. Raises
     _NoRange if the server does not do ranges."""
     count = (total + SEGMENT - 1) // SEGMENT
+    client = _client_for(self)
 
     def span(i):
         return i * SEGMENT, min((i + 1) * SEGMENT, total)
@@ -280,7 +299,7 @@ def _parallel(self, bar, part, key, total, note_key, say, last_progress_box):
             if abort.is_set():
                 return False
             try:
-                response = self.s3_client.get_object(Bucket=self._bucket_name, Key=key, Range=f"bytes={pos}-{stop - 1}")
+                response = client.get_object(Bucket=self._bucket_name, Key=key, Range=f"bytes={pos}-{stop - 1}")
                 if "ContentRange" not in response:
                     raise _NoRange()
                 with open(part, "r+b") as out:

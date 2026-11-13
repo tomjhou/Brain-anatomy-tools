@@ -5031,6 +5031,21 @@ def visible_points_only(offsets, facecolors, sizes, xlim, ylim):
     return offsets[visible], facecolors, sizes
 
 
+MAX_EXPORT_PATH_CHARS = 240   # a file's whole path, kept under Windows' 260 (a browser or Explorer cannot open a longer one: "your file couldn't be accessed")
+
+
+def shorten_export_stem(target_dir, stem, extensions):
+    """`stem` itself when the whole path (folder, name, extension and a '_NNN' suffix) fits in MAX_EXPORT_PATH_CHARS, else its start, '_etc_' and six characters
+    of a hash of the whole (so that two long names that start alike stay different). The names of exports that list their groups (3d_cluster_4687-4703-...) can
+    be very long; the full list is inside the file."""
+    room = MAX_EXPORT_PATH_CHARS - len(str(target_dir)) - 1 - max((len(e) for e in extensions), default=0) - 5
+    if len(stem) <= room:
+        return stem
+    tag = hashlib.md5(stem.encode('utf-8')).hexdigest()[:6]
+    keep = max(room - len(tag) - 5, 12)
+    return f"{stem[:keep].rstrip('-_ ')}_etc_{tag}"
+
+
 def unique_export_paths(target_dir, stem, extensions):
     """{ext: path} for a new export named `stem` (no leading '.' on the
     extensions), without overwriting an earlier one: the first save uses
@@ -5040,6 +5055,7 @@ def unique_export_paths(target_dir, stem, extensions):
     the user appended themselves after the number (e.g. renaming a copy to
     '..._2_final.png') doesn't confuse the numbering — only the digits
     immediately after '_N' are read; anything past that is ignored."""
+    stem = shorten_export_stem(target_dir, stem, extensions)
     base_exists = any((target_dir / f'{stem}{ext}').exists() for ext in extensions)
     if not base_exists:
         return {ext: target_dir / f'{stem}{ext}' for ext in extensions}

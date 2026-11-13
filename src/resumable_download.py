@@ -160,7 +160,7 @@ def download_file(self, file_attributes, force_download=False, skip_hash_check=F
         started = time.monotonic()
         total = _object_size(self, key, say, started + GIVE_UP_S, note_key)
         have = part.stat().st_size if part.exists() else 0
-        bar = tqdm.tqdm(desc=key.split("/")[-1], total=total, initial=min(have, total), unit_scale=True, unit_divisor=1000., unit="MB")
+        bar = tqdm.tqdm(desc=key.split("/")[-1], total=total, initial=min(have, total), unit_scale=True, unit_divisor=1000., unit="B")     # ("B" with unit_scale: tqdm adds the M or G itself; the library's unit="MB" gave "MMB/s")
         if have:
             say(f"Continuing {key.split('/')[-1]} from {_size_text(have)} of {_size_text(total)}.")
         wrong_hash = 0

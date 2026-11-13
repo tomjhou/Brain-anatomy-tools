@@ -75,7 +75,8 @@ DEFAULT_BREGMA_CCF_DV_MM = 0.332
 
 # (these settings are always kept in viewer_settings.json, whether or not the viewer's own settings persist)
 COORD_SETTINGS = {'bregma_ap_mm': DEFAULT_BREGMA_CCF_AP_MM, 'bregma_dv_mm': DEFAULT_BREGMA_CCF_DV_MM,
-                  'reconstructed_coords': True}
+                  'reconstructed_coords': True,
+                  'use_imputed': None}       # (None: not asked yet; True: the imputed gene dataset, about 50 GB, is downloaded at start-up; False: only when Imputed Gene is chosen)
 
 
 def load_coordinate_settings():
@@ -86,6 +87,8 @@ def load_coordinate_settings():
         if not isinstance(on_disk, dict):
             return
         COORD_SETTINGS['reconstructed_coords'] = bool(on_disk.get('reconstructed_coords', True))
+        if isinstance(on_disk.get('use_imputed'), bool):
+            COORD_SETTINGS['use_imputed'] = on_disk['use_imputed']
         bregma = float(on_disk.get('bregma_ap_mm'))
         if 0.0 < bregma < 13.5:
             COORD_SETTINGS['bregma_ap_mm'] = bregma
@@ -113,6 +116,8 @@ def save_coordinate_settings():
     on_disk['bregma_ap_mm'] = COORD_SETTINGS['bregma_ap_mm']
     on_disk['bregma_dv_mm'] = COORD_SETTINGS['bregma_dv_mm']
     on_disk['reconstructed_coords'] = bool(COORD_SETTINGS['reconstructed_coords'])
+    if COORD_SETTINGS['use_imputed'] is not None:
+        on_disk['use_imputed'] = bool(COORD_SETTINGS['use_imputed'])
     try:
         SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:

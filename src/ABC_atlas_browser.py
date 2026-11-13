@@ -543,6 +543,8 @@ def save_viewer_settings(settings):
     to_write = {'persist_settings': bool(settings.get('persist_settings', False)),
                 'bregma_ap_mm': COORD_SETTINGS['bregma_ap_mm'], 'bregma_dv_mm': COORD_SETTINGS['bregma_dv_mm'],
                 'reconstructed_coords': bool(COORD_SETTINGS['reconstructed_coords'])}   # (always kept: see COORD_SETTINGS)
+    if COORD_SETTINGS['use_imputed'] is not None:
+        to_write['use_imputed'] = bool(COORD_SETTINGS['use_imputed'])
     if to_write['persist_settings']:
         to_write['hover_enabled'] = bool(settings.get('hover_enabled', True))
         to_write['gene456_shape'] = settings.get('gene456_shape', GENE456_SHAPE_DEFAULT)
@@ -705,6 +707,14 @@ def build_common_settings_tab(tab):
         "May be more biologically accurate: it corrects possible tissue distortions in the raw coordinates, and the CCF atlas then lines "
         "up with the cells. One-time download (about 260 MB); applies to the next run you open.")).pack(anchor="w", pady=(2, 0))
     ttk.Separator(frame).pack(fill=tk.X, pady=(14, 8))
+    imputed_before = COORD_SETTINGS['use_imputed']
+    imputed_var = tk.BooleanVar(tab, bool(imputed_before))
+    ttk.Checkbutton(frame, text="I plan to use imputed genes (download them at start-up)", variable=imputed_var).pack(anchor="w")
+    ttk.Label(frame, foreground="gray35", justify=tk.LEFT, wraplength=460, text=(
+        f"Checked: the imputed gene dataset (about {ATLAS_IMPUTED_GB} GB, covering far more genes than the 500-gene panel) is downloaded in the background "
+        "the next time the program starts, and continues after an interruption. Unchecked: it is only downloaded (after asking) the first time "
+        "you choose Imputed Gene.")).pack(anchor="w", pady=(2, 0))
+    ttk.Separator(frame).pack(fill=tk.X, pady=(14, 8))
     import app_update
     auto_var = tk.BooleanVar(tab, app_update.auto_update_enabled())
     ttk.Checkbutton(frame, text="Download updates automatically", variable=auto_var).pack(anchor="w")
@@ -727,7 +737,10 @@ def build_common_settings_tab(tab):
                 raise ValueError
         except ValueError:
             raise ValueError("Enter bregma's position as numbers of mm: AP between 0 and 13.5, DV between -5 and 8.")
-        return {'bregma_ap_mm': bregma, 'bregma_dv_mm': bregma_dv, 'reconstructed_coords': bool(recon_var.get()), 'auto_update': bool(auto_var.get())}
+        values = {'bregma_ap_mm': bregma, 'bregma_dv_mm': bregma_dv, 'reconstructed_coords': bool(recon_var.get()), 'auto_update': bool(auto_var.get())}
+        if bool(imputed_var.get()) != bool(imputed_before):        # (left alone, "not asked yet" stays so: the question is still asked at start-up)
+            values['use_imputed'] = bool(imputed_var.get())
+        return values
 
     return read
 
@@ -1188,7 +1201,12 @@ def start_atlas_prefetch(cache):
         have = resumable_download.downloaded_bytes(imputed_path)
         if have > 0:
             resume = (imputed_path, imputed_size, have)
-    if not core_files and not ccf and resume is None:
+    # Nothing of it is here yet: whether it is wanted is asked once ("Do you plan to use imputed genes?", kept in COORD_SETTINGS['use_imputed'] and
+    # changeable in Settings). Yes: it downloads now, with the rest. No: it is offered (as before) when Imputed Gene is first chosen.
+    absent = imputed_present is False and imputed_path is not None and bool(imputed_size) and resume is None
+    ask_plan = absent and COORD_SETTINGS['use_imputed'] is None
+    plan_download = absent and COORD_SETTINGS['use_imputed'] is True
+    if not core_files and not ccf and resume is None and not ask_plan and not plan_download:
         return                     # (the reconstructed coordinates alone, a setting changed later, are asked for when needed, as before)
     recon = []
     if core_files and COORD_SETTINGS['reconstructed_coords']:
@@ -1199,6 +1217,48 @@ def start_atlas_prefetch(cache):
     missing = recon + ccf + core_files                  # (the small ones first, needed as soon as the browser opens; the big files last)
     update_before_download()                      # (asked first, before anything is downloaded)
     only_resume = False
+    if ask_plan:
+        try:
+            import centered_dialog
+            plan = centered_dialog.ask_yes_no(
+                "Imputed genes",
+                "Do you plan to use imputed genes?\n\n"
+                f"The imputed gene dataset covers far more genes than the standard 500-gene panel, but it is large: about {imputed_size / 1e9:.0f} GB, "
+                "which takes an hour or more to download. If you say Yes, it downloads in the background now, so it is ready when you need it, and it "
+                "continues from where it stopped if it is interrupted.\n\n"
+                "If you say No, nothing is downloaded now; you are offered the download the first time you choose Imputed Gene. "
+                "You can change your mind at any time: in the Settings window's Common tab, tick or untick \"I plan to use imputed genes\".")
+        except Exception:
+            plan = None                                         # (no GUI to ask on: asked again next time)
+        if plan is not None:
+            COORD_SETTINGS['use_imputed'] = bool(plan)
+            try:
+                save_coordinate_settings()
+            except Exception:
+                pass
+            plan_download = bool(plan)
+    if plan_download:
+        free = None
+        try:
+            where = Path(imputed_path).parent
+            while not where.exists() and where != where.parent:
+                where = where.parent
+            free = shutil.disk_usage(where).free
+        except Exception:
+            pass
+        if free is not None and free < imputed_size * 1.05 + 2e9:
+            plan_download = False
+            msg = (f"The imputed gene dataset needs about {imputed_size / 1e9:.0f} GB, but only {free / 1e9:.0f} GB is free where the atlas is kept, "
+                   "so it is not being downloaded. Free some space, or move the atlas (Settings), and it is offered again at the next start.")
+            print(msg)
+            try:
+                import centered_dialog
+                centered_dialog.info("Not enough disk space", msg)
+            except Exception:
+                pass
+        else:
+            only_resume = not missing
+            missing.append(("the imputed gene dataset", IMPUTED_DATASET_DIRECTORY, IMPUTED_DATASET_FILE_NAME, 'data', imputed_size, imputed_path))
     if resume is not None:
         path, size, have = resume
         try:
@@ -1232,7 +1292,10 @@ def start_atlas_prefetch(cache):
     atlas_prefetch['thread'].start()
 
     if only_resume:                                             # (the question just asked was the notice)
-        print(f"Continuing the imputed gene download in the background ({resume[2] / 1e9:.1f} of {resume[1] / 1e9:.1f} GB is here already).")
+        if resume is not None:
+            print(f"Continuing the imputed gene download in the background ({resume[2] / 1e9:.1f} of {resume[1] / 1e9:.1f} GB is here already).")
+        else:
+            print(f"Downloading the imputed gene dataset in the background (about {imputed_size / 1e9:.0f} GB); progress is shown here.")
         return
 
     def size_text(n):

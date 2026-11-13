@@ -288,6 +288,39 @@ class ExportsMixin:
             return None
         return sel["level"], targets
 
+    def group_selection(self, action):
+        """The groups the 3D view shows: {"level", "targets", "colors", "counts"}, or None (saying why). In Specific group(s) the groups typed; in All groups the
+        ones switched on, if there are at most MAX_3D_GROUPS of them (so that "All groups" works at a level with few groups, or after switching most off)."""
+        if self.mode == "single":
+            chosen = self.group_choice(action)
+            if chosen is None:
+                return None
+            return {"level": chosen[0], "targets": chosen[1], "colors": self.last_ids["colors"], "counts": self.last_ids["counts"]}
+        if self.mode == "all" and self.info.get(self.level) is not None:
+            level = self.level
+            codes, uniques = self.category_codes(level)
+            counts = np.bincount(codes[codes >= 0], minlength=len(uniques))
+            on = [int(u) for u in np.argsort(-counts, kind="stable") if counts[u] > 0 and str(uniques[u]) not in self.off_groups]
+            if not on:
+                self.var_status.set(f"No group is switched on: switch some on in the list before {action}.")
+                return None
+            if len(on) > self.MAX_3D_GROUPS:
+                self.var_status.set(f"{len(on)} groups are switched on: at most {self.MAX_3D_GROUPS} can be shown in 3D. Click groups in the list to switch some off, "
+                                    f"or use Specific group(s), before {action}.")
+                return None
+            keys = self.group_keys(level, uniques)
+            palette = getattr(self, "group_rgb", None)
+            targets, colors, sizes = [], {}, {}
+            for u in on:
+                v = keys[u]
+                t = int(v) if isinstance(v, (int, float, np.integer, np.floating)) and v == v else str(v)
+                targets.append(t)
+                colors[t] = palette[u] if palette is not None else None
+                sizes[t] = int(counts[u])
+            return {"level": level, "targets": targets, "colors": colors, "counts": sizes}
+        self.var_status.set(f"Choose All groups (with {self.MAX_3D_GROUPS} or fewer switched on) or Specific group(s) before {action}.")
+        return None
+
     def background(self, text, work, done):
         """Run `work` (no Tk in it) off the main thread; `done(result)` runs back on it."""
         return self.job(text, work, done)
@@ -1030,15 +1063,28 @@ class ExportsMixin:
         ttk.Button(buttons, text="Open", command=ok).pack(side="right", padx=(0, 6))
         top.bind("<Return>", lambda e: ok())
         top.bind("<Escape>", lambda e: top.destroy())
+        self.center_dialog(top)
         top.grab_set()
         self.root.wait_window(top)
         return result[0] if result else None
 
+    def center_dialog(self, top, owner=None):
+        """Put the dialog `top` in the middle of `owner` (the window by default): a new window otherwise opens wherever the system puts it, often in a corner of the screen."""
+        import tkinter as tk
+        owner = owner or self.root
+        try:
+            top.update_idletasks()
+            x = owner.winfo_rootx() + (owner.winfo_width() - top.winfo_reqwidth()) // 2
+            y = owner.winfo_rooty() + (owner.winfo_height() - top.winfo_reqheight()) // 2
+            top.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        except tk.TclError:
+            pass
+
     def prepare_3d(self, action, jitter_mm=0.0):
-        chosen = self.group_choice(action)
-        if chosen is None:
+        selection = self.group_selection(action)
+        if selection is None:
             return None
-        level, targets = chosen
+        level, targets = selection["level"], selection["targets"]
         h = self.host
         table, scope = self.selected_group_cells(level, targets)
         if table.empty:
@@ -1062,7 +1108,7 @@ class ExportsMixin:
             if have_ccf and "ccf_structure" in rows.columns:
                 hover = (rows["ccf_structure"].fillna("?").astype(str) + " | section " + rows["brain_section_label"].astype(str).str.rsplit(".", n=1).str[-1]
                          + " | " + rows["cell_label"].astype(str)).to_numpy()
-            color = self.last_ids["colors"].get(t)
+            color = selection["colors"].get(t)
             xyz = rows[list(columns)].to_numpy(dtype=float)
             if jitter_mm > 0:                    # (the middle column is the one across the sections)
                 xyz[:, 1] += np.random.default_rng().uniform(-jitter_mm, jitter_mm, len(xyz))
@@ -1081,7 +1127,7 @@ class ExportsMixin:
         except ImportError:
             self.var_status.set("The browser 3D view needs plotly: run  python -m pip install plotly  and restart.")
             return
-        if self.group_choice("opening the 3D view") is None:
+        if self.group_selection("opening the 3D view") is None:
             return
         jitter = self.ask_3d_jitter()
         if jitter is None:

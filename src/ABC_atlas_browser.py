@@ -479,7 +479,7 @@ DEFAULT_VIEWER_SETTINGS = {
     'gene456_shape': 'small circle',
     'umap_circle_size': 'Default',
     'colorize_other_cells': True,   # in a neuron project the non-neurons (and in a non-neuron project the neurons) of the section maps are colored too; off: always gray
-    'group_colors': 'cycle',        # 'cycle': every group colored, the look repeating past 400; 'lineage': a group's color comes from its parent's
+    'group_colors': 'cycle',        # 'cycle': the colors and shapes in order of group size; 'numeric': in order of group number; 'lineage': a group's color comes from its parent's
     # Itself a setting, with a deliberately asymmetric persistence rule —
     # see load_viewer_settings/save_viewer_settings's own docstrings.
     'persist_settings': False,
@@ -521,7 +521,7 @@ def load_viewer_settings():
             settings['umap_circle_size'] = on_disk['umap_circle_size']
         if 'colorize_other_cells' in on_disk:
             settings['colorize_other_cells'] = bool(on_disk['colorize_other_cells'])
-        if on_disk.get('group_colors') in ('cycle', 'lineage'):
+        if on_disk.get('group_colors') in ('cycle', 'numeric', 'lineage'):
             settings['group_colors'] = on_disk['group_colors']
     return settings
 
@@ -5722,8 +5722,9 @@ def build_viewer_settings_tab(tab, current_settings, umap_params=None, n_cells=N
     shape_frame.pack(fill='x', padx=12, pady=(0, 6))
 
     colors_var = tk.StringVar(tab, value=current_settings.get('group_colors', 'cycle'))
-    colors_frame = tk.LabelFrame(tab, text="Group colors (when there are more groups than looks)")
-    for value, text in (('cycle', "Cycle: every group colored; past the 400th largest the colors and shapes repeat (hover tells which)"),
+    colors_frame = tk.LabelFrame(tab, text="Group colors (past 400 groups the colors and shapes repeat: hover tells which)")
+    for value, text in (('cycle', "Color/shape ordered from largest to smallest group"),
+                        ('numeric', "Color/shape ordered numerically by group (the same colors and shapes, in taxonomic order)"),
                         ('lineage', "Lineage: a group's color comes from its parent group, so related groups look alike (experimental)")):
         tk.Radiobutton(colors_frame, text=text, value=value, variable=colors_var, anchor='w', justify='left').pack(fill='x', padx=6)
     colors_frame.pack(fill='x', padx=12, pady=(0, 6))

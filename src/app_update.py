@@ -1,5 +1,7 @@
 """Updating the apps from GitHub, in either of the two ways the folder can have come from:
-- a git clone: a fetch and a fast-forward pull (needs git);
+- a git clone: a fetch and a fast-forward pull (needs git: looked for on the PATH, then where its installers and GitHub Desktop put
+  it). Without git, a clone can still be checked (its branch and commit read from .git itself, and GitHub's API asked what is new) but
+  not updated: copying files over it would leave git seeing them all as changed, so no_pull_reason() says to install git instead;
 - a ZIP download (GitHub's Code > Download ZIP): no git needed. GitHub writes the commit into src/version.txt when it makes the ZIP
   (export-subst in .gitattributes), so the folder knows its version; GitHub's API says what has changed since, and the update
   downloads the newest ZIP and copies its files over the folder's, removing the files the new version no longer has. Nothing else in
@@ -7,9 +9,11 @@
 
 repo_root() says which folder (and the way), check() and pull() use the network (slowly), so call them from a thread; relaunch()
 starts the app again."""
+import glob
 import json
 import os
 import queue
+import re
 import shutil
 import ssl
 import subprocess
@@ -33,13 +37,53 @@ class UpdateError(Exception):
     """Something to tell the user, in a sentence."""
 
 
+GIT_NEEDED = ("This folder is a git clone, and git was not found on this computer, so the update cannot be installed here.\n\n"
+              "Install git from https://git-scm.com/downloads, then check for updates again.")
+_found_git = []                                         # ([path or None], once looked for)
+
+
+def git_exe():
+    """The git program: the one on the PATH, else one where Git for Windows, GitHub Desktop or Homebrew install it (apps started from a
+    shortcut or the Finder often have a PATH without it); None: not found."""
+    if not _found_git:
+        _found_git.append(_find_git())
+    return _found_git[0]
+
+
+def _find_git():
+    found = shutil.which("git")
+    if found:
+        return found
+    places = []
+    if sys.platform == "win32":
+        for var in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"):
+            if os.environ.get(var):
+                places.append(os.path.join(os.environ[var], "Git", "cmd", "git.exe"))
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            places.append(os.path.join(local, "Programs", "Git", "cmd", "git.exe"))      # (Git for Windows, installed for one user)
+            desktop = glob.glob(os.path.join(local, "GitHubDesktop", "app-*", "resources", "app", "git", "cmd", "git.exe"))
+            places += sorted(desktop, key=lambda p: [int(n) for n in re.findall(r"\d+", os.path.basename(p.split("resources")[0].rstrip("\\/")))],
+                             reverse=True)                                              # (the newest GitHub Desktop's first)
+    else:
+        places += ["/opt/homebrew/bin/git", "/usr/local/bin/git",
+                   "/Applications/GitHub Desktop.app/Contents/Resources/app/git/bin/git"]
+    return next((p for p in places if os.path.isfile(p)), None)
+
+
+class NoGit(UpdateError):
+    """A git clone, and no git to update it with."""
+
+
 def _git(root, *args):
+    exe = git_exe()
+    if exe is None:
+        raise NoGit(GIT_NEEDED)
     try:
-        done = subprocess.run(["git", "-C", root, *args], capture_output=True, text=True, timeout=TIMEOUT, creationflags=_FLAGS,
+        done = subprocess.run([exe, "-C", root, *args], capture_output=True, text=True, timeout=TIMEOUT, creationflags=_FLAGS,
                               env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
     except FileNotFoundError:
-        raise UpdateError("Git is not installed (or not on the PATH), so this folder (a git clone) cannot update itself.\n"
-                          "Install it from https://git-scm.com/downloads, or download the newest version from GitHub by hand.")
+        raise NoGit(GIT_NEEDED)
     except subprocess.TimeoutExpired:
         raise UpdateError("Git took too long to answer (is the network down?).")
     if done.returncode != 0:
@@ -55,7 +99,7 @@ def repo_root(start=None):
     """The apps' top folder (above src): a git clone, or a folder unzipped from GitHub."""
     root = os.path.dirname(os.path.dirname(os.path.abspath(start or __file__)))
     if _is_clone(root):
-        return _git(root, "rev-parse", "--show-toplevel")
+        return _git(root, "rev-parse", "--show-toplevel") if git_exe() else root
     if not os.path.isdir(os.path.join(root, "src")):
         raise UpdateError(f"The apps' folder was not found (looked in {root}).")
     return root
@@ -63,11 +107,22 @@ def repo_root(start=None):
 
 def check(root):
     """Returns the one-line summaries of the changes waiting on GitHub (newest first; empty: up to date)."""
-    return _git_check(root) if _is_clone(root) else _zip_check(root)
+    if _is_clone(root):
+        return _git_check(root) if git_exe() else _clone_check_without_git(root)
+    return _zip_check(root)
+
+
+def no_pull_reason(root):
+    """Why pull() cannot update this folder (a git clone, and no git), to say with the changes check() found instead of offering to
+    download them; None: it can."""
+    return GIT_NEEDED if _is_clone(root) and git_exe() is None else None
 
 
 def pull(root):
     """Brings the folder up to date. Returns a report."""
+    reason = no_pull_reason(root)
+    if reason:
+        raise NoGit(reason)
     return _git_pull(root) if _is_clone(root) else _zip_pull(root)
 
 
@@ -84,6 +139,97 @@ def _git_check(root):
     _git(root, "fetch", "--quiet")
     log = _git(root, "log", "--format=%s", "HEAD..@{u}")
     return log.splitlines() if log else []
+
+
+def _git_dirs(root):
+    """(the clone's own git folder, the folder with its refs and config): the same but for a worktree (whose .git is a file naming its
+    folder)."""
+    own = os.path.join(root, ".git")
+    if os.path.isfile(own):
+        with open(own, encoding="utf-8") as f:
+            line = f.read().strip()
+        if not line.startswith("gitdir:"):
+            raise UpdateError("This folder's .git could not be read.")
+        own = os.path.normpath(os.path.join(root, line[len("gitdir:"):].strip()))
+    common = own
+    if os.path.isfile(os.path.join(own, "commondir")):
+        with open(os.path.join(own, "commondir"), encoding="utf-8") as f:
+            common = os.path.normpath(os.path.join(own, f.read().strip()))
+    return own, common
+
+
+def _read_ref(common, name):
+    """The commit a ref (refs/heads/...) points at, from its file or packed-refs; None: neither has it."""
+    try:
+        with open(os.path.join(common, *name.split("/")), encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        pass
+    try:
+        with open(os.path.join(common, "packed-refs"), encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2 and parts[1] == name:
+                    return parts[0]
+    except OSError:
+        pass
+    return None
+
+
+def _read_config(common):
+    """{(section, name, key): value} from the clone's config, e.g. ("branch", "main", "remote")."""
+    values, section = {}, None
+    try:
+        with open(os.path.join(common, "config"), encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                m = re.match(r'\[\s*([\w.-]+)(?:\s+"(.*)")?\s*\]$', line)
+                if m:
+                    section = (m.group(1).lower(), m.group(2))
+                elif section and "=" in line and not line.startswith(("#", ";")):
+                    key, value = line.split("=", 1)
+                    values[section + (key.strip().lower(),)] = value.strip().strip('"')
+    except OSError:
+        pass
+    return values
+
+
+def _clone_check_without_git(root):
+    """check() for a clone where git isn't found: the branch and its commit read from .git, and GitHub's API asked what its branch
+    on GitHub has that this commit hasn't (git's HEAD..@{u}, as far as GitHub knows)."""
+    own, common = _git_dirs(root)
+    try:
+        with open(os.path.join(own, "HEAD"), encoding="utf-8") as f:
+            head = f.read().strip()
+    except OSError:
+        raise UpdateError("This folder's .git could not be read.")
+    if not head.startswith("ref: refs/heads/"):
+        raise UpdateError("This folder (a git clone) is not on a branch, so there is nothing to update from.")
+    branch = head[len("ref: refs/heads/"):]
+    sha = _read_ref(common, "refs/heads/" + branch)
+    config = _read_config(common)
+    remote, merge = config.get(("branch", branch, "remote")), config.get(("branch", branch, "merge"), "")
+    url = config.get(("remote", remote, "url"), "")
+    m = re.search(r"github\.com[:/]+([^/]+/[^/]+?)(?:\.git)?/?$", url)
+    if not sha or not merge.startswith("refs/heads/") or not m:
+        raise UpdateError("The current branch does not follow a branch on GitHub, so there is nothing to update from.")
+    try:
+        data = json.loads(_get(f"https://api.github.com/repos/{m.group(1)}/compare/{sha}...{merge[len('refs/heads/'):]}",
+                               "the list of changes"))
+    except urllib.error.HTTPError:
+        raise UpdateError("GitHub does not know this folder's newest commit (made here, and not on GitHub?), so what is new there "
+                          "cannot be worked out without git.\n\nInstall git from https://git-scm.com/downloads, then check again.")
+    return _summaries(data)
+
+
+def _summaries(data):
+    """The one-line summaries (newest first, as git log) of the commits in GitHub's comparison."""
+    commits = data.get("commits") or []
+    if data.get("status") == "identical" or not commits:
+        return []
+    lines = [c["commit"]["message"].splitlines()[0] for c in reversed(commits)]
+    more = data.get("ahead_by", len(commits)) - len(commits)                       # (the API lists 250 at most)
+    return lines + [f"(and {more} older ones)"] * (more > 0)
 
 
 def _has_upstream(root):
@@ -162,9 +308,7 @@ def _zip_check(root):
     if data.get("status") == "identical" or not commits:
         return []
     _pending[root] = (old, commits[-1]["sha"])
-    lines = [c["commit"]["message"].splitlines()[0] for c in reversed(commits)]     # (newest first, as git log)
-    more = data.get("ahead_by", len(commits)) - len(commits)                       # (the API lists 250 at most)
-    return lines + [f"(and {more} older ones)"] * (more > 0)
+    return _summaries(data)
 
 
 def _zip_pull(root):
@@ -250,7 +394,7 @@ def _remove_empty_folders(root, folder):
 def watch_for_update(root, show):
     """At launch: looks on GitHub for newer commits in a background thread, and calls show(summaries) (from the Tk loop) when there are
     some. Nothing waits for it: a slow or unreachable network only keeps that thread waiting (it is a daemon: it never holds the program
-    open), and any failure (offline, no git, rate limit) is silent: the Check for updates button (or menu) reports those when it is used."""
+    open), and any failure (offline, rate limit) is silent: the Check for updates button (or menu) reports those when it is used."""
     found = queue.Queue()
 
     def work():
@@ -346,6 +490,10 @@ class AutoUpdate:
                     return                                      # (the user's own check or update is under way)
                 if hooks["blocked"]():
                     self.root.after(1000, self.step)
+                    return
+                reason = no_pull_reason(repo_root())
+                if reason:                                      # (a clone with no git: the menu or button says what is new, and why it isn't installed)
+                    print("Updates are available, but not installed automatically: " + reason.replace("\n\n", " "))
                     return
                 hooks["status"]("Updating...")
                 self.thread = threading.Thread(target=self.work, daemon=True)

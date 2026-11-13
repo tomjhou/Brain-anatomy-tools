@@ -4635,9 +4635,12 @@ class XlefViewer:
             if not value:
                 return finish("You have the newest version.")
             shown = "\n".join("  • " + line for line in value[:12]) + (f"\n  ... and {len(value) - 12} more" if len(value) > 12 else "")
+            news = f"{len(value)} new change{'s' if len(value) != 1 else ''} on GitHub:\n\n{shown}\n\n"
+            reason = app_update.no_pull_reason(root)
+            if reason:                                  # (a git clone, and no git: what is new, and how to get it)
+                return finish(news + reason)
             self.root.config(cursor="")
-            if not messagebox.askyesno("Update", f"{len(value)} new change{'s' if len(value) != 1 else ''} on GitHub:\n\n{shown}\n\n"
-                                       "Download them now?", parent=self._on_top()):
+            if not messagebox.askyesno("Update", news + "Download them now?", parent=self._on_top()):
                 return finish()
             self.status.config(text="Updating ...")
             self.root.config(cursor="watch")

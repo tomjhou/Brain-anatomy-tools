@@ -681,10 +681,13 @@ def check_for_update(root, button, changes=None, helpers=None):
             button.idle_text = "Check for updates"
             return finish("You have the newest version.")
         shown = "\n".join("  • " + line for line in value[:12]) + (f"\n  ... and {len(value) - 12} more" if len(value) > 12 else "")
+        news = f"{len(value)} new change{'s' if len(value) != 1 else ''} on GitHub:\n\n{shown}\n\n"
+        reason = app_update.no_pull_reason(folder)
+        if reason:                                  # (a git clone, and no git: what is new, and how to get it)
+            return finish(news + reason)
         root.config(cursor="")
         with question():
-            yes = messagebox.askyesno("Update", f"{len(value)} new change{'s' if len(value) != 1 else ''} on GitHub:\n\n{shown}\n\n"
-                                      "Download them now?", parent=dialog_parent())
+            yes = messagebox.askyesno("Update", news + "Download them now?", parent=dialog_parent())
         if not yes:
             return finish()
         run(app_update.pull, folder, then=pulled, label="Updating…")

@@ -118,12 +118,26 @@ def no_pull_reason(root):
     return GIT_NEEDED if _is_clone(root) and git_exe() is None else None
 
 
-def pull(root):
-    """Brings the folder up to date. Returns a report."""
+def pull(root, inside_start=False):
+    """Brings the folder up to date. Returns a report. Only one copy of the apps at a time does it (instance_lock), and not while this copy is
+    downloading the atlas: replacing the program files under a running download (or a second copy writing the same files) is what went wrong
+    when several updates met. `inside_start`: asked by the start-up's own update step, which already holds the lock."""
     reason = no_pull_reason(root)
     if reason:
         raise NoGit(reason)
-    return _git_pull(root) if _is_clone(root) else _zip_pull(root)
+    import instance_lock
+    lock = instance_lock.maintenance
+    if lock.held and not inside_start:
+        raise UpdateError("This copy of the app is still downloading the atlas. The update waits until that has finished (it is applied the next "
+                          "time you check, or when the app starts).")
+    if not lock.acquire("updating the apps"):
+        holder = lock.who_holds()
+        raise UpdateError("Another copy of the app is updating or downloading right now" + (f" ({holder})" if holder else "") +
+                          ". Try again when that has finished.")
+    try:
+        return _git_pull(root) if _is_clone(root) else _zip_pull(root)
+    finally:
+        lock.release()
 
 
 def relaunch():

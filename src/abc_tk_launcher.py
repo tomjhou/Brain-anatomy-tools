@@ -732,6 +732,7 @@ def restart():
     """Starts the browser again in the same console window (app_update.relaunch() would start it with none, hiding its progress output),
     and ends this one."""
     args = [sys.executable, os.path.abspath(sys.argv[0])] + sys.argv[1:]
+    os.environ["ABC_RESTARTED"] = "1"               # (the new copy waits a while for this one to end, and so for its hold on instance_lock to be let go)
     sys.stdout.flush()
     sys.stderr.flush()
     if os.name == "nt":

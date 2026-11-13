@@ -1151,6 +1151,7 @@ OPEN_WITH_PROGID = "JhouLab.BrainAnatomyTools.XlefViewer.File"     # as in regis
 OPEN_WITH_CLASSES = r"Software\Classes"                             # (under HKEY_CURRENT_USER; for tests: another key)
 AUTO_UPDATE_NOTE = ("Applies to all the Brain-anatomy-tools apps on this computer. If an experiment is open, the viewer doesn't restart:\n"
                     "the new version runs the next time it starts. Off: the menu only says that updates are available.")
+RESTART_NOTICE_MS = 1000          # how long "Restarting the viewer..." shows before an update's restart (see XlefViewer._restart)
 OPEN_WITH_NOTE = ("Add: allows user to open with XLEF viewer by right-clicking .xlef, .xlif or .lif files in Windows Explorer.\n"
                   "The viewer adds (or repairs) this itself when it starts, unless you remove it here.")
 
@@ -4568,11 +4569,42 @@ class XlefViewer:
             self._restart()
 
     def _restart(self):
-        self.quit()
+        """Unsaved changes are asked about first (Cancel: the viewer stays as it is); then "Restarting the viewer..." shows for a second
+        (RESTART_NOTICE_MS), so that the window going away and coming back is not a surprise, and the new version starts."""
+        if not self.saved_or_discarded():
+            return
+        self._restart_notice()
+        self.root.after(RESTART_NOTICE_MS, self._restart_now)
+
+    def _restart_now(self):
+        self.quit(asked=True)
         try:
-            self.root.winfo_exists()                # (still there: closing was cancelled, e.g. unsaved changes)
+            self.root.winfo_exists()                # (still there: closing failed)
         except tk.TclError:
             app_update.relaunch()
+
+    def _restart_notice(self):
+        """A small window over the viewer's (or in the middle of the screen, while it is minimized) saying that it restarts to use the
+        update; it has the input meanwhile, and goes with the main window."""
+        note = tk.Toplevel(self.root)
+        note.wm_overrideredirect(True)
+        box = tk.Frame(note, bg="#ffffff", relief="solid", borderwidth=1)
+        box.pack()
+        tk.Label(box, text="Updated: restarting the viewer...", bg="#ffffff", font=("Segoe UI", 12), padx=28, pady=18).pack()
+        note.update_idletasks()
+        w, h = note.winfo_reqwidth(), note.winfo_reqheight()
+        if self.root.winfo_viewable():
+            x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
+            y = self.root.winfo_rooty() + (self.root.winfo_height() - h) // 2
+        else:
+            x, y = (self.root.winfo_screenwidth() - w) // 2, (self.root.winfo_screenheight() - h) // 2
+        note.wm_geometry(f"+{x}+{y}")
+        note.lift()
+        try:
+            note.grab_set()                         # (no clicks on the viewer in the second before it closes)
+        except tk.TclError:
+            pass
+        self.restart_note = note
 
     def _on_top(self):
         """The window a question goes over: the dialog that has the input (e.g. the open dialog, shown at launch), else the main
@@ -4666,8 +4698,9 @@ class XlefViewer:
         self.root.config(cursor="watch")
         run(app_update.check, root, then=lambda ok, value: (self.status.config(text=""), checked(ok, value)))
 
-    def quit(self):
-        if not self.saved_or_discarded():
+    def quit(self, asked=False):
+        """Closes the viewer, after asking about unsaved changes (asked: that was done already, as for an update's restart)."""
+        if not asked and not self.saved_or_discarded():
             return
         self._save_settings()
         self.generation += 1
@@ -8755,6 +8788,9 @@ class XlefViewer:
         target = self._disk_location(item)
         if target is not None:
             menu.add_command(label=REVEAL_LABEL, command=lambda: reveal_in_file_manager(*target))
+        path = self._copy_path_of(item)
+        if path:
+            menu.add_command(label="Copy path", command=lambda: self.copy_path(path))
         menu.add_command(label="Properties", command=lambda: self.show_properties(item))
         try:
             menu.tk_popup(int(x_root), int(y_root))
@@ -8780,6 +8816,26 @@ class XlefViewer:
         if os.path.basename(here).lower() == "metadata":
             here = os.path.dirname(here)
         return (here, False) if os.path.isdir(here) else None
+
+    def _copy_path_of(self, item):
+        """What Copy path puts on the clipboard for a list row: a project's .xlef (or .lif); a section's folder, the one with its channels'
+        image files (other sections' can be there too), or its .lif for an image inside one; a folder's own folder. None: no path known.
+        (Online-only files too: the path is useful before they are downloaded.)"""
+        if item in self.entries:
+            files = self.entries[item].all_files()
+            if not files:
+                return None
+            return files[0] if files[0].lower().endswith(".lif") else os.path.dirname(files[0])
+        if item in self.projects:
+            return self.projects[item]["path"]
+        target = self._disk_location(item)
+        return target[0] if target else None
+
+    def copy_path(self, path):
+        path = os.path.normpath(path)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(path)
+        self.status.config(text=f"Copied: {path}")
 
     def show_properties(self, item):
         """Right-click > Properties: what LAS X's Properties window shows for an image (see image_properties), or for a folder or a

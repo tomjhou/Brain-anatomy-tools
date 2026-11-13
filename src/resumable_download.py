@@ -441,7 +441,33 @@ def _parallel(self, bar, part, key, total, note_key, say, last_progress_box, wan
 
 
 def download_file(self, file_attributes, force_download=False, skip_hash_check=False):
-    """The replacement for S3CloudCache._download_file (same arguments; True if the file was downloaded, False if it was there). See the module's text."""
+    """The replacement for S3CloudCache._download_file (same arguments; True if the file was downloaded, False if it was there). See the module's text.
+    Only one copy of the apps (one program) at a time downloads a given file: another that asks for it meanwhile waits for the first (the file's own
+    lock, held by the operating system, so it is let go if that copy ends) and then finds the file there, or carries on from the .part file."""
+    import instance_lock
+    local = Path(file_attributes.local_path)
+    lock = instance_lock.Lock("download", path=str(part_path(local)) + ".lock")
+    told = False
+    while not lock.acquire("downloading " + local.name):
+        if not told:
+            tqdm_say(f"Another copy of the app is downloading {local.name}: waiting for it to finish (it is not downloaded twice).")
+            told = True
+        time.sleep(2)
+    try:
+        return _download_file_locked(self, file_attributes, force_download, skip_hash_check)
+    finally:
+        lock.release()
+
+
+def tqdm_say(text):
+    try:
+        import tqdm
+        tqdm.tqdm.write(text)
+    except Exception:
+        print(text)
+
+
+def _download_file_locked(self, file_attributes, force_download=False, skip_hash_check=False):
     import tqdm
     local = Path(file_attributes.local_path)
     part = part_path(local)

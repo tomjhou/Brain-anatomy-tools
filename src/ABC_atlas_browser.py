@@ -1200,7 +1200,7 @@ def update_before_download():
             return
         print(f"{len(changes)} new change(s) on GitHub: updating before the atlas download starts...")
         try:
-            app_update.pull(folder)
+            app_update.pull(folder, inside_start=True)
         except app_update.UpdateError as e:
             print(f"The update could not be applied ({e}); carrying on with this version.")
             return
@@ -1230,6 +1230,25 @@ def download_time_text(gb):
 
 
 def start_atlas_prefetch(cache):
+    """The start-up maintenance: updating these apps and downloading the atlas files that are missing (see _start_atlas_prefetch). Only one copy of
+    the apps on this computer does it at a time (instance_lock): a copy started while another is updating or downloading says so and opens without
+    it (a file it needs that is still arriving is waited for, see resumable_download), instead of both writing the same files. A copy started by an
+    update's restart waits a while for the copy it replaces to end."""
+    import instance_lock
+    restarted = os.environ.pop('ABC_RESTARTED', '') == '1'
+    if not instance_lock.maintenance.acquire("updating and downloading", wait=20.0 if restarted else 0.0):
+        holder = instance_lock.maintenance.who_holds()
+        print("Another copy of the app is updating or downloading right now" + (f" ({holder})" if holder else "") + ": this copy does not update or "
+              "download anything, so that the two do not collide. It opens normally; a file that is still arriving is waited for when it is needed, "
+              "and anything left over is done the next time the app starts with no other copy running.")
+        return
+    try:
+        _start_atlas_prefetch(cache)
+    finally:
+        instance_lock.maintenance.release()                  # (the download thread, if there is one, holds the lock for itself until it ends)
+
+
+def _start_atlas_prefetch(cache):
     """Start downloading the core atlas files that are missing, on a background thread (nothing if all are there, or offline).
     Fills atlas_prefetch with the thread and the size, and tells the user once what is going on."""
     core_files = []
@@ -1339,12 +1358,18 @@ def start_atlas_prefetch(cache):
     atlas_prefetch['core_gb'] = core_gb
     atlas_prefetch['core_paths'] = [m[5] for m in missing if m is not imputed_entry and m[5] is not None]
 
+    import instance_lock
+    instance_lock.maintenance.acquire("downloading the atlas")      # (the thread's own hold on the lock: let go when it ends)
+
     def work():
-        for _label, directory, file_name, kind, _size, _path in missing:          # (one after another: one progress bar in the console)
-            try:
-                (cache.get_data_path if kind == 'data' else cache.get_metadata_path)(directory=directory, file_name=file_name)
-            except Exception as e:
-                print(f"Could not download {file_name} ({type(e).__name__}: {e}); it will be tried again when it is needed.")
+        try:
+            for _label, directory, file_name, kind, _size, _path in missing:          # (one after another: one progress bar in the console)
+                try:
+                    (cache.get_data_path if kind == 'data' else cache.get_metadata_path)(directory=directory, file_name=file_name)
+                except Exception as e:
+                    print(f"Could not download {file_name} ({type(e).__name__}: {e}); it will be tried again when it is needed.")
+        finally:
+            instance_lock.maintenance.release()
     atlas_prefetch['thread'] = threading.Thread(target=work, daemon=True)
     atlas_prefetch['thread'].start()
 

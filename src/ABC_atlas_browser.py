@@ -1180,6 +1180,24 @@ def update_before_download():
         print(f"Could not update before the download ({type(e).__name__}: {e}).")
 
 
+def download_time_text(gb):
+    """A rough time for downloading `gb` gigabytes, as "about 5 to 15 minutes": at 30 MB/s (what the parallel download reaches on a good day) to 10 MB/s
+    (a slow one). Speeds vary a lot with the network, so it is a range, and said to be rough."""
+    def one(minutes):
+        if minutes < 1:
+            return "1 minute"
+        if minutes < 60:
+            step = 1 if minutes < 10 else 5
+            return f"{int(round(minutes / step) * step)} minutes"
+        hours = round(minutes / 60 * 2) / 2
+        return f"{hours:g} hours"
+    fast, slow = gb * 1000 / 30 / 60, gb * 1000 / 10 / 60
+    low, high = one(fast), one(slow)
+    if low.split()[-1].rstrip("s") == high.split()[-1].rstrip("s"):
+        low = low.split()[0]
+    return f"{low} to {high}"
+
+
 def start_atlas_prefetch(cache):
     """Start downloading the core atlas files that are missing, on a background thread (nothing if all are there, or offline).
     Fills atlas_prefetch with the thread and the size, and tells the user once what is going on."""
@@ -1281,6 +1299,11 @@ def start_atlas_prefetch(cache):
         atlas_prefetch['keys'].add((directory, file_name))
     total_gb = sum(m[4] or 0 for m in missing) / 1e9
     atlas_prefetch['total_gb'] = total_gb
+    imputed_entry = next((m for m in missing if (m[1], m[2]) == (IMPUTED_DATASET_DIRECTORY, IMPUTED_DATASET_FILE_NAME)), None)
+    imputed_gb = (imputed_entry[4] or 0) / 1e9 if imputed_entry else 0.0
+    core_gb = total_gb - imputed_gb                                  # (what opening the browser waits for: the imputed file is only waited for by Imputed Gene)
+    atlas_prefetch['core_gb'] = core_gb
+    atlas_prefetch['core_paths'] = [m[5] for m in missing if m is not imputed_entry and m[5] is not None]
 
     def work():
         for _label, directory, file_name, kind, _size, _path in missing:          # (one after another: one progress bar in the console)
@@ -1302,9 +1325,16 @@ def start_atlas_prefetch(cache):
         return f"{n / 1e9:.1f} GB" if n >= 1e8 else f"{max(n / 1e6, 1):.0f} MB"
     parts = "\n".join(f"    {m[0]}: {size_text(m[4])}" if m[4] else f"    {m[0]}" for m in missing)
     if total_gb >= 1:
-        message = (f"The atlas data is not on this computer yet, so it is being downloaded now (one time only):\n\n{parts}\n\n"
-                   f"That is about {total_gb:.0f} GB and can take 10 minutes or much longer, depending on the connection. Progress is shown in "
-                   "the console window. You can carry on to the launch screen; opening the browser will wait for the download to finish. "
+        if imputed_gb and core_gb >= 1:
+            sizes = (f"That is about {total_gb:.0f} GB in all: {core_gb:.0f} GB of core atlas data (roughly {download_time_text(core_gb)}), which the browser waits for, "
+                     f"then the {imputed_gb:.0f} GB imputed gene dataset (roughly {download_time_text(imputed_gb)} more), which carries on in the background "
+                     "while you work; Imputed Gene waits for it.")
+        elif imputed_gb:
+            sizes = f"That is about {imputed_gb:.0f} GB, roughly {download_time_text(imputed_gb)}. You can work meanwhile; Imputed Gene waits for it."
+        else:
+            sizes = f"That is about {total_gb:.0f} GB, roughly {download_time_text(total_gb)}; opening the browser waits for it."
+        message = (f"The atlas data is not on this computer yet, so it is being downloaded now (one time only):\n\n{parts}\n\n{sizes} "
+                   "The time depends on the connection. Progress is shown in the console window. You can carry on to the launch screen. "
                    "If the program is closed or the connection is lost, the download continues from where it stopped the next time.")
     else:                                                       # (only the small files, such as the CCF coordinates, were missing)
         message = (f"A little atlas data is not on this computer yet, so it is being downloaded now (one time only):\n\n{parts}\n\n"
@@ -7885,10 +7915,12 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         return loaded, get_section_labels(loaded, abc_cache)
 
     # The first time on a computer the atlas is still downloading (gigabytes, started at program start): far longer than reading it.
-    downloading = atlas_prefetch['thread'] is not None and atlas_prefetch['thread'].is_alive() and atlas_prefetch['total_gb'] >= 1
+    core_gb = atlas_prefetch.get('core_gb', atlas_prefetch['total_gb'])
+    downloading = (atlas_prefetch['thread'] is not None and atlas_prefetch['thread'].is_alive() and core_gb >= 1
+                   and any(not Path(p).exists() for p in atlas_prefetch.get('core_paths', [])))      # (the imputed file, after these, is not waited for here)
     if downloading:
-        loading_message = (f"Waiting for the MERFISH brain atlas to finish downloading ({atlas_prefetch['total_gb']:.0f} GB, one time only).\n"
-                           "This can take 10 minutes or more; see the console window for progress.")
+        loading_message = (f"Waiting for the MERFISH brain atlas to finish downloading ({core_gb:.0f} GB, one time only).\n"
+                           f"This can take roughly {download_time_text(core_gb)}; see the console window for progress.")
     else:
         loading_message = "Loading the MERFISH brain atlas (4+ million cells).\nThe first load after startup can take a minute."
     adata, section_series = run_with_loading_window(loading_message, load_raw_and_section_labels)

@@ -5,6 +5,9 @@ program closed or crashed, the network went away) leaves a file that is there bu
 deletes it and starts from the first byte. For the 50 GB imputed dataset that can be an hour or more lost.
 
 install() replaces the library's S3 download method (for every cache, whoever makes it) with download_file() here:
+- a big file (100 MB or more) is fetched in pieces of 32 MB, eight at a time, each over its own connection: one connection to the server
+  carries only a few MB/s, however fast the link, and eight carry several times that. The finished pieces are listed in "<name>.part.json", so
+  a later ask does only the pieces that were not finished (and a .part file from the one-stream version is continued: its whole pieces count);
 - the file is written to "<name>.part" beside its final name, and only moved to that name, and recorded as downloaded, once it is whole and
   its hash is right: nothing else (the library, the program's checks) ever sees a half-written file under the real name;
 - if it stops, the next ask continues from the end of the .part file (an HTTP range request) instead of from the start;
@@ -17,7 +20,9 @@ Progress for a window: downloaded_bytes(path) (the .part file's size while it is
 is waiting for the network, or checking the file, else None). The console shows tqdm's bar as the library did."""
 import errno
 import hashlib
+import json
 import os
+import queue
 import threading
 import time
 from pathlib import Path
@@ -26,9 +31,13 @@ CHUNK = 1 << 20
 RETRY_FIRST_S = 5                # the wait after the first failure, doubled each time up to RETRY_MAX_S
 RETRY_MAX_S = 60
 GIVE_UP_S = 2 * 3600             # no byte for this long: stop (the next ask of the file continues from the same place)
+WORKERS = 8                      # connections at once for a big file (the library's S3 client allows 10)
+SEGMENT = 32 * 1000 * 1000       # bytes in a piece: a piece is what is done again if the program stops in the middle of it
+PARALLEL_MIN = 100 * 1000 * 1000  # files smaller than this are fetched in one stream
 HASH_ATTEMPTS = 2                # whole downloads whose hash was wrong, before giving up
 _locks = {}
 _notes = {}
+_active = {}                       # path -> {'bytes': ...} for a download of pieces under way in this process
 _guard = threading.Lock()
 
 
@@ -41,14 +50,52 @@ def part_path(path):
     return path.with_name(path.name + ".part")
 
 
+def _state_path(part):
+    return Path(str(part) + ".json")
+
+
+def _read_state(part):
+    """The list of finished pieces kept beside a .part file by a download of pieces: {'total', 'segment', 'done': [...]}, or None."""
+    try:
+        with open(_state_path(part), "r", encoding="utf-8") as f:
+            state = json.load(f)
+        return {"total": int(state["total"]), "segment": int(state["segment"]), "done": [int(i) for i in state["done"]]}
+    except Exception:
+        return None
+
+
+def _write_state(part, total, done):
+    target = _state_path(part)
+    temporary = target.with_name(target.name + ".tmp")
+    try:
+        with open(temporary, "w", encoding="utf-8") as f:
+            json.dump({"total": total, "segment": SEGMENT, "done": done}, f)
+        os.replace(temporary, target)
+    except OSError:
+        pass                                                    # (only a progress note: the pieces are redone if it is missing)
+
+
 def downloaded_bytes(path):
-    """How much of the file is on disk: the .part file's size while it is being downloaded, else the file's own (0 if neither is there)."""
+    """How much of the file is on disk: while it is being downloaded, the bytes of the finished pieces and those arriving (parallel download), or the
+    .part file's size (one stream); else the file's own (0 if neither is there)."""
+    active = _active.get(str(path))
+    if active is not None:
+        return active["bytes"]
     sizes = [0]
-    for candidate in (part_path(path), Path(path)):
+    part = part_path(path)
+    state = _read_state(part)
+    if state is not None:
+        seg, total = state["segment"], state["total"]
+        sizes.append(sum(min((i + 1) * seg, total) - i * seg for i in state["done"]))
+    else:
         try:
-            sizes.append(candidate.stat().st_size)
+            sizes.append(part.stat().st_size)
         except OSError:
             pass
+    try:
+        sizes.append(Path(path).stat().st_size)
+    except OSError:
+        pass
     return max(sizes)
 
 
@@ -136,6 +183,175 @@ def _md5(path, key_text, total):
     return hasher.hexdigest()
 
 
+class _NoRange(Exception):
+    """The server ignored a Range header (it sent the whole object): parallel pieces cannot be used."""
+
+
+def _sequential(self, bar, part, key, total, note_key, say, last_progress_box):
+    """Downloads `part` from its end to `total` bytes in one stream, continuing after errors (the way for a small file, or when the server does not do ranges)."""
+    have = part.stat().st_size if part.exists() else 0
+    if have > total:
+        part.unlink()
+        have = 0
+        bar.n = 0
+        bar.refresh()
+    delay = RETRY_FIRST_S
+    last_progress_box[0] = time.monotonic()
+    while have < total:
+        try:
+            request = {"Bucket": self._bucket_name, "Key": key}
+            if have:
+                request["Range"] = f"bytes={have}-"
+            response = self.s3_client.get_object(**request)
+            if have and "ContentRange" not in response:         # (a server that ignores the range sends it all: from the beginning)
+                have = 0
+                bar.n = 0
+                bar.refresh()
+            with open(part, "ab" if have else "wb") as out:
+                for chunk in response["Body"].iter_chunks(CHUNK):
+                    out.write(chunk)
+                    have += len(chunk)
+                    bar.update(len(chunk))
+                    last_progress_box[0] = time.monotonic()
+                    delay = RETRY_FIRST_S
+                    _notes.pop(note_key, None)
+        except Exception as e:
+            if _fatal(e):
+                raise
+            have = part.stat().st_size if part.exists() else 0         # (what is on the disk is where it continues from)
+            bar.n = have
+            bar.refresh()
+            if time.monotonic() - last_progress_box[0] > GIVE_UP_S:
+                raise RuntimeError(f"Could not download {key}: no data for {GIVE_UP_S // 3600} hours ({type(e).__name__}: {e}). "
+                                   "What was downloaded is kept; asking for the file again continues from it.")
+            say(f"The download of {key.split('/')[-1]} was interrupted ({type(e).__name__}); continuing from {_size_text(have)} in {delay} s.")
+            _pause(note_key, delay, type(e).__name__, say)
+            delay = min(delay * 2, RETRY_MAX_S)
+            continue
+        have = part.stat().st_size if part.exists() else 0
+        if have < total:                                                # (the stream ended early without an error: ask for the rest)
+            if time.monotonic() - last_progress_box[0] > GIVE_UP_S:
+                raise RuntimeError(f"Could not download {key}: the server sent no more data for {GIVE_UP_S // 3600} hours.")
+            time.sleep(1)
+
+
+def _parallel(self, bar, part, key, total, note_key, say, last_progress_box):
+    """Downloads `part` in pieces of SEGMENT bytes, WORKERS at a time, each its own connection (one connection to the server runs at a fraction of
+    what the link can carry). The pieces that are finished are listed in the .part.json file beside it, so a later ask does only the rest. Raises
+    _NoRange if the server does not do ranges."""
+    count = (total + SEGMENT - 1) // SEGMENT
+
+    def span(i):
+        return i * SEGMENT, min((i + 1) * SEGMENT, total)
+
+    state = _read_state(part)
+    have = part.stat().st_size if part.exists() else 0
+    done = set()
+    if state is not None and state["total"] == total and state["segment"] == SEGMENT and have >= max((span(i)[1] for i in state["done"]), default=0):
+        done = set(state["done"])
+    elif state is None and have > 0:                           # (a file from the one-stream downloader: its whole pieces are the beginning)
+        done = {i for i in range(count) if span(i)[1] <= have}
+    else:
+        part.unlink(missing_ok=True)                              # (a leftover that does not fit this file: start over)
+        _state_path(part).unlink(missing_ok=True)
+    part.touch()
+    prog = {"bytes": sum(span(i)[1] - span(i)[0] for i in done)}
+    bar.n = prog["bytes"]
+    bar.refresh()
+    lock = threading.Lock()
+    abort = threading.Event()
+    errors = []
+    pending = queue.Queue()
+    for i in range(count):
+        if i not in done:
+            pending.put(i)
+    _active[note_key] = prog
+    last_progress_box[0] = time.monotonic()
+    wrote_state = [0.0]
+
+    def save_state(force=False):
+        with lock:
+            _write_state(part, total, sorted(done))
+
+    def run_segment(i):
+        start, stop = span(i)
+        pos, delay = start, RETRY_FIRST_S
+        while pos < stop:
+            if abort.is_set():
+                return False
+            try:
+                response = self.s3_client.get_object(Bucket=self._bucket_name, Key=key, Range=f"bytes={pos}-{stop - 1}")
+                if "ContentRange" not in response:
+                    raise _NoRange()
+                with open(part, "r+b") as out:
+                    out.seek(pos)
+                    for chunk in response["Body"].iter_chunks(CHUNK):
+                        if abort.is_set():
+                            return False
+                        chunk = chunk[:stop - pos]
+                        out.write(chunk)
+                        pos += len(chunk)
+                        with lock:
+                            prog["bytes"] += len(chunk)
+                            bar.update(len(chunk))
+                            last_progress_box[0] = time.monotonic()
+                        delay = RETRY_FIRST_S
+                        _notes.pop(note_key, None)
+                        if pos >= stop:
+                            break
+            except _NoRange:
+                raise
+            except Exception as e:
+                if _fatal(e):
+                    raise
+                if time.monotonic() - last_progress_box[0] > GIVE_UP_S:
+                    raise RuntimeError(f"Could not download {key}: no data for {GIVE_UP_S // 3600} hours ({type(e).__name__}: {e}). "
+                                       "What was downloaded is kept; asking for the file again continues from it.")
+                say(f"A part of {key.split('/')[-1]} was interrupted ({type(e).__name__}); continuing in {delay} s.")
+                _pause(note_key, delay, type(e).__name__, say)
+                delay = min(delay * 2, RETRY_MAX_S)
+                continue
+            if pos < stop:                                              # (the stream ended early without an error: ask for the rest)
+                time.sleep(1)
+        return True
+
+    def worker():
+        while not abort.is_set():
+            try:
+                i = pending.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                if run_segment(i):
+                    with lock:
+                        done.add(i)
+                    save_state()
+            except BaseException as e:
+                errors.append(e)
+                abort.set()
+                return
+
+    if done:
+        save_state()
+        say(f"Continuing {key.split('/')[-1]} from {_size_text(prog['bytes'])} of {_size_text(total)}.")
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(min(WORKERS, max(1, count - len(done))))]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            while t.is_alive():
+                t.join(0.5)
+    finally:
+        abort.set()
+        for t in threads:
+            t.join()
+        _active.pop(note_key, None)
+    if errors:
+        raise errors[0]
+    if part.stat().st_size != total:
+        raise RuntimeError(f"Could not download {key}: the file is {part.stat().st_size} bytes, not {total}.")
+
+
 def download_file(self, file_attributes, force_download=False, skip_hash_check=False):
     """The replacement for S3CloudCache._download_file (same arguments; True if the file was downloaded, False if it was there). See the module's text."""
     import tqdm
@@ -151,67 +367,42 @@ def download_file(self, file_attributes, force_download=False, skip_hash_check=F
                 self._remove_download_from_list(file_attributes)
                 local.unlink()
                 part.unlink(missing_ok=True)
+                _state_path(part).unlink(missing_ok=True)
             else:                                               # (cut short by the library's own downloader: a good beginning, continue from it)
                 part.unlink(missing_ok=True)
+                _state_path(part).unlink(missing_ok=True)
                 os.replace(local, part)
         local.parent.mkdir(parents=True, exist_ok=True)
         key = str(file_attributes.relative_path).replace("\\", "/")
         say = lambda text: tqdm.tqdm.write(text)
         started = time.monotonic()
         total = _object_size(self, key, say, started + GIVE_UP_S, note_key)
-        have = part.stat().st_size if part.exists() else 0
-        bar = tqdm.tqdm(desc=key.split("/")[-1], total=total, initial=min(have, total), unit_scale=True, unit_divisor=1000., unit="B")     # ("B" with unit_scale: tqdm adds the M or G itself; the library's unit="MB" gave "MMB/s")
-        if have:
+        have = downloaded_bytes(local)
+        bar = tqdm.tqdm(desc=key.split("/")[-1], total=total, initial=min(have, total), unit_scale=True, unit_divisor=1000., unit="B")
+        if have and total < PARALLEL_MIN:
             say(f"Continuing {key.split('/')[-1]} from {_size_text(have)} of {_size_text(total)}.")
+        last_progress = [time.monotonic()]
         wrong_hash = 0
+        parallel = total >= PARALLEL_MIN
         try:
             while True:
-                have = part.stat().st_size if part.exists() else 0
-                if have > total:
-                    part.unlink()
-                    have = 0
-                    bar.n = 0
-                    bar.refresh()
-                delay, last_progress = RETRY_FIRST_S, time.monotonic()
-                while have < total:
+                if parallel:
                     try:
-                        request = {"Bucket": self._bucket_name, "Key": key}
-                        if have:
-                            request["Range"] = f"bytes={have}-"
-                        response = self.s3_client.get_object(**request)
-                        if have and "ContentRange" not in response:         # (a server that ignores the range sends it all: from the beginning)
-                            have = 0
-                            bar.n = 0
-                            bar.refresh()
-                        with open(part, "ab" if have else "wb") as out:
-                            for chunk in response["Body"].iter_chunks(CHUNK):
-                                out.write(chunk)
-                                have += len(chunk)
-                                bar.update(len(chunk))
-                                last_progress = time.monotonic()
-                                delay = RETRY_FIRST_S
-                                _notes.pop(note_key, None)
-                    except Exception as e:
-                        if _fatal(e):
-                            raise
-                        have = part.stat().st_size if part.exists() else 0         # (what is on the disk is where it continues from)
-                        bar.n = have
+                        _parallel(self, bar, part, key, total, note_key, say, last_progress)
+                    except _NoRange:
+                        say("The server does not support downloading in parts; downloading in one stream.")
+                        parallel = False
+                        part.unlink(missing_ok=True)
+                        _state_path(part).unlink(missing_ok=True)
+                        bar.n = 0
                         bar.refresh()
-                        if time.monotonic() - last_progress > GIVE_UP_S:
-                            raise RuntimeError(f"Could not download {key}: no data for {GIVE_UP_S // 3600} hours ({type(e).__name__}: {e}). "
-                                               "What was downloaded is kept; asking for the file again continues from it.")
-                        say(f"The download of {key.split('/')[-1]} was interrupted ({type(e).__name__}); continuing from {_size_text(have)} in {delay} s.")
-                        _pause(note_key, delay, type(e).__name__, say)
-                        delay = min(delay * 2, RETRY_MAX_S)
                         continue
-                    have = part.stat().st_size if part.exists() else 0
-                    if have < total:                                                # (the stream ended early without an error: ask for the rest)
-                        if time.monotonic() - last_progress > GIVE_UP_S:
-                            raise RuntimeError(f"Could not download {key}: the server sent no more data for {GIVE_UP_S // 3600} hours.")
-                        time.sleep(1)
+                else:
+                    _sequential(self, bar, part, key, total, note_key, say, last_progress)
                 if not skip_hash_check:
                     if _md5(part, note_key, total) != file_attributes.file_hash:
                         part.unlink(missing_ok=True)
+                        _state_path(part).unlink(missing_ok=True)
                         wrong_hash += 1
                         if wrong_hash >= HASH_ATTEMPTS:
                             raise RuntimeError(f"Could not download {key}: the file's check value was wrong {wrong_hash} times.")
@@ -224,5 +415,6 @@ def download_file(self, file_attributes, force_download=False, skip_hash_check=F
             bar.close()
             _notes.pop(note_key, None)
         os.replace(part, local)
+        _state_path(part).unlink(missing_ok=True)
         self._update_list_of_downloads(file_attributes=file_attributes)
         return True

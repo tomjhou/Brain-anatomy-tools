@@ -2884,7 +2884,7 @@ def load_ccf_for_cells(abc_cache, cell_labels, shell_points=0):
         chunks = []
         for chunk in pd.read_csv(csv_path, index_col=0, dtype={'cell_label': str}, chunksize=SPATIAL_CSV_CHUNK_SIZE):
             chunks.append(chunk)
-        table = pd.concat(chunks, copy=False)
+        table = pd.concat(chunks)
         table = table.rename(columns={'x': 'x_ccf', 'y': 'y_ccf', 'z': 'z_ccf'})
         for column in ('x_ccf', 'y_ccf', 'z_ccf'):
             table[column] = table[column].astype(np.float32)

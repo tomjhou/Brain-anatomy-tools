@@ -774,7 +774,7 @@ def _load_raw_section_spatial_coords(adata, abc_cache, progress_callback=None):
             rows_read += len(chunk)
             if progress_callback is not None:
                 progress_callback(rows_read, total_rows)
-        cell_meta = pd.concat(chunks, copy=False)
+        cell_meta = pd.concat(chunks)
         if cache_path is not None:
             try:
                 t0 = time.perf_counter()

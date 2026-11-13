@@ -20,6 +20,7 @@ from PIL import Image
 
 import abc_core as core
 from tk_dash import dash
+from screen_area import place_beside
 from abc_tk_picker import SectionData, ZoomView, prompt_subregion_selection_tk
 
 SECTION_Z_LABEL_FONTSIZE = 8          # points: the z label at the top-right of each thumbnail
@@ -285,15 +286,7 @@ class GridWindow:
         self.tip.wm_overrideredirect(True)
         tk.Label(self.tip, text=SECTION_TIP_TEXT, bg="#ffffe0", relief="solid", borderwidth=1, font=("Segoe UI", 9), padx=4, pady=1,
                  justify=tk.LEFT, wraplength=360).pack()
-        self.tip.update_idletasks()
-        w, h = self.tip.winfo_reqwidth(), self.tip.winfo_reqheight()
-        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        x, y = x_root + 12, y_root + 18
-        if x + w > sw:
-            x = max(x_root - w - 12, 0)
-        if y + h > sh:
-            y = max(y_root - h - 8, 0)
-        self.tip.wm_geometry(f"+{x}+{y}")
+        place_beside(self.tip, x_root, y_root, self.root)          # (beside the pointer, kept on the monitor it is on)
 
     def on_press(self, e):
         self.tip_off()

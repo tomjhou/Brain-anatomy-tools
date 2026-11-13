@@ -1126,6 +1126,12 @@ ATLAS_RECON_LABELS = ("the reconstructed cell coordinates", "the atlas regions t
 # ...and the CCF coordinates of the cells (a third of a GB) and the CCF region names: the AP from bregma of the sections, shown in the section grid and the
 # single-section readout, is read from them, and so are the CCF atlas overlay and the cell tips' ML and DV. Fetched with the rest, not when first asked for.
 ATLAS_CCF_LABELS = ("the CCF cell coordinates", "the CCF region names")
+# ...and the CCF annotation volume (a few MB: the CCF's regions, for the brain edges of the 3D views and the CCF browser). So all of the CCF is on
+# the computer once the first download is done, and nothing about it is asked later: a file missing after that (deleted, damaged) is downloaded
+# again when it is needed, with a progress window (ensure_ccf_downloaded), not asked about.
+CCF_VOLUME_DIRECTORY = 'Allen-CCF-2020'
+CCF_VOLUME_FILE_NAME = 'annotation_25'      # ~3.6 MB download; 528 x 320 x 456 voxels, axes (AP, DV, ML) as x/y/z_ccf
+CCF_ALL_FILES = tuple((d, f, 'metadata') for d, f in CCF_FILES) + ((CCF_VOLUME_DIRECTORY, CCF_VOLUME_FILE_NAME, 'data'),)
 atlas_prefetch = {'thread': None, 'total_gb': 0.0, 'files': [], 'keys': set()}
 
 
@@ -1211,6 +1217,9 @@ def start_atlas_prefetch(cache):
         path, size, present = metadata_file_status(cache, directory, file_name)
         if present is False:
             ccf.append((label, directory, file_name, 'metadata', size, path))
+    path, size, present = metadata_file_status(cache, CCF_VOLUME_DIRECTORY, CCF_VOLUME_FILE_NAME)
+    if present is False:
+        ccf.append(("the CCF annotation volume", CCF_VOLUME_DIRECTORY, CCF_VOLUME_FILE_NAME, 'data', size, path))
     # The imputed gene dataset (about 50 GB) is not fetched at start-up unless a download of it was begun and cut short (the program closed, a
     # crash, the network lost): what is on the disk then is the start of it (a .part file: see resumable_download.py), and it is offered to continue.
     resume = None
@@ -1896,8 +1905,6 @@ THREED_WEB_SMOOTH_SPHERE_MAX_POINTS = 6000  # up to this many cells: 42-vertex s
 THREED_WEB_SPHERE_MAX_POINTS = 40000        # up to this many: 12-vertex spheres; beyond, outlined flat markers
 # Edges for the browser view: the Allen CCF annotation volume (every 25 um voxel labelled with its brain region, the same
 # parcellation_index the cells carry) gives the true brain surface, the ventricles and any region's boundary.
-CCF_VOLUME_DIRECTORY = 'Allen-CCF-2020'
-CCF_VOLUME_FILE_NAME = 'annotation_25'      # ~3.6 MB download; 528 x 320 x 456 voxels, axes (AP, DV, ML) as x/y/z_ccf
 CCF_VOLUME_VOXEL_MM = 0.025
 CCF_VENTRICLE_DIVISIONS = ('VL', 'V3', 'V4', 'AQ', 'c')   # lateral, third, fourth ventricle, aqueduct, central canal
 CCF_EDGES_CACHE_VERSION = 1
@@ -2792,34 +2799,22 @@ def read_run_frame(run_folder):
         return 'raw'
 
 
-def ensure_ccf_downloaded(abc_cache, parent=None, files=CCF_FILES, what="CCF coordinates", note=""):
-    """True once every CCF file (or each of `files`, as in RECON_FILES) is in the local cache, downloading
-    them first if need be: asks (naming the size, and saying `note` if given) before downloading, then shows a progress window fed
-    by the bytes landing on disk. False if the user declined or cancelled, or the download failed."""
+def ensure_ccf_downloaded(abc_cache, parent=None, files=CCF_ALL_FILES, what="CCF atlas files"):
+    """True once every CCF file (or each of `files`, as in RECON_FILES) is in the local cache. They come with the first download
+    (start_atlas_prefetch), so this is a repair, for a file deleted or damaged since: it is downloaded again, without asking, behind a
+    progress window fed by the bytes landing on disk. False if the download failed or was cancelled. (`parent` is not used: kept for the
+    callers.)"""
     missing = ccf_files_missing(abc_cache, files)
     if not missing:
         return True
     kinds = {(entry[0], entry[1]): (entry[2] if len(entry) > 2 else 'metadata') for entry in files}
     total_bytes = sum(size or 0 for _d, _f, size, _p in missing)
     size_text = f"{total_bytes / 1e6:.0f} MB" if total_bytes else "a large file"
-    # Already on their way in the atlas download at start-up (start_atlas_prefetch): not asked about, and not downloaded a second time beside it
-    # (the per-file lock of serialize_downloads makes the download below wait for that one, and then find the files there).
+    # Still on their way in the first download (start_atlas_prefetch): not downloaded a second time beside it (the per-file lock of
+    # serialize_downloads makes the download below wait for that one, and then find the files there).
     queued = atlas_download_running() is not None and all((d, f) in atlas_prefetch['keys'] for d, f, _s, _p in missing)
     if not queued:
-        question = (f"This needs the Allen {what}, a one-time download of "
-                    f"{size_text} into your atlas cache folder.\n\n" + (f"{note}\n\n" if note else "") + "Download it now?")
-        try:
-            if parent is None:                          # (no window to put it over: in the middle of the screen, see centered_dialog.py)
-                import centered_dialog
-                answer = centered_dialog.ask_yes_no("Download CCF coordinates?", question)
-            else:
-                from tkinter import messagebox
-                answer = messagebox.askyesno("Download CCF coordinates?", question, parent=parent)
-            if not answer:
-                return False
-        except Exception as e:
-            print(f"Could not ask about the CCF download ({e}); not downloading.")
-            return False
+        print(f"Some of the {what} are missing from the atlas cache: downloading them again ({size_text}).")
 
     outcome = {'error': None, 'done': False}
 
@@ -2837,8 +2832,7 @@ def ensure_ccf_downloaded(abc_cache, parent=None, files=CCF_FILES, what="CCF coo
 
     threading.Thread(target=worker, daemon=True).start()
     restore_cursors = set_wait_cursor_on_open_figures()
-    proc_fig, cancel_flag, set_progress = show_processing_dialog(
-        f"Downloading the {what} ({size_text}); a one-time download.")
+    proc_fig, cancel_flag, set_progress = show_processing_dialog(f"Downloading the {what} ({size_text}).")
     started = time.perf_counter()
     try:
         set_progress(0.0)
@@ -6101,27 +6095,15 @@ def get_cached_raw_backed_adata(raw_backed_cache, abc_cache):
 def build_3d_edges(abc_cache, structures, parent=None):
     """The browser view's edge geometry (brain surface, ventricles, white-matter tracts, and the region(s) holding most of the shown cells'
     `structures`, none if there are none) from the CCF annotation volume, or None (the view then just has its cloud).
-    Asks before the one-time download of that volume; the first build takes about half a minute, and is cached after
-    that. Runs behind a loading window, so call it from the thread that owns the Tk windows."""
+    (The volume comes with the first download; ensure_ccf_downloaded fetches it again if it has gone.) The first build takes about half a
+    minute, and is cached after that. Runs behind a loading window, so call it from the thread that owns the Tk windows."""
     names = load_parcellation_names(abc_cache)
     if names is None:
         return None
     regions = choose_cell_regions(structures) if structures is not None and len(structures) else []
     _store, missing, have_skimage = ccf_edges_missing(regions)
-    if missing:
-        _path, size, present = metadata_file_status(abc_cache, CCF_VOLUME_DIRECTORY, CCF_VOLUME_FILE_NAME)
-        if present is not True:
-            try:
-                from tkinter import messagebox
-                size_text = f"{size / 1e6:.1f} MB" if size else "a small file"
-                if not messagebox.askyesno(
-                        "Download the CCF annotation volume?",
-                        f"The brain edges need the Allen CCF annotation volume, a one-time download of {size_text} "
-                        f"into your atlas cache folder. Download it now?", parent=parent):
-                    return None
-            except Exception as e:
-                print(f"Could not ask about the CCF volume download ({e}); no edges.")
-                return None
+    if missing and not ensure_ccf_downloaded(abc_cache, parent=parent):
+        return None
     try:
         return run_with_loading_window(
             "Building the brain edges (the first time takes about half a minute; they are cached after that).",
@@ -6193,7 +6175,7 @@ def read_coordinates_for_3d(path):
 
 def build_3d_viewer_page(abc_cache, csv_path=None, parent=None):
     """Writes the interactive 3D page for the cells in `csv_path` (none when it is None or empty: the brain alone) into
-    THREED_VIEWER_DIR and returns its path, or None if the CCF download it needs was declined. Raises on a bad file or
+    THREED_VIEWER_DIR and returns its path, or None if CCF files it needs were missing and could not be downloaded. Raises on a bad file or
     a missing plotly. Blocking and, the first time, slow: run it from the thread that owns the Tk windows."""
     import plotly  # noqa: F401  (fail early, before any of the slow steps)
     loaded = read_coordinates_for_3d(csv_path) if csv_path else None

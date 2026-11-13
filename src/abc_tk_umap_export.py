@@ -719,7 +719,7 @@ class ExportsMixin:
         level, targets = chosen
         h = self.host
         level_name = LEVEL_LONG[level]
-        choice = h["prompt_deg_comparison_mode"](self.root, f"DEGs for {level_name} {', '.join(str(t) for t in targets)}", level_name)
+        choice = h["prompt_deg_comparison_mode"](self.root, f"DEGs for {level_name} {', '.join(core.typed_text(t) for t in targets)}", level_name)
         if choice is None:
             self.var_status.set("DEG export cancelled.")
             return
@@ -731,7 +731,7 @@ class ExportsMixin:
         ids_arr = self.level_ids(level)
         adata, sc, has_counts = self.adata, h["sc"], self.has_counts
         imputed_full = self.imputed_for_export()
-        token = safe_token(f"{level}_{'-'.join(str(t) for t in eff)}" + (f"_vsRef{reference}" if mode == "reference" else ""), level)
+        token = safe_token(f"{level}_{'-'.join(core.key_text(t) for t in eff)}" + (f"_vsRef{reference}" if mode == "reference" else ""), level)
         paths = self.ask_csv_paths("DE genes", "DEG", token, has_counts, imputed_full is not None)
         if paths is None:
             self.var_status.set("DEG export cancelled.")
@@ -746,14 +746,14 @@ class ExportsMixin:
                 frames = []
                 for t in eff:
                     if mode == "reference":
-                        pair = (ids_arr == t) | (ids_arr == reference)
-                        comp, gm = m[pair], ids_arr[pair] == t
+                        pair = core.in_group(ids_arr, t) | (ids_arr == reference)
+                        comp, gm = m[pair], core.in_group(ids_arr[pair], t)
                     else:
-                        comp, gm = m, ids_arr == t
+                        comp, gm = m, core.in_group(ids_arr, t)
                     if not gm.any() or gm.all():
                         continue
                     df = h["compute_de_genes"](comp, gm, log1p_base=None)
-                    df.insert(0, "group_id", t)
+                    df.insert(0, "group_id", core.group_id_value(t))
                     if mode == "reference":
                         df.insert(1, "reference_id", reference)
                     frames.append(df)
@@ -775,14 +775,14 @@ class ExportsMixin:
                     frames = []
                     for t in eff:
                         if mode == "reference":
-                            pair = (iid == t) | (iid == reference)
-                            comp, gm = sub[pair], iid[pair] == t
+                            pair = core.in_group(iid, t) | (iid == reference)
+                            comp, gm = sub[pair], core.in_group(iid[pair], t)
                         else:
-                            comp, gm = sub, iid == t
+                            comp, gm = sub, core.in_group(iid, t)
                         if not gm.any() or gm.all():
                             continue
                         df = h["compute_de_genes"](comp, gm, log1p_base=2)
-                        df.insert(0, "group_id", t)
+                        df.insert(0, "group_id", core.group_id_value(t))
                         if mode == "reference":
                             df.insert(1, "reference_id", reference)
                         frames.append(df)
@@ -827,7 +827,7 @@ class ExportsMixin:
         ids_arr = self.level_ids(level)
         adata, sc, has_counts = self.adata, h["sc"], self.has_counts
         imputed_full = self.imputed_for_export()
-        token = safe_token(f"{level}_{'-'.join(str(t) for t in targets)}", level)
+        token = safe_token(f"{level}_{'-'.join(core.key_text(t) for t in targets)}", level)
         paths = self.ask_csv_paths("expression", "EXPR", token, has_counts, imputed_full is not None)
         if paths is None:
             self.var_status.set("Expression export cancelled.")
@@ -842,9 +842,9 @@ class ExportsMixin:
                 df = pd.DataFrame({"gene_symbol": m.var["gene_symbol"].values, "ensembl_id": m.var_names})
                 included = []
                 for t in targets:
-                    gm = ids_arr == t
+                    gm = core.in_group(ids_arr, t)
                     if gm.any():
-                        df[f"mean_log2_expr_{t}"] = h["mean_log2_expression"](m, gm, log1p_base=None).values
+                        df[f"mean_log2_expr_{core.key_text(t)}"] = h["mean_log2_expression"](m, gm, log1p_base=None).values
                         included.append(t)
                 if included:
                     df = df.sort_values("gene_symbol", kind="stable").reset_index(drop=True)
@@ -864,9 +864,9 @@ class ExportsMixin:
                     df = pd.DataFrame({"gene_symbol": sub.var["gene_symbol"].values, "ensembl_id": sub.var_names})
                     included = []
                     for t in targets:
-                        gm = iid == t
+                        gm = core.in_group(iid, t)
                         if gm.any():
-                            df[f"mean_log2_expr_{t}"] = h["mean_log2_expression"](sub, gm, log1p_base=2).values
+                            df[f"mean_log2_expr_{core.key_text(t)}"] = h["mean_log2_expression"](sub, gm, log1p_base=2).values
                             included.append(t)
                     if included:
                         df = df.sort_values("gene_symbol", kind="stable").reset_index(drop=True)
@@ -908,10 +908,10 @@ class ExportsMixin:
         if use_bg:
             ids = self.group_keys(level, barr)
             for t in targets:
-                rows = np.flatnonzero(ids == t)
+                rows = np.flatnonzero(core.in_group(ids, t))
                 if not rows.size:
                     continue
-                f = pd.DataFrame({"cell_label": bg["ids"][rows], "group_id": t, "brain_section_label": bg["sec_arr"][rows]})
+                f = pd.DataFrame({"cell_label": bg["ids"][rows], "group_id": core.group_id_value(t), "brain_section_label": bg["sec_arr"][rows]})
                 for tl in ("class", "subclass", "supertype", "cluster"):
                     v = bg["levels"].get(tl)
                     if v is not None:
@@ -924,10 +924,10 @@ class ExportsMixin:
         else:
             ids = self.level_ids(level)
             for t in targets:
-                rows = np.flatnonzero(ids == t)
+                rows = np.flatnonzero(core.in_group(ids, t))
                 if not rows.size:
                     continue
-                f = pd.DataFrame({"cell_label": self.adata.obs_names[rows], "group_id": t})
+                f = pd.DataFrame({"cell_label": self.adata.obs_names[rows], "group_id": core.group_id_value(t)})
                 if self.section_of is not None:
                     f["brain_section_label"] = self.section_of[rows]
                 for tl in ("class", "subclass", "supertype", "cluster"):
@@ -969,7 +969,7 @@ class ExportsMixin:
         if chosen is None:
             return
         level, targets = chosen
-        stem = f"coordinates_{level}_{'-'.join(str(t) for t in targets)}"
+        stem = f"coordinates_{level}_{'-'.join(core.key_text(t) for t in targets)}"
         proposed = self.host["unique_export_paths"](self.target_dir(), stem, (".csv",))[".csv"].name
         path = self.ask_save_path("Save the coordinates of the cells of those groups", proposed, ".csv", "CSV file")
         if path is None:
@@ -988,7 +988,7 @@ class ExportsMixin:
                          "section_z_mm", "ccf_x_mm", "ccf_y_mm", "ccf_z_mm", "ccf_division", "ccf_structure", "ccf_substructure", "in_run", "umap1", "umap2"]
                 table = table[[c for c in front if c in table.columns]]
                 table.to_csv(path, index=False)
-                self.var_status.set(f"Saved {len(table):,} cells ({scope})" + ("" if have_ccf else " (no CCF columns: that download was declined)") + f" to {path}.")
+                self.var_status.set(f"Saved {len(table):,} cells ({scope})" + ("" if have_ccf else " (no CCF columns: the CCF atlas files could not be downloaded)") + f" to {path}.")
         except Exception as e:
             self.var_status.set(f"Could not export coordinates: {e}")
             print(f"Could not export coordinates: {e}", flush=True)
@@ -1057,7 +1057,7 @@ class ExportsMixin:
         level_name = LEVEL_LONG[level]
         groups = []
         for t in targets:
-            rows = table[table["group_id"] == t]
+            rows = table[table["group_id"] == core.group_id_value(t)]
             hover = None
             if have_ccf and "ccf_structure" in rows.columns:
                 hover = (rows["ccf_structure"].fillna("?").astype(str) + " | section " + rows["brain_section_label"].astype(str).str.rsplit(".", n=1).str[-1]
@@ -1066,11 +1066,11 @@ class ExportsMixin:
             xyz = rows[list(columns)].to_numpy(dtype=float)
             if jitter_mm > 0:                    # (the middle column is the one across the sections)
                 xyz[:, 1] += np.random.default_rng().uniform(-jitter_mm, jitter_mm, len(xyz))
-            groups.append({"label": f"{level_name} {t} ({len(rows):,})", "color": hexcolor(color) if color is not None else "red",
+            groups.append({"label": f"{level_name} {core.key_text(t)} ({len(rows):,})", "color": hexcolor(color) if color is not None else "red",
                            "xyz": xyz, "hover": hover})
         structures = table["ccf_structure"].to_numpy() if have_ccf and "ccf_structure" in table.columns else None
         return {"groups": groups, "shell_xyz": shell_xyz, "outline": outline, "axis_labels": axis_labels, "structures": structures,
-                "title": f"3D view: {level_name.lower()} {', '.join(str(t) for t in targets)} ({scope})", "have_ccf": have_ccf, "level": level,
+                "title": f"3D view: {level_name.lower()} {', '.join(core.typed_text(t) for t in targets)} ({scope})", "have_ccf": have_ccf, "level": level,
                 "targets": targets}
 
     def show_3d_browser(self):
@@ -1094,7 +1094,7 @@ class ExportsMixin:
             if p is not None:
                 h = self.host
                 target = self.target_dir()
-                path = h["unique_export_paths"](target, f"3d_{p['level']}_{'-'.join(str(t) for t in p['targets'])}", (".html",))[".html"]
+                path = h["unique_export_paths"](target, f"3d_{p['level']}_{'-'.join(core.key_text(t) for t in p['targets'])}", (".html",))[".html"]
                 edges = h["build_3d_edges"](self.abc_cache, p["structures"], self.root) if p["have_ccf"] else None
                 self.var_status.set("Writing the 3D page...")
                 self.root.update()

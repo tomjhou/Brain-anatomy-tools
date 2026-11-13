@@ -849,7 +849,8 @@ CCF_FILES = ((CCF_DIRECTORY, CCF_COORDS_FILE_NAME), (CCF_PARCELLATION_DIRECTORY,
 
 
 # For the reconstructed coordinates: each cell's x, y, z in Allen's reconstructed space (a table), and the CCF annotation resampled into that same
-# space (a volume: [x, y, section] voxels of 10, 10 and 200 um, the labels of the CCF's regions). Downloaded (with a confirmation) when first needed.
+# space (a volume: [x, y, section] voxels of 10, 10 and 200 um, the labels of the CCF's regions). Part of the first download when the setting asks
+# for them, else downloaded (with a progress window, not a question) when first needed.
 RECON_COORDS_FILE_NAME = 'reconstructed_coordinates'
 RECON_ANNOTATION_FILE_NAME = 'resampled_annotation'
 RECON_FILES = ((CCF_DIRECTORY, RECON_COORDS_FILE_NAME, 'metadata'), (CCF_DIRECTORY, RECON_ANNOTATION_FILE_NAME, 'data'))
@@ -1271,6 +1272,40 @@ def render_group_highlight_array(section_series, section_label, spatial, level, 
 
 GROUP_HIGHLIGHT_COLORS = [(1.0, 0.84, 0.0), (0.0, 0.85, 1.0), (1.0, 0.25, 0.85), (0.35, 1.0, 0.25), (1.0, 0.45, 0.1), (0.65, 0.5, 1.0),
                           (1.0, 0.2, 0.2), (0.0, 1.0, 0.7)]
+
+
+# A group target of Specific group(s): one group's number (or name), or a tuple of them that are one group together, typed in parentheses.
+def in_group(values, target):
+    """Which of `values` (an array of group keys: numbers, or names) belong to `target`: one key, or a tuple of keys that are one group together."""
+    return np.isin(values, list(target)) if isinstance(target, tuple) else values == target
+
+
+def target_members(target):
+    return target if isinstance(target, tuple) else (target,)
+
+
+def key_text(target):
+    """A group target as the legend and the file names write it: '888', or '888+890+891' for several together."""
+    members = target_members(target)
+    return str(members[0]) if len(members) == 1 else (" + " if any(isinstance(m, str) for m in members) else "+").join(str(m) for m in members)
+
+
+def typed_text(target):
+    """A group target as it is typed: '888', or '(888, 890, 891)'."""
+    return "(" + ", ".join(str(m) for m in target) + ")" if isinstance(target, tuple) else str(target)
+
+
+def target_row(targets, key):
+    """The index of the target of `targets` that has `key` (one group's number or name) in it, or None."""
+    for j, t in enumerate(targets):
+        if key in target_members(t):
+            return j
+    return None
+
+
+def group_id_value(target):
+    """What a group target is called in an exported table's group_id column: its number, or '888+890+891' for several together."""
+    return key_text(target) if isinstance(target, tuple) else target
 
 
 def parse_group_numbers(text):

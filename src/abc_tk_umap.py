@@ -33,6 +33,7 @@ from scipy.spatial import cKDTree
 import abc_core as core
 import abc_project
 from tk_dash import dash
+from screen_area import place_beside
 import abc_tk_ccf
 from abc_tk_umap_export import ExportsMixin, hexcolor
 
@@ -56,6 +57,8 @@ LINEAGE_HUE_STEP = 0.04
 LEVEL_NAMES = {"class": "Class", "subclass": "Subclass", "supertype": "Supertype", "cluster": "Cluster", "leiden": "Leiden", "neurotransmitter": "Neurotransmitter"}
 NOT_IN_TAXONOMY = ("leiden", "neurotransmitter")        # the levels that are not a step down from the one above (so a group's table is just its own row)
 TILE_PX = 230
+CAPTION_AP_MIN_PX = 110      # a section map this wide (pixels) has its AP from bregma after its number; narrower, only the number (a longer caption would widen the panel)
+CAPTION_Z_MIN_PX = 200       # ...and this wide, the section's MERFISH z as well
 BLINK_PAUSE_MS = 1000              # a highlighted cell (its ring or white dot) starts to blink when it has stood this long...
 BLINK_ON_MS, BLINK_OFF_MS = 450, 250       # ...shown this long, hidden this long, over and over (until another cell is highlighted or it is cleared)
 MIN_TILE_PX = 50
@@ -106,6 +109,52 @@ HOVER_RADIUS_PX = 9
 HOVER_REACH_DOTS = 0.75               # at a high zoom the pointer reaches a cell this many dot widths away (HOVER_RADIUS_PX is the least)
 SCALE_UNITS = {("standard", "log"): "log2(1 + expr)", ("standard", "linear"): "expr (raw counts)",
                ("imputed", "log"): "log2 (imputed)", ("imputed", "linear"): "linear (imputed)"}
+
+
+def split_group_items(text, spaces_separate=True):
+    """The entries typed in Specific group(s): separated by commas (and, for numbers, spaces), where several inside parentheses are one entry, a
+    group made of all of them: '(888, 890, 891), 1047' -> [['888', '890', '891'], ['1047']]. Returns (the entries, each a list of the pieces in
+    it; the problems with the parentheses: 'unclosed (' or 'extra )', and a '(' inside another is ignored)."""
+    items, bad = [], []
+    state = {"group": None, "buf": ""}
+
+    def end_piece():
+        piece = state["buf"].strip()
+        state["buf"] = ""
+        if piece:
+            if state["group"] is None:
+                items.append([piece])
+            else:
+                state["group"].append(piece)
+
+    for ch in text:
+        if ch == "(":
+            end_piece()
+            if state["group"] is not None:
+                bad.append("( inside ( )")
+            else:
+                state["group"] = []
+        elif ch == ")":
+            end_piece()
+            if state["group"] is None:
+                bad.append("extra )")
+            else:
+                if state["group"]:
+                    items.append(state["group"])
+                state["group"] = None
+        elif ch in ",;" or (spaces_separate and ch.isspace()):
+            end_piece()
+        else:
+            state["buf"] += ch
+    end_piece()
+    if state["group"] is not None:
+        if state["group"]:
+            items.append(state["group"])
+        bad.append("unclosed (")
+    return items, bad
+
+
+in_group, target_members, key_text, typed_text, target_row = core.in_group, core.target_members, core.key_text, core.typed_text, core.target_row
 
 
 def rank_color(rank):
@@ -498,16 +547,26 @@ class RangeSlider(tk.Canvas):
 
 
 class HoverTip:
-    """A small tip beside the pointer while it is over `widget`; `text_fn()` gives the text (asked again as the pointer moves)."""
+    """A small tip beside the pointer while it is over `widget`; `text_fn()` gives the text (asked again as the pointer moves).
+    more: (title, more_fn) for a "Learn more..." link at the foot of the tip, which opens more_fn()'s longer text in a message box. Such a
+    tip stays where it came up (it doesn't follow the pointer), and stays open while the pointer goes from the widget onto it, so that the
+    link can be reached and clicked."""
 
-    def __init__(self, widget, text_fn):
-        self.widget, self.text_fn, self.tip, self.label = widget, text_fn, None, None
+    BG = "#ffffe0"
+
+    def __init__(self, widget, text_fn, more=None, title=None):
+        self.widget, self.text_fn, self.more, self.tip, self.label = widget, text_fn, more, None, None
+        self.title = title                                    # (bold, at the top of the tip: which button it is about, where buttons are close together)
+        self.hide_job = None
         widget.bind("<Enter>", self.show, add="+")
         widget.bind("<Motion>", self.show, add="+")
-        widget.bind("<Leave>", self.hide, add="+")
-        widget.bind("<ButtonPress>", self.show, add="+")
+        widget.bind("<Leave>", self.hide_later if more else self.hide, add="+")
+        widget.bind("<ButtonPress>", self.hide if more else self.show, add="+")      # (with a link: the click's own window comes up, not the tip)
 
     def show(self, e):
+        if self.more and self.tip is not None:
+            self.cancel_hide()                                # (it stays where it came up, so that its link can be reached)
+            return
         text = self.text_fn()
         if not text:                                          # (nothing to say where the pointer is now: no tip)
             self.hide()
@@ -515,21 +574,49 @@ class HoverTip:
         if self.tip is None:
             self.tip = tk.Toplevel(self.widget)
             self.tip.wm_overrideredirect(True)
-            self.label = tk.Label(self.tip, bg="#ffffe0", relief="solid", borderwidth=1, font=("Segoe UI", 9), padx=4, pady=1, justify=tk.LEFT, wraplength=460)
-            self.label.pack()
+            box = tk.Frame(self.tip, bg=self.BG, relief="solid", borderwidth=1)
+            box.pack()
+            if self.title:
+                tk.Label(box, text=self.title, bg=self.BG, font=("Segoe UI", 9, "bold"), padx=4, pady=1, justify=tk.LEFT).pack(anchor="w")
+            self.label = tk.Label(box, bg=self.BG, font=("Segoe UI", 9), padx=4, pady=1, justify=tk.LEFT, wraplength=460)
+            self.label.pack(anchor="w")
+            if self.more:
+                link = tk.Label(box, text="Learn more...", bg=self.BG, fg="#0645ad", cursor="hand2", font=("Segoe UI", 9, "underline"), padx=4, pady=1)
+                link.pack(anchor="w", pady=(0, 2))
+                link.bind("<Button-1>", self.learn_more)
+                self.tip.bind("<Enter>", lambda e: self.cancel_hide())
+                self.tip.bind("<Leave>", self.hide_later)
         self.label.config(text=text)
-        # beside the pointer, but kept on the screen: to its left if it would run off the right edge, above it if off the bottom
-        self.tip.update_idletasks()
-        w, h = self.tip.winfo_reqwidth(), self.tip.winfo_reqheight()
-        sw, sh = self.widget.winfo_screenwidth(), self.widget.winfo_screenheight()
-        x, y = e.x_root + 12, e.y_root + 18
-        if 0 <= e.x_root < sw and x + w > sw:
-            x = max(e.x_root - w - 12, 0)
-        if 0 <= e.y_root < sh and y + h > sh:
-            y = max(e.y_root - h - 8, 0)
-        self.tip.wm_geometry(f"+{x}+{y}")
+        place_beside(self.tip, e.x_root, e.y_root, self.widget)     # (beside the pointer, kept on the monitor it is on)
+
+    def learn_more(self, e=None):
+        title, more_fn = self.more
+        self.hide()
+        messagebox.showinfo(title, more_fn(), parent=self.widget.winfo_toplevel())
+
+    def hide_later(self, e=None):
+        """The pointer left the widget or the tip: the tip goes unless the pointer is on one of them a moment later (on its way across)."""
+        self.cancel_hide()
+        self.hide_job = self.widget.after(300, self.hide_unless_pointer_in)
+
+    def cancel_hide(self):
+        if self.hide_job is not None:
+            self.widget.after_cancel(self.hide_job)
+            self.hide_job = None
+
+    def hide_unless_pointer_in(self):
+        self.hide_job = None
+        try:
+            x, y = self.widget.winfo_pointerxy()
+            for w in (self.widget, self.tip):
+                if w is not None and w.winfo_rootx() <= x < w.winfo_rootx() + w.winfo_width() and w.winfo_rooty() <= y < w.winfo_rooty() + w.winfo_height():
+                    return
+        except tk.TclError:
+            pass
+        self.hide()
 
     def hide(self, e=None):
+        self.cancel_hide()
         if self.tip is not None:
             self.tip.destroy()
             self.tip = self.label = None
@@ -867,18 +954,10 @@ class CellTip:
         self.start_poll()
         pin.bind("<ButtonRelease-1>", lambda e, t=self.tip: self.pin_clicked(t), add="+")        # (after the drag handlers: they say whether this press moved the tip)
         pin.config(cursor="hand2")
-        # just beside the pointer (close, so that it is quickly reached), but kept on the screen
+        # just beside the pointer (close, so that it is quickly reached), but kept on the monitor it is on
         x0, y0 = self.root.winfo_pointerxy()
         self.anchor = (x0, y0)
-        self.tip.update_idletasks()
-        w, h = self.tip.winfo_reqwidth(), self.tip.winfo_reqheight()
-        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        x, y = x0 + 6, y0 + 6
-        if x + w > sw:
-            x = max(x0 - w - 6, 0)
-        if y + h > sh:
-            y = max(y0 - h - 6, 0)
-        self.tip.wm_geometry(f"+{x}+{y}")
+        place_beside(self.tip, x0, y0, self.root, dx=6, dy=6, gap_up=6)
 
     def copy(self, text, button):
         self.root.clipboard_clear()
@@ -2294,7 +2373,7 @@ class UmapWindow(ExportsMixin):
                                                                   # box's, and the group list under it was pushed down by it)
         # a group number box (Specific group(s))
         self.id_frame = ttk.LabelFrame(self.box, text="Group number(s)", padding=6)
-        self.id_hint = ttk.Label(self.id_frame, text="One or more, separated by commas (Enter):", foreground="gray30", wraplength=300)
+        self.id_hint = ttk.Label(self.id_frame, text="One or more, separated by commas; numbers in parentheses, (888, 890), are one group, in one color (Enter):", foreground="gray30", wraplength=300)
         self.id_hint.pack(anchor="w")
         self.var_ids = tk.StringVar(f, "")
         self.ids_by_level = {}                              # level -> the group numbers last typed for it (see on_level)
@@ -2438,6 +2517,20 @@ class UmapWindow(ExportsMixin):
                 if self.no_umap and text == "Save UMAP":
                     b.state(["disabled"])
                     HoverTip(b, lambda: "This project was made without a UMAP.")
+                if text == "Export coordinates":
+                    HoverTip(b, lambda: "Save the brain coordinates, UMAP coordinates and taxonomic classes of the cells of the chosen groups, as a CSV file.",
+                             title="Export coordinates:", more=("Export coordinates", lambda: (
+                                 "A CSV file with a row for every cell of the groups entered in Single group(s): across the whole brain when the "
+                                 "all-cell table is loaded, else only this project's cells.\n\n"
+                                 "Brain coordinates, two kinds:\n"
+                                 "• Section map: section_x_mm, section_y_mm (where the cell is in its brain section, as on the section maps) and "
+                                 "section_z_mm (the section's place along the brain).\n"
+                                 "• CCF: ccf_x_mm, ccf_y_mm, ccf_z_mm (the cell in the Allen Common Coordinate Framework, the 3D reference brain), "
+                                 "with its brain region (division, structure, substructure).\n\n"
+                                 "UMAP coordinates: umap1, umap2 (blank for cells that are not in this project).\n\n"
+                                 "Taxonomic classes: class, subclass, supertype and cluster, and the cell's brain section.\n\n"
+                                 "\"Open 3D Viewer…\" on this app's opening screen, and the standalone CCF browser app, "
+                                 "can both open this CSV file.")))
                 if text == "Create subproject":
                     HoverTip(b, lambda: "Analyze only the groups switched on in the legend: a project of its own, in a subfolder of this one, with its own "
                                         "PCA and UMAP, opened in a second window.")
@@ -2468,10 +2561,10 @@ class UmapWindow(ExportsMixin):
         self.level_frame.config(text="Group by" if self.mode in ("all", "single") else "Group by (hover)")
         if self.level_has_ids.get(self.level, True):                 # (what the box takes: the groups' numbers, or their names where they have no numbers)
             self.id_frame.config(text="Group number(s)")
-            self.id_hint.config(text="One or more, separated by commas (Enter):")
+            self.id_hint.config(text="One or more, separated by commas; numbers in parentheses, (888, 890), are one group, in one color (Enter):")
         else:
             self.id_frame.config(text="Group name(s)")
-            self.id_hint.config(text="One or more names (a start will do: GABA, Glut), separated by commas (Enter):")
+            self.id_hint.config(text="One or more names (a start will do: GABA, Glut), separated by commas; names in parentheses, (GABA, Glut), are one group (Enter):")
         for w in (self.id_frame, self.gene_frame, self.select_bar, self.legend, self.group_list):
             w.pack_forget()
         if self.mode == "single":
@@ -2537,6 +2630,36 @@ class UmapWindow(ExportsMixin):
             self.tiles.append(tile)
         self.tile_cols = self.tile_px = 0
         self.layout_tiles()
+        core.start_section_coordinate_load(self.abc_cache)
+        self.watch_section_coordinates()
+
+    def update_tile_captions(self):
+        """The captions over the section maps: the section's number, then (once the table of the sections' places is read, and the panel is wide enough: see
+        CAPTION_AP_MIN_PX) its approximate AP from bregma, and when wider still its MERFISH z."""
+        ready = core.section_coordinates_ready()
+        for t in self.tiles:
+            text = t["token"]
+            if ready and self.tile_px >= CAPTION_AP_MIN_PX:
+                z, ccf_ap = core.section_coords(t["label"])
+                parts = []
+                if z is not None and self.tile_px >= CAPTION_Z_MIN_PX:
+                    parts.append(f"z {z:.2f}")
+                if ccf_ap is not None:
+                    parts.append(f"AP {core.paxinos_coords(ccf_ap)[0]:+.2f}")
+                if parts:
+                    text += "   " + "  ".join(parts)
+            if t["title"].get() != text:
+                t["title"].set(text)
+
+    def watch_section_coordinates(self):
+        """Until the table of the sections' places has been read (in the background), look for it every half second, then put it in the captions."""
+        try:
+            if core.section_coordinates_ready():
+                self.update_tile_captions()
+            else:
+                self.root.after(500, self.watch_section_coordinates)
+        except tk.TclError:
+            pass                                                # (the window is gone)
 
     def apply_ccf_opacity(self):
         """The CCF atlas slider: the cells of the section maps are drawn again, more or less see-through (the outlines are not)."""
@@ -2574,7 +2697,7 @@ class UmapWindow(ExportsMixin):
         if core.reconstructed_in_use() and self.bg is not None and self.bg.get("z") is not None:
             return self.load_ccf_from_slices()
         if not h["ensure_ccf_downloaded"](self.abc_cache, parent=self.root):
-            self.var_status.set("The CCF coordinates were not downloaded, so there is no atlas to draw.")
+            self.var_status.set("The CCF atlas files could not be downloaded, so there is no atlas to draw.")
             return False
         cells, homes = {}, {}
         for t in self.tiles:
@@ -2760,6 +2883,7 @@ class UmapWindow(ExportsMixin):
         if same:
             return
         self.tile_cols, self.tile_px = cols, px
+        self.update_tile_captions()                                  # (before the panels are measured: the captions' widths count)
         big = self.panel_zoom > 1.0
         ph = int(px / self.tile_aspect)
         for t in self.tiles:
@@ -4100,34 +4224,47 @@ class UmapWindow(ExportsMixin):
 
     def parse_names(self, uniques):
         """The group names typed in the box, separated by commas, as the level's own names: whatever the case, and the start of a name will do if it is of
-        one group alone ('Glut' is Glut, though Glut-GABA also starts with it: the whole name wins). (names, the entries that name no group or several)"""
+        one group alone ('Glut' is Glut, though Glut-GABA also starts with it: the whole name wins). Names in parentheses are one group together. (the
+        groups: a name, or a tuple of names; the entries that name no group or several)"""
         names = [str(u) for u in uniques]
         folded = [n.casefold() for n in names]
         found, bad = [], []
-        for tok in (t.strip() for t in self.var_ids.get().split(",")):
-            if not tok:
-                continue
-            key = tok.casefold()
-            hits = [i for i, f in enumerate(folded) if f == key] or [i for i, f in enumerate(folded) if f.startswith(key)]
-            if len(hits) == 1:
-                if names[hits[0]] not in found:
-                    found.append(names[hits[0]])
-            else:
-                bad.append(tok)
+        items, bad = split_group_items(self.var_ids.get(), spaces_separate=False)
+        for item in items:
+            members = []
+            for tok in item:
+                key = tok.casefold()
+                hits = [i for i, f in enumerate(folded) if f == key] or [i for i, f in enumerate(folded) if f.startswith(key)]
+                if len(hits) == 1:
+                    if names[hits[0]] not in members:
+                        members.append(names[hits[0]])
+                else:
+                    bad.append(tok)
+            if members:
+                target = members[0] if len(members) == 1 else tuple(members)
+                if target not in found:
+                    found.append(target)
         return found, bad
 
     def parse_ids(self):
-        ids, bad = [], []
-        for tok in re.split(r"[,\s]+", self.var_ids.get().strip()):
-            if not tok:
-                continue
-            try:
-                v = int(tok)
-            except ValueError:
-                bad.append(tok)
-                continue
-            if v not in ids:
-                ids.append(v)
+        """The group numbers typed in the box: a number, or a tuple of numbers for several in parentheses, which are one group together
+        ('(888, 890), 1047' is two groups). (the groups, in order; the pieces that are not numbers)"""
+        ids = []
+        items, bad = split_group_items(self.var_ids.get())
+        for item in items:
+            numbers = []
+            for tok in item:
+                try:
+                    v = int(tok)
+                except ValueError:
+                    bad.append(tok)
+                    continue
+                if v not in numbers:
+                    numbers.append(v)
+            if numbers:
+                target = numbers[0] if len(numbers) == 1 else tuple(numbers)
+                if target not in ids:
+                    ids.append(target)
         return ids, bad
 
     def color_single(self):
@@ -4141,11 +4278,11 @@ class UmapWindow(ExportsMixin):
         colors = {t: (GREY if t in self.off_groups else np.array([255, 0, 0], np.uint8) if len(ids) == 1 else rank_color(i)) for i, t in enumerate(ids)}
         lut = np.tile(GREY, (len(uniques), 1))
         for t, col in colors.items():
-            lut[uid == t] = col
+            lut[in_group(uid, t)] = col
         rgb = np.where((codes >= 0)[:, None], lut[np.maximum(codes, 0)], LIGHT_GREY).astype(np.uint8)         # (code -1: a cell with no annotation at this level: gray)
         hit = np.zeros(len(uniques), np.int32)
         for i, t in enumerate(ids):
-            hit[uid == t] = i + 1
+            hit[in_group(uid, t)] = i + 1
         self.rank_run = np.where(codes >= 0, hit[np.maximum(codes, 0)], 0).astype(np.int32)
         order = np.argsort(self.rank_run, kind="stable")
         bgc = self.bg_codes(level) if self.bg else None
@@ -4163,11 +4300,15 @@ class UmapWindow(ExportsMixin):
             return self.bg["x"][w][o], self.bg["y"][w][o], col[o], w[o]
 
         self.apply(rgb, order, bg_fn)
-        counts = {t: int((uid[np.maximum(codes, 0)] == t)[codes >= 0].sum()) for t in ids}
-        full = {t: (str(uniques[np.flatnonzero(uid == t)[0]]) if (uid == t).any() else f"{self.level_names[level]} {t}") for t in ids}
+        counts = {t: int(in_group(uid[np.maximum(codes, 0)], t)[codes >= 0].sum()) for t in ids}
+
+        def one_name(m):
+            return str(uniques[np.flatnonzero(uid == m)[0]]) if (uid == m).any() else f"{self.level_names[level]} {m}"
+        full = {t: (" + ".join(re.sub(r"^\s*\d+\s*", "", one_name(m)) for m in t) if isinstance(t, tuple) else one_name(t)) for t in ids}
+        absent = [m for t in ids for m in target_members(t) if not (uid == m).any()]
         self.last_ids = {"level": level, "targets": ids, "colors": colors, "counts": counts}
-        self.view_kind, self.view_token = "single", f"{level}_{'-'.join(str(t) for t in ids)}"
-        self.view_title = f"{self.level_names[level]} {', '.join(str(t) for t in ids)}"
+        self.view_kind, self.view_token = "single", f"{level}_{'-'.join(key_text(t) for t in ids)}"
+        self.view_title = f"{self.level_names[level]} {', '.join(typed_text(t) for t in ids)}"
         order_of = {t: i for i, t in enumerate(ids)}
         self.export_cat = {"rank": np.where((codes >= 0) & (hit[np.maximum(codes, 0)] > 0), hit[np.maximum(codes, 0)] - 1, -1), "title": self.level_names[level],
                            "entries": [(hexcolor(colors[t]), full[t], counts[t]) for t in ids]}
@@ -4176,9 +4317,10 @@ class UmapWindow(ExportsMixin):
         self.shown_values = None
         parts = []
         if ids:
-            parts.append("Highlighting " + ", ".join(f"{t} ({counts[t]} cells)" for t in ids if counts[t]))
-            if any(not counts[t] for t in ids):
-                parts.append("not found: " + ", ".join(str(t) for t in ids if not counts[t]))
+            parts.append("Highlighting " + ", ".join(f"{key_text(t)} ({counts[t]} cells)" for t in ids if counts[t]))
+            if absent or any(not counts[t] for t in ids):
+                parts.append("not found: " + ", ".join(str(m) for m in absent if m is not None) if absent else
+                             "not found: " + ", ".join(key_text(t) for t in ids if not counts[t]))
         else:
             parts.append(f"Enter one or more {self.level_names[level].lower()} {'numbers' if self.level_has_ids.get(level, True) else 'names'}")        # (the joined status ends with its own period)
         if bad:
@@ -4196,8 +4338,8 @@ class UmapWindow(ExportsMixin):
         self.legend.delete("all")
         self.legend.config(height=22 * len(ids) + 8)
         numbered = self.level_has_ids.get(self.level, True)
-        rows = [("#%02x%02x%02x" % tuple(int(v) for v in colors[t]), str(t) if numbered else "", f"({counts[t]})",
-                 re.sub(r"^\s*\d+\s*", "", (names or {}).get(t, "")) if numbered else str(t), t in self.off_groups,
+        rows = [("#%02x%02x%02x" % tuple(int(v) for v in colors[t]), key_text(t) if numbered else "", f"({counts[t]})",
+                 re.sub(r"^\s*\d+\s*", "", (names or {}).get(t, "")) if numbered else key_text(t), t in self.off_groups,
                  int(self.shape_codes(np.array([i]))[0]))
                 for i, t in enumerate(ids)]
         self.draw_legend_rows(self.legend, rows, 4)
@@ -4778,7 +4920,7 @@ class UmapWindow(ExportsMixin):
         if key is None:
             self.group_tip.pointer_off()
             return
-        label = key if self.mode == "all" else self.single_names.get(key)
+        label = key if self.mode == "all" else (None if isinstance(key, tuple) else self.single_names.get(key))        # (a group made of several has no one row to describe)
         rows = self.group_info_rows(self.level, label) if label is not None else None
         if rows is not None:
             if self.mode == "all":
@@ -5230,11 +5372,7 @@ class UmapWindow(ExportsMixin):
         threading.Thread(target=work, daemon=True).start()
 
     def download_ccf_coords(self):
-        # (said when the reconstructed coordinates are in use: a table of much the same size, downloaded earlier, that this is easily taken for)
-        note = ("This is a separate table from the reconstructed coordinates already downloaded: those place the cells on the section "
-                "maps, but are not CCF positions.") if core.reconstructed_in_use() else ""
-        if self.host["ensure_ccf_downloaded"](self.abc_cache, parent=self.root, what="CCF coordinates of every cell (for their ML and DV)",
-                                              note=note):
+        if self.host["ensure_ccf_downloaded"](self.abc_cache, parent=self.root, what="CCF coordinates of every cell (for their ML and DV)"):
             self.start_ccf_lookup()
 
     def cell_info(self, i, source):
@@ -5280,10 +5418,10 @@ class UmapWindow(ExportsMixin):
                 else:
                     ids = (self.last_ids or {}).get("targets", [])
                     m = re.match(r"^\s*(\d+)", str(label))
-                    if len(ids) > 1 and not self.level_has_ids.get(self.level, True) and str(label) in ids:
-                        canvas, k = self.legend, ids.index(str(label))
-                    elif len(ids) > 1 and m and int(m.group(1)) in ids:
-                        canvas, k = self.legend, ids.index(int(m.group(1)))
+                    if len(ids) > 1 and not self.level_has_ids.get(self.level, True) and target_row(ids, str(label)) is not None:
+                        canvas, k = self.legend, target_row(ids, str(label))
+                    elif len(ids) > 1 and m and target_row(ids, int(m.group(1))) is not None:
+                        canvas, k = self.legend, target_row(ids, int(m.group(1)))
         self.bold_legend_row(canvas, k)
 
     def show_info(self, info):
@@ -5628,7 +5766,7 @@ class UmapWindow(ExportsMixin):
             "kind": self.STATE_KIND, "version": 1,
             "project": Path(self.run_folder).name if self.run_folder is not None else "",
             "mode": self.mode, "level": self.level, "group_numbers": ids,
-            "groups_off": sorted(self.off_groups), "group_sort": list(self.group_sort),
+            "groups_off": [key_text(k) if isinstance(k, tuple) else k for k in sorted(self.off_groups, key=str)], "group_sort": list(self.group_sort),
             "genes": self.var_gene.get().strip(), "scale": self.var_scale.get(),
             "theme": self.var_theme.get(), "theme_choice": self.theme_choice,
             "translucent": bool(self.var_translucent.get()),
@@ -5705,7 +5843,13 @@ class UmapWindow(ExportsMixin):
         self.var_gene.set(str(state.get("genes") or ""))
         self.pending_gene_state = {"levels": {g: tuple(v) for g, v in (state.get("gene_levels") or {}).items() if isinstance(v, (list, tuple)) and len(v) == 2},
                                    "off": set(state.get("genes_off") or [])}
-        off = set(str(g) for g in (state.get("groups_off") or []))
+        off = set()
+        for g in (state.get("groups_off") or []):
+            if mode == "single" and self.level_has_ids.get(level, True) and re.fullmatch(r"\d+(\+\d+)*", str(g)):          # (a number, or several together: 888+890)
+                parts = tuple(int(x) for x in str(g).split("+"))
+                off.add(parts[0] if len(parts) == 1 else parts)
+            else:
+                off.add(str(g))
         self.var_mode.set(mode)
         self.on_mode()                                    # (colors once; asks to load the imputed genes if they are needed and not loaded)
         if self.mode in ("all", "single") and off:

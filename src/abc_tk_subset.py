@@ -51,9 +51,10 @@ def legend_selection(v):
         chosen = np.isin(np.asarray([str(u) for u in uniques]), np.asarray([str(k) for k in on]))
     else:
         numbers = v.group_keys(level, uniques)
-        chosen = np.isin(numbers, np.asarray(on, dtype=object if not v.level_has_ids.get(level, True) else None))
+        members = [m for k in on for m in core.target_members(k)]           # (a group made of several, typed in parentheses, takes the cells of all of them)
+        chosen = np.isin(numbers, np.asarray(members, dtype=object if not v.level_has_ids.get(level, True) else None))
     mask = (codes >= 0) & chosen[np.maximum(codes, 0)]
-    names = [str(k) for k in on]
+    names = [core.key_text(k) for k in on]
     return level, mask, names, ""
 
 
@@ -61,9 +62,9 @@ def subset_folder(run_folder, level, names, n_components=PCA_COMPONENTS):
     """The subfolder of the run for these groups: named after the level and the groups (their numbers, when there are few), with a short hash of the
     exact set so that two different selections never share one. The number of PCA components is in the name too (pc50): the same groups analyzed
     with another number are another subset."""
-    numbers = [re.match(r"^\s*(\d+)", n) for n in names]
+    numbers = [re.fullmatch(r"\s*(\d+(?:\+\d+)*)\s*", n) or re.match(r"^\s*(\d+)", n) for n in names]
     if all(numbers) and len(names) <= 4:
-        token = "-".join(sorted((m.group(1) for m in numbers), key=int))
+        token = "-".join(sorted((m.group(1) for m in numbers), key=lambda t: int(re.match(r"\d+", t).group(0))))
     else:
         token = f"{len(names)}groups"
     extra = [f"pc{n_components}"]

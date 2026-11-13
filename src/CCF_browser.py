@@ -2624,16 +2624,7 @@ class CCFBrowser:
             self.message.configure(text="No atlas folder chosen.")
             return
         path, size, present = volume_status(base)
-        download = False
-        if not present:
-            size_text = f"{size / 1e6:.1f} MB" if size else "a few MB"
-            download = messagebox.askyesno(
-                "Download the CCF annotation volume?",
-                f"The CCF annotation volume is not in the atlas cache ({base}). It is a one-time download of "
-                f"{size_text}. Download it now?", parent=self.root)
-            if not download:
-                self.message.configure(text="The CCF volume is needed; restart to be asked again.")
-                return
+        download = not present          # (it comes with the MERFISH browser's first download; else, a few MB, fetched without asking)
         self.run_in_thread("Loading the CCF atlas…" if present else "Downloading the CCF volume…",
                            lambda: load_atlas(base, download), self.atlas_ready, overlay="Loading Atlas…")
 

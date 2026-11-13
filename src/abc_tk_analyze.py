@@ -391,7 +391,7 @@ class AnalyzeWindow:
         combo.pack(fill=tk.X)
         combo.bind("<<ComboboxSelected>>", lambda ev: self.level_changed())
 
-        self.var_per = tk.StringVar(top, "cell")                  # (Per cell / Per group: in the Expression tab, which is the only plot it is about)
+        self.var_per = tk.StringVar(top, "group")                 # (Per cell / Per group: in the Expression tab, which is the only plot it is about)
         self.var_exclude_small = tk.BooleanVar(top, True)
         self.var_jitter = tk.BooleanVar(top, True)
         self.var_density = tk.BooleanVar(top, False)
@@ -403,7 +403,7 @@ class AnalyzeWindow:
                            "selectivity": tk.StringVar(top, "imputed" if can_impute else "panel")}
         self.source_shown = {tab: var.get() for tab, var in self.var_source.items()}
 
-        self.var_scale = tk.StringVar(top, viewer.var_scale.get())         # (the viewer's choice to begin with; changing it here leaves the viewer's alone)
+        self.var_scale = tk.StringVar(top, "linear")                       # (always linear to begin with; changing it here leaves the viewer's alone)
 
         # the two analyses, a tab each (the tab control is as tall as the taller of them, so nothing below it moves)
         outline = tk.Frame(side, highlightthickness=1, highlightbackground="#7f7f7f", highlightcolor="#7f7f7f", bd=0)      # (a line round the tab control, to see where it is)
@@ -435,13 +435,25 @@ class AnalyzeWindow:
         plot_box.pack(fill=tk.X, pady=(8, 0))
         ttk.Radiobutton(plot_box, text="Per cell", value="cell", variable=self.var_per, command=self.per_changed).pack(anchor="w")
         ttk.Radiobutton(plot_box, text="Per group", value="group", variable=self.var_per, command=self.per_changed).pack(anchor="w")
-        self.chk_exclude = ttk.Checkbutton(plot_box, text=f"Exclude groups with\n<{MIN_PLOTTED_GROUP_CELLS} cells", variable=self.var_exclude_small, command=self.redraw)
+        self.exclude_row = ttk.Frame(plot_box)
+        self.chk_exclude = ttk.Checkbutton(self.exclude_row, text="Exclude groups with", variable=self.var_exclude_small, command=self.redraw)
+        self.chk_exclude.pack(anchor="w")
+        fewer = ttk.Frame(self.exclude_row)            # (a line of its own, under the box's words: on one line it ran off the side panel's edge)
+        fewer.pack(anchor="w", padx=(21, 0))
+        ttk.Label(fewer, text="fewer than").pack(side=tk.LEFT)
+        self.var_min_cells = tk.StringVar(top, str(MIN_PLOTTED_GROUP_CELLS))       # (not remembered: it is the default again in the next window)
+        self.min_cells_entry = ttk.Entry(fewer, textvariable=self.var_min_cells, width=5)
+        self.min_cells_entry.pack(side=tk.LEFT, padx=(4, 4))
+        ttk.Label(fewer, text="cells").pack(side=tk.LEFT)
+        self.min_cells_entry.bind("<Return>", lambda ev: self.redraw())
+        self.min_cells_entry.bind("<FocusOut>", lambda ev: self.redraw())
         self.chk_jitter = ttk.Checkbutton(page, text="Jitter counts", variable=self.var_jitter, command=self.redraw)
         self.chk_jitter.pack(anchor="w", pady=(6, 0))
         from abc_tk_umap import HoverTip                  # (the viewer's own tip; imported here, as that module imports this one)
         HoverTip(self.chk_jitter, lambda: "Cells with the same count would sit on top of each other: each is spread over the stretch of the axis its count stands for.")
         self.chk_density = ttk.Checkbutton(page, text="Shade per-cell dots by density", variable=self.var_density, command=self.redraw)
         self.chk_density.pack(anchor="w")
+        self.per_changed()                                 # (the boxes follow the plot chosen to begin with)
 
         page = ttk.Frame(self.tabs, padding=6)
         self.tabs.add(page, text="Selectivity")
@@ -622,9 +634,9 @@ class AnalyzeWindow:
         self.chk_jitter.configure(state=state)
         self.chk_density.configure(state=state)
         if self.var_per.get() == "group":                  # (the box about small groups, just under the radio button, is for a plot of groups)
-            self.chk_exclude.pack(anchor="w", padx=(20, 0))
+            self.exclude_row.pack(anchor="w", padx=(20, 0))
         else:
-            self.chk_exclude.pack_forget()
+            self.exclude_row.pack_forget()
 
     def level_changed(self):
         self.sel = None                         # (the means are kept for every group type: the next Analyze plots the new one from them)
@@ -634,7 +646,7 @@ class AnalyzeWindow:
         """The note under the genes box (nothing hides it)."""
         self.var_genes_hint.set(text)
         if text:
-            self.genes_hint.pack(anchor="w", pady=(4, 0), before=self.cells_of_label)
+            self.genes_hint.pack(anchor="w", pady=(4, 0), before=self.chk_main_only)
         else:
             self.genes_hint.pack_forget()
 
@@ -645,6 +657,13 @@ class AnalyzeWindow:
             self.groups_hint.pack(anchor="w", pady=(4, 0), before=self.mark_label)
         else:
             self.groups_hint.pack_forget()
+
+    def min_plotted_cells(self):
+        """The number in the box under 'Exclude groups with' ('fewer than _ cells'; the default where it is not a whole number)."""
+        try:
+            return max(0, int(self.var_min_cells.get().strip()))
+        except ValueError:
+            return MIN_PLOTTED_GROUP_CELLS
 
     def scale_changed(self):
         """Log / Linear: the plot on the screen is read and drawn again on the new scale."""
@@ -740,7 +759,7 @@ class AnalyzeWindow:
         if v.mode == "single":
             ids, _bad = v.typed_groups(level, uniques)
             uid = v.group_keys(level, uniques)
-            chosen = [int(i) for t in ids if t not in v.off_groups for i in np.flatnonzero(uid == t)[:1]]
+            chosen = [int(i) for t in ids if t not in v.off_groups for m in (t if isinstance(t, tuple) else (t,)) for i in np.flatnonzero(uid == m)[:1]]
         else:
             chosen = [i for i in everyone if str(uniques[i]) not in v.off_groups]
         if not chosen:
@@ -767,7 +786,7 @@ class AnalyzeWindow:
         _cols, resolved, missing = core.resolve_gene_names(source, names)
         if missing:
             self.genes_entry.configure(foreground="red")
-            self.var_status.set(f"Not found in the {'imputed' if imputed else 'standard'} dataset: {', '.join(missing)}.")
+            self.show_genes_hint(f"Not found in the {'imputed' if imputed else 'standard'} dataset: {', '.join(missing)}.")
             return None
         return resolved
 
@@ -885,7 +904,7 @@ class AnalyzeWindow:
             xs, ys, names, cols, counts, shown_groups = [], [], [], [], [], []
             for g in chosen:
                 m = in_group & (codes == g)
-                if not m.any() or (self.var_exclude_small.get() and m.sum() < MIN_PLOTTED_GROUP_CELLS):
+                if not m.any() or (self.var_exclude_small.get() and m.sum() < self.min_plotted_cells()):
                     continue
                 xs.append(float(np.mean(vx[m])))
                 ys.append(float(np.mean(vy[m])))
@@ -1276,6 +1295,23 @@ class AnalyzeWindow:
         self.canvas.restore_region(self.background)
         self.canvas.blit(self.fig.bbox)
 
+    def place_tip(self):
+        """Keep the tip inside the figure: above and to the right of its point, as usual, but to the left of it where that would run off the right edge
+        of the figure, and below it where it would run off the top."""
+        tip = self.tip
+        try:
+            width, height = tip.get_window_extent(self.canvas.get_renderer()).size
+            px, py = self.ax.transData.transform(tip.xy)
+        except Exception:
+            return                                              # (not drawn yet: the usual place)
+        offset = 14 * self.fig.dpi / 72
+        margin = 12                                             # (pixels: the box's padding and its border)
+        left = px + offset + width + margin > self.fig.bbox.width
+        down = py + offset + height + margin > self.fig.bbox.height
+        tip.set_position((-14 if left else 14, -14 if down else 14))
+        tip.set_ha("right" if left else "left")
+        tip.set_va("top" if down else "baseline")
+
     def on_motion(self, ev):
         if self.pan_start is not None:
             self.pan_to(ev)
@@ -1301,6 +1337,7 @@ class AnalyzeWindow:
             self.hover_group = i
             self.tip.set_text(f"{h['names'][i]}\n{h['x'][i]:.3g}, {h['y'][i]:.3g}")
             self.tip.xy = (h["x"][i], h["y"][i])
+            self.place_tip()
             self.tip.set_visible(True)
             self.ax.draw_artist(self.tip)
             self.canvas.blit(self.fig.bbox)
@@ -1321,6 +1358,7 @@ class AnalyzeWindow:
                 lines.append(f"mean {gene}: {both_scales(value, h['scale'])}")
             self.tip.set_text("\n".join(lines))
             self.tip.xy = (h["x"][i], h["y"][i])
+            self.place_tip()
             self.tip.set_visible(True)
             self.ax.draw_artist(self.tip)
             self.canvas.blit(self.fig.bbox)
@@ -1346,6 +1384,7 @@ class AnalyzeWindow:
             lines.append(f"{gene}: {both_scales(value, h['scale'])}")
         self.tip.set_text("\n".join(lines))
         self.tip.xy = (h["x"][i], h["y"][i])
+        self.place_tip()
         self.tip.set_visible(True)
         self.ax.draw_artist(self.pluses)
         self.ax.draw_artist(self.tip)

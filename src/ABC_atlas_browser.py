@@ -416,6 +416,31 @@ import scanpy as sc
 import_mark('scanpy (the rest)')
 
 
+def _make_umap_neighbors_contiguous():
+    """Some combinations of scanpy / umap-learn / numba hand umap's compiled graph code the nearest-neighbor arrays in the wrong memory order
+    (a transposed or sliced view), which it rejects: "numba.core.errors.TypingError ... No conversion from array(float32, 2d, A) to array(float32,
+    2d, C) for 'knn_dists'", and the neighbor graph (Step 6 of a new project) fails. Copying them into ordinary (C-ordered) arrays first costs
+    nothing and changes nothing else; scanpy looks the function up at each call, so replacing it here is enough."""
+    try:
+        import umap.umap_ as umap_module
+        original = umap_module.fuzzy_simplicial_set
+        if getattr(original, '_contiguous_wrapper', False):
+            return
+
+        def fuzzy_simplicial_set(*args, **kwargs):
+            for key in ('knn_indices', 'knn_dists'):
+                if kwargs.get(key) is not None:
+                    kwargs[key] = np.ascontiguousarray(kwargs[key])
+            return original(*args, **kwargs)
+        fuzzy_simplicial_set._contiguous_wrapper = True
+        umap_module.fuzzy_simplicial_set = fuzzy_simplicial_set
+    except Exception:
+        pass                                                    # (umap not installed or changed: scanpy fails or works on its own)
+
+
+_make_umap_neighbors_contiguous()
+
+
 
 # Every interactive window in this file has its own hand-rolled pan/zoom/
 # hover controls (right-mouse-drag panning, scroll-to-zoom, ROI dragging,

@@ -166,19 +166,31 @@ def _object_size(cache, key, say, gave_up_at, key_text):
             delay = min(delay * 2, RETRY_MAX_S)
 
 
-def _md5(path, key_text, total):
+def _md5(path, key_text, total, name=None):
+    """The MD5 of the file. With a `name` and a big file, the console says it is checking and shows a bar (reading 50 GB back takes minutes)."""
+    import tqdm
     hasher = hashlib.md5()
     done, last = 0, 0.0
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(8 * CHUNK)
-            if not chunk:
-                break
-            hasher.update(chunk)
-            done += len(chunk)
-            if time.monotonic() - last > 1.0:
-                last = time.monotonic()
-                _notes[key_text] = f"checking the download ({100 * done / max(total, 1):.0f}%)"
+    bar = None
+    if name and total >= PARALLEL_MIN:
+        tqdm.tqdm.write(f"Checking {name} (it is read back once to make sure it arrived whole)...")
+        bar = tqdm.tqdm(desc="checking " + name, total=total, unit_scale=True, unit_divisor=1000., unit="B")
+    try:
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(8 * CHUNK)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                done += len(chunk)
+                if bar is not None:
+                    bar.update(len(chunk))
+                if time.monotonic() - last > 1.0:
+                    last = time.monotonic()
+                    _notes[key_text] = f"checking the download ({100 * done / max(total, 1):.0f}%)"
+    finally:
+        if bar is not None:
+            bar.close()
     _notes.pop(key_text, None)
     return hasher.hexdigest()
 
@@ -253,10 +265,11 @@ def _client_for(cache):
     return client
 
 
-def _parallel(self, bar, part, key, total, note_key, say, last_progress_box):
+def _parallel(self, bar, part, key, total, note_key, say, last_progress_box, want_hash=False):
     """Downloads `part` in pieces of SEGMENT bytes, WORKERS at a time, each its own connection (one connection to the server runs at a fraction of
     what the link can carry). The pieces that are finished are listed in the .part.json file beside it, so a later ask does only the rest. Raises
-    _NoRange if the server does not do ranges."""
+    _NoRange if the server does not do ranges. With want_hash, a thread hashes the pieces in order as they land (reading them back from the disk
+    cache), so that little is left to read when the last one arrives; returns the file's MD5 then (None if it could not be worked out), else None."""
     count = (total + SEGMENT - 1) // SEGMENT
     client = _client_for(self)
 
@@ -278,6 +291,7 @@ def _parallel(self, bar, part, key, total, note_key, say, last_progress_box):
     bar.n = prog["bytes"]
     bar.refresh()
     lock = threading.Lock()
+    cond = threading.Condition(lock)
     abort = threading.Event()
     errors = []
     pending = queue.Queue()
@@ -286,7 +300,36 @@ def _parallel(self, bar, part, key, total, note_key, say, last_progress_box):
             pending.put(i)
     _active[note_key] = prog
     last_progress_box[0] = time.monotonic()
-    wrote_state = [0.0]
+    hashed = {"bytes": 0, "next": 0, "digest": None}
+
+    def hash_in_order():
+        """Hashes piece 0, 1, 2, ... as each is finished (a piece is finished when it is in `done`)."""
+        try:
+            md5 = hashlib.md5()
+            while hashed["next"] < count:
+                i = hashed["next"]
+                with cond:
+                    while i not in done:
+                        if abort.is_set():
+                            return
+                        cond.wait(0.5)
+                start, stop = span(i)
+                with open(part, "rb") as f:
+                    f.seek(start)
+                    left = stop - start
+                    while left > 0:
+                        chunk = f.read(min(left, 8 * CHUNK))
+                        if not chunk:
+                            return                                  # (the file is shorter than it should be: the caller hashes it itself)
+                        md5.update(chunk)
+                        left -= len(chunk)
+                        hashed["bytes"] += len(chunk)
+                hashed["next"] = i + 1
+            hashed["digest"] = md5.hexdigest()
+        except Exception:
+            hashed["digest"] = None
+
+    hash_thread = threading.Thread(target=hash_in_order, daemon=True) if want_hash else None
 
     def save_state(force=False):
         with lock:
@@ -342,8 +385,9 @@ def _parallel(self, bar, part, key, total, note_key, say, last_progress_box):
                 return
             try:
                 if run_segment(i):
-                    with lock:
+                    with cond:
                         done.add(i)
+                        cond.notify_all()
                     save_state()
             except BaseException as e:
                 errors.append(e)
@@ -355,20 +399,45 @@ def _parallel(self, bar, part, key, total, note_key, say, last_progress_box):
         say(f"Continuing {key.split('/')[-1]} from {_size_text(prog['bytes'])} of {_size_text(total)}.")
     threads = [threading.Thread(target=worker, daemon=True) for _ in range(min(WORKERS, max(1, count - len(done))))]
     try:
+        if hash_thread is not None:
+            hash_thread.start()
         for t in threads:
             t.start()
         for t in threads:
             while t.is_alive():
                 t.join(0.5)
     finally:
-        abort.set()
+        with cond:
+            abort.set()
+            cond.notify_all()
         for t in threads:
             t.join()
         _active.pop(note_key, None)
     if errors:
         raise errors[0]
     if part.stat().st_size != total:
+        abort.set()
         raise RuntimeError(f"Could not download {key}: the file is {part.stat().st_size} bytes, not {total}.")
+    if hash_thread is None:
+        abort.set()
+        return None
+    if hash_thread.is_alive():                                            # (the last pieces are still being hashed: show that)
+        import tqdm
+        name = key.split("/")[-1]
+        say(f"Checking {name} (it is checked as it arrives; {_size_text(total - hashed['bytes'])} is left to check)...")
+        check_bar = tqdm.tqdm(desc="checking " + name, total=total, initial=hashed["bytes"], unit_scale=True, unit_divisor=1000., unit="B")
+        try:
+            while hash_thread.is_alive():
+                check_bar.n = hashed["bytes"]
+                check_bar.refresh()
+                _notes[note_key] = f"checking the download ({100 * hashed['bytes'] / max(total, 1):.0f}%)"
+                hash_thread.join(0.5)
+        finally:
+            check_bar.close()
+            _notes.pop(note_key, None)
+    hash_thread.join()
+    abort.set()
+    return hashed["digest"]
 
 
 def download_file(self, file_attributes, force_download=False, skip_hash_check=False):
@@ -407,7 +476,7 @@ def download_file(self, file_attributes, force_download=False, skip_hash_check=F
             while True:
                 if parallel:
                     try:
-                        _parallel(self, bar, part, key, total, note_key, say, last_progress)
+                        digest = _parallel(self, bar, part, key, total, note_key, say, last_progress, want_hash=not skip_hash_check)
                     except _NoRange:
                         say("The server does not support downloading in parts; downloading in one stream.")
                         parallel = False
@@ -417,9 +486,10 @@ def download_file(self, file_attributes, force_download=False, skip_hash_check=F
                         bar.refresh()
                         continue
                 else:
+                    digest = None
                     _sequential(self, bar, part, key, total, note_key, say, last_progress)
                 if not skip_hash_check:
-                    if _md5(part, note_key, total) != file_attributes.file_hash:
+                    if (digest or _md5(part, note_key, total, key.split("/")[-1])) != file_attributes.file_hash:
                         part.unlink(missing_ok=True)
                         _state_path(part).unlink(missing_ok=True)
                         wrong_hash += 1

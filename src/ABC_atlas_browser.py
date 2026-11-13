@@ -504,7 +504,7 @@ DEFAULT_VIEWER_SETTINGS = {
     'gene456_shape': 'small circle',
     'umap_circle_size': 'Default',
     'colorize_other_cells': True,   # in a neuron project the non-neurons (and in a non-neuron project the neurons) of the section maps are colored too; off: always gray
-    'group_colors': 'cycle',        # 'cycle': every group colored, the look repeating past 400; 'lineage': a group's color comes from its parent's
+    'group_colors': 'cycle',        # 'cycle': the colors and shapes in order of group size; 'numeric': in order of group number; 'lineage': a group's color comes from its parent's
     # Itself a setting, with a deliberately asymmetric persistence rule —
     # see load_viewer_settings/save_viewer_settings's own docstrings.
     'persist_settings': False,
@@ -546,7 +546,7 @@ def load_viewer_settings():
             settings['umap_circle_size'] = on_disk['umap_circle_size']
         if 'colorize_other_cells' in on_disk:
             settings['colorize_other_cells'] = bool(on_disk['colorize_other_cells'])
-        if on_disk.get('group_colors') in ('cycle', 'lineage'):
+        if on_disk.get('group_colors') in ('cycle', 'numeric', 'lineage'):
             settings['group_colors'] = on_disk['group_colors']
     return settings
 
@@ -5081,6 +5081,21 @@ def visible_points_only(offsets, facecolors, sizes, xlim, ylim):
     return offsets[visible], facecolors, sizes
 
 
+MAX_EXPORT_PATH_CHARS = 240   # a file's whole path, kept under Windows' 260 (a browser or Explorer cannot open a longer one: "your file couldn't be accessed")
+
+
+def shorten_export_stem(target_dir, stem, extensions):
+    """`stem` itself when the whole path (folder, name, extension and a '_NNN' suffix) fits in MAX_EXPORT_PATH_CHARS, else its start, '_etc_' and six characters
+    of a hash of the whole (so that two long names that start alike stay different). The names of exports that list their groups (3d_cluster_4687-4703-...) can
+    be very long; the full list is inside the file."""
+    room = MAX_EXPORT_PATH_CHARS - len(str(target_dir)) - 1 - max((len(e) for e in extensions), default=0) - 5
+    if len(stem) <= room:
+        return stem
+    tag = hashlib.md5(stem.encode('utf-8')).hexdigest()[:6]
+    keep = max(room - len(tag) - 5, 12)
+    return f"{stem[:keep].rstrip('-_ ')}_etc_{tag}"
+
+
 def unique_export_paths(target_dir, stem, extensions):
     """{ext: path} for a new export named `stem` (no leading '.' on the
     extensions), without overwriting an earlier one: the first save uses
@@ -5090,6 +5105,7 @@ def unique_export_paths(target_dir, stem, extensions):
     the user appended themselves after the number (e.g. renaming a copy to
     '..._2_final.png') doesn't confuse the numbering — only the digits
     immediately after '_N' are read; anything past that is ignored."""
+    stem = shorten_export_stem(target_dir, stem, extensions)
     base_exists = any((target_dir / f'{stem}{ext}').exists() for ext in extensions)
     if not base_exists:
         return {ext: target_dir / f'{stem}{ext}' for ext in extensions}
@@ -5772,8 +5788,9 @@ def build_viewer_settings_tab(tab, current_settings, umap_params=None, n_cells=N
     shape_frame.pack(fill='x', padx=12, pady=(0, 6))
 
     colors_var = tk.StringVar(tab, value=current_settings.get('group_colors', 'cycle'))
-    colors_frame = tk.LabelFrame(tab, text="Group colors (when there are more groups than looks)")
-    for value, text in (('cycle', "Cycle: every group colored; past the 400th largest the colors and shapes repeat (hover tells which)"),
+    colors_frame = tk.LabelFrame(tab, text="Group colors (past 400 groups the colors and shapes repeat: hover tells which)")
+    for value, text in (('cycle', "Color/shape ordered from largest to smallest group"),
+                        ('numeric', "Color/shape ordered numerically by group (the same colors and shapes, in taxonomic order)"),
                         ('lineage', "Lineage: a group's color comes from its parent group, so related groups look alike (experimental)")):
         tk.Radiobutton(colors_frame, text=text, value=value, variable=colors_var, anchor='w', justify='left').pack(fill='x', padx=6)
     colors_frame.pack(fill='x', padx=12, pady=(0, 6))

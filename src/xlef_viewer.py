@@ -5853,24 +5853,46 @@ class XlefViewer:
                         report((c + 1) / n)
                 if all(a is not None for a in sharp):
                     self.results.put(("sharp", gen, (z, sharp, img.pyramid[1])))
-                self.results.put(("loaded", gen, on_disk()))
-                return
+                    self.results.put(("loaded", gen, on_disk()))
+                    return
+                # (a pyramid level's file is missing or unreadable: read from the image itself below, which says what is missing)
+                img.use_step(img.overview_step())
             for c in range(n):
                 if gen != self.generation:
                     return
                 self.results.put(("progress", gen, f"Reading {img.entry.name}{plane}: channel {c + 1} of {n} ..."))
                 try:
-                    img.overview(z, c, lambda f, c=c: report((c + f) / n), stale=lambda: gen != self.generation)
+                    small = img.overview(z, c, lambda f, c=c: report((c + f) / n), stale=lambda: gen != self.generation)
                 except StaleRead:
                     return              # (the z slider has moved on: the plane that is wanted now is read by its own thread)
+                except FileNotFoundError:
+                    self.results.put(("error", gen, self._missing_note(img, z, c)))
+                    return
                 except Exception as e:
                     self.results.put(("error", gen, f"Can't read channel {c + 1} of {img.entry.name}: {e}"))
+                    return
+                if small is None:
+                    self.results.put(("error", gen, self._missing_note(img, z, c)))
                     return
                 self.results.put(("overview", gen, None))
             self.results.put(("loaded", gen, on_disk()))
 
         threading.Thread(target=work, daemon=True).start()
         self.status.config(text=f"Reading {img.entry.name}{plane} ...")
+
+    @staticmethod
+    def _missing_note(img, z, c):
+        """Why channel c of plane z couldn't be read (asked of the disk: os.path.exists only, no download)."""
+        e = img.entry
+        path = e.files.get((z, c))
+        if path is None:
+            return f"Can't show {e.name}: its metadata names no image file for channel {c + 1}."
+        if not os.path.exists(path):
+            gone = sum(not os.path.exists(f) for f in e.all_files())
+            what = ("none of its image files are there" if gone == len(e.all_files())
+                    else f"{gone} of its {len(e.all_files())} image files are missing")
+            return (f"Can't show {e.name}: {what} (only the metadata was copied?). Looked for {path}")
+        return f"Can't read channel {c + 1} of {e.name} from {path}"
 
     # --- channel controls
 

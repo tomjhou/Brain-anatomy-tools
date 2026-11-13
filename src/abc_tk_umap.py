@@ -2512,6 +2512,9 @@ class UmapWindow(ExportsMixin):
                 b.grid(row=r, column=c, columnspan=2 if len(pair) == 1 else 1, sticky="ew", padx=2, pady=2)
                 if grouped:
                     self.group_buttons.append(b)
+                    HoverTip(b, lambda b=b: self.group_button_tip(b))
+                    if text == "3D in browser":
+                        self.threed_button = b
                 if self.own is not None and text == "Save section maps":
                     b.state(["disabled"])                                 # (no section maps)
                 if self.no_umap and text == "Save UMAP":
@@ -2552,10 +2555,47 @@ class UmapWindow(ExportsMixin):
         import abc_tk_subset
         abc_tk_subset.analyze_subset(self)
 
+    MAX_3D_GROUPS = 30
+
+    def groups_on_count(self):
+        """How many groups are switched on (in their color) in All groups: the 3D view takes those, if there are few enough."""
+        if self.mode != "all" or self.info.get(self.level) is None:
+            return 0
+        codes, uniques = self.category_codes(self.level)
+        key = ("counts", self.level)
+        if key not in self.cache:
+            self.cache[key] = np.bincount(codes[codes >= 0], minlength=len(uniques))
+        counts = self.cache[key]
+        return sum(1 for u in np.flatnonzero(counts > 0) if str(uniques[u]) not in self.off_groups)
+
+    def group_button_tip(self, button=None):
+        """Why one of the buttons that work on groups is greyed out (nothing when it is not)."""
+        if self.own is not None:
+            return "Not available for a dataset of your own."
+        if button is getattr(self, "threed_button", None):
+            if self.mode == "single":
+                return ""
+            if self.mode == "all":
+                n = self.groups_on_count()
+                if n > self.MAX_3D_GROUPS:
+                    return (f"{n} groups are switched on: the 3D view takes at most {self.MAX_3D_GROUPS}. Click groups in the list to switch some off "
+                            "(or None, then the ones you want), or use Specific group(s).")
+                return "No group is switched on." if n == 0 else ""
+            return f"Choose All groups (with {self.MAX_3D_GROUPS} or fewer switched on) or Specific group(s) under Color by to use this."
+        if self.mode != "single":
+            return "Choose Specific group(s) under Color by, and enter the group numbers, to use this."
+        return ""
+
     def update_group_buttons(self):
-        """The group exports and 3D views are for the groups typed in Single group(s)."""
+        """The group exports are for the groups typed in Single group(s); the 3D view also for the groups switched on in All groups, if there are at most
+        MAX_3D_GROUPS of them."""
         for b in self.group_buttons:
-            b.state(["!disabled"] if self.mode == "single" and self.own is None else ["disabled"])
+            if b is getattr(self, "threed_button", None):
+                n = self.groups_on_count() if self.mode == "all" else 0
+                usable = self.mode == "single" or (self.mode == "all" and 1 <= n <= self.MAX_3D_GROUPS)
+            else:
+                usable = self.mode == "single"
+            b.state(["!disabled"] if usable and self.own is None else ["disabled"])
 
     def update_frames(self):
         self.level_frame.config(text="Group by" if self.mode in ("all", "single") else "Group by (hover)")
@@ -3807,6 +3847,7 @@ class UmapWindow(ExportsMixin):
             self.group_list.pack_forget()                # (a gene's colors say nothing of the groups: no list, even before a gene is entered and the cells keep their group colors)
             self.legend.pack_forget()
         self.sync_select_bar()
+        self.update_group_buttons()                      # (the 3D button follows how many groups are switched on)
 
     def dot_scale(self):
         return self.host.get("umap_circle_sizes", {}).get(self.viewer_settings.get("umap_circle_size", "Default"), 1.0)
@@ -3985,6 +4026,9 @@ class UmapWindow(ExportsMixin):
         counts = np.bincount(codes[codes >= 0], minlength=len(uniques))
         ranked = np.argsort(-counts, kind="stable")
         ranked = ranked[counts[ranked] > 0]
+        by_size = ranked                                                        # (the largest first: the labels go to the largest groups whatever the colors' order)
+        if self.viewer_settings.get("group_colors", "cycle") == "numeric":
+            ranked = self.numeric_order(uniques, ranked)
         palette = self.group_palette(level, codes, uniques, counts, ranked)
         self.group_rgb = palette
         lut = np.tile(GREY, (len(uniques), 1))
@@ -4006,7 +4050,7 @@ class UmapWindow(ExportsMixin):
 
         # each coloured group's number at its centre
         cent = pd.DataFrame({"g": codes, "x": self.coords[:, 0], "y": self.coords[:, 1]})
-        on = [u for u in ranked if str(uniques[u]) not in self.off_groups][:MAX_COLORED_CATEGORIES]          # (labels for the largest: thousands would only be a smear)
+        on = [u for u in by_size if str(uniques[u]) not in self.off_groups][:MAX_COLORED_CATEGORIES]          # (labels for the largest: thousands would only be a smear)
         cent = cent[cent["g"].isin(on)].groupby("g").median()
         labels = []
         weights = label_weights(counts[cent.index.to_numpy()])
@@ -4024,13 +4068,21 @@ class UmapWindow(ExportsMixin):
         self.set_cell_ranks(self.export_cat["rank"], np.where(bgc >= 0, rank_of[np.maximum(bgc, 0)], -1) if bgc is not None else None)
         self.shown_values = None
         n_cat = int((counts > 0).sum())
-        self.var_status.set(f"Showing all {n_cat} {plural_name(self.level_names[level])}" + (f"; the looks repeat past the {MAX_COLORED_CATEGORIES} largest: hover a cell for its group." if n_cat > MAX_COLORED_CATEGORIES and self.viewer_settings.get("group_colors", "cycle") == "cycle" else ".") + " Click group in list to select/deselect.")
+        self.var_status.set(f"Showing all {n_cat} {plural_name(self.level_names[level])}" + (f"; the colors and shapes repeat after {MAX_COLORED_CATEGORIES} groups: hover a cell for its group." if n_cat > MAX_COLORED_CATEGORIES and self.viewer_settings.get("group_colors", "cycle") != "lineage" else ".") + " Click group in list to select/deselect.")
         self.values = None
         self.draw_group_list(ranked, uniques, counts)
 
+    def numeric_order(self, uniques, ranked):
+        """The groups `ranked` (indexes into `uniques`) in the order of their numbers (the taxonomy's order), those with no number after them by name."""
+        def key(u):
+            text = str(uniques[u])
+            m = re.match(r"^\s*(\d+)", text)
+            return (0, int(m.group(1)), text) if m else (1, 0, text.lower())
+        return np.array(sorted((int(u) for u in ranked), key=key), dtype=ranked.dtype)
+
     def group_palette(self, level, codes, uniques, counts, ranked):
         """The color of each group of a level (indexed like `uniques`), by the Group colors setting: 'cycle' gives the r-th largest the browser's r-th color (they
-        repeat past MAX_COLORED_CATEGORIES); 'lineage' derives a group's color from its parent's (see lineage_palette), falling back to the cycle for a level that
+        repeat past MAX_COLORED_CATEGORIES), 'numeric' the same in the order of the groups' numbers (`ranked` is already in that order); 'lineage' derives a group's color from its parent's (see lineage_palette), falling back to the cycle for a level that
         is not a step down the taxonomy."""
         if self.viewer_settings.get("group_colors", "cycle") == "lineage":
             palette = self.lineage_palette(level, codes, uniques, counts)

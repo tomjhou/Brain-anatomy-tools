@@ -3911,7 +3911,8 @@ class XlefViewer:
                                     name_tip=self._grid_tip_text, is_unsaved=self._is_unsaved)
         self.grid_marks_job = None   # (the grid's red *s redrawn once, after a change to what is unsaved: see _place_unsaved_mark)
         self.thumb_gen = 0           # bumped for each experiment opened: thumbnails made for an earlier one are dropped
-        self.thumb_mask = None       # (channel names, on/off) while some of the shown image's channels are off: see _thumb_shown
+        self.channels_on = {}        # channel names -> on/off: the switches last set for images of those channels (see show_entry)
+        self.thumb_mask = {}         # (the same, for those with a channel off: see _thumb_shown)
         self.key_level = {}          # sharp views read from a pyramid level: their pixels' size (see _origin)
         self.thumbs_started = False
         self._tree_tag_colors()
@@ -5622,7 +5623,6 @@ class XlefViewer:
                 self.img.close()
         self._stop_glide()
         self.img = None
-        self.root.after_idle(self._update_thumb_mask)  # (once the next image, if any, is shown: its channels and switches)
         self._show_loaded()
         self.photo = None
         self.flip_one.set(False)
@@ -5698,9 +5698,8 @@ class XlefViewer:
         agreed to already; None: ask then; False: no)."""
         self.full_res_ok = full_res_ok
         self._probe_speed(entry)
-        same_channels = (len(entry.channels) == len(self.ch_settings) and self.img is not None
-                         and [c.name for c in entry.channels] == [c.name for c in self.img.entry.channels])
-        shown = [st["on"] for st in self.ch_settings] if same_channels else [True] * len(entry.channels)
+        names = tuple(c.name for c in entry.channels)
+        shown = list(self.channels_on.get(names, ())) or [True] * len(entry.channels)
         kept = self.kept_images.pop(entry, None)        # (seen recently, or loaded in the background: its picture is in memory)
         self._kept_changed()
         self._close_image()
@@ -5716,7 +5715,8 @@ class XlefViewer:
             self.thumbs_go.clear()          # (the thumbnails wait until this image is shown: see _start_thumbnails)
             self.img = OpenImage(entry)
         self._show_loaded()
-        # Each image opens with its own LAS X contrast; which channels are switched on carries over to images of the same channels.
+        # Each image opens with its own LAS X contrast; which channels are switched on carries over to images of the same channels,
+        # even when images of other channels (an overview, say) were looked at in between.
         self.ch_settings = [{"on": on, "lo": c.black, "hi": c.white} for c, on in zip(entry.channels, shown)]
         self.flip_one.set(self._section_flipped(entry))
         self.flip_one_check.configure(state=tk.NORMAL)
@@ -5897,27 +5897,26 @@ class XlefViewer:
         self.ch_settings[i][key] = value
         self.schedule_redraw()
         if key == "on":
+            if self.img is not None and len(self.ch_settings) == len(self.img.entry.channels):
+                self.channels_on[tuple(c.name for c in self.img.entry.channels)] = tuple(st["on"] for st in self.ch_settings)
             self._update_thumb_mask()
 
     def _thumb_shown(self, entry, mask=False):
-        """Which channels the thumbnail of `entry` draws: the channel switches (on/off) of the image on show, if `entry` has the same
-        channels (they carry over to it when it is opened: see show_entry); else None, every channel. (Read by the thumbnail threads:
-        thumb_mask is replaced whole, never changed in place.) mask: thumb_mask as it was earlier."""
+        """Which channels the thumbnail of `entry` draws: the channel switches (on/off) last set for images of its channels (they are
+        what it opens with: see show_entry); None: every channel. (Read by the thumbnail threads: thumb_mask is replaced whole, never
+        changed in place.) mask: thumb_mask as it was earlier."""
         m = self.thumb_mask if mask is False else mask
-        if m is None or tuple(c.name for c in entry.channels) != m[0]:
-            return None
-        return m[1]
+        return (m or {}).get(tuple(c.name for c in entry.channels))
 
     def _update_thumb_mask(self):
-        """After a channel was switched on or off, or another image shown: thumb_mask, and the thumbnails it changes (those of the
-        images with the channels of the old mask or the new one) made again."""
-        old, new = self.thumb_mask, None
-        if self.img is not None and len(self.ch_settings) == len(self.img.entry.channels) and not all(st["on"] for st in self.ch_settings):
-            new = (tuple(c.name for c in self.img.entry.channels), tuple(st["on"] for st in self.ch_settings))
+        """After a channel was switched on or off: thumb_mask, and the thumbnails it changes (those of the images of the channels
+        whose switches changed) made again."""
+        old = self.thumb_mask
+        new = {k: v for k, v in self.channels_on.items() if not all(v)}
         if new == old:
             return
         self.thumb_mask = new
-        names = {m[0] for m in (old, new) if m is not None}
+        names = {k for k in set(old) | set(new) if old.get(k) != new.get(k)}
         self._refresh_thumbnails([i for i, e in self.entries.items() if tuple(c.name for c in e.channels) in names])
 
     def _set_lo_hi(self, i, lo, hi):

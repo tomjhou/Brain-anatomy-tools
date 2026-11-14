@@ -9,6 +9,32 @@
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
 source "$REPO/src/terminal_window.sh"     # (press_enter_to_close)
+# Not from the Downloads folder (it gets cleared out, and the ABC atlas browser keeps its atlas download, up to about 60 GB, next to this
+# folder by default): there, ask for this folder to be moved somewhere permanent and this run again from there. (Compared without case,
+# as macOS's disks normally are, and by the real path too, in case of a link.)
+DOWNLOADS_DIR="${DOWNLOADS_DIR:-$HOME/Downloads}"     # (tests set it)
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+in_downloads=""
+for here in "$REPO" "$(cd "$REPO" && pwd -P)"; do
+    case "$(lower "$here")/" in "$(lower "${DOWNLOADS_DIR%/}")"/*) in_downloads=1 ;; esac
+done
+if [ -n "$in_downloads" ]; then
+    echo "This folder is in your Downloads folder:"
+    echo "    $REPO"
+    echo
+    echo "Files in Downloads are often cleared out, which would remove the tools (and the ABC atlas download, which is kept beside"
+    echo "this folder). Please move the whole $(basename "$REPO") folder somewhere permanent, for example a BrainTools folder in your"
+    echo "home folder (not an iCloud Drive folder), then run INSTALL_APPS_MAC.command again from there."
+    if [ -d "$(dirname "$REPO")/abc_atlas_cache" ]; then
+        echo
+        echo "Move the abc_atlas_cache folder next to it as well, into the same new folder, so the ABC atlas browser finds its download there."
+    fi
+    echo
+    echo "No apps were made."
+    if [ -z "$APPS_TEST" ]; then press_enter_to_close 1; fi
+    exit 1
+fi
+
 APPS_DIR="${APPS_DIR:-$HOME/Applications}"      # (tests set APPS_DIR, and APPS_TEST: see the end)
 echo "==== Making apps for the Brain anatomy tools ===="
 echo

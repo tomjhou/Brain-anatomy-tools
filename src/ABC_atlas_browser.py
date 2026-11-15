@@ -135,6 +135,11 @@ def _make_windows_dpi_aware():
 # window opens that much too large.
 _make_windows_dpi_aware()
 
+# Installed from a new folder while an earlier copy is still here: offer to bring over its settings, atlas download and results, before
+# the atlas location is looked for (see previous_install.py; nothing happens unless the installer left its note about this folder).
+import previous_install
+previous_install.offer("abc_atlas_browser")
+
 
 # Checked before the imports below, at every launch. Import name -> pip
 # package spec (they differ for some). Specs are plain argv strings, not
@@ -985,24 +990,27 @@ def choose_atlas_cache_location():
     to this repository (if it exists), or else ask the user once. Asking lists
     every local drive and its free space on the console, then opens
     prompt_atlas_cache_location pre-filled with suggest_atlas_cache_dir. The
-    answer is saved to ATLAS_CACHE_LOCATION_FILE. Exits if cancelled."""
-    try:
-        saved = json.loads(ATLAS_CACHE_LOCATION_FILE.read_text(encoding='utf-8')).get('path')
-    except (OSError, ValueError, AttributeError):
-        saved = None
+    answer is saved to ATLAS_CACHE_LOCATION_FILE, and per user (previous_install.remember_atlas_location), so that any other copy of the
+    tools on this computer finds the same download rather than downloading it again. Exits if cancelled."""
+    import previous_install
+    saved = previous_install.saved_atlas_location(ATLAS_CACHE_LOCATION_FILE)      # (this copy's record, else the one kept per user)
     if saved:
         if Path(saved).is_dir():
             usable = usable_atlas_dir(saved)
             if usable is not None:
                 if usable != Path(saved):
                     print(f"The ABC atlas download was found inside the saved location, in {usable}.")
-                    ATLAS_CACHE_LOCATION_FILE.write_text(json.dumps({'path': str(usable)}, indent=2), encoding='utf-8')
+                CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                ATLAS_CACHE_LOCATION_FILE.write_text(json.dumps({'path': str(usable)}, indent=2), encoding='utf-8')
+                previous_install.remember_atlas_location(usable)
                 return usable
             print(f"The saved ABC atlas location {saved} holds other files and no atlas download, so it will not be used.")
         else:
             print(f"The saved ABC atlas location {saved} no longer exists.")
     if DEFAULT_ATLAS_CACHE_DIR.is_dir() and usable_atlas_dir(DEFAULT_ATLAS_CACHE_DIR) is not None:
-        return usable_atlas_dir(DEFAULT_ATLAS_CACHE_DIR)
+        found = usable_atlas_dir(DEFAULT_ATLAS_CACHE_DIR)
+        previous_install.remember_atlas_location(found)          # (for the other copies on this computer)
+        return found
 
     drives = list_local_drives()
     print(f"No ABC atlas download found at {DEFAULT_ATLAS_CACHE_DIR}.")
@@ -1031,6 +1039,7 @@ def choose_atlas_cache_location():
         print(f"Could not create {chosen} ({e}); exiting.")
         sys.exit(1)
     ATLAS_CACHE_LOCATION_FILE.write_text(json.dumps({'path': str(chosen)}, indent=2), encoding='utf-8')
+    previous_install.remember_atlas_location(chosen)
     print(f"Using {chosen} for the ABC atlas download (saved to {ATLAS_CACHE_LOCATION_FILE}).")
     return chosen
 

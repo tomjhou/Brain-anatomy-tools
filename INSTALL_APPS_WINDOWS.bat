@@ -18,6 +18,15 @@ if errorlevel 2 (
   exit /b 1
 )
 
+REM Installed already? From this folder (run again): says what that does and does not fix, and asks whether to go on. From another
+REM folder: asks whether this one is to be the installed copy. Its "no", code 3, stops here. See src\check_previous_install.ps1.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\check_previous_install.ps1"
+if errorlevel 3 (
+  echo.
+  pause
+  exit /b 0
+)
+
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\install_shortcuts.ps1"
 if errorlevel 1 (
   echo.

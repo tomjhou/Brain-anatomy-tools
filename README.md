@@ -6,7 +6,9 @@ The fastest way to get started is to click the green "CODE" button above, then c
 
 <p align="center"><img src="src/readme_images/download_zip.png" width="361" alt="The green Code button on GitHub, and Download ZIP in the menu it opens"></p>
 
-Unzip the download, then double click `INSTALL_APPS_WINDOWS.bat` on Windows (red arrow below), or `INSTALL_APPS_MAC.command` on Mac (orange arrow).
+Unzip the download, move the folder somewhere permanent (for example a `BrainTools` folder in your home folder: not Downloads, which gets
+cleared out, so the installer asks for it to be moved first), then double click `INSTALL_APPS_WINDOWS.bat` on Windows (red arrow below), or
+`INSTALL_APPS_MAC.command` on Mac (orange arrow).
 
 <p align="center"><img src="src/readme_images/install_apps.png" width="471" alt="Double click the installer"></p>
 
@@ -29,6 +31,10 @@ this folder. This takes a few minutes and needs an internet connection, and it l
 - **Update:** in the xlef viewer, choose Update > Update from GitHub. It shows what's new and updates all tools at once.
 - **Uninstall:** Windows Settings > Apps > "Brain anatomy tools", or double-click `UNINSTALL_APPS_WINDOWS.bat` (`UNINSTALL_APPS_MAC.command` on a
   Mac). It asks before removing anything large, and never touches your images, projects or results.
+- **Installing again:** from the same folder, the installer says the tools are installed already, and that running it again only remakes
+  the shortcuts (it doesn't repair the programs: use Update for that). From a new folder while an earlier copy is still on the computer, it
+  asks whether the new folder is to be the installed one; if so, the first app you open from it offers to bring over the earlier copy's
+  settings, ABC atlas download and results, so nothing is downloaded again (and strongly recommends moving anything that is in Downloads).
 
 Most buttons and controls explain themselves when you hover the mouse over them.
 

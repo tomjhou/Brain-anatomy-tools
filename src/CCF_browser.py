@@ -237,11 +237,14 @@ def ask_choice(parent, title, text, buttons):
 
 
 def remember_atlas_cache_dir(folder):
-    """Create `folder` if need be and save it as the atlas download location (where ABC_atlas_browser.py will find it too)."""
+    """Create `folder` if need be and save it as the atlas download location (where ABC_atlas_browser.py will find it too, and, kept per
+    user, any other copy of the tools on this computer)."""
+    import previous_install
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     ATLAS_CACHE_LOCATION_FILE.write_text(json.dumps({'path': str(folder)}, indent=2), encoding='utf-8')
+    previous_install.remember_atlas_location(folder)
     return folder
 
 
@@ -268,11 +271,10 @@ def choose_new_atlas_cache_dir(parent):
 
 def find_atlas_cache_dir(parent=None):
     """The ABC atlas download folder: the location ABC_atlas_browser.py saved, else the default next to the repository. If a saved
-    location is gone the user is asked to locate it or to download again; with nothing saved, where to put a new download. None if cancelled."""
-    try:
-        saved = json.loads(ATLAS_CACHE_LOCATION_FILE.read_text(encoding='utf-8')).get('path')
-    except (OSError, ValueError, AttributeError):
-        saved = None
+    location is gone the user is asked to locate it or to download again; with nothing saved, where to put a new download. None if cancelled.
+    (Saved: this copy's record, else the one kept per user, by any copy of the tools.)"""
+    import previous_install
+    saved = previous_install.saved_atlas_location(ATLAS_CACHE_LOCATION_FILE)
     if saved and is_atlas_cache(saved):
         return Path(saved)
     if saved and Path(saved).is_dir() and atlas_cache_in(saved):       # (the cache was moved into a subfolder: follow it)
@@ -395,10 +397,8 @@ def load_atlas(base, download):
 
 def quiet_atlas_cache_dir():
     """Like find_atlas_cache_dir, but never asks: the saved or default ABC atlas folder, else None."""
-    try:
-        saved = json.loads(ATLAS_CACHE_LOCATION_FILE.read_text(encoding='utf-8')).get('path')
-    except (OSError, ValueError, AttributeError):
-        saved = None
+    import previous_install
+    saved = previous_install.saved_atlas_location(ATLAS_CACHE_LOCATION_FILE)
     if saved and is_atlas_cache(saved):
         return Path(saved)
     return DEFAULT_ATLAS_CACHE_DIR if is_atlas_cache(DEFAULT_ATLAS_CACHE_DIR) else None
@@ -3739,6 +3739,8 @@ class CCFBrowser:
 def main():
     from app_identity import use_app_identity
     use_app_identity("ccf_browser")
+    import previous_install                 # (installed from a new folder: offer to bring over the earlier copy's settings and files)
+    previous_install.offer("ccf_browser")
     startup_note("Opening the window...")
     CCFBrowser().run()
 

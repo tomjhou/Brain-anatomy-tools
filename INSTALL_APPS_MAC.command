@@ -36,6 +36,74 @@ if [ -n "$in_downloads" ]; then
 fi
 
 APPS_DIR="${APPS_DIR:-$HOME/Applications}"      # (tests set APPS_DIR, and APPS_TEST: see the end)
+
+# Installed already? (As check_previous_install.ps1 on Windows.) From this same folder (run again, by mistake or as a "repair"): say what
+# that does and doesn't fix, and ask whether to go on. From another folder that is still there: ask whether this one is to be the
+# installed copy; if so, leave a note for the programs, the first of which opened from here offers to bring over the old copy's
+# settings, atlas download and results (see src/previous_install.py). An old copy in Downloads is warned about, strongly. Where the tools
+# are installed from: the folder the existing apps start them from. The same folder is judged by the folder on disk (device and inode),
+# not by the spelling of its path.
+NOTE="${NOTE:-$HOME/.brain_anatomy_tools_switch.txt}"   # (tests set it, and INSTALL_ANSWER: yes or no instead of asking)
+installed_folder() {
+    local f line
+    for f in "$APPS_DIR"/{"ABC atlas browser","Leica xlef viewer","CCF browser","Section assembler"}.app/Contents/MacOS/launcher; do
+        [ -f "$f" ] || continue
+        line="$(grep -m1 '^REPO=' "$f")" || continue
+        ( eval "$line"; printf '%s' "$REPO" )              # (the line is printf %q's own quoting, written by make_app below)
+        return
+    done
+}
+folder_id() { if [ "$(uname)" = Darwin ]; then stat -f '%d:%i' "$1" 2>/dev/null; else stat -c '%d:%i' "$1" 2>/dev/null; fi; }
+ask() {   # title, text, default button (Yes or No), icon (1 note, 2 caution): 0 for Yes
+    if [ -n "$INSTALL_ANSWER" ]; then [ "$INSTALL_ANSWER" = yes ]; return; fi
+    local answer
+    answer="$(osascript - "$1" "$2" "$3" "$4" 2>/dev/null <<'APPLESCRIPT'
+on run argv
+    set r to display dialog (item 2 of argv) with title (item 1 of argv) buttons {"No", "Yes"} default button (item 3 of argv) with icon ((item 4 of argv) as integer)
+    return button returned of r
+end run
+APPLESCRIPT
+)"
+    if [ -z "$answer" ]; then                              # (no dialog could be shown: ask here in Terminal)
+        echo "$2"; echo
+        read -r -p "Yes or no? " answer
+    fi
+    case "$(lower "$answer")" in y|yes) return 0 ;; *) return 1 ;; esac
+}
+stop_here() { echo "$1"; if [ -z "$APPS_TEST" ]; then press_enter_to_close 0; fi; exit 0; }
+old="$(installed_folder)"
+if [ -n "$old" ] && [ -d "$old" ]; then
+    if [ "$(folder_id "$old")" = "$(folder_id "$REPO")" ]; then
+        ask "Already installed from this folder" "The Brain anatomy tools are already installed from this folder:
+    $REPO
+
+Running the installer again only remakes the apps in $APPS_DIR. It does not repair the programs themselves. For those:
+  - missing or damaged program files: the Update button in one of the programs (or download the tools again);
+  - missing Python libraries, or a broken Python environment: delete the .venv-macos folder here; it is rebuilt, with the libraries, when a program next starts.
+
+Remake the apps anyway?" No 1 || stop_here "Already installed from this folder: nothing was changed."
+    else
+        text="The Brain anatomy tools are already installed from another folder:
+    $old
+
+This new folder is:
+    $REPO
+
+Make this new folder the installed copy? Its apps replace the old ones, and the first time you open one of the programs from here, it offers to bring over the old copy's settings, its ABC atlas download and your results, so that nothing is downloaded again. The old copy itself is left as it is."
+        icon=1
+        case "$(lower "$old")/" in "$(lower "${DOWNLOADS_DIR%/}")"/*)
+            text="$text
+
+The old copy is in your Downloads folder. Files there are often cleared out, and the tools, the ABC atlas download (up to about 60 GB) and your results kept beside them would go too. Switching to this folder is strongly recommended, and so is moving the atlas download and your results out of Downloads (offered when you open a program from here)."
+            icon=2 ;;
+        esac
+        ask "Already installed from another folder" "$text" Yes "$icon" || stop_here "Nothing was changed: the tools are still installed from $old"
+        printf 'previous=%s\nnew=%s\n' "$old" "$REPO" > "$NOTE"
+        echo "This folder will be the installed copy (the old one, $old, is left as it is)."
+        echo
+    fi
+fi
+
 echo "==== Making apps for the Brain anatomy tools ===="
 echo
 

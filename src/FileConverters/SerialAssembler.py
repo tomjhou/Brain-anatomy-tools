@@ -143,6 +143,8 @@ if __name__ == "__main__":
         sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))     # (after this folder: its modules come first)
         from app_identity import use_app_identity
         use_app_identity("section_assembler")
+        import previous_install             # (installed from a new folder: offer to bring over the earlier copy's settings and files)
+        previous_install.offer("section_assembler")
     except ImportError:
         pass
     main()

@@ -7,24 +7,30 @@
 # progress there); after that it starts the program directly, with no Terminal window, its output in ~/Library/Logs/JhouLab (the ABC
 # atlas browser always opens in Terminal: it prints its progress there and asks questions there).
 
-REPO="$(cd "$(dirname "$0")" && pwd)"
+REPO="${INSTALL_REPO:-$(cd "$(dirname "$0")" && pwd)}"   # (tests set INSTALL_REPO, running a copy of this from outside the folder)
 source "$REPO/src/terminal_window.sh"     # (press_enter_to_close)
-# Not from the Downloads folder (it gets cleared out, and the ABC atlas browser keeps its atlas download, up to about 60 GB, next to this
-# folder by default): there, ask for this folder to be moved somewhere permanent and this run again from there. (Compared without case,
-# as macOS's disks normally are, and by the real path too, in case of a link.)
-DOWNLOADS_DIR="${DOWNLOADS_DIR:-$HOME/Downloads}"     # (tests set it)
+# Not from the Downloads folder (it gets cleared out, and the ABC atlas browser keeps its atlas download, up to about 60 GB, and its results
+# next to this folder by default): there, offer to move this folder to a permanent place (a BrainTools folder in the home folder, or one
+# chosen) and run this again from there. The atlas download and output folder beside it go along when they are there, on the same disk
+# (an instant rename), and the records that name them are put right. (macOS lets a folder be moved while a script runs from it: bash goes
+# on reading this file as it is.) Downloads is compared without case, as macOS's disks normally are, and by the real path too.
+DOWNLOADS_DIR="${DOWNLOADS_DIR:-$HOME/Downloads}"     # (tests set it, and MOVE_BASE and MOVE_ANSWER: move, cancel or a folder)
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
-in_downloads=""
-for here in "$REPO" "$(cd "$REPO" && pwd -P)"; do
-    case "$(lower "$here")/" in "$(lower "${DOWNLOADS_DIR%/}")"/*) in_downloads=1 ;; esac
-done
-if [ -n "$in_downloads" ]; then
+is_in_downloads() {
+    local here
+    for here in "$1" "$(cd "$1" 2>/dev/null && pwd -P)"; do
+        case "$(lower "$here")/" in "$(lower "${DOWNLOADS_DIR%/}")"/*) return 0 ;; esac
+    done
+    return 1
+}
+disk_of() { if [ "$(uname)" = Darwin ]; then stat -f '%d' "$1" 2>/dev/null; else stat -c '%d' "$1" 2>/dev/null; fi; }
+tell_cancelled() {
     echo "This folder is in your Downloads folder:"
     echo "    $REPO"
     echo
-    echo "Files in Downloads are often cleared out, which would remove the tools (and the ABC atlas download, which is kept beside"
-    echo "this folder). Please move the whole $(basename "$REPO") folder somewhere permanent, for example a BrainTools folder in your"
-    echo "home folder (not an iCloud Drive folder), then run INSTALL_APPS_MAC.command again from there."
+    echo "Files in Downloads are often cleared out, which would remove the tools (and the ABC atlas download and your results, which are"
+    echo "kept beside this folder). Please move the whole $(basename "$REPO") folder somewhere permanent, for example a BrainTools folder in"
+    echo "your home folder (not an iCloud Drive folder), then run INSTALL_APPS_MAC.command again from there."
     if [ -d "$(dirname "$REPO")/abc_atlas_cache" ]; then
         echo
         echo "Move the abc_atlas_cache folder next to it as well, into the same new folder, so the ABC atlas browser finds its download there."
@@ -33,6 +39,101 @@ if [ -n "$in_downloads" ]; then
     echo "No apps were made."
     if [ -z "$APPS_TEST" ]; then press_enter_to_close 1; fi
     exit 1
+}
+replace_in_file() {   # file, old text, new text (the records are JSON: a path in them is written as it is, on a Mac)
+    [ -f "$1" ] || return 0
+    local content; content="$(cat "$1")"
+    printf '%s\n' "${content//"$2"/"$3"}" > "$1"
+}
+if is_in_downloads "$REPO"; then
+    name="$(basename "$REPO")"
+    parent="$(dirname "$REPO")"
+    base="${MOVE_BASE:-$HOME/BrainTools}"
+    while :; do
+        dest="$base/$name"; k=2
+        while [ -e "$dest" ]; do dest="$base/$name-$k"; k=$((k + 1)); done   # (never into a folder that is there already)
+        probe="$base"; while [ ! -d "$probe" ]; do probe="$(dirname "$probe")"; done
+        moving=(); text_moving=""; text_staying=""
+        for item in abc_atlas_cache:"the ABC atlas download" ABC_atlas_browser_output:"your ABC browser results"; do
+            n="${item%%:*}"; what="${item#*:}"
+            [ -d "$parent/$n" ] || continue
+            if [ "$(disk_of "$parent")" = "$(disk_of "$probe")" ] && [ ! -e "$base/$n" ]; then
+                moving+=("$parent/$n"); text_moving="$text_moving
+    $parent/$n  ($what)"
+            else
+                text_staying="$text_staying
+    $parent/$n  ($what)"
+            fi
+        done
+        text="This folder is in your Downloads folder:
+    $REPO
+
+Files in Downloads are often cleared out, which would remove the tools, and the ABC atlas download (up to about 60 GB) and your results, which are kept beside them.
+
+Move the folder here, and install from there?
+    $dest"
+        [ -n "$text_moving" ] && text="$text
+
+Moved along with it (instant: nothing is copied):$text_moving"
+        [ -n "$text_staying" ] && text="$text
+
+Left where it is (offered again when you open the ABC atlas browser):$text_staying"
+        if [ -n "$MOVE_ANSWER" ]; then
+            case "$MOVE_ANSWER" in move|cancel) choice="$MOVE_ANSWER" ;; *) choice=choose ;; esac
+        else
+            choice="$(osascript - "$text" 2>/dev/null <<'APPLESCRIPT'
+on run argv
+    set r to display dialog (item 1 of argv) with title "The tools are in your Downloads folder" buttons {"Cancel", "Choose another place…", "Move and install"} default button "Move and install" cancel button "Cancel" with icon 2
+    if button returned of r is "Move and install" then return "move"
+    return "choose"
+end run
+APPLESCRIPT
+)"
+            [ -n "$choice" ] || choice=cancel                              # (Cancel, or no dialog could be shown)
+        fi
+        [ "$choice" = cancel ] && tell_cancelled
+        [ "$choice" = move ] && break
+        if [ -n "$MOVE_ANSWER" ]; then picked="$MOVE_ANSWER"; MOVE_ANSWER=move; else
+            picked="$(osascript -e 'POSIX path of (choose folder with prompt "Choose where to put the tools folder (not Downloads or iCloud Drive)")' 2>/dev/null)"
+        fi
+        picked="${picked%/}"
+        [ -n "$picked" ] || continue                                       # (the folder picker cancelled: ask again)
+        if is_in_downloads "$picked" || case "$(lower "$picked")/" in "$(lower "$REPO")"/*) true ;; *) false ;; esac; then
+            [ -n "$MOVE_ANSWER" ] && tell_cancelled
+            osascript -e 'display alert "Choose another place" message "That is in Downloads, or in this folder itself."' >/dev/null 2>&1
+            continue
+        fi
+        base="$picked"
+    done
+    if pgrep -f "$REPO/.venv-macos/bin/" >/dev/null 2>&1; then
+        echo "A program from this folder is open, so it can't be moved. Close the Brain anatomy tools, then run INSTALL_APPS_MAC.command again."
+        echo "Nothing was moved."
+        if [ -z "$APPS_TEST" ]; then press_enter_to_close 1; fi
+        exit 1
+    fi
+    echo "Moving the tools out of Downloads, to"
+    echo "    $dest"
+    mkdir -p "$base" && mv "$REPO" "$dest" || { echo "The folder could not be moved. Nothing was changed."; [ -z "$APPS_TEST" ] && press_enter_to_close 1; exit 1; }
+    echo "  Moved the tools to $dest"
+    for old in "${moving[@]}"; do
+        if mv "$old" "$base/$(basename "$old")"; then
+            echo "  Moved $old to $base/$(basename "$old")"
+            # the records that name it: the copy's own, and the atlas location kept per user
+            for record in "$dest/src/cache_local/abc_atlas_cache_location.json" "$dest/src/cache_local/recent_output_folders.json" \
+                          "$HOME/.brain_anatomy_tools_settings.json"; do
+                replace_in_file "$record" "$old" "$base/$(basename "$old")"
+            done
+        else
+            echo "  Could not move $old; it is still there (the ABC atlas browser offers it again)."
+        fi
+    done
+    if [ "$(lower "${parent%/}")" != "$(lower "${DOWNLOADS_DIR%/}")" ]; then    # (the folder it was unzipped into, if now empty)
+        rmdir "$parent" 2>/dev/null
+    fi
+    echo
+    echo "Now installing from the new place."
+    echo
+    INSTALL_REPO="" exec bash "$dest/INSTALL_APPS_MAC.command"     # (from its new place, which it then finds for itself)
 fi
 
 APPS_DIR="${APPS_DIR:-$HOME/Applications}"      # (tests set APPS_DIR, and APPS_TEST: see the end)

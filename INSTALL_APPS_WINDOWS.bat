@@ -9,9 +9,12 @@ title Install app shortcuts
 echo ==== Making shortcuts for the Brain anatomy tools ====
 echo.
 
-REM Not from the Downloads folder (it gets cleared out): there, it asks for this folder to be moved first. See src\check_install_folder.ps1.
-REM (Only its "in Downloads" answer, code 2, stops the installer: if the check itself can't run, the shortcuts are made anyway.)
+REM Not from the Downloads folder (it gets cleared out): there, it offers to move this folder to a permanent place and install from
+REM there. See src\check_install_folder.ps1. Code 4: the move has started, in a window of its own, which waits for this one to end (so
+REM that nothing holds the folder), then runs the installer from the new place: so end now. Code 2: cancelled (no shortcuts made). If
+REM the check itself can't run, the shortcuts are made anyway. (4 is looked at first: "errorlevel 2" means 2 or more.)
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\check_install_folder.ps1"
+if errorlevel 4 exit /b 0
 if errorlevel 2 (
   echo.
   pause

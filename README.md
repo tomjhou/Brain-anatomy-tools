@@ -6,9 +6,9 @@ The fastest way to get started is to click the green "CODE" button above, then c
 
 <p align="center"><img src="src/readme_images/download_zip.png" width="361" alt="The green Code button on GitHub, and Download ZIP in the menu it opens"></p>
 
-Unzip the download, move the folder somewhere permanent (for example a `BrainTools` folder in your home folder: not Downloads, which gets
-cleared out, so the installer asks for it to be moved first), then double click `INSTALL_APPS_WINDOWS.bat` on Windows (red arrow below), or
-`INSTALL_APPS_MAC.command` on Mac (orange arrow).
+Unzip the download, then double click `INSTALL_APPS_WINDOWS.bat` on Windows (red arrow below), or `INSTALL_APPS_MAC.command` on Mac (orange
+arrow). If the folder is still in Downloads (which gets cleared out), the installer offers to move it to a permanent place first, a
+`BrainTools` folder in your home folder or one you choose, and installs from there.
 
 <p align="center"><img src="src/readme_images/install_apps.png" width="471" alt="Double click the installer"></p>
 

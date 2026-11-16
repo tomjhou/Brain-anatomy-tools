@@ -311,7 +311,7 @@ def _ask(p):
     from tkinter import ttk
     root = tk.Tk()
     root.withdraw()
-    root.title("Bring over from the previous copy?")
+    root.title("Previous copy found")
     root.resizable(False, False)
     try:
         root.attributes("-topmost", True)
@@ -320,26 +320,20 @@ def _ask(p):
     frame = ttk.Frame(root, padding=(20, 16, 20, 14))
     frame.pack(fill=tk.BOTH, expand=True)
     wrap = 760
-    warn = p["previous_in_downloads"] or any(it and it["in_downloads"] for it in (p.get("atlas"), p.get("output")))
     text = ("The Brain anatomy tools are now installed from:\n    " + p["new"] + "\n\nThe previous copy is still at:\n    " + p["previous"]
-            + "\n\nBring over what it has, so that nothing is downloaded again and your results are found?")
+            + "\n\nChoose what the new copy should use from it:")
     ttk.Label(frame, text=text, wraplength=wrap, justify=tk.LEFT).pack(anchor="w")
-    if warn:
-        ttk.Label(frame, text="Something here is in your Downloads folder. " + DOWNLOADS_WARNING, wraplength=wrap, justify=tk.LEFT,
-                  foreground="firebrick").pack(anchor="w", pady=(10, 0))
     choices = {}
 
-    if p["settings"]:
-        choices["settings"] = tk.BooleanVar(root, True)
-        ttk.Checkbutton(frame, text="Copy the settings (the ABC and CCF browsers' settings, the recent output folders)",
-                        variable=choices["settings"]).pack(anchor="w", pady=(12, 0))
-
-    def item_rows(key, name, what):
+    def item_rows(key, name):
         it = p.get(key)
         if it is None:
             return
         box = ttk.LabelFrame(frame, text=f"{name} ({size_text(it['size'])}), at {it['path']}", padding=(10, 4))
         box.pack(fill=tk.X, pady=(10, 0))
+        if it["in_downloads"]:                                # (the warning, by the folder it is about and the choice it argues for)
+            ttk.Label(box, text="This is in your Downloads folder. " + DOWNLOADS_WARNING, wraplength=wrap - 30, justify=tk.LEFT,
+                      foreground="firebrick").pack(anchor="w", pady=(0, 4))
         var = choices[key] = tk.StringVar(root, "move" if it["movable"] and it["in_downloads"] else "keep")
         move_text = f"Move it beside the new copy, to {it['target']} (instant: nothing is copied)"
         if it["in_downloads"] and it["movable"]:
@@ -350,21 +344,26 @@ def _ask(p):
             mv.state(["disabled"])
             ttk.Label(box, text=f"(It can't be moved from here: {it['why']}. Move it yourself if you want it elsewhere.)",
                       foreground="gray35", wraplength=wrap - 30, justify=tk.LEFT).pack(anchor="w")
-        keep_text = f"Keep it where it is, and use {what} from there"
+        keep_text = "Leave it where it is; the new copy uses it from there"
         if it["in_downloads"]:
             keep_text += "  (not recommended: it is in Downloads)"
         ttk.Radiobutton(box, text=keep_text, value="keep", variable=var).pack(anchor="w")
 
-    item_rows("atlas", "The ABC atlas download", "it")
-    item_rows("output", "The ABC browser's output folder (your results)", "it")
+    item_rows("atlas", "The ABC atlas download")
+    item_rows("output", "Your ABC browser results")
+
+    if p["settings"]:                                         # (last: the folders above are what the question is mostly about)
+        choices["settings"] = tk.BooleanVar(root, True)
+        ttk.Checkbutton(frame, text="Also copy the settings (the ABC and CCF browsers' settings, the recent output folders)",
+                        variable=choices["settings"]).pack(anchor="w", pady=(12, 0))
 
     answer = tk.StringVar(root, "")
     row = ttk.Frame(frame)
     row.pack(anchor="e", pady=(16, 0))
-    ttk.Button(row, text="Bring over", default="active", command=lambda: answer.set("go")).pack(side=tk.LEFT)
+    # (two buttons, not a button for each way of doing it: the choices above already say move or keep for each folder)
+    ttk.Button(row, text="OK", default="active", command=lambda: answer.set("go")).pack(side=tk.LEFT)
     ttk.Button(row, text="Not now", command=lambda: answer.set("later")).pack(side=tk.LEFT, padx=(8, 0))
-    ttk.Button(row, text="No, start afresh", command=lambda: answer.set("never")).pack(side=tk.LEFT, padx=(8, 0))
-    ttk.Label(frame, text="Not now asks again next time; start afresh doesn't ask again. The previous copy itself is left as it is.",
+    ttk.Label(frame, text="Nothing is deleted, whichever you choose. Not now asks again next time.",
               foreground="gray35", wraplength=wrap, justify=tk.LEFT).pack(anchor="w", pady=(8, 0))
     root.protocol("WM_DELETE_WINDOW", lambda: answer.set("later"))
     root.bind("<Return>", lambda e: answer.set("go"))
@@ -379,9 +378,6 @@ def _ask(p):
     picked = {k: v.get() for k, v in choices.items()}
     root.destroy()
     import centered_dialog
-    if answer.get() == "never":
-        clear_note()
-        return
     if answer.get() != "go":
         return
     moving = picked.get("atlas") == "move" or picked.get("output") == "move"
@@ -399,10 +395,10 @@ def _ask(p):
         it = p.get(key)
         if it is not None and picked.get(key) != "move" and it["in_downloads"]:
             left.append(it["path"])
-    message = "\n".join(done) if done else "Nothing was brought over."
+    message = "\n".join(done) if done else "Nothing needed changing."
     if failed:
         message += "\n\nNot done:\n" + "\n".join(failed) + "\n\nOpen this program again to try those once more."
     if left:
         message += "\n\nStill in Downloads (at risk of being cleared out):\n" + "\n".join("    " + x for x in left)
     message += ("\n\nThe previous copy is still at\n    " + p["previous"] + "\nOnce you have checked that everything is here, you can delete it.")
-    centered_dialog.info("Brought over" if not failed else "Partly brought over", message)
+    centered_dialog.info("Done" if not failed else "Partly done", message)

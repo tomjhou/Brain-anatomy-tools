@@ -122,11 +122,27 @@ if ($Wrapper -and (Test-Path -LiteralPath $Wrapper) -and -not (Get-ChildItem -Li
 }
 
 Write-Host ""
-Write-Host "Done. The installer now runs from the new place."
+Write-Host "The folder is moved. Nothing more to do here."
 if (-not $NoInstall) {
-    if (-not $env:JHOULAB_INSTALL_TEST) { Start-Process explorer.exe -ArgumentList "`"$Dest`"" }   # (the old Explorer window shows a folder now gone)
-    Start-Process -FilePath (Join-Path $Dest "INSTALL_APPS_WINDOWS.bat") -WorkingDirectory $Dest
-    Start-Sleep -Seconds 2
+    # The new folder in Explorer (the old Explorer window shows a folder now gone), first, and given time to open: else it opened on top
+    # of the installer's window, which then went unseen, and the installation looked as if it had to be started again by hand.
+    if (-not $env:JHOULAB_INSTALL_TEST) {
+        Start-Process explorer.exe -ArgumentList "`"$Dest`""
+        Start-Sleep -Seconds 2
+    }
+    $installer = Join-Path $Dest "INSTALL_APPS_WINDOWS.bat"
+    try {
+        Start-Process -FilePath $installer -WorkingDirectory $Dest
+        Write-Host "The installer has started again by itself, from the new place, in a new window: finish the installation there."
+        Write-Host "(This window closes in a few seconds.)"
+        Start-Sleep -Seconds 6
+    } catch {
+        Write-Host "The installer could not be started from the new place ($($_.Exception.Message)). To finish the installation, run"
+        Write-Host "    $installer"
+        Write-Host "(its folder is open in Explorer)."
+        Write-Host ""
+        Read-Host "Press Enter to close" | Out-Null
+    }
     Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue        # (this copy, in %TEMP%)
 }
 exit 0

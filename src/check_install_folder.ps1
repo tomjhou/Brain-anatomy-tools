@@ -69,7 +69,8 @@ function Ask-Where([string]$dest, [string[]]$moving, [string[]]$staying) {
         Font = New-Object System.Drawing.Font("Segoe UI", 9); AutoScaleMode = "Dpi" }
     $text = "This folder is in your Downloads folder:`n    $Folder`n`nFiles in Downloads are often cleared out, by hand or automatically " +
             "(Storage Sense), which would remove the tools, and the ABC atlas download (up to about 60 GB) and your results, which are " +
-            "kept beside them.`n`nMove the folder here, and install from there?`n    $dest"
+            "kept beside them.`n`nMove the folder here?`n    $dest`n`nThe installer then starts again by itself, from there, in a new " +
+            "window, to finish the installation: there is nothing to run by hand."
     if ($moving) { $text += "`n`nMoved along with it (instant: nothing is copied):`n" + (($moving | ForEach-Object { "    $_" }) -join "`n") }
     if ($staying) { $text += "`n`nLeft where it is (offered again when you open the ABC atlas browser):`n" + (($staying | ForEach-Object { "    $_" }) -join "`n") }
     $scale = 1.0                                                                  # (the screen's scaling: the width below is in its pixels)
@@ -147,5 +148,6 @@ if ($extra) { $command += " -Extra @(" + (($extra | ForEach-Object { Quote $_ })
 $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))     # (encoded: paths reach it exactly, whatever is in them)
 # (started in %TEMP%: it would otherwise be in this folder, as this script is, and Windows won't move a folder a program is in)
 Start-Process powershell -WorkingDirectory $env:TEMP -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encoded)
-Write-Host "Moving the folder to $dest (in a window of its own); the installer then runs from there."
+Write-Host "Moving the folder to $dest, in a window of its own. The installer then starts again by itself, from there, in a new"
+Write-Host "window, to finish the installation: there is nothing to run by hand. (This window closes now.)"
 exit 4

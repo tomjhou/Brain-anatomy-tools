@@ -70,8 +70,10 @@ if is_in_downloads "$REPO"; then
 
 Files in Downloads are often cleared out, which would remove the tools, and the ABC atlas download (up to about 60 GB) and your results, which are kept beside them.
 
-Move the folder here, and install from there?
-    $dest"
+Move the folder here?
+    $dest
+
+The installation then goes on by itself from there, in this same Terminal window: there is nothing to run by hand."
         [ -n "$text_moving" ] && text="$text
 
 Moved along with it (instant: nothing is copied):$text_moving"
@@ -131,7 +133,7 @@ APPLESCRIPT
         rmdir "$parent" 2>/dev/null
     fi
     echo
-    echo "Now installing from the new place."
+    echo "The folder is moved. The installation goes on from the new place, here (nothing to run by hand):"
     echo
     INSTALL_REPO="" exec bash "$dest/INSTALL_APPS_MAC.command"     # (from its new place, which it then finds for itself)
 fi

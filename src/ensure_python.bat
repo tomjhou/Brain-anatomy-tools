@@ -95,7 +95,7 @@ if not exist "%VENV_PYTHON%" (
     if exist "%VENV_DIR%" rmdir /s /q "%VENV_DIR%"
     exit /b 0
   )
-  "%VENV_PYTHON%" -m pip install --quiet --upgrade pip >nul 2>&1
+  "%VENV_PYTHON%" -m pip install --quiet --timeout 30 --retries 3 --upgrade pip >nul 2>&1
 )
 set "PYTHON_CMD=%VENV_PYTHON%"
 exit /b 0

@@ -13,6 +13,11 @@ install() replaces the library's S3 download method (for every cache, whoever ma
 - if it stops, the next ask continues from the end of the .part file (an HTTP range request) instead of from the start;
 - a network error does not end it: it waits (5 s, then longer, up to a minute) and continues, for up to two hours without a single byte
   arriving; errors that retrying cannot mend (access denied, no such file, no room on the disk) end it with the reason;
+- a connection that stops sending without an error (it died while the laptop slept, say) is given up on and continued like any other
+  interruption: by the socket's read timeout (60 s, botocore's: set explicitly on the client made here, the library's own uses the default),
+  and on macOS and Linux sooner, by a watchdog that shuts the socket down after STALL_S seconds without a byte (on Windows shutting a socket
+  down does not wake a read blocked on it, tried: there the read timeout does it);
+- the computer is kept awake while a file downloads (keep_awake.py): a closed laptop lid would otherwise pause the download;
 - a file cut short by the library's own downloader (under its real name, not recorded as finished) is taken over as the beginning of the
   .part file, since the library writes in order: what was already downloaded is not lost.
 
@@ -35,6 +40,7 @@ WORKERS = 16                     # connections at once for a big file
 SEGMENT = 32 * 1000 * 1000       # bytes in a piece: a piece is what is done again if the program stops in the middle of it
 PARALLEL_MIN = 100 * 1000 * 1000  # files smaller than this are fetched in one stream
 HASH_ATTEMPTS = 2                # whole downloads whose hash was wrong, before giving up
+STALL_S = 45                     # a connection that has sent nothing for this long is broken off, and the download continued on a new one
 _locks = {}
 _notes = {}
 _active = {}                       # path -> {'bytes': ...} for a download of pieces under way in this process
@@ -195,6 +201,89 @@ def _md5(path, key_text, total, name=None):
     return hasher.hexdigest()
 
 
+class NoDataStall(Exception):
+    """A connection sent nothing for STALL_S seconds and was broken off."""
+
+
+_watched = set()
+_watch_guard = threading.Lock()
+_watchdog = []
+
+
+def _sockets_of(body):
+    """The sockets under a botocore StreamingBody (urllib3 response, http.client response), as far as they can be found."""
+    found = []
+    raw = getattr(body, "_raw_stream", None)
+    for holder in (raw, getattr(raw, "_connection", None), getattr(raw, "connection", None)):
+        sock = getattr(holder, "sock", None)
+        if sock is not None:
+            found.append(sock)
+    reader = getattr(getattr(raw, "_fp", None), "fp", None)               # (http.client's response: a buffered reader on socket.SocketIO)
+    sock = getattr(getattr(reader, "raw", None), "_sock", None)
+    if sock is not None:
+        found.append(sock)
+    return found
+
+
+def _break_off(body):
+    """Ends a stream that is waiting for data, from another thread: its socket is shut down, which makes the blocked read fail on macOS and
+    Linux. On Windows it does not (tried), and the socket's own read timeout (botocore's, 60 s) ends the read instead. The stream is not closed
+    here: closing it waits for the lock that the blocked read holds (tried: it hung), so the reading thread closes it once its read has
+    failed. Never raises."""
+    import socket
+    for sock in _sockets_of(body):
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+
+
+def _watch_loop():
+    while True:
+        time.sleep(1.0)
+        now = time.monotonic()
+        with _watch_guard:
+            late = [w for w in _watched if not w.stalled and now - w.last > w.limit]
+            for w in late:
+                w.stalled = True
+        for w in late:
+            _break_off(w.body)
+
+
+class _Watched:
+    """The chunks of a response body, with a watchdog: if no chunk comes for `limit` seconds the connection is broken off (_break_off) and
+    NoDataStall is raised (also when the broken stream merely ends, or fails with some other error)."""
+
+    def __init__(self, body, limit=None):
+        self.body, self.limit, self.last, self.stalled = body, STALL_S if limit is None else limit, time.monotonic(), False
+
+    def chunks(self, size):
+        with _watch_guard:
+            _watched.add(self)
+            if not _watchdog:
+                _watchdog.append(threading.Thread(target=_watch_loop, daemon=True, name="download watchdog"))
+                _watchdog[0].start()
+        try:
+            for chunk in self.body.iter_chunks(size):
+                if self.stalled:
+                    break
+                self.last = time.monotonic()
+                yield chunk
+        except Exception:
+            if not self.stalled:
+                raise
+        finally:
+            with _watch_guard:
+                _watched.discard(self)
+            if self.stalled:
+                try:
+                    self.body.close()                   # (here, in the reading thread: see _break_off)
+                except Exception:
+                    pass
+        if self.stalled:
+            raise NoDataStall(f"no data for {self.limit} s")
+
+
 class _NoRange(Exception):
     """The server ignored a Range header (it sent the whole object): parallel pieces cannot be used."""
 
@@ -220,7 +309,7 @@ def _sequential(self, bar, part, key, total, note_key, say, last_progress_box):
                 bar.n = 0
                 bar.refresh()
             with open(part, "ab" if have else "wb") as out:
-                for chunk in response["Body"].iter_chunks(CHUNK):
+                for chunk in _Watched(response["Body"]).chunks(CHUNK):
                     out.write(chunk)
                     have += len(chunk)
                     bar.update(len(chunk))
@@ -256,7 +345,8 @@ def _client_for(cache):
             import boto3
             from botocore import UNSIGNED
             from botocore.client import Config
-            kwargs = {"max_pool_connections": WORKERS + 2}
+            # (explicit timeouts, though they are botocore's defaults: a request that gets no answer is tried again rather than waited on)
+            kwargs = {"max_pool_connections": WORKERS + 2, "connect_timeout": 30, "read_timeout": 60}
             if not getattr(cache, "_auth_required", False):
                 kwargs["signature_version"] = UNSIGNED
             return boto3.client("s3", config=Config(**kwargs))
@@ -347,7 +437,7 @@ def _parallel(self, bar, part, key, total, note_key, say, last_progress_box, wan
                     raise _NoRange()
                 with open(part, "r+b") as out:
                     out.seek(pos)
-                    for chunk in response["Body"].iter_chunks(CHUNK):
+                    for chunk in _Watched(response["Body"]).chunks(CHUNK):
                         if abort.is_set():
                             return False
                         chunk = chunk[:stop - pos]
@@ -454,7 +544,12 @@ def download_file(self, file_attributes, force_download=False, skip_hash_check=F
             told = True
         time.sleep(2)
     try:
-        return _download_file_locked(self, file_attributes, force_download, skip_hash_check)
+        try:
+            from keep_awake import keep_awake                  # (a closed laptop lid would pause the download: see keep_awake.py)
+        except Exception:
+            from contextlib import nullcontext as keep_awake
+        with keep_awake("downloading " + local.name):
+            return _download_file_locked(self, file_attributes, force_download, skip_hash_check)
     finally:
         lock.release()
 

@@ -23,7 +23,7 @@ if not defined PYTHON_CMD (
 if errorlevel 1 (
   echo Installing the libraries the viewer needs ^(numpy, tifffile, pillow, imagecodecs^)...
   echo.
-  "%PYTHON_CMD%" -m pip install numpy tifffile pillow imagecodecs
+  "%PYTHON_CMD%" "%~dp0src\keep_awake.py" install numpy tifffile pillow imagecodecs
   if errorlevel 1 (
     echo.
     echo The libraries could not be installed ^(see above^).
@@ -35,7 +35,7 @@ if errorlevel 1 (
 
 REM tkinterdnd2 (dragging .xlef files onto the window) is optional: the viewer works without it.
 "%PYTHON_CMD%" -c "import tkinterdnd2" >nul 2>&1
-if errorlevel 1 "%PYTHON_CMD%" -m pip install tkinterdnd2 >nul 2>&1
+if errorlevel 1 "%PYTHON_CMD%" "%~dp0src\keep_awake.py" install tkinterdnd2 >nul 2>&1
 
 REM Once everything is in place, start it with pythonw.exe (no console window), and close this window. Its output goes to a log file
 REM (%LOCALAPPDATA%\JhouLab\logs\xlef_viewer.log), and errors are shown in a message box: see app_identity.py.

@@ -16,28 +16,28 @@ echo Installing into %PYTHON_CMD%
 echo.
 
 REM Required
-"%PYTHON_CMD%" -m pip install numpy
-"%PYTHON_CMD%" -m pip install pandas
-"%PYTHON_CMD%" -m pip install matplotlib
-"%PYTHON_CMD%" -m pip install pillow
-"%PYTHON_CMD%" -m pip install anndata
-"%PYTHON_CMD%" -m pip install scanpy
-"%PYTHON_CMD%" -m pip install "abc_atlas_access[notebooks] @ https://github.com/alleninstitute/abc_atlas_access/archive/refs/heads/main.zip"
+"%PYTHON_CMD%" "%~dp0src\keep_awake.py" install numpy
+"%PYTHON_CMD%" "%~dp0src\keep_awake.py" install pandas
+"%PYTHON_CMD%" "%~dp0src\keep_awake.py" install matplotlib
+"%PYTHON_CMD%" "%~dp0src\keep_awake.py" install pillow
+"%PYTHON_CMD%" "%~dp0src\keep_awake.py" install anndata
+"%PYTHON_CMD%" "%~dp0src\keep_awake.py" install scanpy
+"%PYTHON_CMD%" "%~dp0src\keep_awake.py" install "abc_atlas_access[notebooks] @ https://github.com/alleninstitute/abc_atlas_access/archive/refs/heads/main.zip"
 
 REM Optional: Leiden clustering of new UMAP runs
-"%PYTHON_CMD%" -m pip install igraph
+"%PYTHON_CMD%" "%~dp0src\keep_awake.py" install igraph
 
 REM Parquet file support
-"%PYTHON_CMD%" -m pip install pyarrow
+"%PYTHON_CMD%" "%~dp0src\keep_awake.py" install pyarrow
 
 REM Interactive 3D view in the browser
-"%PYTHON_CMD%" -m pip install plotly
+"%PYTHON_CMD%" "%~dp0src\keep_awake.py" install plotly
 
 REM Drag-and-drop of CSV files into the 3D viewer and CCF browser windows
-"%PYTHON_CMD%" -m pip install tkinterdnd2
+"%PYTHON_CMD%" "%~dp0src\keep_awake.py" install tkinterdnd2
 
 REM CCF browser "Generate meshes" (region surfaces for MBF / NeuroInfo atlases)
-"%PYTHON_CMD%" -m pip install vtk
+"%PYTHON_CMD%" "%~dp0src\keep_awake.py" install vtk
 
 echo.
 echo Done.

@@ -8,7 +8,7 @@ if [ -z "$PYTHON_CMD" ]; then press_enter_to_close 1; fi
 # (CCF_browser.py installs these itself too; here so that its app can take over once they are in: see hand_off_to_app)
 if ! "$PYTHON_CMD" -c "import numpy, pandas, PIL" >/dev/null 2>&1; then
     echo "Installing the libraries it needs (numpy, pandas, pillow)..."
-    "$PYTHON_CMD" -m pip install --only-binary :all: numpy pandas pillow
+    "$PYTHON_CMD" keep_awake.py install --only-binary :all: numpy pandas pillow
 fi
 hand_off_to_app "numpy, pandas, PIL"     # (started by its app to set up: the app runs it from here: see terminal_window.sh)
 

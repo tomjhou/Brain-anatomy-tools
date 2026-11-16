@@ -23,7 +23,7 @@ if not defined PYTHON_CMD (
 if errorlevel 1 (
   echo Installing the libraries the converter needs ^(numpy, opencv-python, pillow^)...
   echo.
-  "%PYTHON_CMD%" -m pip install numpy opencv-python pillow
+  "%PYTHON_CMD%" "%~dp0src\keep_awake.py" install numpy opencv-python pillow
   if errorlevel 1 (
     echo.
     echo The libraries could not be installed ^(see above^).

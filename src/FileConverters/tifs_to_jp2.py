@@ -93,6 +93,27 @@ def _report_install_failure(message):
     sys.exit(1)
 
 
+def _pip_runner():
+    """keep_awake.py (in src, above this folder): pip kept awake, with network timeouts, started again if it hangs. None if it is not there."""
+    try:
+        src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if src not in sys.path:
+            sys.path.append(src)                        # (after this folder: its modules come first)
+        import keep_awake
+        return keep_awake
+    except Exception:
+        return None
+
+
+def _pip_install(args):
+    """pip install `args` into this Python; the exit code."""
+    runner = _pip_runner()
+    if runner is None:
+        return subprocess.run([sys.executable, "-m", "pip", "install", *args]).returncode
+    code, _tail = runner.run_pip(runner.pip_install_command(args))
+    return 1 if code is None else code
+
+
 def ensure_packages():
     """Install any missing REQUIRED_PACKAGES into this interpreter's environment."""
     missing = _missing_packages()
@@ -107,8 +128,7 @@ def ensure_packages():
         subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"])
     # Prebuilt wheels only: building numpy/imagecodecs from source needs a C
     # compiler and native libraries, and fails after a long wait without them
-    result = subprocess.run([sys.executable, "-m", "pip", "install",
-                             "--only-binary", ":all:", *missing])
+    returncode = _pip_install(["--only-binary", ":all:", *missing])
     importlib.invalidate_caches()
     # pip falls back to a per-user install when site-packages isn't writable;
     # that folder may not have existed (so isn't on sys.path) when Python started
@@ -121,7 +141,7 @@ def ensure_packages():
         version = f"{sys.version_info.major}.{sys.version_info.minor}"
         _report_install_failure(
             f"Couldn't install {', '.join(still_missing)} for Python {version} "
-            f"(pip exit code {result.returncode}).\n\n"
+            f"(pip exit code {returncode}).\n\n"
             f"If this Python version is very new, prebuilt packages may not exist "
             f"for it yet. Try running the script with an older Python, e.g.\n"
             f"  py -3.12 tifs_to_jp2.py")

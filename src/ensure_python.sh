@@ -34,7 +34,7 @@ else
     if [ ! -x "$_venv/bin/python" ]; then
         echo "Setting up a private Python environment in $_venv (this happens once and takes a minute)..."
         if "$_found" -m venv "$_venv"; then
-            "$_venv/bin/python" -m pip install --quiet --upgrade pip >/dev/null 2>&1
+            "$_venv/bin/python" -m pip install --quiet --timeout 30 --retries 3 --upgrade pip >/dev/null 2>&1
         else
             echo "The virtual environment could not be created, so $_found will be used instead."
             rm -rf "$_venv"

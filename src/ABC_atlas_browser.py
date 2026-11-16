@@ -193,7 +193,6 @@ def _install_libraries(specs):
     window keeps repainting even during pip's long quiet stretches (building
     wheels, resolving dependencies). Returns [(spec, error_tail), ...] for
     the ones that failed."""
-    import queue
     ui = None
     try:
         import tkinter as tk
@@ -219,43 +218,24 @@ def _install_libraries(specs):
             ui = None  # window gone; carry on with console output only
 
     failures = []
-    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+    # The computer is kept awake meanwhile (a closed laptop lid paused pip for good), pip gives up on a dead connection and tries again, and a
+    # pip that prints nothing for a long time is started again: see keep_awake.py.
+    import keep_awake
     for i, spec in enumerate(specs, 1):
         header = f"Installing {_display_spec(spec)} ({i} of {len(specs)})..."
         print(header)
         show(header + "\n\nThis can take a few minutes; the console shows pip's full output.")
-        try:
-            proc = subprocess.Popen(
-                [sys.executable, '-m', 'pip', 'install', spec],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-                creationflags=creationflags,
-            )
-        except OSError as e:
-            failures.append((spec, str(e)))
-            continue
-        lines = queue.Queue()
+        last = []
 
-        def drain(stream=proc.stdout, out=lines):
-            for line in stream:
-                out.put(line)
-            out.put(None)  # end-of-output sentinel
+        def on_line(text, last=last):
+            print(text, flush=True)
+            last[:] = [text]
 
-        threading.Thread(target=drain, daemon=True).start()
-        tail = []
-        while True:
-            try:
-                line = lines.get(timeout=0.1)
-            except queue.Empty:
-                line = ''
-            if line is None:
-                break
-            if line:
-                print(line, end='')
-                tail.append(line.rstrip())
-            # Repainted on every pass, including empty ones, so the window
-            # stays responsive during pip's quiet stretches.
-            show(header + ("\n\n" + tail[-1][:100] if tail else ""))
-        if proc.wait() != 0:
+        # Repainted about ten times a second, including when pip is quiet, so the window stays responsive during pip's quiet stretches.
+        code, tail = keep_awake.run_pip(keep_awake.pip_install_command([spec]), on_line=on_line,
+                                        on_idle=lambda: show(header + ("\n\n" + last[0][:100] if last else "")),
+                                        reason=f"installing {spec.split(' @ ')[0]}")
+        if code != 0:
             failures.append((spec, "\n".join(tail[-8:])))
     if ui is not None:
         try:
@@ -1371,12 +1351,14 @@ def _start_atlas_prefetch(cache):
     instance_lock.maintenance.acquire("downloading the atlas")      # (the thread's own hold on the lock: let go when it ends)
 
     def work():
+        import keep_awake                         # (a closed laptop lid would pause it: kept awake till the last file, see keep_awake.py)
         try:
-            for _label, directory, file_name, kind, _size, _path in missing:          # (one after another: one progress bar in the console)
-                try:
-                    (cache.get_data_path if kind == 'data' else cache.get_metadata_path)(directory=directory, file_name=file_name)
-                except Exception as e:
-                    print(f"Could not download {file_name} ({type(e).__name__}: {e}); it will be tried again when it is needed.")
+            with keep_awake.keep_awake("downloading the Allen atlas data"):
+                for _label, directory, file_name, kind, _size, _path in missing:          # (one after another: one progress bar in the console)
+                    try:
+                        (cache.get_data_path if kind == 'data' else cache.get_metadata_path)(directory=directory, file_name=file_name)
+                    except Exception as e:
+                        print(f"Could not download {file_name} ({type(e).__name__}: {e}); it will be tried again when it is needed.")
         finally:
             instance_lock.maintenance.release()
     atlas_prefetch['thread'] = threading.Thread(target=work, daemon=True)
@@ -2878,12 +2860,14 @@ def ensure_ccf_downloaded(abc_cache, parent=None, files=CCF_ALL_FILES, what="CCF
     outcome = {'error': None, 'done': False}
 
     def worker():
+        import keep_awake
         try:
-            for directory, file_name, _size, _path in missing:
-                if kinds.get((directory, file_name)) == 'data':
-                    abc_cache.get_data_path(directory=directory, file_name=file_name)
-                else:
-                    abc_cache.get_metadata_path(directory=directory, file_name=file_name)
+            with keep_awake.keep_awake(f"downloading the {what}"):
+                for directory, file_name, _size, _path in missing:
+                    if kinds.get((directory, file_name)) == 'data':
+                        abc_cache.get_data_path(directory=directory, file_name=file_name)
+                    else:
+                        abc_cache.get_metadata_path(directory=directory, file_name=file_name)
         except Exception as e:
             outcome['error'] = e
         finally:

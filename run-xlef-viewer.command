@@ -7,13 +7,13 @@ if [ -z "$PYTHON_CMD" ]; then press_enter_to_close 1; fi
 
 if ! "$PYTHON_CMD" -c "import numpy, tifffile, PIL, imagecodecs" >/dev/null 2>&1; then
     echo "Installing the libraries it needs (numpy, tifffile, pillow, imagecodecs)..."
-    if ! "$PYTHON_CMD" -m pip install numpy tifffile pillow imagecodecs; then
+    if ! "$PYTHON_CMD" keep_awake.py install numpy tifffile pillow imagecodecs; then
         echo; echo "The libraries could not be installed (see above)."
         press_enter_to_close 1
     fi
 fi
 # tkinterdnd2 (dragging .xlef files onto the window) is optional: the viewer works without it.
-"$PYTHON_CMD" -c "import tkinterdnd2" >/dev/null 2>&1 || "$PYTHON_CMD" -m pip install tkinterdnd2 >/dev/null 2>&1
+"$PYTHON_CMD" -c "import tkinterdnd2" >/dev/null 2>&1 || "$PYTHON_CMD" keep_awake.py install tkinterdnd2 >/dev/null 2>&1
 hand_off_to_app "numpy, tifffile, PIL, imagecodecs"     # (started by its app to set up: the app runs it from here: see terminal_window.sh)
 
 if ! "$PYTHON_CMD" xlef_viewer.py "$@"; then

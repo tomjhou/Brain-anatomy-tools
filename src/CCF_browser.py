@@ -52,7 +52,8 @@ def ensure_libraries(required):
     if not missing or getattr(sys, 'frozen', False):
         return
     print(f"Installing missing libraries ({', '.join(missing)}) into {sys.executable}...", flush=True)
-    subprocess.run([sys.executable, '-m', 'pip', 'install', '--only-binary', ':all:', *missing])
+    import keep_awake                           # (kept awake, with network timeouts, and started again if it hangs: see keep_awake.py)
+    keep_awake.run_pip(keep_awake.pip_install_command(missing, extra=['--only-binary', ':all:']))
     importlib.invalidate_caches()
     still = [pip for module, pip in required.items() if importlib.util.find_spec(module) is None]
     if still:
@@ -158,7 +159,11 @@ def import_drag_and_drop():
         pass
     print("Installing tkinterdnd2 (drag-and-drop of a CSV into the box)...")
     try:
-        subprocess.run([sys.executable, '-m', 'pip', 'install', 'tkinterdnd2'], check=True)
+        import keep_awake
+        code, tail = keep_awake.run_pip(keep_awake.pip_install_command(['tkinterdnd2']))
+        if code != 0:
+            raise RuntimeError(f"pip said {code}")
+        importlib.invalidate_caches()
         from tkinterdnd2 import DND_FILES, TkinterDnD
         return TkinterDnD, DND_FILES
     except Exception as e:
@@ -328,14 +333,15 @@ def import_project_cache():
         pass
     if _abc_atlas_access_problem is None and not getattr(sys, 'frozen', False):
         print(f"Installing abc_atlas_access (the Allen Institute's atlas download library) into {sys.executable}...", flush=True)
-        result = subprocess.run([sys.executable, '-m', 'pip', 'install', ABC_ATLAS_ACCESS])
+        import keep_awake
+        returncode, _tail = keep_awake.run_pip(keep_awake.pip_install_command([ABC_ATLAS_ACCESS]), reason="installing abc_atlas_access")
         importlib.invalidate_caches()
         try:
             from abc_atlas_access.abc_atlas_cache.abc_project_cache import AbcProjectCache
             _make_downloads_resumable()
             return AbcProjectCache
         except ImportError:
-            _abc_atlas_access_problem = (f"abc_atlas_access could not be installed (pip said {result.returncode}); install it by hand with  "
+            _abc_atlas_access_problem = (f"abc_atlas_access could not be installed (pip said {returncode}); install it by hand with  "
                                          f"python -m pip install \"{ABC_ATLAS_ACCESS}\"")
     raise ImportError(_abc_atlas_access_problem or 'abc_atlas_access is not installed')
 
@@ -2155,7 +2161,10 @@ class CCFBrowser:
                 return
 
             def install():
-                subprocess.run([sys.executable, '-m', 'pip', 'install', '--only-binary', ':all:', 'vtk'], check=True)
+                import keep_awake
+                code, tail = keep_awake.run_pip(keep_awake.pip_install_command(['vtk'], extra=['--only-binary', ':all:']), reason="installing vtk")
+                if code != 0:
+                    raise RuntimeError(f"pip could not install vtk (it said {code}): " + " / ".join(tail[-3:]))
                 importlib.invalidate_caches()
                 import site
                 user_site = site.getusersitepackages()

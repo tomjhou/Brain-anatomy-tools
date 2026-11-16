@@ -8696,6 +8696,14 @@ class XlefViewer:
 
     def _download_work(self, gen, stop):
         try:
+            from keep_awake import keep_awake               # (a closed laptop lid would pause OneDrive's download: see keep_awake.py)
+        except Exception:
+            from contextlib import nullcontext as keep_awake
+        with keep_awake("downloading sections from OneDrive"):
+            self._download_queue_work(gen, stop)
+
+    def _download_queue_work(self, gen, stop):
+        try:
             while self.download_queue and not stop.is_set() and gen == self.download_gen:
                 item = self.download_queue.pop(0)
                 entry = self.entries.get(item)

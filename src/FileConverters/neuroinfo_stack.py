@@ -93,6 +93,27 @@ def lower_thread_priority():
             pass
 
 
+def _pip_runner():
+    """keep_awake.py (in src, above this folder): pip kept awake, with network timeouts, started again if it hangs. None if it is not there."""
+    try:
+        src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if src not in sys.path:
+            sys.path.append(src)                        # (after this folder: its modules come first)
+        import keep_awake
+        return keep_awake
+    except Exception:
+        return None
+
+
+def _pip_install(args):
+    """pip install `args` into this Python; the exit code."""
+    runner = _pip_runner()
+    if runner is None:
+        return subprocess.run([sys.executable, "-m", "pip", "install", *args]).returncode
+    code, _tail = runner.run_pip(runner.pip_install_command(args))
+    return 1 if code is None else code
+
+
 def ensure_packages(required=None, exit_on_failure=True):
     """Install any missing packages ({import name: pip name}) into this
     interpreter's environment."""
@@ -108,7 +129,7 @@ def ensure_packages(required=None, exit_on_failure=True):
     if not missing:
         return
     print(f"Installing missing libraries ({', '.join(missing)}) into {sys.executable}...", flush=True)
-    subprocess.run([sys.executable, "-m", "pip", "install", "--only-binary", ":all:", *missing])
+    _pip_install(["--only-binary", ":all:", *missing])
     importlib.invalidate_caches()
     import site
     user_site = site.getusersitepackages()

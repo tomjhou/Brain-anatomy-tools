@@ -7,7 +7,7 @@ if [ -z "$PYTHON_CMD" ]; then press_enter_to_close 1; fi
 
 if ! "$PYTHON_CMD" -c "import numpy, cv2, PIL" >/dev/null 2>&1; then
     echo "Installing the libraries it needs (numpy, opencv-python, pillow)..."
-    if ! "$PYTHON_CMD" -m pip install numpy opencv-python pillow; then
+    if ! "$PYTHON_CMD" ../keep_awake.py install numpy opencv-python pillow; then
         echo; echo "The libraries could not be installed (see above)."
         press_enter_to_close 1
     fi

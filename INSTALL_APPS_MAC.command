@@ -1,7 +1,8 @@
 #!/bin/bash
 # macOS: makes an app, with its own icon, for the xlef viewer, CCF browser, ABC atlas browser and section assembler, in your Applications folder
 # (~/Applications), to start them from Launchpad, Spotlight or the Dock. Double-click it in Finder (the first time, right-click it and
-# choose Open). Run it again after moving this folder, or when an icon has changed. UNINSTALL_APPS_MAC.command removes them.
+# choose Open; on macOS 15 and later that no longer works, and a downloaded folder needs its quarantine flag cleared instead: see
+# README_MAC_INSTALL.md). Run it again after moving this folder, or when an icon has changed. UNINSTALL_APPS_MAC.command removes them.
 #
 # Each app runs this folder's run-*.command file in Terminal the first time (to set up Python and the libraries, which shows its
 # progress there); after that it starts the program directly, with no Terminal window, its output in ~/Library/Logs/JhouLab (the ABC
@@ -271,7 +272,7 @@ make_app "ABC atlas browser" run-abc-atlas-browser.command abc_atlas_browser org
     ABC_atlas_browser.py ""
 make_app "Section assembler" run-assembler.command section_assembler org.jhoulab.brainanatomytools.sectionassembler \
     FileConverters/SerialAssembler.py ""
-chmod +x "$REPO"/run-*.command "$REPO/UNINSTALL_APPS_MAC.command" 2>/dev/null
+chmod +x "$REPO"/run-*.command "$REPO"/extra-tools/run-*.command "$REPO/UNINSTALL_APPS_MAC.command" 2>/dev/null
 
 # Let Launchpad and Spotlight know about them (and their icons) now rather than later
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister

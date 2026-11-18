@@ -3,12 +3,12 @@ REM Starts the Leica .lif converter (double-click this file in Windows Explorer)
 REM Finds Python (installing Python 3.13 first if there is none): see ensure_python.bat.
 REM Missing libraries (numpy, opencv-python, pillow) are installed automatically on first run.
 setlocal
-cd /d "%~dp0src\FileConverters"
+cd /d "%~dp0..\src\FileConverters"
 title Leica .lif converter
 echo ==== Leica .lif converter ====
 echo.
 
-call "%~dp0src\ensure_python.bat"
+call "%~dp0..\src\ensure_python.bat"
 
 if not defined PYTHON_CMD (
   echo Python could not be found or installed automatically.
@@ -23,7 +23,7 @@ if not defined PYTHON_CMD (
 if errorlevel 1 (
   echo Installing the libraries the converter needs ^(numpy, opencv-python, pillow^)...
   echo.
-  "%PYTHON_CMD%" "%~dp0src\keep_awake.py" install numpy opencv-python pillow
+  "%PYTHON_CMD%" "%~dp0..\src\keep_awake.py" install numpy opencv-python pillow
   if errorlevel 1 (
     echo.
     echo The libraries could not be installed ^(see above^).

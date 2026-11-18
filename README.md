@@ -21,8 +21,8 @@ Run the apps like you would any normal Windows or Mac app.
 The first time each app starts, it sets itself up: it installs Python if the computer has none, and downloads the libraries it needs into
 this folder. This takes a few minutes and needs an internet connection, and it leaves any Python you already have alone. Later starts are quick.
 
-**On a Mac**, install Python 3.13 from [python.org](https://www.python.org/downloads/) first. The first time you open
-`INSTALL_APPS_MAC.command`, right-click it and choose Open: macOS asks before running a script it hasn't seen before.
+**On a Mac**, install Python 3.13 from [python.org](https://www.python.org/downloads/) first. macOS may refuse to open
+`INSTALL_APPS_MAC.command` ("can't verify"): see [README_MAC_INSTALL.md](README_MAC_INSTALL.md) for the short fix.
 
 **Windows may warn** "Windows protected your PC" the first time you run one of the stand-alone `.exe` programs below, because they are not code-signed: choose More info, then Run anyway.
 

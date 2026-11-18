@@ -1,7 +1,7 @@
 #!/bin/bash
 # Starts the LIF converter on macOS: the counterpart of run-lifconverter.bat. Double-click it in Finder (the first time, right-click it and
 # choose Open: macOS asks before running a script it hasn't seen). Finds Python and the private .venv-macos: see src/ensure_python.sh.
-cd "$(dirname "$0")/src/FileConverters" || exit 1
+cd "$(dirname "$0")/../src/FileConverters" || exit 1
 source "../ensure_python.sh"
 if [ -z "$PYTHON_CMD" ]; then press_enter_to_close 1; fi
 

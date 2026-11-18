@@ -2430,7 +2430,7 @@ THREED_WEB_PINCH_SCRIPT = """
 (function () {
   var gd = document.getElementById('{plot_id}');
   var scene = gd._fullLayout.scene._scene;
-  var startGap = 0, startCamera = null, pinching = false, pageMode = false;
+  var startGap = 0, startCamera = null, pinching = false, pageMode = false, settling = false;   // settling: one finger is left after a pinch
   var chip = document.createElement('div');   // shown while a pinch zooms the page rather than the brain
   chip.textContent = 'Page mode: drag to move the page, pinch to zoom it (double-tap the brain to go back)';
   chip.style.cssText = 'position:absolute;left:50%;bottom:8px;transform:translateX(-50%);z-index:30;padding:4px 10px;display:none;' +
@@ -2472,9 +2472,11 @@ THREED_WEB_PINCH_SCRIPT = """
     startGap = gap(ev.touches);
     startCamera = scene.getCamera();
     pinching = startGap > 0;
+    settling = false;
     ev.stopPropagation(); ev.preventDefault();
   }, {capture: true, passive: false});
   gd.addEventListener('touchmove', function (ev) {
+    if (settling) { ev.stopPropagation(); ev.preventDefault(); return; }   // (the finger left after a pinch must not turn the brain: plotly would see it jump)
     if (!pinching || ev.touches.length !== 2) return;
     ev.stopPropagation(); ev.preventDefault();
     var g = gap(ev.touches);
@@ -2498,11 +2500,13 @@ THREED_WEB_PINCH_SCRIPT = """
     if (pinching) {
       if (ev.touches.length < 2) {
         pinching = false;
-        ev.stopPropagation();   // (the finger left on the screen should not start a turn from where it is)
+        settling = ev.touches.length > 0;   // (the finger left on the screen should not start a turn from where it is: it is ignored until it lifts)
+        ev.stopPropagation();
         try { Plotly.relayout(gd, {'scene.camera': scene.getCamera()}); } catch (err) { /* the layout keeps its own camera */ }
       }
       return;
     }
+    if (settling) { if (!ev.touches.length) settling = false; return; }   // (the last finger lifting goes to plotly, which lets go of its drag)
     if (ev.type !== 'touchend' || !down || ev.touches.length || !ev.changedTouches.length) { return; }
     var t = ev.changedTouches[0], now = Date.now();
     var still = Math.hypot(t.clientX - down.x, t.clientY - down.y) < 15 && now - down.at < 350;

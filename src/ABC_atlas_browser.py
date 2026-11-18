@@ -2409,6 +2409,47 @@ THREED_WEB_SLICE_SCRIPT = """
 """
 
 
+# Pinch to zoom on a touch screen. Plotly's 3D scene turns with one finger but has no pinch (its zoom is the mouse wheel), so two fingers are
+# handled here: the camera's distance from its center follows the distance between the fingers. The gesture is kept from plotly (and from the
+# browser's own page zoom), the live camera is set directly while the fingers move (as the Spin does) and handed to the layout when they lift.
+THREED_WEB_PINCH_SCRIPT = """
+(function () {
+  var gd = document.getElementById('{plot_id}');
+  var scene = gd._fullLayout.scene._scene;
+  var startGap = 0, startCamera = null, pinching = false;
+  function gap(t) { return Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY); }
+  function begin(t) {
+    startGap = gap(t);
+    startCamera = scene.getCamera();
+    pinching = startGap > 0;
+  }
+  gd.addEventListener('touchstart', function (ev) {
+    if (ev.touches.length === 2) { begin(ev.touches); ev.stopPropagation(); ev.preventDefault(); }
+  }, {capture: true, passive: false});
+  gd.addEventListener('touchmove', function (ev) {
+    if (!pinching || ev.touches.length !== 2) return;
+    ev.stopPropagation(); ev.preventDefault();
+    var g = gap(ev.touches);
+    if (g <= 0) return;
+    var ratio = Math.min(20, Math.max(0.05, startGap / g));   // fingers apart: closer
+    var c = startCamera.center, e = startCamera.eye;
+    scene.setViewport({camera: {eye: {x: c.x + (e.x - c.x) * ratio, y: c.y + (e.y - c.y) * ratio, z: c.z + (e.z - c.z) * ratio},
+                                center: c, up: startCamera.up, projection: startCamera.projection},
+                       aspectratio: gd._fullLayout.scene.aspectratio});
+  }, {capture: true, passive: false});
+  function end(ev) {
+    if (!pinching) return;
+    if (ev.touches.length < 2) {
+      pinching = false;
+      ev.stopPropagation();   // (the finger left on the screen should not start a turn from where it is)
+      try { Plotly.relayout(gd, {'scene.camera': scene.getCamera()}); } catch (err) { /* the layout keeps its own camera */ }
+    }
+  }
+  gd.addEventListener('touchend', end, {capture: true, passive: false});
+  gd.addEventListener('touchcancel', end, {capture: true, passive: false});
+})();
+"""
+
 # The "Spin" button, to the right of the Background radio buttons: while it is on, the camera turns smoothly around the
 # vertical axis (the azimuth advances, the angle above the horizontal and the distance stay as they are, so the user's own
 # tilt and zoom are kept, and a drag or scroll in between simply carries on from there) until the button is clicked again.
@@ -3685,6 +3726,7 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
                        .replace('__ROW__', str(row)))
     scripts.append(THREED_WEB_SLICE_SCRIPT.replace('__MESH_INDEX__', str(mesh_index if mesh_groups else -1)))
     scripts.append(THREED_WEB_SPIN_SCRIPT)
+    scripts.append(THREED_WEB_PINCH_SCRIPT)
     scripts.append(THREED_WEB_LEGEND_MARK_SCRIPT)
     figure.write_html(str(path), include_plotlyjs=True, full_html=True, config={'displaylogo': False},
                       post_script='\n'.join(scripts) or None)

@@ -2081,6 +2081,9 @@ THREED_WEB_MESH_SCRIPT = """
     for (var n = 0; n < faceCount; n++) order[n] = packed[n] - Math.floor(packed[n] / shift) * shift;
     return order;
   }
+  // The cells are re-sorted (and the mesh sent to the graphics card again, which blocks the page for a moment, so the mouse wheel does not answer) only when
+  // the viewing direction has turned by more than about 2 degrees (cos 2 degrees) since the last time: a smaller turn leaves the depth order good enough.
+  var SAME_VIEW = 0.9994;
   function rebuild(force) {
     var scene = gd._fullLayout.scene || {};
     var camera = scene.camera || {eye: {x: 1.25, y: 1.25, z: 1.25}, center: {x: 0, y: 0, z: 0}};
@@ -2091,14 +2094,14 @@ THREED_WEB_MESH_SCRIPT = """
     // sort; skipping it keeps the page responsive right after a scroll. Anything else (cut, group, opacity) forces one.
     var length = Math.sqrt(ex * ex + ey * ey + ez * ez) || 1, direction = [ex / length, ey / length, ez / length];
     if (!force && lastDirection && direction[0] * lastDirection[0] + direction[1] * lastDirection[1] +
-        direction[2] * lastDirection[2] > 0.99999) return;
+        direction[2] * lastDirection[2] > SAME_VIEW) return;
     lastDirection = direction;
     var translucent = gd._fullData[meshIndex].opacity < 1;
     if (!force && !translucent) return;   // opaque cells need no re-sorting: a camera move changes nothing here
     var base = null;
     if (translucent) {
       if (!sortedAll || sortedDirection[0] * direction[0] + sortedDirection[1] * direction[1] +
-          sortedDirection[2] * direction[2] < 0.99999) {
+          sortedDirection[2] * direction[2] < SAME_VIEW) {
         sortedAll = sortAll(ex, ey, ez);
         sortedDirection = direction;
       }
@@ -2420,8 +2423,8 @@ THREED_WEB_SLICE_SCRIPT = """
 # Pinch to zoom on a touch screen. Plotly's 3D scene turns with one finger but has no pinch (its zoom is the mouse wheel), so two fingers are
 # handled here: the camera's distance from its center follows the distance between the fingers. Only a pinch with both fingers on the 3D canvas
 # itself does this (one that starts on the legend, a slider or a box is left to the browser, which zooms the page). A double tap on the canvas
-# switches between the two meanings, so that a page zoomed until the brain fills it can still be zoomed back out: in "page zoom" mode the canvas
-# lets the browser take the pinch, and a small label says so. The camera is set directly while the fingers move (as the Spin does) and handed
+# switches between the two meanings, so that a page zoomed until the brain fills it can still be zoomed back out: in "page" mode the canvas
+# lets the browser pan and pinch-zoom the page (one finger drags it), and a small label says so. The camera is set directly while the fingers move (as the Spin does) and handed
 # to the layout when they lift.
 THREED_WEB_PINCH_SCRIPT = """
 (function () {
@@ -2429,7 +2432,7 @@ THREED_WEB_PINCH_SCRIPT = """
   var scene = gd._fullLayout.scene._scene;
   var startGap = 0, startCamera = null, pinching = false, pageMode = false;
   var chip = document.createElement('div');   // shown while a pinch zooms the page rather than the brain
-  chip.textContent = 'Pinch zooms the page (double-tap the brain to go back)';
+  chip.textContent = 'Page mode: drag to move the page, pinch to zoom it (double-tap the brain to go back)';
   chip.style.cssText = 'position:absolute;left:50%;bottom:8px;transform:translateX(-50%);z-index:30;padding:4px 10px;display:none;' +
     'background:rgba(59,111,212,0.92);color:#fff;border-radius:6px;font:12px sans-serif;pointer-events:none;';
   gd.style.position = 'relative';
@@ -2447,10 +2450,10 @@ THREED_WEB_PINCH_SCRIPT = """
   function setPageMode(on) {
     pageMode = on;
     gd.querySelectorAll('canvas').forEach(function (c) {
-      c.style.touchAction = on ? 'pinch-zoom' : 'none';   // 'none': the browser takes no gesture on the brain, so every touch reaches the handlers below
+      c.style.touchAction = on ? 'manipulation' : 'none';   // 'none': the browser takes no gesture on the brain, so every touch reaches the handlers below; 'manipulation': it pans and pinch-zooms the page
     });
     chip.style.display = on ? 'block' : 'none';
-    toast(on ? 'Pinch now zooms the page' : 'Pinch now zooms the brain');
+    toast(on ? 'Page mode: drag moves the page, pinch zooms it' : 'Brain mode: drag turns the brain, pinch zooms it');
   }
   gd.querySelectorAll('canvas').forEach(function (c) { c.style.touchAction = 'none'; });   // (the brain is zoomed by pinching, to begin with)
   ['gesturestart', 'gesturechange'].forEach(function (name) {   // (iOS Safari zooms the page by its own gesture events as well)
@@ -2482,6 +2485,10 @@ THREED_WEB_PINCH_SCRIPT = """
                                 center: c, up: startCamera.up, projection: startCamera.projection},
                        aspectratio: gd._fullLayout.scene.aspectratio});
   }, {capture: true, passive: false});
+  ['touchstart', 'touchmove', 'touchend', 'touchcancel'].forEach(function (name) {   // (in page mode plotly does not turn the brain under a finger that pans the page)
+    gd.addEventListener(name, function (ev) { if (pageMode && onCanvas(ev.touches.length ? ev.touches : ev.changedTouches)) ev.stopPropagation(); },
+                        {capture: true, passive: true});
+  });
   var lastTap = null, down = null;   // a double tap: two short, still touches of one finger on the canvas, close in time and place
   gd.addEventListener('touchstart', function (ev) {
     down = (ev.touches.length === 1 && onCanvas(ev.touches))

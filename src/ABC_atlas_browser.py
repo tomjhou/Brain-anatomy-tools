@@ -2410,21 +2410,56 @@ THREED_WEB_SLICE_SCRIPT = """
 
 
 # Pinch to zoom on a touch screen. Plotly's 3D scene turns with one finger but has no pinch (its zoom is the mouse wheel), so two fingers are
-# handled here: the camera's distance from its center follows the distance between the fingers. The gesture is kept from plotly (and from the
-# browser's own page zoom), the live camera is set directly while the fingers move (as the Spin does) and handed to the layout when they lift.
+# handled here: the camera's distance from its center follows the distance between the fingers. Only a pinch with both fingers on the 3D canvas
+# itself does this (one that starts on the legend, a slider or a box is left to the browser, which zooms the page). A double tap on the canvas
+# switches between the two meanings, so that a page zoomed until the brain fills it can still be zoomed back out: in "page zoom" mode the canvas
+# lets the browser take the pinch, and a small label says so. The camera is set directly while the fingers move (as the Spin does) and handed
+# to the layout when they lift.
 THREED_WEB_PINCH_SCRIPT = """
 (function () {
   var gd = document.getElementById('{plot_id}');
   var scene = gd._fullLayout.scene._scene;
-  var startGap = 0, startCamera = null, pinching = false;
+  var startGap = 0, startCamera = null, pinching = false, pageMode = false;
+  var chip = document.createElement('div');   // shown while a pinch zooms the page rather than the brain
+  chip.textContent = 'Pinch zooms the page (double-tap the brain to go back)';
+  chip.style.cssText = 'position:absolute;left:50%;bottom:8px;transform:translateX(-50%);z-index:30;padding:4px 10px;display:none;' +
+    'background:rgba(59,111,212,0.92);color:#fff;border-radius:6px;font:12px sans-serif;pointer-events:none;';
+  gd.style.position = 'relative';
+  gd.appendChild(chip);
+  var toastTimer = null;
+  function toast(text) {
+    var t = document.createElement('div');
+    t.textContent = text;
+    t.style.cssText = 'position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:30;padding:8px 14px;' +
+      'background:rgba(20,22,30,0.88);color:#fff;border-radius:8px;font:14px sans-serif;pointer-events:none;';
+    gd.appendChild(t);
+    clearTimeout(toastTimer);
+    setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, 1300);
+  }
+  var savedAction = new Map();
+  function setPageMode(on) {
+    pageMode = on;
+    gd.querySelectorAll('canvas').forEach(function (c) {
+      if (!savedAction.has(c)) savedAction.set(c, c.style.touchAction);
+      c.style.touchAction = on ? 'pinch-zoom' : savedAction.get(c);   // (plotly's own setting returns when the brain is zoomed again)
+    });
+    chip.style.display = on ? 'block' : 'none';
+    toast(on ? 'Pinch now zooms the page' : 'Pinch now zooms the brain');
+  }
+  function onCanvas(touches) {
+    for (var i = 0; i < touches.length; i++) {
+      var t = touches[i].target;
+      if (!t || t.tagName !== 'CANVAS' || !gd.contains(t)) return false;
+    }
+    return true;
+  }
   function gap(t) { return Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY); }
-  function begin(t) {
-    startGap = gap(t);
+  gd.addEventListener('touchstart', function (ev) {
+    if (pageMode || ev.touches.length !== 2 || !onCanvas(ev.touches)) return;
+    startGap = gap(ev.touches);
     startCamera = scene.getCamera();
     pinching = startGap > 0;
-  }
-  gd.addEventListener('touchstart', function (ev) {
-    if (ev.touches.length === 2) { begin(ev.touches); ev.stopPropagation(); ev.preventDefault(); }
+    ev.stopPropagation(); ev.preventDefault();
   }, {capture: true, passive: false});
   gd.addEventListener('touchmove', function (ev) {
     if (!pinching || ev.touches.length !== 2) return;
@@ -2437,12 +2472,30 @@ THREED_WEB_PINCH_SCRIPT = """
                                 center: c, up: startCamera.up, projection: startCamera.projection},
                        aspectratio: gd._fullLayout.scene.aspectratio});
   }, {capture: true, passive: false});
+  var lastTap = null, down = null;   // a double tap: two short, still touches of one finger on the canvas, close in time and place
+  gd.addEventListener('touchstart', function (ev) {
+    down = (ev.touches.length === 1 && onCanvas(ev.touches))
+      ? {x: ev.touches[0].clientX, y: ev.touches[0].clientY, at: Date.now()} : null;
+  }, {capture: true, passive: true});
   function end(ev) {
-    if (!pinching) return;
-    if (ev.touches.length < 2) {
-      pinching = false;
-      ev.stopPropagation();   // (the finger left on the screen should not start a turn from where it is)
-      try { Plotly.relayout(gd, {'scene.camera': scene.getCamera()}); } catch (err) { /* the layout keeps its own camera */ }
+    if (pinching) {
+      if (ev.touches.length < 2) {
+        pinching = false;
+        ev.stopPropagation();   // (the finger left on the screen should not start a turn from where it is)
+        try { Plotly.relayout(gd, {'scene.camera': scene.getCamera()}); } catch (err) { /* the layout keeps its own camera */ }
+      }
+      return;
+    }
+    if (ev.type !== 'touchend' || !down || ev.touches.length || !ev.changedTouches.length) { return; }
+    var t = ev.changedTouches[0], now = Date.now();
+    var still = Math.hypot(t.clientX - down.x, t.clientY - down.y) < 15 && now - down.at < 350;
+    down = null;
+    if (!still) { lastTap = null; return; }
+    if (lastTap && now - lastTap.at < 450 && Math.hypot(t.clientX - lastTap.x, t.clientY - lastTap.y) < 40) {
+      lastTap = null;
+      setPageMode(!pageMode);
+    } else {
+      lastTap = {x: t.clientX, y: t.clientY, at: now};
     }
   }
   gd.addEventListener('touchend', end, {capture: true, passive: false});

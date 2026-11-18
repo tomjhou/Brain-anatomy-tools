@@ -2859,9 +2859,12 @@ THREED_WEB_OPACITY_SCRIPT = """
       out.i.push(shape.i[n] + base); out.j.push(shape.j[n] + base); out.k.push(shape.k[n] + base); out.key.push(key[n]);
     }
   }
+  var relistDirection = null;   // the viewing direction (unit) the envelopes were last sorted for
   function relistEnvelopes(withGeometry) {
     if (!env) return Promise.resolve();
     var direction = viewDirection(), cull = state.envelope * state.cells < 0.995;
+    var norm = Math.sqrt(direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2]) || 1;
+    relistDirection = [direction[0] / norm, direction[1] / norm, direction[2] / norm];
     var all = {i: [], j: [], k: [], key: []};
     shown.forEach(function (on, g) { if (on) visibleFaces(g, direction, cull, all); });
     var count = all.key.length, order = new Uint32Array(count);
@@ -2881,7 +2884,13 @@ THREED_WEB_OPACITY_SCRIPT = """
     loadShapes();
     relistEnvelopes(true);   // (nothing is switched on yet: this puts the mesh in step with the page's own state)
     gd.on('plotly_relayout', function (e) {
-      if (e && Object.keys(e).some(function (name) { return name.indexOf('scene.camera') === 0; })) scheduleRelist();
+      if (!e || !Object.keys(e).some(function (name) { return name.indexOf('scene.camera') === 0; })) return;
+      // A zoom leaves the order unchanged, and with no envelope switched on there is nothing to sort: either way the mesh would be sent to the graphics
+      // card again for nothing, and the page would not answer the mouse wheel for a moment. Only a turn of more than about 2 degrees re-sorts.
+      if (!gd.__envelopesNeedSort()) return;
+      var d = viewDirection(), norm = Math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) || 1;
+      if (relistDirection && (d[0] * relistDirection[0] + d[1] * relistDirection[1] + d[2] * relistDirection[2]) / norm > 0.9994) return;
+      scheduleRelist();
     });
     gd.__legendRoutes.push(function (e) {   // a click on an envelope's legend entry (see THREED_WEB_LEGEND_ROUTER_SCRIPT)
       var g = env.standIns.indexOf(e.curveNumber);

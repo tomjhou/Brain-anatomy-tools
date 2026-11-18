@@ -274,6 +274,15 @@ make_app "Section assembler" run-assembler.command section_assembler org.jhoulab
     FileConverters/SerialAssembler.py ""
 chmod +x "$REPO"/run-*.command "$REPO"/extra-tools/run-*.command "$REPO/UNINSTALL_APPS_MAC.command" 2>/dev/null
 
+# A folder from a downloaded zip carries macOS's quarantine flag, and the apps start the run-*.command files in it, each of which would show "could not
+# verify" until allowed one by one. Running this installer was the user's decision to trust the folder, so clear the flag on it and on the apps.
+if command -v xattr >/dev/null 2>&1; then
+    xattr -dr com.apple.quarantine "$REPO" 2>/dev/null
+    for app in "$APPS_DIR"/{"Leica xlef viewer","CCF browser","ABC atlas browser","Section assembler"}.app; do
+        [ -d "$app" ] && xattr -dr com.apple.quarantine "$app" 2>/dev/null
+    done
+fi
+
 # Let Launchpad and Spotlight know about them (and their icons) now rather than later
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 if [ -x "$LSREGISTER" ]; then

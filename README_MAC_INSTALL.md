@@ -53,6 +53,9 @@ place first (a `BrainTools` folder in your home folder, or one you choose), toge
 and then installs from there. It makes four apps in `~/Applications`, to start from Launchpad, Spotlight or the Dock. Run it again after
 moving the folder.
 
+Once it is running, the installer also clears the quarantine flag on the whole folder and on the apps, so the apps themselves should not
+show the "can't verify" warning. (If one still does, use Option A above on the folder.)
+
 The first time each app starts, it opens a Terminal window to set up its own Python environment (`.venv-macos` in this folder) and download
 the libraries it needs: a few minutes, with an internet connection. macOS may ask whether the app can access your folders (for example
 Documents, or a network drive): click Allow.

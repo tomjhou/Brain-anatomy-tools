@@ -732,6 +732,14 @@ def build_common_settings_tab(tab):
         "Checked: updates are downloaded when the program starts, and it restarts to use them (not while the atlas is still downloading). "
         "Unchecked: the launch screen only says that an update is available, and the Check for updates button asks. Applies to all the apps "
         "on this computer.")).pack(anchor="w", pady=(2, 0))
+    ttk.Separator(frame).pack(fill=tk.X, pady=(14, 8))
+    version_row = ttk.Frame(frame)                                  # (the version: selectable, to copy into a bug report)
+    version_row.pack(anchor="w", fill=tk.X)
+    ttk.Label(version_row, text="Version:").pack(side=tk.LEFT)
+    version_entry = ttk.Entry(version_row, width=60)
+    version_entry.insert(0, app_update.version_text())
+    version_entry.state(["readonly"])
+    version_entry.pack(side=tk.LEFT, padx=6)
     if os.name == "nt" and not getattr(sys, 'frozen', False):
         ttk.Separator(frame).pack(fill=tk.X, pady=(14, 8))
         slow_row = ttk.Frame(frame)
@@ -2436,16 +2444,18 @@ THREED_WEB_PINCH_SCRIPT = """
     clearTimeout(toastTimer);
     setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, 1300);
   }
-  var savedAction = new Map();
   function setPageMode(on) {
     pageMode = on;
     gd.querySelectorAll('canvas').forEach(function (c) {
-      if (!savedAction.has(c)) savedAction.set(c, c.style.touchAction);
-      c.style.touchAction = on ? 'pinch-zoom' : savedAction.get(c);   // (plotly's own setting returns when the brain is zoomed again)
+      c.style.touchAction = on ? 'pinch-zoom' : 'none';   // 'none': the browser takes no gesture on the brain, so every touch reaches the handlers below
     });
     chip.style.display = on ? 'block' : 'none';
     toast(on ? 'Pinch now zooms the page' : 'Pinch now zooms the brain');
   }
+  gd.querySelectorAll('canvas').forEach(function (c) { c.style.touchAction = 'none'; });   // (the brain is zoomed by pinching, to begin with)
+  ['gesturestart', 'gesturechange'].forEach(function (name) {   // (iOS Safari zooms the page by its own gesture events as well)
+    gd.addEventListener(name, function (ev) { if (!pageMode && onCanvas([ev])) ev.preventDefault(); }, {capture: true, passive: false});
+  });
   function onCanvas(touches) {
     for (var i = 0; i < touches.length; i++) {
       var t = touches[i].target;
@@ -3758,7 +3768,8 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
         template='plotly_dark', scene=scene, margin=dict(l=0, r=0, t=50, b=bottom_margin),
         title=title if shown >= total else f"{title}  (showing {shown:,} of {total:,} cells)",
         legend=dict(itemsizing='constant'))
-    scripts = [THREED_WEB_LEGEND_ROUTER_SCRIPT] + ([post_script] if post_script else [])
+    # (the pinch script first, and apart: a failure in one of the scripts below it must not stop it)
+    scripts = [THREED_WEB_PINCH_SCRIPT, THREED_WEB_LEGEND_ROUTER_SCRIPT] + ([post_script] if post_script else [])
     if roles['lines'] or roles['surfaces']:
         scripts.append(THREED_WEB_EDGE_SCRIPT.replace('__ROLES__', json.dumps(roles)).replace('__OFF__', json.dumps(legend_off)).replace('__DEFAULT__', default_mode))
     if slider_rows or envelope_mesh is not None:
@@ -3779,7 +3790,6 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
                        .replace('__ROW__', str(row)))
     scripts.append(THREED_WEB_SLICE_SCRIPT.replace('__MESH_INDEX__', str(mesh_index if mesh_groups else -1)))
     scripts.append(THREED_WEB_SPIN_SCRIPT)
-    scripts.append(THREED_WEB_PINCH_SCRIPT)
     scripts.append(THREED_WEB_LEGEND_MARK_SCRIPT)
     figure.write_html(str(path), include_plotlyjs=True, full_html=True, config={'displaylogo': False},
                       post_script='\n'.join(scripts) or None)

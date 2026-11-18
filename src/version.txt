@@ -1,2 +1,2 @@
 $Format:%H$
-$Format:%cs$
+$Format:%cI$

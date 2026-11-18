@@ -275,6 +275,38 @@ def installed_version(root):
     return sha if len(sha) == 40 and all(c in "0123456789abcdef" for c in sha) else None
 
 
+def version_text(root=None):
+    """One line saying which version this is, for the Settings window: the date and time of the commit (in this computer's time), its short id and, for a
+    git clone, the branch. A clone asks git; a folder unzipped from GitHub reads src/version.txt (which GitHub filled in). "Unknown" when neither knows."""
+    import datetime
+    try:
+        root = root or repo_root()
+    except Exception:
+        return "unknown"
+    sha = stamp = branch = ""
+    if _is_clone(root):
+        try:
+            sha, stamp = (_git(root, "log", "-1", "--format=%H%n%cI").splitlines() + ["", ""])[:2]
+            branch = _git(root, "branch", "--show-current")
+        except Exception:
+            sha = stamp = ""
+    if not sha:
+        try:
+            with open(os.path.join(root, VERSION_FILE), encoding="utf-8") as f:
+                lines = [line.strip() for line in f.read().splitlines()]
+            sha, stamp = (lines + ["", ""])[:2]
+        except OSError:
+            return "unknown"
+        if len(sha) != 40:
+            return "unknown (this folder does not say which commit it is)"
+    try:
+        shown = (stamp if len(stamp) == 10 and stamp[:1].isdigit() else          # (a date alone, from a ZIP made before the time was added)
+                 datetime.datetime.fromisoformat(stamp).astimezone().strftime("%Y-%m-%d %H:%M"))
+    except ValueError:
+        shown = stamp if stamp and not stamp.startswith("$") else ""
+    return f"{shown + '  ' if shown else ''}(commit {sha[:7]}{', branch ' + branch if branch else ''})"
+
+
 def _context():
     """Certificates to check GitHub's with: certifi's when it is there (Python from python.org on a Mac has none of its own until its
     "Install Certificates" is run), else the system's."""

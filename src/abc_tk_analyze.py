@@ -39,6 +39,8 @@ MARK_COLOR = "#d62728"           # the genes typed in the Selectivity tab
 LABEL_RATIO = 5.0                # a Selectivity plot names every gene whose ratio (y) is above this
 EXPRESSION_DOT_AREA = {False: 4.0, True: 1.5}      # the dots of a per-cell plot (marker area, points squared), for panel genes and for imputed ones
 SELECTIVITY_DOT_AREA = {False: 16.0, True: 5.0}    # ... and of a Selectivity plot (500 panel genes, but 8,000 imputed ones)
+DEFAULT_RADIUS_MM = 1.0          # Selectivity, "Radius from centroid": the radius the box starts with
+MIN_SIDE_FRACTION = 0.1          # ... a group has a centroid on each side of the brain that holds at least this share of its cells
 MAX_LEGEND_GROUPS = 15           # a per-cell plot has a legend up to this many groups
 POINT_ALPHA = 0.5
 
@@ -205,6 +207,28 @@ def selectivity_values(means, counts, target, k, floor=SELECTIVITY_FLOOR, min_ce
         x = (means[:, own].astype(float) * weights).sum(axis=1) / max(weights.sum(), 1.0)
     top = means[:, others].max(axis=1).astype(float) if others else np.zeros(len(x))
     return x, (x + floor) / (top + floor), len(others)
+
+
+def radius_scope(xyz, in_target, radius, midline=None, min_side=MIN_SIDE_FRACTION):
+    """The cells Selectivity's "Radius from centroid" compares: (which cells: those of the group, and every other cell within `radius` of
+    the group's centroid; the centroids), or (None, []) if no cell of the group has a position. `xyz`: cells x 3 (mm; x is left to right);
+    `in_target`: which cells are the group's. With a `midline` (the x of the middle of the brain) a group on both sides has a centroid on
+    each side, not one between them, where the group is not: a side counts if it holds at least `min_side` of the group's cells."""
+    known = np.isfinite(xyz).all(axis=1)
+    own = in_target & known
+    if not own.any():
+        return None, []
+    sides = [own]
+    if midline is not None:
+        left = own & (xyz[:, 0] < midline)
+        halves = [h for h in (left, own & ~left) if h.sum() >= max(min_side * own.sum(), 1)]
+        if len(halves) == 2:
+            sides = halves
+    centroids = [xyz[h].mean(axis=0) for h in sides]
+    near = np.zeros(len(xyz), dtype=bool)
+    for c in centroids:
+        near[known] |= np.linalg.norm(xyz[known] - c, axis=1) <= radius
+    return in_target | near, centroids
 
 
 def group_means_panel(counts_matrix, codes, n_groups):
@@ -469,6 +493,32 @@ class AnalyzeWindow:
         self.var_sel_genes = tk.StringVar(top, viewer.var_gene.get())
         self.sel_genes_entry = ttk.Entry(page, textvariable=self.var_sel_genes)
         self.sel_genes_entry.pack(fill=tk.X, pady=(2, 0))
+        # which cells the group is compared with: every cell of the project, or only those near the group (which needs the cells' positions)
+        self.xyz = None
+        self.scope_kept = None                  # the last scope worked out (see scope_for): the labels ask for it at every keystroke
+        scope_box = ttk.LabelFrame(page, text="Compare with", padding=(6, 2))
+        scope_box.pack(fill=tk.X, pady=(8, 0))
+        has_positions = self.cell_xyz() is not None
+        self.var_scope = tk.StringVar(top, "radius" if has_positions else "all")
+        ttk.Radiobutton(scope_box, text="All project cells", value="all", variable=self.var_scope, command=self.scope_changed).pack(anchor="w")
+        radius_row = ttk.Frame(scope_box)
+        radius_row.pack(anchor="w")
+        self.radio_radius = ttk.Radiobutton(radius_row, text="Radius from centroid:", value="radius", variable=self.var_scope, command=self.scope_changed)
+        self.radio_radius.pack(side=tk.LEFT)
+        self.var_radius = tk.StringVar(top, f"{DEFAULT_RADIUS_MM:g}")
+        self.radius_entry = ttk.Entry(radius_row, textvariable=self.var_radius, width=5)
+        self.radius_entry.pack(side=tk.LEFT, padx=(4, 4))
+        ttk.Label(radius_row, text="mm").pack(side=tk.LEFT)
+        if not has_positions:
+            self.radio_radius.state(["disabled"])
+            self.radius_entry.state(["disabled"])
+        from abc_tk_umap import HoverTip
+        for w in (self.radio_radius, self.radius_entry):
+            HoverTip(w, lambda: "The group against the other cells of the project within this distance of the group's centroid "
+                                "(in three dimensions; a group on both sides of the brain has a centroid on each side)."
+                                if has_positions else "The positions of the cells are not known for this dataset.")
+        self.var_radius.trace_add("write", lambda *a: (self.radius_entry.configure(foreground=""), self.scope_changed()))
+        self.radius_entry.bind("<Return>", lambda ev: self.analyze())
         ttk.Label(page, text="Compared with the largest other groups:", foreground="gray30", wraplength=250, justify=tk.LEFT).pack(anchor="w", pady=(8, 0))
         self.var_slider = tk.DoubleVar(top, 50.0)
         self.slider_touched = False             # (until it is moved, the slider keeps to DEFAULT_OTHER_GROUPS whatever the group type and group)
@@ -638,6 +688,50 @@ class AnalyzeWindow:
         else:
             self.exclude_row.pack_forget()
 
+    def cell_xyz(self):
+        """The position of each cell of the project (mm: across the section, down it, and the section's place along the brain), or None
+        where they are not known (a dataset of the user's own, a project without sections)."""
+        v = self.v
+        parts = [getattr(v, name, None) for name in ("cx", "cy", "cz")]
+        if any(p is None for p in parts):
+            return None
+        if self.xyz is None:
+            self.xyz = np.column_stack([np.asarray(p, dtype=float) for p in parts])
+        return self.xyz
+
+    def radius_mm(self):
+        """The radius in the box (mm), or None if it is not a number above 0."""
+        try:
+            r = float(self.var_radius.get().strip())
+        except ValueError:
+            return None
+        return r if np.isfinite(r) and r > 0 else None
+
+    def scope_for(self, level, codes, target):
+        """None for "All project cells" (or no group, radius or positions); else, for "Radius from centroid", a dict: mask (the cells
+        compared: the group's, and the others within the radius of its centroid), radius, sides (how many centroids), near (how many
+        other cells are within the radius)."""
+        target = target_list(target)
+        radius = self.radius_mm()
+        xyz = self.cell_xyz()
+        if self.var_scope.get() != "radius" or not target or radius is None or xyz is None:
+            return None
+        key = (level, tuple(target), radius)
+        if self.scope_kept is not None and self.scope_kept[0] == key:
+            return self.scope_kept[1]
+        in_target = np.isin(codes, target)
+        # (the middle of the brain is known in Allen's reconstructed coordinates, which is what the positions are unless the Settings say otherwise)
+        midline = core.BREGMA_CCF_ML_MM if core.reconstructed_in_use() else None
+        mask, centroids = radius_scope(xyz, in_target, radius, midline)
+        scope = None if mask is None else {"mask": mask, "radius": radius, "sides": len(centroids), "near": int((mask & ~in_target).sum())}
+        self.scope_kept = (key, scope)
+        return scope
+
+    def scope_changed(self):
+        """All project cells / Radius from centroid, or the radius: the plot on the screen is of other cells, so the slider no longer redraws it."""
+        self.sel = None
+        self.update_labels()
+
     def level_changed(self):
         self.sel = None                         # (the means are kept for every group type: the next Analyze plots the new one from them)
         self.update_labels()
@@ -684,13 +778,20 @@ class AnalyzeWindow:
             return
         counts = np.bincount(codes[codes >= 0], minlength=len(uniques))
         chosen = match_groups(entries, uniques)[0] if entries else []
+        scope = self.scope_for(self.level(), codes, chosen)
+        if scope is not None:                      # (only the cells near the group: the other groups are counted among those)
+            counts = np.bincount(codes[(codes >= 0) & scope["mask"]], minlength=len(uniques))
         sizes = other_group_sizes(counts, chosen)
         n_others = max(len(sizes), 1)
         if not self.slider_touched:
             self.var_slider.set(slider_for_groups(DEFAULT_OTHER_GROUPS, n_others))
         k = other_groups_used(self.var_slider.get(), n_others)
         smallest = sizes[k - 1] if sizes else 0
-        self.var_others.set(f"Largest {k} of {n_others} other groups used, each with at least {smallest:,} cells (groups under {MIN_GROUP_CELLS} cells are ignored).")
+        if scope is not None and not sizes:
+            self.var_others.set(f"No other group has {MIN_GROUP_CELLS} cells within {scope['radius']:g} mm ({scope['near']:,} other cells there): use a larger radius.")
+            return
+        where = f" within {scope['radius']:g} mm ({scope['near']:,} other cells)" if scope is not None else ""
+        self.var_others.set(f"Largest {k} of {n_others} other groups{where} used, each with at least {smallest:,} cells (groups under {MIN_GROUP_CELLS} cells are ignored).")
 
     def slider_moved(self):
         self.slider_touched = True
@@ -972,33 +1073,58 @@ class AnalyzeWindow:
             self.show_groups_hint(f"{what} only {total} cells in this run; at least {MIN_GROUP_CELLS} are needed.")
             self.var_status.set(f"{what} only {total} cells in this run: at least {MIN_GROUP_CELLS} are needed.")
             return
-        meta = dict(level=level, target=target, uniques=uniques, imputed=imputed,
+        scope, scope_text = None, ""
+        if self.var_scope.get() == "radius":
+            if self.radius_mm() is None:
+                self.radius_entry.configure(foreground="red")
+                self.var_status.set("Enter the radius in mm (a number above 0), or choose All project cells.")
+                return
+            scope = self.scope_for(level, codes, target)
+            if scope is None:
+                self.var_status.set("The positions of this group's cells are not known, so there is no centroid: choose All project cells.")
+                return
+            near = np.bincount(codes[(codes >= 0) & scope["mask"]], minlength=len(uniques))
+            if not other_group_sizes(near, target):
+                self.var_status.set(f"No other group has {MIN_GROUP_CELLS} cells within {scope['radius']:g} mm of the centroid "
+                                    f"({scope['near']:,} other cells there): use a larger radius.")
+                return
+            scope_text = f"within {scope['radius']:g} mm of its centroid" + (" on each side" if scope["sides"] > 1 else "")
+        meta = dict(level=level, target=target, uniques=uniques, imputed=imputed, scope_text=scope_text,
                     note=(f" ({len(target)} groups combined)" if len(target) > 1 else "") + note_source)
-        data = self.ensure_means(imputed, meta)
+        data = self.ensure_means(imputed, meta, scope)
         if data is not None:
             self.finish_means(data, meta)
 
-    def ensure_means(self, imputed, meta):
+    def ensure_means(self, imputed, meta, scope=None):
         """The mean of every gene in every group, for every group type at once (so that changing the group type needs no new read): from memory,
-        else from the file saved for this run, else read now in the background (None is returned and the plot follows when it is done)."""
+        else from the file saved for this run, else read now in the background (None is returned and the plot follows when it is done).
+        With a `scope` (Radius from centroid) only its cells are counted (the others are given no group), only for the group type asked
+        for, and nothing is saved: it is for one group and one radius. Only the last such read is kept in memory."""
         v = self.v
-        by_level = {k: v.category_codes(k) for k in self.level_keys}
+        by_level = {k: v.category_codes(k) for k in (self.level_keys if scope is None else [meta["level"]])}
+        if scope is not None:
+            by_level = {k: (np.where(scope["mask"], c, -1), u_) for k, (c, u_) in by_level.items()}
         digest = hashlib.md5(core._index_fingerprint(v.adata.obs_names).encode())
         for k, (c, _u) in by_level.items():
             digest.update(k.encode() + c.astype(np.int32).tobytes())
         fingerprint = digest.hexdigest()[:16]                  # (the cells, and the group each is in at every level)
-        key = (imputed, fingerprint)
+        key = (imputed, fingerprint, scope is not None)
         if key in self.means_cache:
             return self.means_cache[key]
+        if scope is not None:
+            for old in [k for k in self.means_cache if k[2]]:
+                del self.means_cache[old]
         uniques_of = {k: np.asarray([str(u) for u in u_], dtype=str) for k, (_c, u_) in by_level.items()}
         counts_of = {k: np.bincount(c[c >= 0], minlength=len(by_level[k][1])) for k, (c, _u) in by_level.items()}
         if imputed:
             source = v.imputed_state["adata"]
             path = source.filename
             positions = source.obs_names.get_indexer(v.adata.obs_names)
+            if scope is not None:
+                positions = np.where(scope["mask"], positions, -1)        # (the cells out of it are not read at all)
             names = source.var["gene_symbol"].astype(str).to_numpy()
             disk = core.CACHE_DIR / f"analyze_means_{fingerprint}.npz"
-            loaded = load_saved_means(disk, uniques_of)
+            loaded = load_saved_means(disk, uniques_of) if scope is None else None
             if loaded is not None:
                 self.means_cache[key] = loaded
                 return loaded
@@ -1009,7 +1135,8 @@ class AnalyzeWindow:
                 if means is None:
                     return None
                 data = {"names": names, "levels": {k: {"means": means[k], "uniques": uniques_of[k], "counts": counts_of[k]} for k in means}}
-                save_means(disk, data)
+                if scope is None:
+                    save_means(disk, data)
                 return data
         else:
             names = v.adata.var["gene_symbol"].astype(str).to_numpy()
@@ -1039,7 +1166,8 @@ class AnalyzeWindow:
 
         threading.Thread(target=run, daemon=True).start()
         self.btn_analyze.config(text="Cancel")
-        label = "the imputed genes (the first time for this run: a minute or two)" if meta["imputed"] else "the genes"
+        label = ("the imputed genes" + (" of the cells within the radius" if meta.get("scope_text") else " (the first time for this run: a minute or two)")
+                 if meta["imputed"] else "the genes")
         started = time.perf_counter()
 
         def poll():
@@ -1123,7 +1251,8 @@ class AnalyzeWindow:
                 else "mean count per cell")
         ax.set_xlabel(f"{unit} in {label}")
         ax.set_ylabel(textwrap.fill(f"ratio to the highest of the {used} largest other {plural(self.v.level_names[level])}", 42))
-        ax.set_title(textwrap.fill(f"{len(x):,} genes: {label}", 70))
+        scope_text = s.get("scope_text", "")
+        ax.set_title(textwrap.fill(f"{len(x):,} genes: {label}" + (f", against the cells {scope_text}" if scope_text else ""), 70))
         ax.grid(True, alpha=0.25, which="both")
         self.hover = {"kind": "genes", "x": x, "y": y, "names": names}
         self.table = pd.DataFrame({"gene": names, ax.get_xlabel().replace("\n", " "): x, ax.get_ylabel().replace("\n", " "): y})
@@ -1143,7 +1272,8 @@ class AnalyzeWindow:
         if not_shown:
             extra += f" None in {label}, so not on the graph: {', '.join(not_shown)}."
         self.var_status.set(f"{len(x):,} genes plotted" + (f" ({dropped:,} with none in {label} are left out)" if dropped else "")
-                            + f", each against the {used} largest other {plural(self.v.level_names[level])} (at least {smallest:,} cells each). "
+                            + f", each against the {used} largest other {plural(self.v.level_names[level])}" + (f" {scope_text}" if scope_text else "")
+                            + f" (at least {smallest:,} cells each). "
                             f"{len(named):,} with a ratio above {LABEL_RATIO:g} are named." + s.get("note", "") + extra
                             + " Scroll to zoom, double-click to reset.")
 

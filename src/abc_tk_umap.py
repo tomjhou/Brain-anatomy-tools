@@ -2042,6 +2042,7 @@ class UmapWindow(ExportsMixin):
         ok = spatial is not None and "x" in spatial.columns and "y" in spatial.columns
         self.cx = pd.to_numeric(spatial["x"], errors="coerce").to_numpy() if ok else None
         self.cy = pd.to_numeric(spatial["y"], errors="coerce").to_numpy() if ok else None
+        self.cz = pd.to_numeric(spatial["z"], errors="coerce").to_numpy() if ok and "z" in spatial.columns else None      # (its section's place along the brain, mm: for Analyze's radius)
         self.region_of_run = spatial["parcellation_index"].to_numpy() if ok and "parcellation_index" in spatial.columns else None      # (Allen's CCF region of each cell)
         self.region_names = None
         if self.region_of_run is not None:

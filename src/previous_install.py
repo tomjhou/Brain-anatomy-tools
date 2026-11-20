@@ -196,7 +196,17 @@ def plan(top=TOP):
     if not atlas or not os.path.isdir(atlas):
         atlas = os.path.join(old_parent, ATLAS_NAME)
     result["atlas"] = item(atlas, ATLAS_NAME)
-    result["output"] = item(os.path.join(old_parent, OUTPUT_NAME), OUTPUT_NAME)
+    # The output folder the previous copy was using: the one its launch screen showed (the most recent of its recent output folders,
+    # as DEFAULT_OUTPUT_FOLDER's use in ABC_atlas_browser.py), which may be anywhere; the default one beside it only if it has none.
+    output = os.path.join(old_parent, OUTPUT_NAME)
+    try:
+        with open(os.path.join(previous, RECENT_FILE), encoding="utf-8") as f:
+            recent = json.load(f)
+        if isinstance(recent, list) and recent and os.path.isdir(str(recent[0])):
+            output = str(recent[0])
+    except (OSError, ValueError):
+        pass
+    result["output"] = item(output, os.path.basename(os.path.normpath(output)) or OUTPUT_NAME)
     return result
 
 

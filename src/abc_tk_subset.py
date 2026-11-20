@@ -50,7 +50,7 @@ def legend_selection(v):
         return None, None, [], "There are no groups in the legend to take a subset from."
     if not on:
         return None, None, [], "No group is selected. Switch on the groups to analyze in the legend (click an entry, or use All), then try again."
-    if len(on) == len(keys):
+    if v.mode == "all" and len(on) == len(keys):             # (only All groups: every group switched on is the whole run; typed groups are a part of it by themselves)
         return None, None, [], ("Every group is selected, so the subset would be the whole run. Switch off the groups to leave out (click an entry, "
                                 "or use None and then switch some on), then try again.")
     codes, uniques = v.category_codes(level)

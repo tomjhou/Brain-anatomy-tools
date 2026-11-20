@@ -1976,6 +1976,8 @@ class UmapWindow(ExportsMixin):
         self.last_group_click = None       # (group, whether it was switched to gray) of the last click on a legend row: where a shift-click starts
         self.hover_group = None            # the legend row the pointer is on
         self.single_names = {}             # Single group(s): number -> full name of each group
+        self.unit_override = {}            # (level, group target) -> the color chosen for it in the Choose groups window
+        self.groups_window = None          # the Choose groups window (abc_tk_groups), while it is open
         self.off_groups = set()            # the groups switched to gray by a click on their legend swatch (All groups: their names; Single group(s): their numbers)
         self.last_ids = None               # the groups typed in Single group(s): level, targets, colors, cells
         self.export_cat = None             # what the categorical colours mean (for a saved legend)
@@ -2382,6 +2384,12 @@ class UmapWindow(ExportsMixin):
         e.pack(fill=tk.X, pady=(2, 0))
         e.bind("<Return>", lambda ev: self.recolor())
         self.id_entry = e
+        self.groups_button = ttk.Button(self.id_frame, text="Choose groups...", style="Side.TButton", command=self.open_groups_window)
+        self.groups_button.pack(anchor="w", pady=(4, 0))
+        HoverTip(self.groups_button, lambda: "Pick groups of any level from the taxonomy, in a tree: a box at every level, to color a group as one or each of its subgroups on its own."
+                 if self.own is None else "Not available for a dataset of your own.")
+        if self.own is not None:
+            self.groups_button.state(["disabled"])
         # the gene box
         self.gene_frame = ttk.LabelFrame(self.box, text="Gene(s)", padding=6)
         ttk.Label(self.gene_frame, text="Up to six, separated by commas: the first three red / green / blue circles, the next three the same as small dots:", foreground="gray30", wraplength=300).pack(anchor="w")
@@ -2569,13 +2577,19 @@ class UmapWindow(ExportsMixin):
         counts = self.cache[key]
         return sum(1 for u in np.flatnonzero(counts > 0) if str(uniques[u]) not in self.off_groups)
 
+    def units_with_cells(self):
+        """How many of the chosen groups have cells of their own (one covered completely by finer groups has none, and is not drawn in 3D)."""
+        sel = self.last_ids or {}
+        return sum(1 for u in sel.get("targets", []) if sel.get("counts", {}).get(u, 0) > 0)
+
     def group_button_tip(self, button=None):
         """Why one of the buttons that work on groups is greyed out (nothing when it is not)."""
         if self.own is not None:
             return "Not available for a dataset of your own."
         if button is getattr(self, "threed_button", None):
             if self.mode == "single":
-                return ""
+                n = self.units_with_cells() if (self.last_ids or {}).get("mixed") else 0
+                return "" if n <= self.MAX_3D_GROUPS else f"{n} groups are chosen: the 3D view takes at most {self.MAX_3D_GROUPS}. Remove some in Choose groups."
             if self.mode == "all":
                 n = self.groups_on_count()
                 if n > self.MAX_3D_GROUPS:
@@ -2591,9 +2605,14 @@ class UmapWindow(ExportsMixin):
         """The group exports are for the groups typed in Single group(s); the 3D view also for the groups switched on in All groups, if there are at most
         MAX_3D_GROUPS of them."""
         for b in self.group_buttons:
+            mixed = bool((self.last_ids or {}).get("mixed"))
+            if mixed and self.mode == "single" and self.units_with_cells() == 0 and b is not getattr(self, "threed_button", None):
+                b.state(["disabled"])
+                continue
             if b is getattr(self, "threed_button", None):
                 n = self.groups_on_count() if self.mode == "all" else 0
-                usable = self.mode == "single" or (self.mode == "all" and 1 <= n <= self.MAX_3D_GROUPS)
+                units_n = self.units_with_cells() if mixed else 0
+                usable = (self.mode == "single" and (not mixed or 1 <= units_n <= self.MAX_3D_GROUPS)) or (self.mode == "all" and 1 <= n <= self.MAX_3D_GROUPS)
             else:
                 usable = self.mode == "single"
             b.state(["!disabled"] if usable and self.own is None else ["disabled"])
@@ -2602,7 +2621,7 @@ class UmapWindow(ExportsMixin):
         self.level_frame.config(text="Group by" if self.mode in ("all", "single") else "Group by (hover)")
         if self.level_has_ids.get(self.level, True):                 # (what the box takes: the groups' numbers, or their names where they have no numbers)
             self.id_frame.config(text="Group number(s)")
-            self.id_hint.config(text="One or more, separated by commas; numbers in parentheses, (888, 890), are one group, in one color (Enter):")
+            self.id_hint.config(text="One or more, separated by commas; numbers in parentheses, (888, 890), are one group, in one color. Another level: subclass:12 (Enter):")
         else:
             self.id_frame.config(text="Group name(s)")
             self.id_hint.config(text="One or more names (a start will do: GABA, Glut), separated by commas; names in parentheses, (GABA, Glut), are one group (Enter):")
@@ -3804,7 +3823,9 @@ class UmapWindow(ExportsMixin):
             return
         old = self.level
         self.level = self.var_level.get()
-        if self.level != old:                                          # (each level keeps its own group numbers: those last typed for it, else none)
+        if self.level != old and ":" in self.var_ids.get():            # (groups of several levels, each named: the text stays, the level is only what unnamed numbers mean)
+            self.update_frames()
+        elif self.level != old:                                        # (each level keeps its own group numbers: those last typed for it, else none)
             self.ids_by_level[old] = self.var_ids.get()
             self.var_ids.set(self.ids_by_level.get(self.level, ""))
             self.update_frames()
@@ -3849,6 +3870,8 @@ class UmapWindow(ExportsMixin):
             self.legend.pack_forget()
         self.sync_select_bar()
         self.update_group_buttons()                      # (the 3D button follows how many groups are switched on)
+        if self.groups_window is not None:
+            self.groups_window.refresh()
 
     def dot_scale(self):
         return self.host.get("umap_circle_sizes", {}).get(self.viewer_settings.get("umap_circle_size", "Default"), 1.0)
@@ -4320,15 +4343,216 @@ class UmapWindow(ExportsMixin):
                     ids.append(target)
         return ids, bad
 
+    # ---- the groups of Specific group(s), of any level: "units" (see abc_tk_groups)
+
+    def resolve_level(self, word):
+        """The level a typed prefix names ('sub', 'subclass', 'Supertype'), or None (nothing, or several, start with it)."""
+        word = word.casefold()
+        levels = [k for k in self.levels if k not in NOT_IN_TAXONOMY and self.level_has_ids.get(k, True)]
+        exact = [k for k in levels if word in (k.casefold(), self.level_names[k].casefold())]
+        if exact:
+            return exact[0]
+        hits = [k for k in levels if k.casefold().startswith(word) or self.level_names[k].casefold().startswith(word)]
+        return hits[0] if len(hits) == 1 else None
+
+    def parse_units(self):
+        """The groups typed in the box as units: ([(level, number or tuple of numbers), ...], the pieces that are not). A number alone is of the level chosen
+        in Group by; 'subclass:12' (or '(subclass:12, 14)', several together) names its level, so that groups of several levels can be listed."""
+        text = re.sub(r"([A-Za-z]+)\s*:\s*", r"\1:", self.var_ids.get())
+        items, bad = split_group_items(text)
+        units = []
+        for item in items:
+            level, numbers = self.level, []
+            for tok in item:
+                m = re.match(r"^([A-Za-z]+):(.*)$", tok)
+                if m:
+                    named = self.resolve_level(m.group(1)) if self.own is None else None
+                    if named is None:
+                        bad.append(tok)
+                        continue
+                    level, tok = named, m.group(2)
+                try:
+                    v = int(tok)
+                except ValueError:
+                    if tok:
+                        bad.append(tok)
+                    continue
+                if v not in numbers:
+                    numbers.append(v)
+            if numbers:
+                unit = (level, numbers[0] if len(numbers) == 1 else tuple(numbers))
+                if unit not in units:
+                    units.append(unit)
+        return units, bad
+
+    def unit_list_text(self, units):
+        """The units as the box shows them: plain numbers when they are all of one level, else each with its level."""
+        named = len({level for level, _ in units}) > 1
+        parts = []
+        for level, target in units:
+            if isinstance(target, tuple):
+                body = ", ".join(str(m) for m in target)
+                parts.append(f"({level}:{body})" if named else f"({body})")
+            else:
+                parts.append(f"{level}:{target}" if named else str(target))
+        return ", ".join(parts)
+
+    def unit_rgb(self, unit, units):
+        """The color of a unit: the one chosen for it, else red for a single group, else the browser's colors in the order the units were listed."""
+        chosen = self.unit_override.get(unit)
+        if chosen is not None:
+            return np.array(chosen, np.uint8)
+        if len(units) == 1:
+            return np.array([255, 0, 0], np.uint8)
+        return rank_color(units.index(unit) if unit in units else 0)
+
+    def set_unit_color(self, unit, rgb):
+        self.unit_override[unit] = tuple(int(v) for v in rgb)
+        if self.mode == "single":
+            self.recolor(keep_off=True)
+
+    def set_units(self, units):
+        """Make `units` the groups of Specific group(s) (the Choose groups window calls this): the box and the Group by level follow, and the cells are colored."""
+        levels = {level for level, _ in units}
+        if len(levels) == 1:
+            (level,) = levels
+            if level != self.level:
+                self.level = level
+                self.var_level.set(level)
+        self.var_ids.set(self.unit_list_text(units))
+        if len(levels) == 1:
+            self.ids_by_level[self.level] = self.var_ids.get()
+        if self.mode != "single":
+            self.var_mode.set("single")
+            self.on_mode()
+        else:
+            self.recolor()
+
+    def open_groups_window(self):
+        if self.own is not None:
+            return
+        if self.groups_window is not None:
+            self.groups_window.lift()
+            return
+        import abc_tk_groups
+        self.groups_window = abc_tk_groups.GroupTree(self)
+
+    UNIT_ABBREVIATIONS = {"class": "Cl", "subclass": "Sub", "supertype": "Sup", "cluster": "Clu"}
+    MAX_UNIT_LEGEND_ROWS = 12
+
+    def color_mixed(self, units, bad):
+        """Specific group(s) with groups of several levels: each unit (a group of some level) in its own color; a cell in several takes the finest. (units: see
+        parse_units.)"""
+        depth = {level: i for i, level in enumerate(self.levels)}
+        n_run = len(self.category_codes(units[0][0])[0])
+        hit = np.zeros(n_run, np.int32)                          # 1 + the position in `units` of the finest unit each cell is in, else 0
+        bg_hit = None
+        if self.bg:
+            first = next((level for level, _ in units if self.bg["levels"].get(level) is not None), None)
+            if first is not None:
+                bg_hit = np.zeros(len(self.bg["levels"][first]), np.int32)
+        for i in sorted(range(len(units)), key=lambda i: (depth.get(units[i][0], 99), i)):          # (coarse first, so the finer ones paint over them)
+            level, target = units[i]
+            codes, uniques = self.category_codes(level)
+            inside = in_group(self.group_keys(level, uniques), target)
+            hit[(codes >= 0) & inside[np.maximum(codes, 0)]] = i + 1
+            bgc = self.bg_codes(level) if bg_hit is not None else None
+            if bgc is not None:
+                bg_hit[(bgc >= 0) & inside[np.maximum(bgc, 0)]] = i + 1
+        colors = {u: (GREY if u in self.off_groups else self.unit_rgb(u, units)) for u in units}
+        lut = np.vstack([GREY] + [colors[u] for u in units]).astype(np.uint8)
+        rgb = lut[hit]
+        self.rank_run = hit
+        order = np.argsort(hit, kind="stable")
+
+        def bg_fn(label):
+            if not self.bg:
+                return None
+            w = self.bg["where"].get(label)
+            if w is None:
+                return None
+            h = bg_hit[w] if bg_hit is not None else np.zeros(len(w), np.int32)
+            o = np.argsort(h, kind="stable")
+            return self.bg["x"][w][o], self.bg["y"][w][o], lut[h][o], w[o]
+
+        self.apply(rgb, order, bg_fn)
+        counts_list = np.bincount(hit, minlength=len(units) + 1)[1:]
+        counts = {u: int(counts_list[i]) for i, u in enumerate(units)}
+
+        def name_of(level, member):
+            codes, uniques = self.category_codes(level)
+            keys = self.group_keys(level, uniques)
+            found = np.flatnonzero(keys == member)
+            return re.sub(r"^\s*\d+\s*", "", str(uniques[found[0]])) if len(found) else ""
+
+        def label_of(unit):
+            level, target = unit
+            return " + ".join(name_of(level, m) for m in core.target_members(target))
+
+        def short(unit):
+            level, target = unit
+            return f"{self.UNIT_ABBREVIATIONS.get(level, level)} {core.key_text(target)}"
+        shown = sorted(units, key=lambda u: (depth.get(u[0], 99), core.target_members(u[1])[0]))          # (the legend: coarse to fine, by number)
+        self.last_ids = {"level": None, "targets": shown, "colors": colors, "counts": counts, "mixed": True, "units": units, "hit": hit}
+        token = "mixed_" + "-".join(f"{self.UNIT_ABBREVIATIONS.get(l, l)}{core.key_text(t)}" for l, t in shown)
+        self.view_kind, self.view_token = "single", token[:80]
+        self.view_title = "Groups " + ", ".join(short(u) for u in shown)
+        rank = np.where(hit > 0, hit - 1, -1)
+        bg_rank = np.where(bg_hit > 0, bg_hit - 1, -1) if bg_hit is not None else None
+        self.export_cat = {"rank": rank, "title": "Groups",
+                           "entries": [(hexcolor(colors[u]), f"{short(u)} {label_of(u)}".strip(), counts[u]) for u in units]}
+        self.set_cell_ranks(rank, bg_rank)
+        self.shown_values = None
+        levels_used = len({level for level, _ in units})
+        parts = [f"Highlighting {len(units)} groups of {levels_used} levels ({int((hit > 0).sum())} cells)"]
+        empty = [short(u) for u in units if not counts[u]]
+        if empty:
+            parts.append("no cells of its own (covered by a finer group, or not in this run): " + ", ".join(empty))
+        if bad:
+            parts.append("ignored: " + ", ".join(bad))
+        self.var_status.set("; ".join(parts) + ".")
+        self.single_names = {}
+        self.draw_legend_mixed(units, shown, colors, counts, short, label_of)
+        self.values = None
+
+    def draw_legend_mixed(self, units, shown, colors, counts, short, label_of):
+        self.legend.pack(fill=tk.X, pady=(6, 0), after=self.box)
+        self.sync_select_bar()
+        self.legend.delete("all")
+        rows = [("#%02x%02x%02x" % tuple(int(v) for v in colors[u]), short(u), f"({counts[u]})", label_of(u), u in self.off_groups,
+                 int(self.shape_codes(np.array([units.index(u)]))[0]))
+                for u in shown[:self.MAX_UNIT_LEGEND_ROWS]]
+        extra = len(shown) - len(rows)
+        self.legend.config(height=22 * (len(rows) + (1 if extra > 0 else 0)) + 8)
+        self.draw_legend_rows(self.legend, rows, 4)
+        if extra > 0:
+            self.legend.create_text(10, 4 + 22 * len(rows) + 11, anchor="w", fill="gray35", font=("Segoe UI", 9, "italic"),
+                                    text=f"... and {extra} more: see Choose groups")
+
     def color_single(self):
         level = self.level
         if self.info.get(level) is None:
             self.var_status.set(f"No '{level}' column on this dataset.")
             return
+        if self.own is None and self.level_has_ids.get(level, True):
+            units, bad_units = self.parse_units()
+            used = {lv for lv, _ in units}
+            if len(used) > 1:
+                self.color_mixed(units, bad_units)
+                return
+            if used:                                                    # (all of one level: the ordinary view, at that level, with plain numbers)
+                (only,) = used
+                if only != level:
+                    self.level = level = only
+                    self.var_level.set(level)
+                text = self.unit_list_text(units)
+                if text != self.var_ids.get():
+                    self.var_ids.set(text)
         codes, uniques = self.category_codes(level)
         ids, bad = self.typed_groups(level, uniques)
         uid = self.group_keys(level, uniques)
-        colors = {t: (GREY if t in self.off_groups else np.array([255, 0, 0], np.uint8) if len(ids) == 1 else rank_color(i)) for i, t in enumerate(ids)}
+        colors = {t: (GREY if t in self.off_groups else np.array(self.unit_override[(level, t)], np.uint8) if (level, t) in self.unit_override
+                      else np.array([255, 0, 0], np.uint8) if len(ids) == 1 else rank_color(i)) for i, t in enumerate(ids)}
         lut = np.tile(GREY, (len(uniques), 1))
         for t, col in colors.items():
             lut[in_group(uid, t)] = col
@@ -5468,7 +5692,7 @@ class UmapWindow(ExportsMixin):
                     rows = getattr(self, "group_rows", [])
                     if str(label) in rows:
                         canvas, k = self.group_canvas, rows.index(str(label))
-                else:
+                elif not (self.last_ids or {}).get("mixed"):
                     ids = (self.last_ids or {}).get("targets", [])
                     m = re.match(r"^\s*(\d+)", str(label))
                     if len(ids) > 1 and not self.level_has_ids.get(self.level, True) and target_row(ids, str(label)) is not None:
@@ -5819,7 +6043,10 @@ class UmapWindow(ExportsMixin):
             "kind": self.STATE_KIND, "version": 1,
             "project": Path(self.run_folder).name if self.run_folder is not None else "",
             "mode": self.mode, "level": self.level, "group_numbers": ids,
-            "groups_off": [key_text(k) if isinstance(k, tuple) else k for k in sorted(self.off_groups, key=str)], "group_sort": list(self.group_sort),
+            "group_units": self.var_ids.get() if ":" in self.var_ids.get() else "",
+            "unit_colors": {f"{level}:{core.key_text(target)}": list(rgb) for (level, target), rgb in self.unit_override.items()},
+            "groups_off": [key_text(k) if isinstance(k, tuple) else k for k in sorted(self.off_groups if not (self.last_ids or {}).get("mixed") else (), key=str)],
+            "group_sort": list(self.group_sort),
             "genes": self.var_gene.get().strip(), "scale": self.var_scale.get(),
             "theme": self.var_theme.get(), "theme_choice": self.theme_choice,
             "translucent": bool(self.var_translucent.get()),
@@ -5883,7 +6110,16 @@ class UmapWindow(ExportsMixin):
         self.ids_by_level.update({k: str(v) for k, v in (state.get("group_numbers") or {}).items() if k in self.levels})
         self.level = level
         self.var_level.set(level)
-        self.var_ids.set(self.ids_by_level.get(level, ""))
+        self.var_ids.set(str(state.get("group_units") or "") or self.ids_by_level.get(level, ""))
+        self.unit_override = {}
+        for text, rgb in (state.get("unit_colors") or {}).items():
+            try:
+                lv, rest = text.split(":", 1)
+                parts = tuple(int(x) for x in rest.split("+"))
+                if lv in self.levels and isinstance(rgb, (list, tuple)) and len(rgb) == 3:
+                    self.unit_override[(lv, parts[0] if len(parts) == 1 else parts)] = tuple(int(v) for v in rgb)
+            except ValueError:
+                pass
         column, descending = (list(state.get("group_sort") or ["id", False]) + [False])[:2]
         if column in ("id", "count", "name"):
             self.group_sort = (column, bool(descending))
@@ -6050,6 +6286,8 @@ class UmapWindow(ExportsMixin):
                 win.close()
             except Exception:
                 pass
+        if self.groups_window is not None:
+            self.groups_window.close()
         if self.layout_job is not None:
             try:
                 self.root.after_cancel(self.layout_job)

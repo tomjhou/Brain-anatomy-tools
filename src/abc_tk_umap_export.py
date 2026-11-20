@@ -279,6 +279,12 @@ class ExportsMixin:
     def group_choice(self, action):
         """(level, targets) of the groups highlighted in Single group(s) that have cells in this run, or None (saying why)."""
         sel = getattr(self, "last_ids", None)
+        if self.mode == "single" and sel and sel.get("mixed"):          # (groups of several levels: (None, the units that have cells of their own))
+            units = [u for u in sel["targets"] if sel["counts"].get(u, 0) > 0]
+            if not units:
+                self.var_status.set(f"None of the groups chosen has any cells: choose some before {action}.")
+                return None
+            return None, units
         if self.mode != "single" or not sel or not sel["targets"]:
             self.var_status.set(f"Enter at least one group number that exists in this run before {action}.")
             return None
@@ -288,9 +294,27 @@ class ExportsMixin:
             return None
         return sel["level"], targets
 
+    def mixed_membership(self, units):
+        """For groups of several levels: (each run cell's group, as a number: 1 + the position of the finest group it is in, or 0; those numbers for `units`; the
+        group_id text of each number). A cell is in one group only, the finest, so that the groups can be compared as they are colored."""
+        sel = self.last_ids
+        every = sel["units"]
+        keys = [every.index(u) + 1 for u in units]
+        return sel["hit"], keys, {k: self.unit_group_id(every[k - 1]) for k in keys}
+
     def group_selection(self, action):
         """The groups the 3D view shows: {"level", "targets", "colors", "counts"}, or None (saying why). In Specific group(s) the groups typed; in All groups the
         ones switched on, if there are at most MAX_3D_GROUPS of them (so that "All groups" works at a level with few groups, or after switching most off)."""
+        if self.mode == "single" and (getattr(self, "last_ids", None) or {}).get("mixed"):
+            sel = self.last_ids
+            targets = [u for u in sel["targets"] if sel["counts"].get(u, 0) > 0]
+            if not targets:
+                self.var_status.set(f"None of the groups chosen has any cells: choose some before {action}.")
+                return None
+            if len(targets) > self.MAX_3D_GROUPS:
+                self.var_status.set(f"{len(targets)} groups are chosen: at most {self.MAX_3D_GROUPS} can be shown in 3D. Remove some in Choose groups before {action}.")
+                return None
+            return {"level": None, "targets": targets, "colors": sel["colors"], "counts": sel["counts"], "mixed": True}
         if self.mode == "single":
             chosen = self.group_choice(action)
             if chosen is None:
@@ -751,8 +775,17 @@ class ExportsMixin:
             return
         level, targets = chosen
         h = self.host
-        level_name = LEVEL_LONG[level]
-        choice = h["prompt_deg_comparison_mode"](self.root, f"DEGs for {level_name} {', '.join(core.typed_text(t) for t in targets)}", level_name)
+        mixed = level is None
+        if mixed:        # (groups of several levels: each against all the other cells; a reference group is named at one level, so it is not offered)
+            ids_arr, targets, gids = self.mixed_membership(targets)
+            level, level_name = "mixed", "Group"
+            tag = lambda t: gids[t].replace(":", "")
+            choice = {"mode": "others", "reference": None}
+        else:
+            level_name = LEVEL_LONG[level]
+            ids_arr = self.level_ids(level)
+            tag = core.key_text
+            choice = h["prompt_deg_comparison_mode"](self.root, f"DEGs for {level_name} {', '.join(core.typed_text(t) for t in targets)}", level_name)
         if choice is None:
             self.var_status.set("DEG export cancelled.")
             return
@@ -761,10 +794,9 @@ class ExportsMixin:
         if not eff:
             self.var_status.set(f"Every entered {level_name.lower()} ID equals the reference ({reference}); nothing to compare.")
             return
-        ids_arr = self.level_ids(level)
         adata, sc, has_counts = self.adata, h["sc"], self.has_counts
         imputed_full = self.imputed_for_export()
-        token = safe_token(f"{level}_{'-'.join(core.key_text(t) for t in eff)}" + (f"_vsRef{reference}" if mode == "reference" else ""), level)
+        token = safe_token(f"{level}_{'-'.join(tag(t) for t in eff)}" + (f"_vsRef{reference}" if mode == "reference" else ""), level)
         paths = self.ask_csv_paths("DE genes", "DEG", token, has_counts, imputed_full is not None)
         if paths is None:
             self.var_status.set("DEG export cancelled.")
@@ -786,7 +818,7 @@ class ExportsMixin:
                     if not gm.any() or gm.all():
                         continue
                     df = h["compute_de_genes"](comp, gm, log1p_base=None)
-                    df.insert(0, "group_id", core.group_id_value(t))
+                    df.insert(0, "group_id", gids[t] if mixed else core.group_id_value(t))
                     if mode == "reference":
                         df.insert(1, "reference_id", reference)
                     frames.append(df)
@@ -815,7 +847,7 @@ class ExportsMixin:
                         if not gm.any() or gm.all():
                             continue
                         df = h["compute_de_genes"](comp, gm, log1p_base=2)
-                        df.insert(0, "group_id", core.group_id_value(t))
+                        df.insert(0, "group_id", gids[t] if mixed else core.group_id_value(t))
                         if mode == "reference":
                             df.insert(1, "reference_id", reference)
                         frames.append(df)
@@ -840,7 +872,7 @@ class ExportsMixin:
             if written:
                 summary = "; ".join(f"{p.name} ({n} rows, {k} of {len(eff)} IDs)" for p, n, k in written)
                 msg = (f"Exported {summary}" + (f" vs. reference {level_name.lower()} {reference}" if mode == "reference" else "")
-                       + f" to {', '.join(sorted({str(p.parent) for p, _n, _k in written}))}.")
+                       + f" to {', '.join(sorted({str(p.parent) for p, _n, _k in written}))}." + (" Each group against all the other cells." if mixed else ""))
                 if skipped:
                     msg += f" Skipped: {'; '.join(skipped)}."
                 self.var_status.set(msg)
@@ -857,10 +889,16 @@ class ExportsMixin:
             return
         level, targets = chosen
         h = self.host
-        ids_arr = self.level_ids(level)
+        if level is None:        # (groups of several levels: a cell counts in the finest group it is in)
+            ids_arr, targets, gids = self.mixed_membership(targets)
+            level = "mixed"
+            tag = lambda t: gids[t].replace(":", "_")
+        else:
+            ids_arr = self.level_ids(level)
+            tag = core.key_text
         adata, sc, has_counts = self.adata, h["sc"], self.has_counts
         imputed_full = self.imputed_for_export()
-        token = safe_token(f"{level}_{'-'.join(core.key_text(t) for t in targets)}", level)
+        token = safe_token(f"{level}_{'-'.join(tag(t) for t in targets)}", level)
         paths = self.ask_csv_paths("expression", "EXPR", token, has_counts, imputed_full is not None)
         if paths is None:
             self.var_status.set("Expression export cancelled.")
@@ -877,7 +915,7 @@ class ExportsMixin:
                 for t in targets:
                     gm = core.in_group(ids_arr, t)
                     if gm.any():
-                        df[f"mean_log2_expr_{core.key_text(t)}"] = h["mean_log2_expression"](m, gm, log1p_base=None).values
+                        df[f"mean_log2_expr_{tag(t)}"] = h["mean_log2_expression"](m, gm, log1p_base=None).values
                         included.append(t)
                 if included:
                     df = df.sort_values("gene_symbol", kind="stable").reset_index(drop=True)
@@ -899,7 +937,7 @@ class ExportsMixin:
                     for t in targets:
                         gm = core.in_group(iid, t)
                         if gm.any():
-                            df[f"mean_log2_expr_{core.key_text(t)}"] = h["mean_log2_expression"](sub, gm, log1p_base=2).values
+                            df[f"mean_log2_expr_{tag(t)}"] = h["mean_log2_expression"](sub, gm, log1p_base=2).values
                             included.append(t)
                     if included:
                         df = df.sort_values("gene_symbol", kind="stable").reset_index(drop=True)
@@ -932,44 +970,32 @@ class ExportsMixin:
 
     # ---- coordinates and the 3D views
 
-    def selected_group_cells(self, level, targets):
-        """(table, scope): one row per cell of the groups: the whole brain when the all-cell table is loaded, else only this run's cells."""
+    def cells_frame(self, rows, gid, use_bg):
+        """The table rows of the cells `rows` (indexes into the all-cell table when use_bg, else into the run), all of the group called `gid`."""
         bg = self.bg
-        frames = []
-        barr = bg["levels"].get(level) if bg else None
-        use_bg = bg is not None and barr is not None and bg.get("sec_arr") is not None
         if use_bg:
-            ids = self.group_keys(level, barr)
-            for t in targets:
-                rows = np.flatnonzero(core.in_group(ids, t))
-                if not rows.size:
-                    continue
-                f = pd.DataFrame({"cell_label": bg["ids"][rows], "group_id": core.group_id_value(t), "brain_section_label": bg["sec_arr"][rows]})
-                for tl in ("class", "subclass", "supertype", "cluster"):
-                    v = bg["levels"].get(tl)
-                    if v is not None:
-                        f[tl] = v[rows]
-                f["section_x_mm"] = bg["x"][rows]
-                f["section_y_mm"] = bg["y"][rows]
-                if bg.get("z") is not None:
-                    f["section_z_mm"] = bg["z"][rows]
-                frames.append(f)
-        else:
-            ids = self.level_ids(level)
-            for t in targets:
-                rows = np.flatnonzero(core.in_group(ids, t))
-                if not rows.size:
-                    continue
-                f = pd.DataFrame({"cell_label": self.adata.obs_names[rows], "group_id": core.group_id_value(t)})
-                if self.section_of is not None:
-                    f["brain_section_label"] = self.section_of[rows]
-                for tl in ("class", "subclass", "supertype", "cluster"):
-                    if self.info.get(tl) is not None:
-                        f[tl] = self.info[tl][rows]
-                if self.cx is not None:
-                    f["section_x_mm"] = self.cx[rows]
-                    f["section_y_mm"] = self.cy[rows]
-                frames.append(f)
+            f = pd.DataFrame({"cell_label": bg["ids"][rows], "group_id": gid, "brain_section_label": bg["sec_arr"][rows]})
+            for tl in ("class", "subclass", "supertype", "cluster"):
+                v = bg["levels"].get(tl)
+                if v is not None:
+                    f[tl] = v[rows]
+            f["section_x_mm"] = bg["x"][rows]
+            f["section_y_mm"] = bg["y"][rows]
+            if bg.get("z") is not None:
+                f["section_z_mm"] = bg["z"][rows]
+            return f
+        f = pd.DataFrame({"cell_label": self.adata.obs_names[rows], "group_id": gid})
+        if self.section_of is not None:
+            f["brain_section_label"] = self.section_of[rows]
+        for tl in ("class", "subclass", "supertype", "cluster"):
+            if self.info.get(tl) is not None:
+                f[tl] = self.info[tl][rows]
+        if self.cx is not None:
+            f["section_x_mm"] = self.cx[rows]
+            f["section_y_mm"] = self.cy[rows]
+        return f
+
+    def finish_cells_table(self, frames, use_bg):
         table = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["cell_label", "group_id"])
         umap_rows = self.run_index.get_indexer(table["cell_label"])
         in_run = umap_rows >= 0
@@ -977,6 +1003,45 @@ class ExportsMixin:
         table["umap1"] = np.where(in_run, self.coords[np.maximum(umap_rows, 0), 0], np.nan)
         table["umap2"] = np.where(in_run, self.coords[np.maximum(umap_rows, 0), 1], np.nan)
         return table, ("whole brain" if use_bg else "this run only")
+
+    def selected_group_cells(self, level, targets):
+        """(table, scope): one row per cell of the groups: the whole brain when the all-cell table is loaded, else only this run's cells."""
+        bg = self.bg
+        frames = []
+        barr = bg["levels"].get(level) if bg else None
+        use_bg = bg is not None and barr is not None and bg.get("sec_arr") is not None
+        ids = self.group_keys(level, barr) if use_bg else self.level_ids(level)
+        for t in targets:
+            rows = np.flatnonzero(core.in_group(ids, t))
+            if rows.size:
+                frames.append(self.cells_frame(rows, core.group_id_value(t), use_bg))
+        return self.finish_cells_table(frames, use_bg)
+
+    def unit_group_id(self, unit):
+        level, target = unit
+        return f"{level}:{core.key_text(target)}"
+
+    def unit_short(self, unit):
+        level, target = unit
+        return f"{self.UNIT_ABBREVIATIONS.get(level, level)} {core.key_text(target)}"
+
+    def selected_unit_cells(self, units):
+        """(table, scope) like selected_group_cells, for units of several levels (see UmapWindow.parse_units): a cell is in the finest unit it belongs to, so the
+        table has each cell once, its group_id the unit's 'level:number'."""
+        bg = self.bg
+        use_bg = bg is not None and bg.get("sec_arr") is not None and all(bg["levels"].get(level) is not None for level, _ in units)
+        depth = {level: i for i, level in enumerate(self.levels)}
+        hit = np.zeros(len(bg["ids"]) if use_bg else len(self.adata.obs_names), np.int32)
+        for i in sorted(range(len(units)), key=lambda i: (depth.get(units[i][0], 99), i)):           # (coarse first: the finer ones paint over them)
+            level, target = units[i]
+            ids = self.group_keys(level, bg["levels"][level]) if use_bg else self.level_ids(level)
+            hit[core.in_group(ids, target)] = i + 1
+        frames = []
+        for i, unit in enumerate(units):
+            rows = np.flatnonzero(hit == i + 1)
+            if rows.size:
+                frames.append(self.cells_frame(rows, self.unit_group_id(unit), use_bg))
+        return self.finish_cells_table(frames, use_bg)
 
     def attach_ccf(self, table, shell_points=0):
         h = self.host
@@ -1002,7 +1067,9 @@ class ExportsMixin:
         if chosen is None:
             return
         level, targets = chosen
-        stem = f"coordinates_{level}_{'-'.join(core.key_text(t) for t in targets)}"
+        mixed = level is None        # (groups of several levels: each cell once, in the finest group it is in)
+        stem = ("coordinates_mixed_" + "-".join(self.unit_short(u).replace(" ", "") for u in targets)) if mixed else \
+            f"coordinates_{level}_{'-'.join(core.key_text(t) for t in targets)}"
         proposed = self.host["unique_export_paths"](self.target_dir(), stem, (".csv",))[".csv"].name
         path = self.ask_save_path("Save the coordinates of the cells of those groups", proposed, ".csv", "CSV file")
         if path is None:
@@ -1012,7 +1079,7 @@ class ExportsMixin:
         self.var_status.set("Gathering cells...")
         self.root.update()
         try:
-            table, scope = self.selected_group_cells(level, targets)
+            table, scope = self.selected_unit_cells(targets) if mixed else self.selected_group_cells(level, targets)
             if table.empty:
                 self.var_status.set("None of those IDs has any cells to export.")
             else:
@@ -1085,8 +1152,9 @@ class ExportsMixin:
         if selection is None:
             return None
         level, targets = selection["level"], selection["targets"]
+        mixed = bool(selection.get("mixed"))
         h = self.host
-        table, scope = self.selected_group_cells(level, targets)
+        table, scope = self.selected_unit_cells(targets) if mixed else self.selected_group_cells(level, targets)
         if table.empty:
             self.var_status.set("None of those IDs has any cells to show.")
             return None
@@ -1100,10 +1168,10 @@ class ExportsMixin:
             columns = ("section_x_mm", "section_z_mm", "section_y_mm")
             axis_labels = ("section x (mm)", "section position (mm)", "section y (mm)")
             shell_xyz, outline = None, None
-        level_name = LEVEL_LONG[level]
+        level_name = "Groups" if mixed else LEVEL_LONG[level]
         groups = []
         for t in targets:
-            rows = table[table["group_id"] == core.group_id_value(t)]
+            rows = table[table["group_id"] == (self.unit_group_id(t) if mixed else core.group_id_value(t))]
             hover = None
             if have_ccf and "ccf_structure" in rows.columns:
                 hover = (rows["ccf_structure"].fillna("?").astype(str) + " | section " + rows["brain_section_label"].astype(str).str.rsplit(".", n=1).str[-1]
@@ -1112,12 +1180,14 @@ class ExportsMixin:
             xyz = rows[list(columns)].to_numpy(dtype=float)
             if jitter_mm > 0:                    # (the middle column is the one across the sections)
                 xyz[:, 1] += np.random.default_rng().uniform(-jitter_mm, jitter_mm, len(xyz))
-            groups.append({"label": f"{level_name} {core.key_text(t)} ({len(rows):,})", "color": hexcolor(color) if color is not None else "red",
-                           "xyz": xyz, "hover": hover})
+            groups.append({"label": f"{self.unit_short(t) if mixed else level_name + ' ' + core.key_text(t)} ({len(rows):,})",
+                           "color": hexcolor(color) if color is not None else "red", "xyz": xyz, "hover": hover})
+        names = [self.unit_short(t) for t in targets] if mixed else [core.key_text(t) for t in targets]
         structures = table["ccf_structure"].to_numpy() if have_ccf and "ccf_structure" in table.columns else None
         return {"groups": groups, "shell_xyz": shell_xyz, "outline": outline, "axis_labels": axis_labels, "structures": structures,
-                "title": f"3D view: {level_name.lower()} {', '.join(core.typed_text(t) for t in targets)} ({scope})", "have_ccf": have_ccf, "level": level,
-                "targets": targets}
+                "title": f"3D view: {level_name.lower()} {', '.join(names if mixed else [core.typed_text(t) for t in targets])} ({scope})", "have_ccf": have_ccf,
+                "level": level, "targets": targets,
+                "stem": ("3d_mixed_" + "-".join(n.replace(" ", "") for n in names)) if mixed else f"3d_{level}_{'-'.join(core.key_text(t) for t in targets)}"}
 
     def show_3d_browser(self):
         if self.busy:
@@ -1140,7 +1210,7 @@ class ExportsMixin:
             if p is not None:
                 h = self.host
                 target = self.target_dir()
-                path = h["unique_export_paths"](target, f"3d_{p['level']}_{'-'.join(core.key_text(t) for t in p['targets'])}", (".html",))[".html"]
+                path = h["unique_export_paths"](target, p["stem"], (".html",))[".html"]
                 edges = h["build_3d_edges"](self.abc_cache, p["structures"], self.root) if p["have_ccf"] else None
                 self.var_status.set("Writing the 3D page...")
                 self.root.update()

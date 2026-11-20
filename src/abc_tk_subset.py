@@ -34,6 +34,13 @@ def legend_selection(v):
     if v.mode == "all":
         keys = list(getattr(v, "group_rows", []))
         on = [k for k in keys if k not in v.off_groups]
+    elif v.mode == "single" and (v.last_ids or {}).get("mixed"):
+        sel = v.last_ids                                            # (groups of several levels: the cells each is the finest group of)
+        on = [k for k in sel["targets"] if k not in v.off_groups and sel["counts"].get(k, 0) > 0]
+        if not on:
+            return None, None, [], "No group is selected. Switch on the groups to analyze in the legend (click an entry, or use All), then try again."
+        mask = np.isin(sel["hit"], [sel["units"].index(k) + 1 for k in on])
+        return "mixed", mask, [v.unit_short(k) for k in on], ""
     elif v.mode == "single":
         keys = list((v.last_ids or {}).get("targets", []))
         on = [k for k in keys if k not in v.off_groups]
@@ -214,7 +221,7 @@ def analyze_subset(v):
     else:
         n = int(mask.sum())
         sub = host["run_with_loading_window"](
-            f"Analyzing {n:,} cells of {len(names)} {v.level_names[level].lower()} group(s): normalizing, PCA ({n_components} dimensions), neighbors, UMAP "
+            f"Analyzing {n:,} cells of {len(names)} {v.level_names.get(level, 'mixed-level').lower()} group(s): normalizing, PCA ({n_components} dimensions), neighbors, UMAP "
             f"and clustering (a minute or two). Saved in {folder}.",
             lambda: _embed_and_save(v, mask, folder, level, names, n_components), show_after_s=0)
     core.record_run_opened(folder)                       # (the Load Existing list starts on the project opened last)

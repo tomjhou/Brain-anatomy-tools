@@ -2107,12 +2107,13 @@ THREED_WEB_MESH_SCRIPT = """
       }
       base = sortedAll;
     }
-    var cut = gd.__sliceCut;   // {side, x, y, z} while the Slice checkbox is ticked, else absent
+    var cut = gd.__sliceCut;   // {lo: [x, y, z], hi: [x, y, z]} (the range kept) while the Slice checkbox is ticked, else absent
     var keep = new Uint32Array(faceCount), count = 0;
     for (var n = 0; n < faceCount; n++) {
       var f = base ? base[n] : n;
       if (hidden[faceGroup[f]]) continue;
-      if (cut && (cut.side * (faceCx[f] - cut.x) < 0 || faceCy[f] < cut.y || faceCz[f] < cut.z)) continue;
+      if (cut && (faceCx[f] < cut.lo[0] || faceCx[f] > cut.hi[0] || faceCy[f] < cut.lo[1] || faceCy[f] > cut.hi[1] ||
+                  faceCz[f] < cut.lo[2] || faceCz[f] > cut.hi[2])) continue;
       keep[count++] = f;
     }
     var ni = new Int32Array(count), nj = new Int32Array(count), nk = new Int32Array(count);
@@ -2194,15 +2195,12 @@ THREED_WEB_EDGE_SCRIPT = """
 """
 
 
-# The "slice" checkbox under the Background radio group: while it is ticked, three sliders place a coronal, a horizontal
-# and a sagittal plane, and only what is on
-# the posterior side of the coronal plane, the ventral side of the horizontal plane and the far side of the sagittal
-# plane (the side away from the camera, which follows the camera when it is rotated) is shown: a cutaway whose corner you move.
-# Opening positions: the coronal plane at the anterior edge and the horizontal plane at the dorsal edge of the plotted
-# range (so they hide nothing) and the sagittal plane at the brain's midline (5.7 mm), which hides the near half.
-# Plotly has no clipping planes, so the page re-filters the geometry itself: triangles whose centre is cut away are
+# The "slice" checkbox under the Background radio group: while it is ticked, three double sliders (a lower and an upper end each) give the range of the
+# sagittal (left-right), coronal (anterior-posterior) and horizontal (dorsal-ventral) axes that is shown: only what lies inside all three ranges is
+# drawn, a box you narrow from either end. Each opens on the whole range, so nothing is hidden until an end is pushed in.
+# Plotly has no clipping planes, so the page re-filters the geometry itself: triangles whose centre is outside the box are
 # dropped from the shell meshes (and from the cells' mesh, through gd.__sliceCut, see THREED_WEB_MESH_SCRIPT), and
-# points that are cut away are blanked in the line and marker traces.
+# points that are outside are blanked in the line and marker traces.
 THREED_WEB_SLICE_SCRIPT = """
 (function () {
   var gd = document.getElementById('{plot_id}');
@@ -2221,7 +2219,6 @@ THREED_WEB_SLICE_SCRIPT = """
     }
   });
 
-  var MIDLINE_MM = 5.7;
   // A restyle makes plotly re-plot the 3D scene from the camera stored in the layout, which lags behind the live one while a
   // scroll-zoom or drag is still settling, so the view would snap back a little. Handing the live camera to the layout
   // first avoids that.
@@ -2234,46 +2231,9 @@ THREED_WEB_SLICE_SCRIPT = """
   }
   var axes = ['xaxis', 'yaxis', 'zaxis'].map(function (name) { return gd._fullLayout.scene[name].range; });
   var low = axes.map(function (r) { return Math.min(r[0], r[1]); }), high = axes.map(function (r) { return Math.max(r[0], r[1]); });
-  // The page's scene axes are x = left-right (CCF z), y = anterior-posterior (CCF x), z = dorsal-ventral (CCF y), so
-  // position[0] is the sagittal plane, [1] the coronal and [2] the horizontal one.
-  var position = [Math.min(Math.max(MIDLINE_MM, low[0]), high[0]), low[1], low[2]];
-  // The sagittal plane keeps the side away from the viewer, so which side that is follows the camera: the eye's CCF z is
-  // found by carrying the eye (the origin of view space) back through plotly's view and model matrices (the data is
-  // scaled by scene.dataScale before the model matrix acts on it).
-  var scene = gd._fullLayout.scene._scene, farSide = 1;   // +1: keep x above the sagittal plane, -1: keep x below it
-  function matMul(a, b) {
-    var out = new Float64Array(16);
-    for (var c = 0; c < 4; c++) for (var r = 0; r < 4; r++) {
-      var sum = 0;
-      for (var k = 0; k < 4; k++) sum += a[k * 4 + r] * b[c * 4 + k];
-      out[c * 4 + r] = sum;
-    }
-    return out;
-  }
-  function eyeX() {   // Gauss-Jordan on [M | I] for M = view x model, then M^-1 applied to the origin
-    var cp = scene.glplot.cameraParams, m = matMul(cp.view, cp.model), n = 4, a = [];
-    for (var r = 0; r < n; r++) {
-      a.push([]);
-      for (var c = 0; c < n; c++) a[r].push(m[c * 4 + r]);
-      for (var d = 0; d < n; d++) a[r].push(r === d ? 1 : 0);
-    }
-    for (var col = 0; col < n; col++) {
-      var pivot = col;
-      for (var r2 = col + 1; r2 < n; r2++) if (Math.abs(a[r2][col]) > Math.abs(a[pivot][col])) pivot = r2;
-      var tmp = a[col]; a[col] = a[pivot]; a[pivot] = tmp;
-      var div = a[col][col];
-      for (var c2 = 0; c2 < 2 * n; c2++) a[col][c2] /= div;
-      for (var r3 = 0; r3 < n; r3++) {
-        if (r3 === col) continue;
-        var f = a[r3][col];
-        for (var c3 = 0; c3 < 2 * n; c3++) a[r3][c3] -= f * a[col][c3];
-      }
-    }
-    // inverse column 3 (the image of the origin) is the eye in scaled data coordinates; its w is entry [3][7]
-    return a[0][7] / a[3][7] / scene.dataScale[0];
-  }
-  function updateSide() { var side = eyeX() < position[0] ? 1 : -1; var changed = side !== farSide; farSide = side; return changed; }
-  function cutAway(x, y, z) { return farSide * (x - position[0]) < 0 || y < position[1] || z < position[2]; }
+  // The page's scene axes are x = left-right (CCF z), y = anterior-posterior (CCF x), z = dorsal-ventral (CCF y). cutLo and cutHi are the ends of
+  // the range kept on each, opening on the whole range.
+  var cutLo = low.slice(), cutHi = high.slice();
 
   // --- the controls, under the Background radio group
   var box = document.createElement('div');
@@ -2289,19 +2249,62 @@ THREED_WEB_SLICE_SCRIPT = """
   var sliderRows = document.createElement('div');
   sliderRows.style.cssText = 'display:none;';
   var names = ['Sagittal (left to right)', 'Coronal (anterior to posterior)', 'Horizontal (dorsal to ventral)'];
+  if (!document.getElementById('slice-dual-style')) {   // (two range inputs laid over each other: only their round handles take the mouse)
+    var style = document.createElement('style');
+    style.id = 'slice-dual-style';
+    style.textContent = '.slice-dual{-webkit-appearance:none;appearance:none;background:transparent;pointer-events:none;position:absolute;left:0;top:0;' +
+      'width:100%;height:18px;margin:0;}' +
+      '.slice-dual::-webkit-slider-runnable-track{background:transparent;height:18px;}' +
+      '.slice-dual::-moz-range-track{background:transparent;}' +
+      '.slice-dual::-webkit-slider-thumb{-webkit-appearance:none;pointer-events:auto;width:14px;height:14px;margin-top:2px;border-radius:50%;' +
+      'background:#e6e8ee;border:1px solid #8fb0ff;cursor:pointer;}' +
+      '.slice-dual::-moz-range-thumb{pointer-events:auto;width:12px;height:12px;border-radius:50%;background:#e6e8ee;border:1px solid #8fb0ff;cursor:pointer;}';
+    document.head.appendChild(style);
+  }
+  var syncers = [];
   [1, 2, 0].forEach(function (axis) {   // shown as coronal, horizontal, sagittal
-    var name = names[axis];
+    var name = names[axis], span = high[axis] - low[axis] || 1;
     var row = document.createElement('div');
     row.style.cssText = 'margin-top:6px;';
     var text = document.createElement('div');
-    var input = document.createElement('input');
-    input.type = 'range'; input.min = low[axis]; input.max = high[axis]; input.step = 0.05; input.value = position[axis];
-    input.style.cssText = 'width:170px;margin:3px 0 0 0;display:block;';
-    function label() { text.textContent = name + ': ' + position[axis].toFixed(2) + ' mm'; }
-    label();
-    input.addEventListener('input', function () { position[axis] = parseFloat(input.value); label(); sliderMoved(); });
-    row.appendChild(text); row.appendChild(input); sliderRows.appendChild(row);
+    var wrap = document.createElement('div');   // the two sliders, over a track whose kept part is colored
+    wrap.style.cssText = 'position:relative;width:170px;height:18px;margin-top:3px;';
+    var track = document.createElement('div');
+    track.style.cssText = 'position:absolute;left:0;right:0;top:8px;height:3px;border-radius:2px;background:#4a5064;';
+    var fill = document.createElement('div');
+    fill.style.cssText = 'position:absolute;top:8px;height:3px;border-radius:2px;background:#3b6fd4;';
+    wrap.appendChild(track); wrap.appendChild(fill);
+    var lower = document.createElement('input'), upper = document.createElement('input');
+    [lower, upper].forEach(function (input) {
+      input.type = 'range'; input.min = low[axis]; input.max = high[axis]; input.step = 'any'; input.className = 'slice-dual';
+      wrap.appendChild(input);
+    });
+    lower.value = cutLo[axis]; upper.value = cutHi[axis];
+    function show() {
+      text.textContent = name + ': ' + cutLo[axis].toFixed(2) + ' to ' + cutHi[axis].toFixed(2) + ' mm';
+      fill.style.left = (100 * (cutLo[axis] - low[axis]) / span) + '%';
+      fill.style.width = (100 * (cutHi[axis] - cutLo[axis]) / span) + '%';
+      lower.style.zIndex = cutLo[axis] - low[axis] > span / 2 ? 3 : 1;   // (when both are at one end, the one that can still move is on top)
+      upper.style.zIndex = 2;
+    }
+    show();
+    lower.addEventListener('input', function () {
+      cutLo[axis] = Math.min(parseFloat(lower.value), cutHi[axis]); lower.value = cutLo[axis]; show(); sliderMoved();
+    });
+    upper.addEventListener('input', function () {
+      cutHi[axis] = Math.max(parseFloat(upper.value), cutLo[axis]); upper.value = cutHi[axis]; show(); sliderMoved();
+    });
+    syncers.push(function () { cutLo[axis] = low[axis]; cutHi[axis] = high[axis]; lower.value = low[axis]; upper.value = high[axis]; show(); });
+    row.appendChild(text); row.appendChild(wrap); sliderRows.appendChild(row);
   });
+  var resetRow = document.createElement('div');
+  resetRow.style.cssText = 'margin-top:8px;';
+  var reset = document.createElement('button');
+  reset.type = 'button';
+  reset.textContent = 'Show everything';
+  reset.style.cssText = 'padding:1px 10px;font:12px sans-serif;cursor:pointer;border-radius:4px;background:#2b2f3b;color:#e6e8ee;border:1px solid #5a6072;';
+  reset.addEventListener('click', function () { syncers.forEach(function (f) { f(); }); sliderMoved(); });
+  resetRow.appendChild(reset); sliderRows.appendChild(resetRow);
   box.appendChild(checkboxLabel); box.appendChild(sliderRows);
 
   // --- re-filtering the geometry (one pass at a time; a slider moved meanwhile triggers one more pass afterwards).
@@ -2311,7 +2314,7 @@ THREED_WEB_SLICE_SCRIPT = """
   // (4) the shells are brought up to date on every pass along with the cells (the cells' own mesh is filtered by
   // THREED_WEB_MESH_SCRIPT through gd.__sliceCut); while a pass is under way, slider moves are collected into one more pass.
   var active = false, busy = false, pending = false, timer = 0, heavyReady = true, heavyTimer = 0;
-  var cutState = {side: 1, x: 0, y: 0, z: 0};
+  var cutState = {lo: [0, 0, 0], hi: [0, 0, 0]};   // (an end at the end of the whole range is no limit at all)
   function centres(t) {
     if (t.cx) return;
     var n = t.i.length;
@@ -2322,7 +2325,10 @@ THREED_WEB_SLICE_SCRIPT = """
     }
   }
   function apply(restore, withMeshes) {
-    cutState.side = farSide; cutState.x = position[0]; cutState.y = position[1]; cutState.z = position[2];
+    for (var a = 0; a < 3; a++) {
+      cutState.lo[a] = cutLo[a] <= low[a] ? -Infinity : cutLo[a];
+      cutState.hi[a] = cutHi[a] >= high[a] ? Infinity : cutHi[a];
+    }
     gd.__sliceCut = restore ? null : cutState;
     var meshes = {i: [], j: [], k: []}, meshIds = [], points = {x: [], y: [], z: [], text: []}, pointIds = [];
     traces.forEach(function (t) {
@@ -2339,20 +2345,24 @@ THREED_WEB_SLICE_SCRIPT = """
         centres(t);
         var n = t.i.length, keep = new Uint32Array(n), count = 0;
         for (var f = 0; f < n; f++) {
-          if (!(cutState.side * (t.cx[f] - cutState.x) < 0 || t.cy[f] < cutState.y || t.cz[f] < cutState.z)) keep[count++] = f;
+          if (t.cx[f] >= cutState.lo[0] && t.cx[f] <= cutState.hi[0] && t.cy[f] >= cutState.lo[1] && t.cy[f] <= cutState.hi[1] &&
+              t.cz[f] >= cutState.lo[2] && t.cz[f] <= cutState.hi[2]) keep[count++] = f;
         }
+        if (count === n && !t.modified) { t.lastKept = count; return; }   // nothing cut, and nothing cut before: as it was drawn
         if (count === t.lastKept) return;   // the same faces as already shown
         var ni = new Int32Array(count), nj = new Int32Array(count), nk = new Int32Array(count);
         for (var m = 0; m < count; m++) { ni[m] = t.i[keep[m]]; nj[m] = t.j[keep[m]]; nk[m] = t.k[keep[m]]; }
         t.lastKept = count; t.modified = true;
         meshes.i.push(ni); meshes.j.push(nj); meshes.k.push(nk); meshIds.push(t.index);
       } else {
-        var total = t.x.length, nx = [], ny = [], nz = [], nt = t.text ? [] : null, blanked = 0;
+        var total = t.x.length, nx = [], ny = [], nz = [], nt = t.text ? [] : null, blanked = 0, cutOut = 0;
         for (var q = 0; q < total; q++) {
           var x = t.x[q], y = t.y[q], z = t.z[q];
-          var blank = x === null || y === null || z === null || cutState.side * (x - cutState.x) < 0 ||
-                      y < cutState.y || z < cutState.z;
-          if (blank) {
+          var gap = x === null || y === null || z === null;
+          var outside = !gap && (x < cutState.lo[0] || x > cutState.hi[0] || y < cutState.lo[1] || y > cutState.hi[1] ||
+                                 z < cutState.lo[2] || z > cutState.hi[2]);
+          if (outside) cutOut++;
+          if (gap || outside) {
             blanked++;
             if (t.compact) continue;
             nx.push(null); ny.push(null); nz.push(null);
@@ -2362,8 +2372,9 @@ THREED_WEB_SLICE_SCRIPT = """
             if (nt) nt.push(t.text[q]);
           }
         }
-        if (blanked === t.lastKept) return;
-        t.lastKept = blanked; t.modified = true;
+        if (cutOut === 0 && !t.modified) { t.lastKept = 0; return; }   // nothing cut, and nothing cut before: as it was drawn
+        if (cutOut === t.lastKept) return;
+        t.lastKept = cutOut; t.modified = true;
         points.x.push(nx); points.y.push(ny); points.z.push(nz); points.text.push(nt); pointIds.push(t.index);
       }
     });
@@ -2396,20 +2407,9 @@ THREED_WEB_SLICE_SCRIPT = """
     if (active && e && e[0] && 'visible' in e[0]) { heavyReady = true; request(); }
   });
 
-  gd.on('plotly_relayout', function (e) {   // the camera moved: the far side of the sagittal plane may have changed
-    // With opaque cells (100% opacity) the cut keeps the side chosen when Slice was ticked, so a camera move costs no
-    // redraw at all; the far side follows the camera only while the cells are translucent.
-    var translucent = !!(gd.__cellsTranslucent && gd.__cellsTranslucent());
-    if (active && translucent && e && Object.keys(e).some(function (key) { return key.indexOf('scene.camera') === 0; })) {
-      [120, 600].forEach(function (delay) {   // (plotly updates its matrices just after the event, when it next paints)
-        setTimeout(function () { if (active && updateSide()) request(); }, delay);
-      });
-    }
-  });
   checkbox.addEventListener('change', function () {
     active = checkbox.checked;
     gd.__sliceOn = active;   // (the Spin button asks)
-    if (active) updateSide();
     sliderRows.style.display = active ? 'block' : 'none';
     if (gd.__busyStart) gd.__busyStart();
     if (active) { heavyReady = true; request(); } else { clearTimeout(timer); timer = 0; setTimeout(function () { apply(true, true); }, 30); }

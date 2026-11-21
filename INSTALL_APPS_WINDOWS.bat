@@ -9,6 +9,12 @@ title Install app shortcuts
 echo ==== Making shortcuts for the Brain anatomy tools ====
 echo.
 
+REM A folder from a downloaded zip has every file marked as "from the internet", and PowerShell then refuses to run the unsigned .ps1 scripts below on
+REM a computer whose policy is RemoteSigned ("is not digitally signed"). So first clear the mark from the whole folder (an inline command, which that
+REM policy allows; not the .venv or .git folders, which are big and were never downloaded). Harmless where there is no mark.
+set "UNBLOCK_ROOT=%~dp0"
+powershell -NoProfile -Command "Get-ChildItem -LiteralPath $env:UNBLOCK_ROOT -Recurse -Force -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notlike '*\.venv\*' -and $_.FullName -notlike '*\.git\*' } | Unblock-File -ErrorAction SilentlyContinue" >nul 2>&1
+
 REM Not from the Downloads folder (it gets cleared out): there, it offers to move this folder to a permanent place and install from
 REM there. See src\check_install_folder.ps1. Code 4: the move has started, in a window of its own, which waits for this one to end (so
 REM that nothing holds the folder), then runs the installer from the new place: so end now. Code 2: cancelled (no shortcuts made). If

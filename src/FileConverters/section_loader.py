@@ -1589,7 +1589,7 @@ class SectionLoader:
             self.var_edit_help.set(f"{n} outline(s), numbered {how}; {sel} selected.")
         for b in (self.btn_merge,):
             b.config(state="normal" if sel >= 2 and self.mode == "edit" else "disabled")
-        self.btn_split.config(state="normal" if sel == 1 and self.mode == "edit" else "disabled")
+        self.btn_split.config(state="normal" if sel >= 1 and self.mode == "edit" else "disabled")
         # (scenes are a .czi's: an image of one section has none to merge within)
         # (on the grid it acts on all the images shown, so it needs just one with scenes; otherwise on the image on show)
         if self.grid_mode:
@@ -1677,23 +1677,36 @@ class SectionLoader:
         self.var_status.set(f"Merged the outlines within {total_scenes} scene(s) of {len(plan)} image(s): {total_outlines} outline(s) fewer.")
 
     def split_selected(self):
-        """Cut the selected outline in two along the chord whose ends are closest together for the way round the outline between them
-        (see sp.split_polygon): the pieces of a pinched outline come apart, and a merge is undone."""
-        if self.stage != 1 or self.mode != "edit" or len(self.selected) != 1:
+        """Cut each selected outline in two along the chord whose ends are closest together for the way round the outline between them
+        (see sp.split_polygon): the pieces of a pinched outline come apart, and a merge is undone. Several selected outlines are each split on
+        their own, as if they had been selected one at a time; one that cannot be split (too small) is left as it is."""
+        if self.stage != 1 or self.mode != "edit" or not self.selected:
             return
-        i = next(iter(self.selected))
-        parts = sp.split_polygon(self.polys[self.cur][i])
-        if parts is None:
-            self.var_status.set("This outline is too small to split.")
+        polys = self.polys[self.cur]
+        split = {}                                          # outline's position -> its two parts
+        for i in sorted(self.selected):
+            parts = sp.split_polygon(polys[i])
+            if parts is not None:
+                split[i] = parts
+        if not split:
+            self.var_status.set("This outline is too small to split." if len(self.selected) == 1
+                                else f"None of the {len(self.selected)} selected outlines can be split (they are too small).")
             return
+        requested = len(self.selected)
         self.push_undo()
-        keep = [q for k, q in enumerate(self.polys[self.cur]) if k != i] + list(parts)
+        pieces = [q for i in sorted(split) for q in split[i]]
+        keep = [q for k, q in enumerate(polys) if k not in split] + pieces
         self.polys[self.cur] = self.sorted_polys(keep)
-        self.selected = {k for k, q in enumerate(self.polys[self.cur]) if any(q is part for part in parts)}
+        self.selected = {k for k, q in enumerate(self.polys[self.cur]) if any(q is part for part in pieces)}
         self.update_edit_help()
         self.sync_project()
         self.redraw()
-        self.var_status.set("Split into two outlines (Undo goes back).")
+        if requested == 1:
+            self.var_status.set("Split into two outlines (Undo goes back).")
+        else:
+            left = requested - len(split)
+            self.var_status.set(f"Split {len(split)} outlines into {2 * len(split)}" + (f"; {left} too small to split, left as they are" if left else "")
+                                + " (Undo goes back).")
 
     def merge_key(self):
         """The M key: the same as the Merge button (which is usable only for two or more selected outlines in the editing view)."""

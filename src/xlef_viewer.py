@@ -5745,6 +5745,7 @@ class XlefViewer:
         self._each_canvas(lambda: self.canvas.delete("all"))
         self.cursor_label.config(text="")
         self._show_cursor_values([])
+        self.cursor_all = ([], [])
         self.canvas_message = ""
         self.detail_pending = False
         self.detail_cache = self.detail_partial = None
@@ -6101,6 +6102,7 @@ class XlefViewer:
             self._set(i, "on", on.get())
             if self.split:
                 self._layout_panels()       # (a panel more, or one less)
+            self._show_cursor_readout()     # (its value under the pointer gone, or back)
 
     def _auto_range(self, i):
         """Contrast from the overview: 0.1-99.9 percentile of the non-zero pixels (stitched scans have zero outside the tiles); or None."""
@@ -6737,6 +6739,7 @@ class XlefViewer:
         if not (0 <= ix < e.width and 0 <= iy < e.height):
             self.cursor_label.config(text="")
             self._show_cursor_values([])
+            self.cursor_all = ([], [])
             return
         x, y = int(ix), int(iy)
         parts = [f"x {x}, y {y} px"]
@@ -6747,8 +6750,15 @@ class XlefViewer:
             v = self._value_at(c, x, y)
             if v is not None:
                 vals.append((c, f"{ch.name}: {'' if v[1] else '≈'}{v[0]}"))
+        self.cursor_all = (parts, vals)         # (every channel's: shown again, less those switched off, when one is switched)
+        self._show_cursor_readout()
+
+    def _show_cursor_readout(self):
+        """The pointer's position and the values under it (see on_motion), only of the channels switched on."""
+        parts, vals = getattr(self, "cursor_all", ([], []))
+        vals = [(c, text) for c, text in vals if c < len(self.ch_settings) and self.ch_settings[c]["on"]]
         if any("≈" in text for _, text in vals):
-            parts.append("(≈: from the zoomed-out picture; zoom in for exact values)")
+            parts = parts + ["(≈: from the zoomed-out picture; zoom in for exact values)"]
         self.cursor_label.config(text="   ".join(parts))
         self._show_cursor_values(vals)
 

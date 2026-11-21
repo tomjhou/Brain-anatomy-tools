@@ -308,13 +308,16 @@ def version_text(root=None):
 
 
 def _context():
-    """Certificates to check GitHub's with: certifi's when it is there (Python from python.org on a Mac has none of its own until its
-    "Install Certificates" is run), else the system's."""
+    """Certificates to check GitHub's with: the system's together with certifi's. The system's matter on a computer of an organization that inspects its
+    traffic: its own certificate is in Windows' store and not in certifi's, so with certifi's alone every check failed ("unable to get local issuer
+    certificate"). certifi's matter where the system has none (Python from python.org on a Mac, until its "Install Certificates" is run)."""
+    context = ssl.create_default_context()
     try:
         import certifi
-        return ssl.create_default_context(cafile=certifi.where())
-    except ImportError:
-        return ssl.create_default_context()
+        context.load_verify_locations(cafile=certifi.where())
+    except (ImportError, OSError, ssl.SSLError):
+        pass
+    return context
 
 
 def _get(url, what):

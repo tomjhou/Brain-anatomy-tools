@@ -117,6 +117,7 @@ def show_tip_window(window):
             user32.SetWindowLongPtrW(hwnd, -20, exstyle)
             user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020)      # NOSIZE | NOMOVE | NOZORDER | NOACTIVATE | FRAMECHANGED
             window._frame_removed = hwnd
+            window.bind("<Configure>", lambda e, w=window: fit_tip(w) if e.widget is w else None, add="+")      # (Tk sizes the window again when its contents change)
         except Exception:
             window.wm_overrideredirect(True)
     fit_tip(window)
@@ -131,8 +132,13 @@ def fit_tip(window):
         return
     try:
         import ctypes
-        window.update_idletasks()
-        ctypes.windll.user32.SetWindowPos(hwnd, None, 0, 0, window.winfo_reqwidth(), window.winfo_reqheight(), 0x0002 | 0x0004 | 0x0010)      # NOMOVE | NOZORDER | NOACTIVATE
+        from ctypes import wintypes
+        want = (window.winfo_reqwidth(), window.winfo_reqheight())
+        rect = wintypes.RECT()
+        ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        if (rect.right - rect.left, rect.bottom - rect.top) == want:
+            return                                                   # (as large as it should be: nothing to do, and no loop of Configure events)
+        ctypes.windll.user32.SetWindowPos(hwnd, None, 0, 0, want[0], want[1], 0x0002 | 0x0004 | 0x0010)      # NOMOVE | NOZORDER | NOACTIVATE
     except Exception:
         pass
 

@@ -32,6 +32,7 @@ import time
 from pathlib import Path
 
 from app_identity import use_windowless_log
+import screen_area
 
 _STARTUP_T0 = time.perf_counter()
 use_windowless_log('ccf_browser', 'The CCF browser')   # started without a console (pythonw.exe): output to a log file
@@ -1271,13 +1272,15 @@ class HoverTip:
 
     def show(self, e):
         if self.tip is None:
-            self.tip = tk.Toplevel(self.widget)
-            self.tip.wm_overrideredirect(True)
+            self.tip = screen_area.tip_window(self.widget)       # (a frameless pop-up of Tk's own comes up in the wrong place and size on monitors of different scalings)
             self.label = tk.Label(self.tip, bg='#ffffe0', relief='solid', borderwidth=1, font=('Segoe UI', 9), padx=4, pady=2,
                                   justify='left', wraplength=420)
             self.label.pack()
         self.label.config(text=self.text_fn())
-        self.tip.wm_geometry(f"+{e.x_root + 12}+{e.y_root + 18}")
+        screen_area.fit_tip(self.tip)
+        screen_area.place_beside(self.tip, e.x_root, e.y_root, self.widget)          # (beside the pointer, kept on its monitor)
+        if str(self.tip.state()) == 'withdrawn':
+            screen_area.show_tip_window(self.tip)
 
     def hide(self, e=None):
         if self.tip is not None:
@@ -1401,7 +1404,9 @@ class CCFBrowser:
         self.dnd, self.dnd_files = import_drag_and_drop()
         self.root = self.dnd.Tk() if self.dnd is not None else tk.Tk()
         self.root.title("CCF browser")
-        self.root.geometry("1100x800+60+40")
+        _left, _top, _right, _bottom = screen_area.home_area(self.root)       # (the monitor in use, as the other apps choose: the pointer's, else the main one)
+        self.root.geometry(f"1100x800+{_left + 60}+{_top + 40}")
+        screen_area.track(self.root)
         self.settings = load_settings()
         self.volume = self.region_table = self.lut = None
         self.atlas_info = {'voxel_um': CCF_VOXEL_UM, 'legacy': True}   # geometry and orientation of the atlas on screen

@@ -1,7 +1,8 @@
 """A reusable "open a saved file" dialog for Tk programs: a toggle at the top picks one of two panels, and Open acts on the panel that is showing.
 
   Recent <things>       a list of the recently used files (with optional extra columns, filled in by a background thread), double-click opens, a heading sorts
-  Browse for a <thing>  a "Choose file" button, a box for a typed or pasted path, and an area a file can be dragged onto from Explorer
+  Browse for a <thing>  a "Choose file" button (a file accepted in its system dialog is returned at once), a box for a typed or pasted path,
+                        and an area a file can be dragged onto from Explorer
 
 The module knows nothing about any program: it is given the recent paths and a few optional callbacks, and returns what was chosen. It does not
 open the file, check that it exists or remember anything (the caller keeps its own list of recent files), so it can be used as it is by any program.
@@ -84,6 +85,7 @@ def ask_open_file(parent, recent, *, title="Open", noun="file", filetypes=(("All
         file = filedialog.askopenfilename(parent=dlg, title=title, initialdir=start or None, filetypes=list(filetypes))
         if file:
             var_file.set(os.path.normpath(file))
+            choose()                    # (accepted in the system dialog: opened at once, with no second Open here)
     ttk.Button(top, text="Choose file", command=browse).pack(side=tk.LEFT)
     entry = ttk.Entry(top, textvariable=var_file, width=70)
     entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))

@@ -82,7 +82,7 @@ import leica_luts           # (LAS X's colour maps, sampled: see lut_table)
 import app_update          # (the Update menu)
 import xlef_pyramids        # (pyramids for an experiment that has none: see XlefViewer.make_pyramids)
 from color_button import ColorButton
-from tooltip import Tooltip, place_on_monitor, monitor_area
+from tooltip import Tooltip, place_on_monitor, monitor_area, tip_window, show_tip_window, watch_pointer
 
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".xlef_viewer_settings.json")
 # With XLEF_TRACE set in the environment, one line per decision of the viewer goes to xlef_viewer_trace.log in the temp folder: for finding
@@ -2783,8 +2783,7 @@ class HistogramView(tk.Canvas):
         self.create_line(event.x, 0, event.x, self.winfo_height() - 14, fill=PAL["muted"], width=1, tags=("guide",))
         head, rows = self._readout_rows(event.x)
         if self.readout is None:
-            self.readout = tk.Toplevel(self)
-            self.readout.wm_overrideredirect(True)
+            self.readout = tip_window(self)                 # (not Tk's frameless pop-up: see tooltip.tip_window)
             self.readout_text = None
         if self.readout_text != (head, rows):
             self.readout_text = (head, rows)
@@ -2803,6 +2802,7 @@ class HistogramView(tk.Canvas):
                 tk.Label(box, text=self.help, background="#ffffe0", foreground="gray30", font=("Segoe UI", 8), justify=tk.LEFT,
                          wraplength=250).grid(row=len(rows) + 2, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 3))
         place_on_monitor(self.readout, event.x_root + 14, event.y_root + 18, avoid_y=self.winfo_rooty())
+        show_tip_window(self.readout)
 
     def _hide_readout(self):
         self.delete("guide")
@@ -3362,8 +3362,7 @@ class PointerTip:
     after a name in the list); show() moves it and sets its text, hide() removes it."""
 
     def __init__(self, widget):
-        self.win = tk.Toplevel(widget)
-        self.win.wm_overrideredirect(True)
+        self.win = tip_window(widget)                       # (not Tk's frameless pop-up: see tooltip.tip_window)
         self.label = tk.Label(self.win, background="#ffffe0", foreground="black", relief=tk.SOLID, borderwidth=1, padx=4, pady=2,
                               justify=tk.LEFT, wraplength=360)
         self.label.pack()
@@ -3374,6 +3373,7 @@ class PointerTip:
             self.label.configure(text=text)
             self.text = text
         place_on_monitor(self.win, x_root + 14, y_root + 16, avoid_y=y_root)        # (kept on the pointer's monitor)
+        show_tip_window(self.win)
 
     def hide(self):
         self.win.destroy()
@@ -3722,6 +3722,7 @@ class XlefViewer:
             self.root = tk.Tk()
             self.dnd_files = None
         self.root.title("XLEF viewer")
+        watch_pointer(self.root)                            # (tips placed by the pointer between mouse events: see tooltip.pointer_xy)
         self.settings = self._load_settings()
         self.settings.pop("drive_choices", None)          # (kept by an earlier version: the answers are for one session now)
         self.drive_choices = {}      # this session's answers about slow drives: location -> "optimize" or "normal" (see _ask_about_slow_drives)

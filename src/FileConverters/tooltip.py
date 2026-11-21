@@ -1,6 +1,53 @@
 """A small note that appears when the pointer rests on a widget: shared by the alignment tool and the section loader."""
+import os
 import sys
 import tkinter as tk
+
+try:
+    import screen_area           # (src: tips that come up in the right place and size with monitors of different scalings)
+except ImportError:
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))     # (after this folder: its modules come first)
+    try:
+        import screen_area
+    except ImportError:
+        screen_area = None
+
+
+def tip_window(master):
+    """A new, hidden window for a note, shown by show_tip_window once its contents are in and its place is set. On Windows it is an
+    ordinary window with its frame taken off, not Tk's frameless pop-up: with monitors of different scalings, Windows put a pop-up in the
+    wrong place and at the wrong size now and then, when the focus was in a window on the other monitor (see screen_area.tip_window)."""
+    if screen_area is not None:
+        return screen_area.tip_window(master)
+    win = tk.Toplevel(master)
+    win.withdraw()
+    win.wm_overrideredirect(True)
+    return win
+
+
+def show_tip_window(win):
+    """Shows a note made by tip_window (if it is hidden); once shown, call it again after its contents change, to fit it to them."""
+    if str(win.state()) == "withdrawn":
+        if screen_area is not None:
+            screen_area.show_tip_window(win)
+        else:
+            win.deiconify()
+    elif screen_area is not None:
+        screen_area.fit_tip(win)
+
+
+def watch_pointer(window):
+    """Starts correcting pointer_xy (once per program: see screen_area.watch_pointer)."""
+    if screen_area is not None:
+        screen_area.watch_pointer(window)
+
+
+def pointer_xy(widget):
+    """The pointer's place on the screen in the windows' own coordinates. winfo_pointerxy can be in another monitor's scaling, while the
+    focus is in a window on the monitor of another scaling (see screen_area.pointer_xy)."""
+    if screen_area is not None:
+        return screen_area.pointer_xy(widget)
+    return widget.winfo_pointerxy()
 
 
 def monitor_area(widget, x, y):
@@ -63,8 +110,8 @@ class Tooltip:
     def show(self):
         self.job = None
         text = self.text() if callable(self.text) else self.text
-        self.tip = tk.Toplevel(self.widget)
-        self.tip.wm_overrideredirect(True)
+        watch_pointer(self.widget)
+        self.tip = tip_window(self.widget)
         tk.Label(self.tip, text=text, justify=tk.LEFT, background="#ffffe0", foreground="black", relief=tk.SOLID, borderwidth=1,
                  wraplength=self.wraplength, padx=4, pady=2).pack()
         try:
@@ -73,10 +120,11 @@ class Tooltip:
         except tk.TclError:
             self.cursor = None
         self.place()
+        show_tip_window(self.tip)
 
     def place(self):
         """The note below the widget and the pointer, on its monitor."""
-        below = max(self.widget.winfo_rooty() + self.widget.winfo_height() + 4, self.widget.winfo_pointery() + self.CURSOR_HEIGHT)
+        below = max(self.widget.winfo_rooty() + self.widget.winfo_height() + 4, pointer_xy(self.widget)[1] + self.CURSOR_HEIGHT)
         place_on_monitor(self.tip, self.widget.winfo_rootx(), below, avoid_y=self.widget.winfo_rooty())
 
     def hide(self, event=None):
@@ -131,5 +179,5 @@ class HeadingTips(Tooltip):
 
     def place(self):
         """The note below the heading row, at the pointer, on its monitor."""
-        x, y = self.widget.winfo_pointerx(), self.widget.winfo_pointery()
+        x, y = pointer_xy(self.widget)
         place_on_monitor(self.tip, x, y + self.CURSOR_HEIGHT, avoid_y=y)

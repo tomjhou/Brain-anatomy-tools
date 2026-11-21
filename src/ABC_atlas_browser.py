@@ -397,6 +397,7 @@ import sklearn.utils
 import_mark('sklearn')
 import numba
 import_mark('numba')
+import screen_area
 import scanpy as sc
 import_mark('scanpy (the rest)')
 
@@ -673,13 +674,13 @@ def build_common_settings_tab(tab):
 
     def show_reset_tip(e):
         hide_reset_tip()
-        tip = tk.Toplevel(reset)
-        tip.wm_overrideredirect(True)
+        tip = screen_area.tip_window(reset)
         tip.attributes('-topmost', True)
         tk.Label(tip, text=f"Back to the default: AP {DEFAULT_BREGMA_CCF_AP_MM:g} mm, DV {DEFAULT_BREGMA_CCF_DV_MM:g} mm\n"
                            "(the International Brain Laboratory's estimate of bregma in the CCF)", bg="#ffffe0", relief="solid",
                  borderwidth=1, justify=tk.LEFT, padx=4, pady=1).pack()
         tip.wm_geometry(f"+{e.x_root + 12}+{e.y_root + 18}")
+        screen_area.show_tip_window(tip)
         reset_tip['win'] = tip
 
     def hide_reset_tip(e=None):
@@ -880,6 +881,7 @@ def prompt_atlas_cache_location(suggested, drives):
     needed = ATLAS_CACHE_SPACE_NEEDED_GB * 1e9
     result = {'path': None}
     root = tk.Tk()
+    root.withdraw()                                     # (shown only once it is in place: see below)
     root.title("Choose ABC atlas download location")
     root.attributes('-topmost', True)
     root.resizable(False, False)
@@ -963,9 +965,8 @@ def prompt_atlas_cache_location(suggested, drives):
     root.bind('<Escape>', cancel)
     root.protocol('WM_DELETE_WINDOW', cancel)
     root.update_idletasks()
-    x = (root.winfo_screenwidth() - root.winfo_width()) // 2
-    y = (root.winfo_screenheight() - root.winfo_height()) // 3
-    root.geometry(f'+{max(x, 0)}+{max(y, 0)}')
+    screen_area.center_on_home(root, vertical=1 / 3)
+    root.deiconify()
     entry.focus_set()
     entry.icursor('end')
     root.mainloop()
@@ -4410,7 +4411,13 @@ def _windows_monitor_work_area(window):
 
         hwnd = window.winfo_id()
         MONITOR_DEFAULTTONEAREST = 2
-        monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        home = screen_area._home["point"]                  # (the monitor the launcher / project window is on: a new window is created on the main monitor)
+        if home is not None:
+            user32.MonitorFromPoint.restype = ctypes.c_void_p
+            user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+            monitor = user32.MonitorFromPoint(wintypes.POINT(int(home[0]), int(home[1])), MONITOR_DEFAULTTONEAREST)
+        else:
+            monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
         if not monitor:
             return None
 
@@ -4766,6 +4773,7 @@ def show_processing_dialog(message):
         own_root = parent = tk.Tk()
         own_root.withdraw()
     top = tk.Toplevel(parent)
+    top.withdraw()                                      # (shown only once it is in place: see below)
     top.title("Processing")
     top.attributes('-topmost', True)
     top.resizable(False, False)
@@ -4823,8 +4831,8 @@ def show_processing_dialog(message):
 
     win.canvas = Canvas()
     top.update_idletasks()
-    w, h = top.winfo_reqwidth(), top.winfo_reqheight()
-    top.geometry(f"+{max(0, (top.winfo_screenwidth() - w) // 2)}+{max(0, (top.winfo_screenheight() - h) // 3)}")
+    screen_area.center_on_home(top, vertical=1 / 3)
+    top.deiconify()
     top.lift()
     top.update()
     return win, cancel_flag, set_progress
@@ -4886,6 +4894,7 @@ def run_with_loading_window(message, work, show_after_s=0.4):
                 import tkinter as tk
                 from tkinter import ttk
                 root = tk.Tk()
+                root.withdraw()                                  # (shown only once it is in place: see below)
                 root.title("Loading")
                 root.attributes('-topmost', True)
                 root.protocol("WM_DELETE_WINDOW", lambda: None)  # nothing to cancel; ignore close
@@ -4896,8 +4905,8 @@ def run_with_loading_window(message, work, show_after_s=0.4):
                 elapsed_label = tk.Label(root, text="", fg='gray35', pady=10)
                 elapsed_label.pack()
                 root.update_idletasks()
-                w, h = root.winfo_reqwidth(), root.winfo_reqheight()
-                root.geometry(f"+{(root.winfo_screenwidth() - w) // 2}+{(root.winfo_screenheight() - h) // 3}")
+                screen_area.center_on_home(root, vertical=1 / 3)
+                root.deiconify()
                 ui = (root, elapsed_label, bar)
             except Exception:
                 ui = False  # no usable Tk; just wait
@@ -4945,6 +4954,7 @@ class StepWindow:
             import tkinter as tk
             from tkinter import ttk
             root = tk.Tk()
+            root.withdraw()                                            # (shown only once it is in place: see below)
             root.title("Computing")
             root.protocol("WM_DELETE_WINDOW", lambda: None)            # (nothing to cancel)
             tk.Label(root, text="Computing the new run. This can take a while; the console shows the details.",
@@ -4957,8 +4967,8 @@ class StepWindow:
             elapsed = tk.Label(root, text="", fg='gray35', pady=10)
             elapsed.pack()
             root.update_idletasks()
-            w, h = root.winfo_reqwidth(), root.winfo_reqheight()
-            root.geometry(f"+{(root.winfo_screenwidth() - w) // 2}+{(root.winfo_screenheight() - h) // 3}")
+            screen_area.center_on_home(root, vertical=1 / 3)
+            root.deiconify()
             root.lift()
             self.ui = (root, step, bar, elapsed)
         except Exception:
@@ -6464,7 +6474,8 @@ def open_3d_viewer_launcher(abc_cache):
     # (Every variable below is created with master=root: the opening screen has its own Tk window, and a variable made
     # without a master would live in THAT window's interpreter, so this window's widgets would never see it.)
     root.title("3D viewer")
-    root.geometry("+120+120")
+    _left, _top, _right, _bottom = screen_area.home_area(root)               # (on the monitor in use, not always the main one)
+    root.geometry(f"+{_left + 120}+{_top + 120}")
     body = ttk.Frame(root, padding=12)
     body.pack(fill='both', expand=True)
     ttk.Label(body, text="Cells: a coordinates_*.csv from the viewer's Export coordinates (the arrow lists recent files)").pack(

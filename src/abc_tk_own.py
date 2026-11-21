@@ -351,7 +351,8 @@ def ask_options(info):
     root.bind("<Escape>", lambda e: done(False))
     root.protocol("WM_DELETE_WINDOW", lambda: done(False))
     root.update_idletasks()
-    root.geometry(f"+{(root.winfo_screenwidth() - root.winfo_width()) // 2}+{(root.winfo_screenheight() - root.winfo_height()) // 3}")
+    import screen_area
+    screen_area.center_on_home(root, vertical=1 / 3)
     root.attributes("-topmost", True)
     ok_button.focus_force()
     root.mainloop()

@@ -20,6 +20,7 @@ from PIL import Image
 
 import abc_core as core
 from tk_dash import dash
+import screen_area
 from screen_area import place_beside
 from abc_tk_picker import SectionData, ZoomView, prompt_subregion_selection_tk
 
@@ -282,11 +283,11 @@ class GridWindow:
 
     def tip_show(self, x_root, y_root):
         self.tip_job = None
-        self.tip = tk.Toplevel(self.root)
-        self.tip.wm_overrideredirect(True)
+        self.tip = screen_area.tip_window(self.root)
         tk.Label(self.tip, text=SECTION_TIP_TEXT, bg="#ffffe0", relief="solid", borderwidth=1, font=("Segoe UI", 9), padx=4, pady=1,
                  justify=tk.LEFT, wraplength=360).pack()
         place_beside(self.tip, x_root, y_root, self.root)          # (beside the pointer, kept on the monitor it is on)
+        screen_area.show_tip_window(self.tip)
 
     def on_press(self, e):
         self.tip_off()

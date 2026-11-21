@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 import abc_core as core
+import screen_area
 
 EXPORT_FONTSIZE = 14
 EXPORT_AXES_PX = 6400                         # the UMAP's plotting square in a saved file, at the save DPI
@@ -204,9 +205,7 @@ class ExportsMixin:
         dlg.protocol("WM_DELETE_WINDOW", lambda: finish(None))
         dlg.update_idletasks()
         try:                                        # (in the middle of the window, not in a corner of the screen)
-            x = owner.winfo_rootx() + (owner.winfo_width() - dlg.winfo_reqwidth()) // 2
-            y = owner.winfo_rooty() + (owner.winfo_height() - dlg.winfo_reqheight()) // 3
-            dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+            screen_area.center_over(dlg, owner, vertical=1 / 3)
             dlg.grab_set()
         except tk.TclError:
             pass
@@ -1141,9 +1140,7 @@ class ExportsMixin:
         owner = owner or self.root
         try:
             top.update_idletasks()
-            x = owner.winfo_rootx() + (owner.winfo_width() - top.winfo_reqwidth()) // 2
-            y = owner.winfo_rooty() + (owner.winfo_height() - top.winfo_reqheight()) // 2
-            top.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+            screen_area.center_over(top, owner)
         except tk.TclError:
             pass
 
@@ -1209,8 +1206,15 @@ class ExportsMixin:
             p = self.prepare_3d("opening the 3D view", jitter)
             if p is not None:
                 h = self.host
-                target = self.target_dir()
-                path = h["unique_export_paths"](target, p["stem"], (".html",))[".html"]
+                proposed = h["unique_export_paths"](self.target_dir(), p["stem"], (".html",))[".html"].name
+                self.root.config(cursor="")
+                path = self.ask_save_path("Save the 3D view", proposed, ".html", "HTML page")        # (the name and the folder can be changed)
+                if path is None:
+                    self.var_status.set("3D view cancelled.")
+                    return
+                path = Path(path)
+                target = path.parent
+                self.root.config(cursor="watch")
                 edges = h["build_3d_edges"](self.abc_cache, p["structures"], self.root) if p["have_ccf"] else None
                 self.var_status.set("Writing the 3D page...")
                 self.root.update()

@@ -33,6 +33,7 @@ from scipy.spatial import cKDTree
 import abc_core as core
 import abc_project
 from tk_dash import dash
+import screen_area
 from screen_area import place_beside
 import abc_tk_ccf
 from abc_tk_umap_export import ExportsMixin, hexcolor
@@ -572,8 +573,7 @@ class HoverTip:
             self.hide()
             return
         if self.tip is None:
-            self.tip = tk.Toplevel(self.widget)
-            self.tip.wm_overrideredirect(True)
+            self.tip = screen_area.tip_window(self.widget)
             box = tk.Frame(self.tip, bg=self.BG, relief="solid", borderwidth=1)
             box.pack()
             if self.title:
@@ -587,7 +587,10 @@ class HoverTip:
                 self.tip.bind("<Enter>", lambda e: self.cancel_hide())
                 self.tip.bind("<Leave>", self.hide_later)
         self.label.config(text=text)
+        screen_area.fit_tip(self.tip)                                # (the text may be of another size than the last)
         place_beside(self.tip, e.x_root, e.y_root, self.widget)     # (beside the pointer, kept on the monitor it is on)
+        if str(self.tip.state()) == "withdrawn":
+            screen_area.show_tip_window(self.tip)
 
     def learn_more(self, e=None):
         title, more_fn = self.more
@@ -607,7 +610,7 @@ class HoverTip:
     def hide_unless_pointer_in(self):
         self.hide_job = None
         try:
-            x, y = self.widget.winfo_pointerxy()
+            x, y = screen_area.pointer_xy(self.widget)
             for w in (self.widget, self.tip):
                 if w is not None and w.winfo_rootx() <= x < w.winfo_rootx() + w.winfo_width() and w.winfo_rooty() <= y < w.winfo_rooty() + w.winfo_height():
                     return
@@ -714,7 +717,7 @@ class CellTip:
         if self.tip is None:
             return False
         try:
-            x, y = self.root.winfo_pointerxy()
+            x, y = screen_area.pointer_xy(self.root)
             tx, ty = self.tip.winfo_rootx(), self.tip.winfo_rooty()
             return tx <= x < tx + self.tip.winfo_width() and ty <= y < ty + self.tip.winfo_height()
         except tk.TclError:
@@ -723,7 +726,7 @@ class CellTip:
     def near_anchor(self):
         if self.anchor is None:
             return False
-        x, y = self.root.winfo_pointerxy()
+        x, y = screen_area.pointer_xy(self.root)
         return abs(x - self.anchor[0]) <= CELL_TIP_GRACE_PX and abs(y - self.anchor[1]) <= CELL_TIP_GRACE_PX
 
     def hide_unless_pointer_in(self):
@@ -765,7 +768,7 @@ class CellTip:
         if not live and self.tip is None and not self.pinned:
             return
         try:
-            x, y = self.root.winfo_pointerxy()
+            x, y = screen_area.pointer_xy(self.root)
             hit = None
             for tip, token, labels, area in live:
                 boxes = [(w.winfo_rootx(), w.winfo_rooty(), w.winfo_rootx() + w.winfo_width(), w.winfo_rooty() + w.winfo_height())
@@ -884,8 +887,7 @@ class CellTip:
         if not rows:
             return
         self.hide()
-        self.tip = tk.Toplevel(self.root)
-        self.tip.wm_overrideredirect(True)
+        self.tip = screen_area.tip_window(self.root)       # (hidden, and without a frame, until it is in place: see the end of this method)
         self.tip.attributes("-topmost", True)
         bg = "#ffffe0"
         box = tk.Frame(self.tip, bg=bg, relief="solid", borderwidth=1)
@@ -955,9 +957,11 @@ class CellTip:
         pin.bind("<ButtonRelease-1>", lambda e, t=self.tip: self.pin_clicked(t), add="+")        # (after the drag handlers: they say whether this press moved the tip)
         pin.config(cursor="hand2")
         # just beside the pointer (close, so that it is quickly reached), but kept on the monitor it is on
-        x0, y0 = self.root.winfo_pointerxy()
+        x0, y0 = screen_area.pointer_xy(self.root)
         self.anchor = (x0, y0)
         place_beside(self.tip, x0, y0, self.root, dx=6, dy=6, gap_up=6)
+        screen_area.show_tip_window(self.tip)
+        screen_area.debug_tip(self.tip, self.root, (x0, y0))
 
     def copy(self, text, button):
         self.root.clipboard_clear()
@@ -1946,7 +1950,9 @@ class UmapWindow(ExportsMixin):
         self.own_root = parent is None
         self.root = tk.Tk() if parent is None else tk.Toplevel(parent)
         self.root.title(title)
-        self.root.geometry("1750x950")
+        _left, _top, _right, _bottom = screen_area.home_area(self.root)           # (on the monitor the launcher was on: zoomed fills the monitor the window is on)
+        self.root.geometry(f"1750x950+{_left + 40}+{_top + 40}")
+        screen_area.track(self.root)
         try:
             self.root.state("zoomed")                          # (its final size from the start: nothing is drawn at one size and then again at another)
         except tk.TclError:
@@ -2470,10 +2476,6 @@ class UmapWindow(ExportsMixin):
         self.group_canvas.bind("<Motion>", self.on_group_list_motion)
         self.group_canvas.bind("<Leave>", lambda e: self.show_legend_group(None))
         self.group_canvas.config(cursor="hand2")
-        self.legend.bind("<Button-1>", self.on_single_legend_click)
-        self.legend.bind("<Motion>", self.on_single_legend_motion)
-        self.legend.bind("<Leave>", lambda e: self.show_legend_group(None))
-        self.legend.config(cursor="hand2")
         self.group_canvas.bind("<MouseWheel>", lambda e: self.group_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
         self.build_buttons(f)
         # (No "Under the pointer" box: the hovered cell is described in a tip (CellTip), and so is a row of the group list, which then has the room.)
@@ -4228,8 +4230,6 @@ class UmapWindow(ExportsMixin):
         """The colored groups, each with its swatch, number, cell count and name (the ones past the colored cap are gray and not listed),
         in the order of the Sort by buttons."""
         self.group_list_args = (ranked, uniques, counts)
-        c = self.group_canvas
-        c.delete("all")
         rows = []
         for r, u in enumerate(ranked):
             m = re.match(r"^\s*(\d+)", str(uniques[u]))
@@ -4238,17 +4238,26 @@ class UmapWindow(ExportsMixin):
             rows.append({"id": int(m.group(1)) if m else 10 ** 9, "color": hexcolor(GREY if off else self.group_rgb[u]),
                          "num": m.group(1) if m else str(uniques[u]), "count": int(counts[u]), "name": name, "off": off, "key": str(uniques[u]),
                          "code": int(self.shape_codes(np.array([r]))[0])})
+        self.fill_group_list(rows)
+
+    def fill_group_list(self, rows):
+        """Draws the group list (the one list of All groups and of Single group(s), scrollable, sorted by the column heading last clicked).
+        `rows`: a dict for each group: key (what a click on it switches: a group's name, or a target), color (hex), num, count, name, off, code (the
+        shape of its cells), id (the number the # column sorts by)."""
+        self.group_redraw = lambda: self.fill_group_list(rows)
+        c = self.group_canvas
+        c.delete("all")
+        ordered = sorted(rows, key=lambda r: (r["id"], str(r["key"])))              # (ties stay in ID order)
         column, descending = self.group_sort
-        rows.sort(key=lambda r: (r["id"], r["key"]))                      # (ties stay in ID order)
         if column == "count":
-            rows.sort(key=lambda r: r["count"], reverse=descending)
+            ordered.sort(key=lambda r: r["count"], reverse=descending)
         elif column == "name":
-            rows.sort(key=lambda r: (r["name"] or r["num"]).lower(), reverse=descending)
+            ordered.sort(key=lambda r: (r["name"] or r["num"]).lower(), reverse=descending)
         elif descending:
-            rows.reverse()
-        self.group_rows = [r["key"] for r in rows]
-        width = self.draw_legend_rows(c, [(r["color"], r["num"], f"({r['count']})", r["name"], r["off"], r["code"]) for r in rows], 6)
-        c.configure(scrollregion=(0, 0, max(300, width), 8 + 22 * len(rows)))
+            ordered.reverse()
+        self.group_rows = [r["key"] for r in ordered]
+        width = self.draw_legend_rows(c, [(r["color"], r["num"], f"({r['count']})", r["name"], r["off"], r["code"]) for r in ordered], 6)
+        c.configure(scrollregion=(0, 0, max(300, width), 8 + 22 * len(ordered)))
         self.draw_group_header()
         self.group_list.pack(fill=tk.BOTH, expand=True, pady=(6, 0), after=self.box)
         self.sync_select_bar()                              # (packed again, the list is above the buttons: they go back above it)
@@ -4278,13 +4287,13 @@ class UmapWindow(ExportsMixin):
 
     def on_group_header_click(self, e):
         """Click a heading to sort by that column; click it again to reverse the order."""
-        if self.mode != "all" or getattr(self, "group_list_args", None) is None:
+        if self.mode not in ("all", "single") or getattr(self, "group_redraw", None) is None or not self.group_list.winfo_manager():
             return
         x_num, x_cnt_left, x_cnt, x_name = self.legend_cols
         key = "id" if e.x < getattr(self, "count_head_left", x_cnt_left) else "count" if e.x < x_name else "name"
         column, descending = self.group_sort
         self.group_sort = (key, not descending) if key == column else (key, key in GROUP_SORT_DESCENDING_FIRST)
-        self.draw_group_list(*self.group_list_args)
+        self.group_redraw()
         self.group_canvas.yview_moveto(0)
 
     def group_keys(self, level, values):
@@ -4516,18 +4525,11 @@ class UmapWindow(ExportsMixin):
         self.values = None
 
     def draw_legend_mixed(self, units, shown, colors, counts, short, label_of):
-        self.legend.pack(fill=tk.X, pady=(6, 0), after=self.box)
-        self.sync_select_bar()
-        self.legend.delete("all")
-        rows = [("#%02x%02x%02x" % tuple(int(v) for v in colors[u]), short(u), f"({counts[u]})", label_of(u), u in self.off_groups,
-                 int(self.shape_codes(np.array([units.index(u)]))[0]))
-                for u in shown[:self.MAX_UNIT_LEGEND_ROWS]]
-        extra = len(shown) - len(rows)
-        self.legend.config(height=22 * (len(rows) + (1 if extra > 0 else 0)) + 8)
-        self.draw_legend_rows(self.legend, rows, 4)
-        if extra > 0:
-            self.legend.create_text(10, 4 + 22 * len(rows) + 11, anchor="w", fill="gray35", font=("Segoe UI", 9, "italic"),
-                                    text=f"... and {extra} more: see Choose groups")
+        """The groups of several levels (Choose groups), in the group list: coarse to fine, by number, to begin with."""
+        rows = [{"id": i, "key": u, "color": hexcolor(GREY if u in self.off_groups else colors[u]), "num": short(u), "count": int(counts[u]),
+                 "name": label_of(u), "off": u in self.off_groups, "code": int(self.shape_codes(np.array([units.index(u)]))[0])}
+                for i, u in enumerate(shown)]
+        self.fill_group_list(rows)
 
     def color_single(self):
         level = self.level
@@ -4608,18 +4610,19 @@ class UmapWindow(ExportsMixin):
         self.values = None
 
     def draw_legend(self, ids, colors, counts, names=None):
+        """The groups typed in Single group(s), in the group list (as All groups has: sortable, scrollable, a click switches a group), once there
+        are two or more."""
         if len(ids) < 2:
             return
-        self.legend.pack(fill=tk.X, pady=(6, 0), after=self.box)
-        self.sync_select_bar()
-        self.legend.delete("all")
-        self.legend.config(height=22 * len(ids) + 8)
         numbered = self.level_has_ids.get(self.level, True)
-        rows = [("#%02x%02x%02x" % tuple(int(v) for v in colors[t]), key_text(t) if numbered else "", f"({counts[t]})",
-                 re.sub(r"^\s*\d+\s*", "", (names or {}).get(t, "")) if numbered else key_text(t), t in self.off_groups,
-                 int(self.shape_codes(np.array([i]))[0]))
-                for i, t in enumerate(ids)]
-        self.draw_legend_rows(self.legend, rows, 4)
+        rows = []
+        for i, t in enumerate(ids):
+            off = t in self.off_groups
+            rows.append({"id": int(core.target_members(t)[0]) if numbered else 10 ** 9, "key": t,
+                         "color": hexcolor(GREY if off else colors[t]), "num": key_text(t) if numbered else "", "count": int(counts[t]),
+                         "name": re.sub(r"^\s*\d+\s*", "", (names or {}).get(t, "")) if numbered else key_text(t), "off": off,
+                         "code": int(self.shape_codes(np.array([i]))[0])})
+        self.fill_group_list(rows)
 
     # ---- genes
 
@@ -5127,7 +5130,7 @@ class UmapWindow(ExportsMixin):
         if self.mode == "all":
             return list(getattr(self, "group_rows", []))
         if self.mode == "single":
-            return list((self.last_ids or {}).get("targets", []))
+            return list(getattr(self, "group_rows", [])) if self.group_list.winfo_manager() else []
         return []
 
     def select_all_groups(self):
@@ -5150,14 +5153,8 @@ class UmapWindow(ExportsMixin):
     def on_group_list_click(self, e):
         rows = getattr(self, "group_rows", [])
         i = int((self.group_canvas.canvasy(e.y) - 4) // 22)
-        if self.mode == "all" and 0 <= i < len(rows):
+        if self.mode in ("all", "single") and 0 <= i < len(rows):
             self.toggle_group(rows[i], bool(e.state & 0x1), rows)
-
-    def on_single_legend_click(self, e):
-        ids = (self.last_ids or {}).get("targets", [])
-        i = int((e.y - 4) // 22)
-        if self.mode == "single" and len(ids) > 1 and 0 <= i < len(ids):
-            self.toggle_group(ids[i], bool(e.state & 0x1), ids)
 
     # ---- the legend rows under the pointer
 
@@ -5200,11 +5197,8 @@ class UmapWindow(ExportsMixin):
         label = key if self.mode == "all" else (None if isinstance(key, tuple) else self.single_names.get(key))        # (a group made of several has no one row to describe)
         rows = self.group_info_rows(self.level, label) if label is not None else None
         if rows is not None:
-            if self.mode == "all":
-                canvas, names = self.group_canvas, getattr(self, "group_rows", [])
-            else:
-                canvas, names = self.legend, (self.last_ids or {}).get("targets", [])
-            self.bold_legend_row(canvas, names.index(key) if key in names else None)
+            names = getattr(self, "group_rows", [])
+            self.bold_legend_row(self.group_canvas, names.index(key) if key in names else None)
             self.group_tip.pointer_on(("group", self.mode, self.level, key), lambda: rows)
         else:
             self.group_tip.pointer_off()
@@ -5215,12 +5209,7 @@ class UmapWindow(ExportsMixin):
     def on_group_list_motion(self, e):
         rows = getattr(self, "group_rows", [])
         i = int((self.group_canvas.canvasy(e.y) - 4) // 22)
-        self.show_legend_group(rows[i] if self.mode == "all" and 0 <= i < len(rows) else None)
-
-    def on_single_legend_motion(self, e):
-        ids = (self.last_ids or {}).get("targets", [])
-        i = int((e.y - 4) // 22)
-        self.show_legend_group(ids[i] if self.mode == "single" and len(ids) > 1 and 0 <= i < len(ids) else None)
+        self.show_legend_group(rows[i] if self.mode in ("all", "single") and 0 <= i < len(rows) else None)
 
     def on_legend_click(self, e):
         if self.mode not in ("gene", "imputed") or self.multi_rows is None or self.gene_cache is None:
@@ -5693,12 +5682,12 @@ class UmapWindow(ExportsMixin):
                     if str(label) in rows:
                         canvas, k = self.group_canvas, rows.index(str(label))
                 elif not (self.last_ids or {}).get("mixed"):
-                    ids = (self.last_ids or {}).get("targets", [])
+                    ids = list(getattr(self, "group_rows", []))                 # (the list on the screen: in the order it is sorted in)
                     m = re.match(r"^\s*(\d+)", str(label))
                     if len(ids) > 1 and not self.level_has_ids.get(self.level, True) and target_row(ids, str(label)) is not None:
-                        canvas, k = self.legend, target_row(ids, str(label))
+                        canvas, k = self.group_canvas, target_row(ids, str(label))
                     elif len(ids) > 1 and m and target_row(ids, int(m.group(1))) is not None:
-                        canvas, k = self.legend, target_row(ids, int(m.group(1)))
+                        canvas, k = self.group_canvas, target_row(ids, int(m.group(1)))
         self.bold_legend_row(canvas, k)
 
     def show_info(self, info):

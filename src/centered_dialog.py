@@ -49,8 +49,12 @@ def show(title, message, buttons=("OK",)):
     # in the middle of the screen (a little above it, as dialogs are), measured first
     root.update_idletasks()
     w, h = root.winfo_reqwidth(), root.winfo_reqheight()
-    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-    root.geometry(f"+{max((sw - w) // 2, 0)}+{max((sh - h) // 3, 0)}")
+    try:
+        import screen_area
+        screen_area.center_on_home(root, vertical=1 / 3)         # (on the monitor in use: the one the launcher is on, else the pointer's)
+    except Exception:
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.geometry(f"+{max((sw - w) // 2, 0)}+{max((sh - h) // 3, 0)}")
     root.deiconify()
     root.lift()
     try:

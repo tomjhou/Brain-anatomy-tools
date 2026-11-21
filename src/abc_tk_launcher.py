@@ -13,6 +13,7 @@ the window was closed or Exit was clicked. The cell type is None for a new run (
 import contextlib
 import gc
 import os
+import screen_area
 import queue
 import sys
 import subprocess
@@ -260,8 +261,7 @@ def choose_run_options(current="Neurons", counts=None, folder_for=None, whole_br
     root.update_idletasks()
     if known["pending"]:
         watch_count()
-    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-    root.geometry(f"+{(sw - root.winfo_width()) // 2}+{(sh - root.winfo_height()) // 4}")
+    screen_area.center_on_home(root, vertical=0.25)
     root.attributes("-topmost", True)
     ok_button.focus_force()
     root.mainloop()
@@ -933,8 +933,8 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
 
     root.protocol("WM_DELETE_WINDOW", exit_app)
     root.update_idletasks()
-    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-    root.geometry(f"+{(sw - root.winfo_width()) // 2}+{(sh - root.winfo_height()) // 3}")
+    screen_area.center_on_home(root, vertical=1 / 3)
+    screen_area.track(root)                         # (where it is moved to is where the windows that open next go)
     bring_to_front(root)
     root.after(50, helpers.get("launch_screen_shown", lambda: None))           # (the window is up: the start-up time is logged)
     root.mainloop()

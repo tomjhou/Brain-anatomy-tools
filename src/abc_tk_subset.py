@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 import abc_core as core
+import screen_area
 
 MIN_SUBSET_CELLS = 100             # fewer cells than this have too little to embed
 PCA_COMPONENTS = 50                # as for a run: what Analyze subset offers to begin with
@@ -121,9 +122,7 @@ def ask_pca_components(parent, n_cells, n_groups):
     dlg.bind("<Return>", lambda e: ok())
     dlg.bind("<Escape>", lambda e: dlg.destroy())
     dlg.update_idletasks()
-    x = parent.winfo_rootx() + (parent.winfo_width() - dlg.winfo_reqwidth()) // 2             # (in the middle of the window: +120 from its corner was the corner, in a window filling the screen)
-    y = parent.winfo_rooty() + (parent.winfo_height() - dlg.winfo_reqheight()) // 2
-    dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+    screen_area.center_over(dlg, parent)                                    # (in the middle of the window, on its monitor)
     spin.focus_set()
     spin.selection_range(0, tk.END)
     dlg.grab_set()

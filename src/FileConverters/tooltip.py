@@ -95,9 +95,10 @@ class Tooltip:
 
     CURSOR_HEIGHT = 28       # (screen pixels below the pointer that the arrow cursor may cover: the note goes below that)
 
-    def __init__(self, widget, text, delay=500, wraplength=260):
+    def __init__(self, widget, text, delay=500, wraplength=260, at_pointer=False):
         self.widget, self.text, self.delay, self.tip, self.job = widget, text, delay, None, None
         self.wraplength = wraplength
+        self.at_pointer = at_pointer     # (the note just below the pointer, not below the widget: for a tall widget, e.g. a slider)
         self.cursor = None       # (the widget's own cursor, while the note shows: the plain arrow instead, smaller than a hand)
         widget.bind("<Enter>", self.schedule, add="+")
         widget.bind("<Leave>", self.hide, add="+")
@@ -123,7 +124,11 @@ class Tooltip:
         show_tip_window(self.tip)
 
     def place(self):
-        """The note below the widget and the pointer, on its monitor."""
+        """The note below the widget and the pointer (at_pointer: below the pointer only), on its monitor."""
+        if self.at_pointer:
+            x, y = pointer_xy(self.widget)
+            place_on_monitor(self.tip, x, y + self.CURSOR_HEIGHT, avoid_y=y)
+            return
         below = max(self.widget.winfo_rooty() + self.widget.winfo_height() + 4, pointer_xy(self.widget)[1] + self.CURSOR_HEIGHT)
         place_on_monitor(self.tip, self.widget.winfo_rootx(), below, avoid_y=self.widget.winfo_rooty())
 

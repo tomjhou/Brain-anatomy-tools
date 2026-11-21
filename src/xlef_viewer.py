@@ -441,6 +441,7 @@ class Channel:
         self.named = named       # the name is from LAS X (False: made up here, e.g. "Channel 1 (Blue)")
         self.black, self.white = black, white        # display range, in pixel values: LAS X's, or as changed in the viewer
         self.saved_black, self.saved_white = black, white    # (as in the file)
+        self.dye = None          # its fluorochrome, from LAS X's dye list, when that differs from its name (e.g. "Cy5" for "Foxp1")
 
     @property
     def color(self):
@@ -469,6 +470,7 @@ class ImageEntry:
         self.saved_name = name   # its name in the file (self.name may be a rename not saved yet)
         self.parent_file = None  # the .xlef/.xlcf whose <Children> refer to this image's .xlif (None: unknown)
         self.flipped = self.saved_flipped = False    # "Flip this section": as changed in the viewer / as in the file (see write_flip)
+        self.rotated = self.saved_rotated = False    # "Rotate this section 180°": the same way
         self.lif_block = None    # its data block, when it is an image in a .lif (or a pyramid level in a .lifext; see load_lif)
         self.read_only = False   # from a .lif: shown, never written (changes made in the viewer are only for viewing)
 
@@ -486,7 +488,8 @@ class ImageEntry:
 
     @property
     def flip_changed(self):
-        return self.flipped != self.saved_flipped
+        """Its flip or its 180° rotation was changed (both are written by write_flip)."""
+        return self.flipped != self.saved_flipped or self.rotated != self.saved_rotated
 
     @property
     def unsaved(self):
@@ -779,6 +782,25 @@ def _image_entry(name, path, element, image, base_dir, lif=None):
             except (TypeError, ValueError):
                 pass
         entry.channels.append(Channel(nm, lut, top, black, white, named))
+    # The dye of each channel, from LAS X's dye list (<Name>Foxp1</Name> <Fluochrome>Cy5</Fluochrome> <LutName>Red</LutName>): only
+    # when it says more than the name does (not "EGFP" for "EGFP"). A channel LAS X left unnamed (UserDefName="", as in some
+    # experiments) takes its name from that list too: the entry of its colour, if only one has it.
+    dyes, by_lut = {}, {}
+    for d in element.iter():
+        name, fluo, dlut = d.findtext("Name"), d.findtext("Fluochrome"), d.findtext("LutName")
+        if name and name.strip() and fluo is not None and dlut is not None:
+            dyes.setdefault(name.strip(), (fluo or "").strip())
+            by_lut.setdefault(dlut.strip().lower(), set()).add(name.strip())
+    taken = {ch.name for ch in entry.channels if ch.named}
+    for ch in entry.channels:
+        if not ch.named:
+            names = by_lut.get(ch.lut.lower(), set())
+            if len(names) == 1 and not names & taken and sum(c.lut.lower() == ch.lut.lower() for c in entry.channels) == 1:
+                ch.name, ch.named = names.pop(), True
+                taken.add(ch.name)
+        dye = dyes.get(ch.name) if ch.named else None
+        if dye and dye.lower() != ch.name.lower():
+            ch.dye = dye
 
     # The TIFFs: one <Frame File=...> per channel (and z plane). File names carry --cNN (and --zNN); otherwise channels vary fastest.
     frames = [f.get("File") for f in element.iter("Frame") if f.get("File")]
@@ -808,6 +830,7 @@ def _image_entry(name, path, element, image, base_dir, lif=None):
     entry.annotations = [a for a in (Annotation.from_element(an) for an in element.iter("Annotation")) if a is not None]
     mine = next((at for at in element.iter("Attachment") if at.get("Name") == VIEWER_ATTACHMENT), None)
     entry.flipped = entry.saved_flipped = mine is not None and mine.get("FlipX") == "1"
+    entry.rotated = entry.saved_rotated = mine is not None and mine.get("Rotate180") == "1"
     tile = next(element.iter("Tile"), None)
     try:
         if tile is not None:
@@ -1231,9 +1254,9 @@ READING_MODES = {"auto": "Automatic (based on file read speed)", "sharp": "Alway
 READING_NOTE = (f"Automatic: on slower drives or network shares (speed < {32 / LEVEL_BUDGET:.0f} MB/s), images at middle zoom levels\n"     # (as _measured_slow)
                 "may show at lower resolution to reduce disk reads. On fast drives, sharp pictures are read at once.\n"
                 "Always the sharpest: read as soon as more detail would show. Save reading: always the slower-connection way.")
-FLIP_NOTE = ("On: flip/mirror status is saved into the section's metadata (.xlif) in a custom field, so it goes\n"
+FLIP_NOTE = ("On: flip/mirror and 180° rotation status is saved into the section's metadata (.xlif) in a custom field, so it goes\n"
              "with the files to other computers. LAS X keeps this field when it saves (tested with LAS X 6.2), but doesn't read it.\n"
-             "Off: flip status is kept on this computer only, and LAS X's files are unmodified.")
+             "Off: flip and rotation status are kept on this computer only, and LAS X's files are unmodified.")
 BAD_NAME_CHARS = '\\/:*?"<>|'
 
 
@@ -1295,18 +1318,20 @@ def write_contrast(path, ranges, tops):
     return _write_text(path, new_text, bom)
 
 
-def write_flip(path, flipped):
-    """Write "Flip this section" into an image's .xlif, in this viewer's own attachment (LAS X has no flip of its own; it keeps an
-    attachment it doesn't know when it saves the file again):  <Attachment Name="JhouXlefViewer" Application="JhouXlefViewer"
-    Version="1.0" FlipX="1" />  (FlipX="0" when unflipped). Added before </Image> if the file has none. Checked to read back; backed up
-    (see _write_text)."""
+def write_flip(path, flipped, rotated=False):
+    """Write "Flip this section" and "Rotate this section 180°" into an image's .xlif, in this viewer's own attachment (LAS X has no
+    flip of its own; it keeps an attachment it doesn't know when it saves the file again):  <Attachment Name="JhouXlefViewer"
+    Application="JhouXlefViewer" Version="1.0" FlipX="1" Rotate180="0" />  ("0" when not). Added before </Image> if the file has
+    none. Checked to read back; backed up (see _write_text)."""
     text, bom = _read_text(path)
-    value = "1" if flipped else "0"
+    values = {"FlipX": "1" if flipped else "0", "Rotate180": "1" if rotated else "0"}
     m = re.search(rf'<Attachment\b[^>]*\bName="{VIEWER_ATTACHMENT}"[^>]*>', text)
     if m:
-        tag, n = re.subn(r'\bFlipX="[^"]*"', f'FlipX="{value}"', m.group(0))
-        if n == 0:
-            tag = tag[:-1].rstrip("/").rstrip() + f' FlipX="{value}"' + (" />" if tag.endswith("/>") else ">")
+        tag = m.group(0)
+        for attr, value in values.items():
+            tag, n = re.subn(rf'\b{attr}="[^"]*"', f'{attr}="{value}"', tag)
+            if n == 0:
+                tag = tag[:-1].rstrip("/").rstrip() + f' {attr}="{value}"' + (" />" if tag.endswith("/>") else ">")
         new_text = text[:m.start()] + tag + text[m.end():]
     else:
         close = re.search(r"([ \t]*)</Image>", text)
@@ -1314,9 +1339,11 @@ def write_flip(path, flipped):
             raise ValueError("no <Image> element in the file")
         nl = "\r\n" if "\r\n" in text else "\n"
         new_text = (text[:close.start()] + close.group(1) + "  " + f'<Attachment Name="{VIEWER_ATTACHMENT}" Application='
-                    f'"{VIEWER_ATTACHMENT}" Version="1.0" FlipX="{value}" />' + nl + text[close.start():])
-    back = [at.get("FlipX") for at in ET.fromstring(new_text.encode("utf-8")).iter("Attachment") if at.get("Name") == VIEWER_ATTACHMENT]
-    if back != [value]:
+                    f'"{VIEWER_ATTACHMENT}" Version="1.0"' + "".join(f' {a}="{v}"' for a, v in values.items()) + ' />' + nl
+                    + text[close.start():])
+    back = [{a: at.get(a) for a in values} for at in ET.fromstring(new_text.encode("utf-8")).iter("Attachment")
+            if at.get("Name") == VIEWER_ATTACHMENT]
+    if back != [values]:
         raise ValueError("the flip did not read back as written")
     return _write_text(path, new_text, bom)
 
@@ -3404,9 +3431,13 @@ class ThumbGrid(ttk.Frame):
 
     GAP, NAME_H = 8, 30
 
-    def __init__(self, parent, on_click, size=THUMB_SIZE, on_menu=None, on_drop=None, name_tip=None, is_unsaved=None):
+    def __init__(self, parent, on_click, size=THUMB_SIZE, on_menu=None, on_drop=None, name_tip=None, is_unsaved=None, orient=None):
         super().__init__(parent)
         self.on_click, self.size, self.on_menu, self.on_drop = on_click, size, on_menu, on_drop
+        # (orient(item): (mirrored left-right, mirrored top-bottom, badge text) for an image's thumbnail, as the view shows it: see
+        # XlefViewer._thumb_orient; the thumbnails themselves are made, and saved, as the image is)
+        self.orient = orient
+        self.drawn_orient = {}    # item -> the orient() its picture was last drawn with
         self.name_tip, self.tip = name_tip, None     # (name_tip(item): the note on an image's tile or a heading (its list item), or None)
         self.is_unsaved = is_unsaved  # (is_unsaved(item): a red * after its name or heading, as in the list: see place_unsaved_marks)
         self.press = None         # (a thumbnail pressed: (item, x, y, dragging yet); dropped on another: on_drop(item, target, after))
@@ -3416,7 +3447,7 @@ class ThumbGrid(ttk.Frame):
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.rows = []            # ("project", name, its list item), ("folder", name, its list item) or ("image", item, name, tag)
-        self.thumbs = {}          # item -> (PhotoImage or None, state)
+        self.thumbs = {}          # item -> (PhotoImage or None, state, PIL image or None, the orient() the PhotoImage was made with)
         self.dimmed = set()       # items whose names are dimmed (nothing of the image in memory yet: see set_dimmed)
         self.selected = None
         self.cols = 1
@@ -3501,9 +3532,34 @@ class ThumbGrid(ttk.Frame):
         c.create_rectangle(x0 + 4, y1 - 6, x0 + 4 + (x1 - x0 - 8) * frac, y1 - 3, fill="#3a8fff", outline="", tags=(f"prog:{item}",))
 
     def set_thumb(self, item, image, state):
-        photo = ImageTk.PhotoImage(image, master=self.canvas) if image is not None else None
-        self.thumbs[item] = (photo, state)
+        o = self._orient(item)
+        self.thumbs[item] = (self._photo(image, o), state, image, o)
         self._draw_picture(item)
+
+    def _orient(self, item):
+        return self.orient(item) if self.orient is not None else (False, False, "")
+
+    def _photo(self, image, o):
+        """The thumbnail as the view shows the image: mirrored and/or turned (a 180° turn is both mirrors)."""
+        if image is None:
+            return None
+        if o[0]:
+            image = image.transpose(Image.FLIP_LEFT_RIGHT)
+        if o[1]:
+            image = image.transpose(Image.FLIP_TOP_BOTTOM)
+        return ImageTk.PhotoImage(image, master=self.canvas)
+
+    def update_orientation(self, items=None):
+        """The flip or rotation of these images (default: all) may have changed: their pictures and badges redrawn if so."""
+        if items is None:
+            items = [row[1] for row in self.rows if row[0] == "image"]
+        for item in items:
+            o = self._orient(item)
+            t = self.thumbs.get(item)
+            if t is not None and t[3] != o:
+                self.thumbs[item] = (self._photo(t[2], o), t[1], t[2], o)
+            if self.drawn_orient.get(item) != o:
+                self._draw_picture(item)
 
     def set_selected(self, item):
         if item == self.selected:
@@ -3621,7 +3677,7 @@ class ThumbGrid(ttk.Frame):
         c.delete(f"pic:{item}")
         tags = ("tile", f"i:{item}", f"pic:{item}")
         cx, cy = x + (self.size + self.GAP) / 2, y + 4 + self.size / 2
-        photo, state = self.thumbs.get(item, (None, None))
+        photo, state = self.thumbs.get(item, (None, None))[:2]
         if photo is not None:
             c.create_image(cx, cy, image=photo, tags=tags)
         else:
@@ -3629,6 +3685,13 @@ class ThumbGrid(ttk.Frame):
             c.create_rectangle(cx - self.size / 2 + 4, cy - self.size / 2 + 4, cx + self.size / 2 - 4, cy + self.size / 2 - 4,
                                fill=PAL["placeholder"], outline="", tags=tags)
             c.create_text(cx, cy, text=text, justify=tk.CENTER, fill=PAL["link"] if state == "cloud" else PAL["placeholder_fg"], tags=tags)
+        o = self._orient(item)
+        self.drawn_orient[item] = o
+        if o[2]:                    # (flipped or rotated: a badge in the picture's bottom-left corner, so every tile keeps its size)
+            t = c.create_text(cx - self.size / 2 + 8, cy + self.size / 2 - 8, anchor=tk.SW, text=o[2], fill="#ffe080",
+                              font=("Segoe UI", 8, "bold"), tags=tags)
+            x0, y0, x1, y1 = c.bbox(t)
+            c.tag_lower(c.create_rectangle(x0 - 3, y0 - 1, x1 + 3, y1 + 1, fill="#202020", outline="#ffe080", tags=tags), t)
 
     def _item_at(self, event):
         for obj in self.canvas.find_overlapping(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y),
@@ -3910,7 +3973,7 @@ class XlefViewer:
         self.tree.bind("<Double-Button-1>", lambda e: self._cancel_rename_job(), add="+")
         self.thumb_grid = ThumbGrid(tree_frame, on_click=self.select_item, on_menu=lambda item, x, y: self._item_menu(item, x, y),
                                     on_drop=self._grid_drop,
-                                    name_tip=self._grid_tip_text, is_unsaved=self._is_unsaved)
+                                    name_tip=self._grid_tip_text, is_unsaved=self._is_unsaved, orient=self._thumb_orient)
         self.grid_marks_job = None   # (the grid's red *s redrawn once, after a change to what is unsaved: see _place_unsaved_mark)
         self.thumb_gen = 0           # bumped for each experiment opened: thumbnails made for an earlier one are dropped
         self.channels_on = {}        # channel names -> on/off: the switches last set for images of those channels (see show_entry)
@@ -3990,6 +4053,13 @@ class XlefViewer:
                                      "(Save writes it into the section's .xlif, so it goes with the files; or, see Settings, it is kept on this "
                                      "computer). With \"Flip all "
                                      "sections\" ticked too, it is shown unflipped. Only the view is flipped, not the image.")
+        self.rotate_one = tk.BooleanVar(value=False)
+        self.rotate_one_check = ttk.Checkbutton(side, text="Rotate this section 180°", variable=self.rotate_one,
+                                                command=lambda: self.on_flip_one_toggle("rotated"), state=tk.DISABLED)
+        self.rotate_one_check.pack(anchor=tk.W, pady=(0, 4))
+        Tooltip(self.rotate_one_check, "Show this section turned upside down (top for bottom and left for right, with its annotations), "
+                                       "e.g. one placed on the slide the other way round. Saved like \"Flip this section\" (see "
+                                       "Settings). Only the view is rotated, not the image.")
         mid = ttk.Frame(side)
         mid.pack(fill=tk.BOTH, expand=True)
         # A z-stack's plane slider, left of the channels' sliders: vertical, plane 1 at the top, with a button at each end to move by one
@@ -4173,8 +4243,8 @@ class XlefViewer:
         cw, ch = self.canvas_size()
         ix0, iy0, ix1, iy1 = self._view_corners()
         sx = lambda x: round(self._fx((x - self.cx) * self.scale + cw / 2))
-        sy = lambda y: round((y - self.cy) * self.scale + ch / 2)
-        top, bottom = max(0, sy(0)), min(ch, sy(e.height))
+        sy = lambda y: round(self._fy((y - self.cy) * self.scale + ch / 2))
+        top, bottom = max(0, min(sy(0), sy(e.height))), min(ch, max(sy(0), sy(e.height)))
         left, right = max(0, min(sx(0), sx(e.width))), min(cw, max(sx(0), sx(e.width)))
         for x in range(max(0, int(np.ceil(ix0))), min(e.width, int(ix1)) + 1):
             self.canvas.create_line(sx(x), top, sx(x), bottom, fill=PIXEL_GRID_COLOR, tags="pixelgrid")
@@ -4240,7 +4310,7 @@ class XlefViewer:
             self._save_settings()
         ttk.Checkbutton(box, text="Also rename the files and folders on disk", variable=on_disk, command=set_on_disk).pack(anchor=tk.W)
         ttk.Label(box, text=RENAME_NOTE, style="Muted.TLabel", justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
-        box = ttk.LabelFrame(body, text="Section flip status", padding=(10, 6))
+        box = ttk.LabelFrame(body, text="Section flip and rotation status", padding=(10, 6))
         box.pack(fill=tk.X, pady=(10, 0))
         in_files = tk.BooleanVar(dlg, self._flip_in_files())
         ttk.Checkbutton(box, text="Saved in a custom field of LAS X's files", variable=in_files,
@@ -5160,7 +5230,8 @@ class XlefViewer:
                 tags = ("cloud_dim",) if cloud else ("dim",)
             self.tree.item(item, tags=tags)
             self.thumb_grid.set_dimmed(item, tags in (("cloud_dim",), ("dim",)))
-        text = obj.name + ("  ☁" if item in self.item_cloud else "")
+        state = self._orientation_words(obj) if item in self.entries else ""
+        text = obj.name + (f"  ({state})" if state else "") + ("  ☁" if item in self.item_cloud else "")
         if item in self.preload_progress:
             text += f"  {self.preload_progress[item]}% preview"
         elif self.open_progress is not None and self.open_progress[0] == item:
@@ -5171,6 +5242,8 @@ class XlefViewer:
         self.tree.item(item, text=text)
         self._place_list_bar(item)
         self._place_unsaved_mark(item)
+        if item in self.entries:
+            self.thumb_grid.update_orientation([item])
 
     def _list_bar_fraction(self, item):
         """How far the bar under an image's name is (0-1) and its color: its preview being read (blue), else its full resolution
@@ -5245,7 +5318,7 @@ class XlefViewer:
         if getattr(obj, "annotations_changed", False):
             what.append("annotations")
         if isinstance(obj, ImageEntry):
-            what += ["color maps"] * obj.luts_changed + ["contrast"] * obj.contrast_changed + ["flip"] * obj.flip_changed
+            what += ["color maps"] * obj.luts_changed + ["contrast"] * obj.contrast_changed + ["flip"] * (obj.flipped != obj.saved_flipped) + ["rotation"] * (obj.rotated != obj.saved_rotated)
         if getattr(obj, "order_changed", False):
             what.append("the order of what it holds")
         return what
@@ -5664,6 +5737,8 @@ class XlefViewer:
         self.photo = None
         self.flip_one.set(False)
         self.flip_one_check.configure(state=tk.DISABLED)        # (no section shown)
+        self.rotate_one.set(False)
+        self.rotate_one_check.configure(state=tk.DISABLED)
         self.last_view_rgb = self.base_view = None
         self.shrunk.clear()
         self.selected = self.ann_drag = self.hover_ann = None
@@ -5757,6 +5832,8 @@ class XlefViewer:
         self.ch_settings = [{"on": on, "lo": c.black, "hi": c.white} for c, on in zip(entry.channels, shown)]
         self.flip_one.set(self._section_flipped(entry))
         self.flip_one_check.configure(state=tk.NORMAL)
+        self.rotate_one.set(self._section_flipped(entry, "rotated"))
+        self.rotate_one_check.configure(state=tk.NORMAL)
         self._build_channel_controls()
         self._update_annotations_check()
         if entry.nz > 1:
@@ -5913,15 +5990,16 @@ class XlefViewer:
             swatch.bind("<Button-1>", lambda e, i=i: self.toggle_channel(i))
             for ev in RIGHT_CLICKS:
                 swatch.bind(ev, lambda e, i=i: self.pick_channel_color(i))
-            tip = ((ch.name + "\n" if ch.named else "") + f"Click to show or hide this channel (or press {i + 1}).\n"
-                   "Right-click to change its color.")
-            Tooltip(swatch, tip)
+            name = ch.name + (f" ({ch.dye})" if ch.dye else "") + "\n" if ch.named else ""
+            Tooltip(swatch, name + f"Click to show or hide this channel (or press {i + 1}).\nRight-click to change its color.")
             slider = RangeSlider(f, ch.max_value, st["lo"], st["hi"], color, command=lambda lo, hi, i=i: self._set_lo_hi(i, lo, hi),
                                  vertical=True)
             slider.pack(fill=tk.Y, expand=True)
             for ev in RIGHT_CLICKS:
                 slider.bind(ev, lambda e, i=i: self.pick_channel_color(i))
             slider.bind("<Double-Button-1>", lambda e, i=i, s=slider: (s.undo_press(), self.pick_channel_color(i)))
+            Tooltip(slider, name + "Right-click to change its color.", at_pointer=True)  # (as the swatch's, less showing and hiding; at the
+                                                                                         # pointer: the slider is tall)
             swatch.color = color
             swatch.keep_colors = True       # (styled by _show_channel_state)
             self.ch_widgets.append((on, slider, swatch))
@@ -6144,7 +6222,7 @@ class XlefViewer:
         sx = cw / 2 if sx is None else sx
         sy = ch / 2 if sy is None else sy
         ix, iy = self.screen_to_image(sx, sy)
-        sx = self._fx(sx)
+        sx, sy = self._fx(sx), self._fy(sy)
         before = (self.scale, self.cx, self.cy)
         self.scale = scale
         self.clamp_view()
@@ -6158,12 +6236,16 @@ class XlefViewer:
 
     def screen_to_image(self, sx, sy):
         cw, ch = self.canvas_size()
-        sx = self._fx(sx)
+        sx, sy = self._fx(sx), self._fy(sy)
         return self.cx + (sx - cw / 2) / self.scale, self.cy + (sy - ch / 2) / self.scale
 
     def _fx(self, x):
         """Flip left-right: canvas x <-> where it would be unflipped (the view is worked out unflipped, and mirrored when drawn)."""
         return self.canvas_size()[0] - x if self._flipped() else x
+
+    def _fy(self, y):
+        """Rotated 180°: canvas y <-> where it would be unrotated (as _fx, top for bottom)."""
+        return self.canvas_size()[1] - y if self._flipped_y() else y
 
     def _view_corners(self):
         """The image points at the canvas's top-left and bottom-right corners, as if unflipped (ix0 <= ix1 either way)."""
@@ -6173,8 +6255,34 @@ class XlefViewer:
 
     def on_flip_toggle(self):
         self.settings["flip_left_right"] = self.flip_x.get()
+        self.thumb_grid.update_orientation()           # (every thumbnail: mirrored as its section is)
         if self.img:
             self.redraw()
+
+    def _orientation(self, entry):
+        """(flipped, rotated 180°) of a section as it is shown when opened (see _section_flipped), without changing anything: this
+        computer's note if there is one (kept, or not saved into the file yet), else the entry's."""
+        out = []
+        for kind in ("flipped", "rotated"):
+            note = self._flip_note(entry, kind)
+            out.append(bool(getattr(entry, kind) if note is None else note))
+        return tuple(out)
+
+    def _orientation_words(self, entry, long=False):
+        """A section's own flip and rotation, as words after its name ("flipped", "rotated 180°", both), or "" for neither."""
+        flipped, rotated = self._orientation(entry)
+        words = ["flipped" + (" left for right" if long else "")] * flipped + ["rotated 180°"] * rotated
+        return (" and " if long else ", ").join(words)
+
+    def _thumb_orient(self, item):
+        """For the thumbnail grid: (mirrored left-right, mirrored top-bottom, badge) of an image's thumbnail, as the view shows it
+        ("Flip all sections" included; the badge is the section's own flip and rotation only)."""
+        e = self.entries.get(item)
+        if e is None:
+            return False, False, ""
+        flipped, rotated = self._orientation(e)
+        badge = ", ".join(["flipped"] * flipped + ["180°"] * rotated)
+        return bool(self.flip_x.get()) ^ flipped ^ rotated, rotated, badge
 
     @staticmethod
     def _flip_key(entry):
@@ -6184,50 +6292,54 @@ class XlefViewer:
         """Settings: "Flip this section" is saved into the section's .xlif (see write_flip), not kept on this computer."""
         return self.settings.get("flip_in_files", True)
 
-    def _flip_note(self, entry):
-        """This computer's note of the section's flip, by its .xlif's path (in the settings: "flipped_sections", "unflipped_sections"):
-        True, False, or None (none). Kept while "Flip this section" isn't saved into the files, or by an earlier version."""
+    def _flip_note(self, entry, kind="flipped"):
+        """This computer's note of the section's flip (kind "flipped") or 180° rotation ("rotated"), by its .xlif's path (in the
+        settings: "flipped_sections" / "unflipped_sections", "rotated_sections" / "unrotated_sections"): True, False, or None (none).
+        Kept while they aren't saved into the files, or by an earlier version."""
         key = self._flip_key(entry)
-        return (True if key in self.settings.get("flipped_sections", []) else
-                False if key in self.settings.get("unflipped_sections", []) else None)
+        return (True if key in self.settings.get(f"{kind}_sections", []) else
+                False if key in self.settings.get(f"un{kind}_sections", []) else None)
 
-    def _set_flip_note(self, entry, flipped):
-        """Note the section's flip on this computer (None: forget the note)."""
+    def _set_flip_note(self, entry, on, kind="flipped"):
+        """Note the section's flip (or rotation, see _flip_note) on this computer (None: forget the note)."""
         key = self._flip_key(entry)
-        for name in ("flipped_sections", "unflipped_sections"):
+        for name in (f"{kind}_sections", f"un{kind}_sections"):
             if key in self.settings.get(name, []):
                 self.settings[name] = [k for k in self.settings[name] if k != key]
-        if flipped is not None:
-            self.settings.setdefault("flipped_sections" if flipped else "unflipped_sections", []).append(key)
+        if on is not None:
+            self.settings.setdefault(f"{kind}_sections" if on else f"un{kind}_sections", []).append(key)
 
-    def _section_flipped(self, entry):
-        """Whether the section is shown flipped. Saved into the files (the setting): as in its .xlif, or as changed here and not saved
-        yet; a note on this computer (from an earlier version, or from when the setting was off) counts as such a change, until Save
-        writes it into the file. Else: this computer's note, or, without one, the .xlif's."""
-        note = self._flip_note(entry)
+    def _section_flipped(self, entry, kind="flipped"):
+        """Whether the section is shown flipped (kind "flipped") or rotated 180° ("rotated"). Saved into the files (the setting): as in
+        its .xlif, or as changed here and not saved yet; a note on this computer (from an earlier version, or from when the setting was
+        off) counts as such a change, until Save writes it into the file. Else: this computer's note, or, without one, the .xlif's."""
+        note = self._flip_note(entry, kind)
+        now, saved = getattr(entry, kind), getattr(entry, "saved_" + kind)
         if not self._flip_in_files():
-            return entry.flipped if note is None else note
-        if note is not None and note == entry.saved_flipped:
-            self._set_flip_note(entry, None)        # (the file says so already)
-        elif note is not None and note != entry.flipped:
-            entry.flipped = note
+            return now if note is None else note
+        if note is not None and note == saved:
+            self._set_flip_note(entry, None, kind)        # (the file says so already)
+        elif note is not None and note != now:
+            setattr(entry, kind, note)
             self._label_item(self._item_of(entry))
             self._update_annotations_check()
-        return entry.flipped
+        return getattr(entry, kind)
 
-    def on_flip_one_toggle(self):
-        """"Flip this section": written into its .xlif by Save (until then, marked unsaved), or, with that setting off, noted on this
-        computer at once."""
+    def on_flip_one_toggle(self, kind="flipped"):
+        """"Flip this section" (or "Rotate this section 180°", kind "rotated"): written into its .xlif by Save (until then, marked
+        unsaved), or, with that setting off, noted on this computer at once."""
         if not self.img:
             return
         e = self.img.entry
+        on = (self.flip_one if kind == "flipped" else self.rotate_one).get()
         if self._flip_in_files():
-            e.flipped = self.flip_one.get()
-            self._set_flip_note(e, None)
+            setattr(e, kind, on)
+            self._set_flip_note(e, None, kind)
             self._label_item(self._item_of(e))
             self._update_annotations_check()
         else:
-            self._set_flip_note(e, None if self.flip_one.get() == e.flipped else self.flip_one.get())
+            self._set_flip_note(e, None if on == getattr(e, kind) else on, kind)
+            self._label_item(self._item_of(e))
         self.redraw()
 
     def set_flip_in_files(self, on):
@@ -6237,18 +6349,27 @@ class XlefViewer:
         if not on:
             for item, e in self.entries.items():
                 if e.flip_changed:
-                    self._set_flip_note(e, e.flipped)
-                    e.flipped = e.saved_flipped
+                    for kind in ("flipped", "rotated"):
+                        if getattr(e, kind) != getattr(e, "saved_" + kind):
+                            self._set_flip_note(e, getattr(e, kind), kind)
+                            setattr(e, kind, getattr(e, "saved_" + kind))
                     self._label_item(item)
         self._save_settings()
         if self.img:
             self.flip_one.set(self._section_flipped(self.img.entry))
+            self.rotate_one.set(self._section_flipped(self.img.entry, "rotated"))
             self.redraw()
         self._update_annotations_check()
 
     def _flipped(self):
-        """The view is mirrored: "Flip all sections" or "Flip this section", not both (both flip it back)."""
-        return self.flip_x.get() != (self.img is not None and self.flip_one.get())
+        """The view is mirrored left for right: by "Flip all sections", "Flip this section" and "Rotate this section 180°" (a 180°
+        turn is a left-right mirror and a top-bottom one), an odd number of them (two flip it back)."""
+        shown = self.img is not None
+        return bool(self.flip_x.get()) ^ (shown and bool(self.flip_one.get())) ^ (shown and bool(self.rotate_one.get()))
+
+    def _flipped_y(self):
+        """The view is mirrored top for bottom: "Rotate this section 180°" (with the left-right mirror of _flipped)."""
+        return self.img is not None and bool(self.rotate_one.get())
 
     def show_message(self, text):
         """Words in the middle of the image area ("Loading...", ...) until a picture replaces them (any drawing clears the canvas)."""
@@ -6436,6 +6557,9 @@ class XlefViewer:
             t0 = self._lap(times, "scale", t0)
             if self._flipped():
                 frame = frame.transpose(Image.FLIP_LEFT_RIGHT)
+            if self._flipped_y():
+                frame = frame.transpose(Image.FLIP_TOP_BOTTOM)
+            if self._flipped() or self._flipped_y():
                 t0 = self._lap(times, "flip", t0)
             frames.append(frame)
         photos = self.glide_photos
@@ -6595,7 +6719,7 @@ class XlefViewer:
         x0, y0, cx0, cy0 = self.drag
         self._moving()
         self.cx = cx0 - (event.x - x0) / self.scale * (-1 if self._flipped() else 1)
-        self.cy = cy0 - (event.y - y0) / self.scale
+        self.cy = cy0 - (event.y - y0) / self.scale * (-1 if self._flipped_y() else 1)
         self.clamp_view()
         self.redraw(preview_only=True)
 
@@ -7753,6 +7877,9 @@ class XlefViewer:
         if self._flipped():
             ims = [im.transpose(Image.FLIP_LEFT_RIGHT) for im in ims]
             left = self.canvas_size()[0] - left - ims[0].width
+        if self._flipped_y():                       # (rotated 180°: mirrored top for bottom too)
+            ims = [im.transpose(Image.FLIP_TOP_BOTTOM) for im in ims]
+            top = self.canvas_size()[1] - top - ims[0].height
         self.fast_shown, self.fast_now = self.fast_now, False
         self.last_view = (ims, left, top, self.canvas_size(), self.panel_cols)
         self.last_view_rgb = ims[0]
@@ -7846,7 +7973,7 @@ class XlefViewer:
         e = self.img.entry
         cw, ch = self.canvas_size()
         px, py = e.width / 2 + p[0] * 1e6 / e.pixel_um, e.height / 2 + p[1] * 1e6 / e.pixel_um
-        return self._fx((px - self.cx) * self.scale + cw / 2), (py - self.cy) * self.scale + ch / 2
+        return self._fx((px - self.cx) * self.scale + cw / 2), self._fy((py - self.cy) * self.scale + ch / 2)
 
     def screen_to_m(self, sx, sy):
         e = self.img.entry
@@ -7886,7 +8013,7 @@ class XlefViewer:
             pts = [self.m_to_screen(p) for p in a.points()]
             col = a.color
             if a.kind == "text":
-                t = c.create_text(*pts[0], text=a.text, fill=col, font=a.font, anchor=tk.NE if self._flipped() else tk.NW,
+                t = c.create_text(*pts[0], text=a.text, fill=col, font=a.font, anchor=("s" if self._flipped_y() else "n") + ("e" if self._flipped() else "w"),
                                   tags=tags)
                 if a.attrs.get("showBorder") == "True":
                     c.create_rectangle(*c.bbox(t), outline=col, tags=tags)
@@ -8475,7 +8602,7 @@ class XlefViewer:
             what = ([f"the annotations of {len(notes)} image{'s' * (len(notes) != 1)}"] if notes else []) + \
                    ([f"the color maps of {len(maps)} image{'s' * (len(maps) != 1)}"] if maps else []) + \
                    ([f"the contrast of {len(ranges)} image{'s' * (len(ranges) != 1)}"] if ranges else []) + \
-                   ([f"the flip of {len(flips)} image{'s' * (len(flips) != 1)}"] if flips else []) + \
+                   ([f"the flip or rotation of {len(flips)} image{'s' * (len(flips) != 1)}"] if flips else []) + \
                    ([f"{len(renames)} rename{'s' * (len(renames) != 1)}" + (" (files and folders on disk too)" if on_disk else "")]
                     if renames else []) + (["the new order of the list"] if reordered else [])
             extra = ((f"\n\n{n_away} image{'s' * (n_away != 1)} dragged into another project move{'s' * (n_away == 1)} there, files "
@@ -8513,9 +8640,10 @@ class XlefViewer:
                 failed.append(f"contrast of {e.name}: {err}")
         for item, e in flips:
             try:
-                write_flip(e.xlif_path, e.flipped)
-                e.saved_flipped = e.flipped
+                write_flip(e.xlif_path, e.flipped, e.rotated)
+                e.saved_flipped, e.saved_rotated = e.flipped, e.rotated
                 self._set_flip_note(e, None)
+                self._set_flip_note(e, None, "rotated")
             except Exception as err:
                 failed.append(f"flip of {e.name}: {err}")
         touched, binned, aside = set(), 0, 0
@@ -8599,8 +8727,10 @@ class XlefViewer:
         x, y, w, h = self.tree.bbox(item)
         font = tkfont.nametofont("TkDefaultFont")
         start = x + 20 * (self._tree_depth(item) + 1)            # (where the name starts: the tree's indent per level, the open mark)
-        end = start + font.measure(self.entries[item].name) + (font.measure("  ☁") if item in self.item_cloud else 0)
-        if not start - 8 <= event.x <= end + 8:                  # (anywhere on the name, or its cloud)
+        state = self._orientation_words(self.entries[item])
+        end = (start + font.measure(self.entries[item].name) + (font.measure(f"  ({state})") if state else 0)
+               + (font.measure("  ☁") if item in self.item_cloud else 0))
+        if not start - 8 <= event.x <= end + 8:                  # (anywhere on the name, its flip or rotation, or its cloud)
             self._hide_tree_tip()
             return
         if self.tree_tip is None:
@@ -8651,7 +8781,8 @@ class XlefViewer:
         """The note on an image's name in the list: its name, its size and resolution (and layers, for a z-stack), whether it has unsaved
         changes, and (online-only) what its cloud means."""
         e = self.entries[item]
-        lines = [e.name]
+        state = self._orientation_words(e, long=True)
+        lines = [e.name] + ([f"Shown {state}"] if state else []) + [""]         # (a blank line after the name)
         if e.problem:
             lines.append(e.problem)
         elif e.width:

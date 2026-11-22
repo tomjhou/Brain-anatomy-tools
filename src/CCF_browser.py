@@ -322,7 +322,66 @@ def _make_downloads_resumable():
         print(f"Resumable downloads are not available ({e}).")
 
 
-def import_project_cache():
+def seconds_text(seconds):
+    """'0:42', or '1:05:09' from an hour up."""
+    seconds = max(0, int(round(seconds)))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
+class LoadProgress:
+    """What the atlas load is doing, for the note over the picture: the worker thread says each stage as it begins (begin), and the window reads it (lines,
+    fraction) about ten times a second. A stage that is a download of a file of known size has a bar that fills and an estimate of the time left (from the
+    speed so far); any other stage has a bar that moves back and forth (it is working, no one can say how long), and only the time that has passed."""
+
+    def __init__(self):
+        self.started = self.stage_started = time.monotonic()
+        self.stage = "Starting..."
+        self.total = None            # bytes of the file being downloaded, or None
+        self.bytes_fn = None         # () -> bytes of it on disk so far
+        self.note_fn = None          # () -> a line about what the download is doing when it is not simply downloading ("waiting for the network..."), or None
+
+    def begin(self, stage, total=None, bytes_fn=None, note_fn=None):
+        self.stage, self.total, self.bytes_fn, self.note_fn = stage, total, bytes_fn, note_fn
+        self.stage_started = time.monotonic()
+
+    def done_bytes(self):
+        try:
+            return int(self.bytes_fn()) if self.bytes_fn else None
+        except Exception:
+            return None
+
+    def fraction(self):
+        """0..1 for a download of known size, else None."""
+        done = self.done_bytes()
+        if self.total and done is not None:
+            return min(1.0, done / self.total)
+        return None
+
+    def lines(self):
+        """(the stage, and what the download has done if it is one; the time line)"""
+        now = time.monotonic()
+        elapsed = now - self.started
+        stage = self.stage
+        time_line = f"Elapsed {seconds_text(elapsed)}"
+        done = self.done_bytes()
+        try:
+            note = self.note_fn() if self.note_fn else None
+        except Exception:
+            note = None
+        if self.total and done is not None:
+            stage += f"  ({done / 1e6:.1f} of {self.total / 1e6:.1f} MB)"
+            spent = now - self.stage_started
+            if done > 0 and spent >= 1.0 and done < self.total:
+                left = (self.total - done) / (done / spent)
+                time_line += f"   about {seconds_text(left)} left"
+        if note:
+            stage += chr(10) + note
+        return stage, time_line
+
+
+def import_project_cache(say=None):
     """AbcProjectCache from the Allen Institute's abc_atlas_access, installing that first if it is missing (it comes from GitHub, not PyPI).
     Raises ImportError, saying why, if it cannot be had; only the first failure tries to install."""
     global _abc_atlas_access_problem
@@ -333,17 +392,23 @@ def import_project_cache():
     except ImportError:
         pass
     if _abc_atlas_access_problem is None and not getattr(sys, 'frozen', False):
+        if say:
+            say("Installing the atlas download library (first time only: a minute or two)")
         print(f"Installing abc_atlas_access (the Allen Institute's atlas download library) into {sys.executable}...", flush=True)
         import keep_awake
-        returncode, _tail = keep_awake.run_pip(keep_awake.pip_install_command([ABC_ATLAS_ACCESS]), reason="installing abc_atlas_access")
+        returncode, tail = keep_awake.run_pip(keep_awake.pip_install_command([ABC_ATLAS_ACCESS]), reason="installing abc_atlas_access")
         importlib.invalidate_caches()
         try:
             from abc_atlas_access.abc_atlas_cache.abc_project_cache import AbcProjectCache
             _make_downloads_resumable()
             return AbcProjectCache
         except ImportError:
-            _abc_atlas_access_problem = (f"abc_atlas_access could not be installed (pip said {returncode}); install it by hand with  "
-                                         f"python -m pip install \"{ABC_ATLAS_ACCESS}\"")
+            said = chr(10).join(line.strip() for line in (tail or []) if line.strip() and not line.startswith("[notice]"))[-700:]       # (pip's own last words: why it failed)
+            hint = (chr(10) + "(Certificate or SSL errors usually mean the network inspects secure connections: ask its administrator, or try another network.)"
+                    if any(w in said.lower() for w in ("ssl", "certificate")) else "")
+            nl = chr(10)
+            _abc_atlas_access_problem = (f"abc_atlas_access could not be installed (pip said {returncode}).{nl}{nl}pip's last lines:{nl}{said or '(nothing)'}{hint}{nl}{nl}"
+                                         f"To install it by hand:  python -m pip install \"{ABC_ATLAS_ACCESS}\"")
     raise ImportError(_abc_atlas_access_problem or 'abc_atlas_access is not installed')
 
 
@@ -361,22 +426,41 @@ def volume_status(base):
         return (matches[0] if matches else None), None, bool(matches)
 
 
-def load_atlas(base, download):
+def load_atlas(base, download, progress=None):
     """(volume [AP, DV, ML] uint16, region table or None, colour lookup (n, 3) uint8). Blocking: run it on a thread.
-    `download` says the volume may be fetched if it is missing."""
+    `download` says the volume may be fetched if it is missing. `progress` (a LoadProgress) is told each stage as it begins."""
+    stage = progress.begin if progress is not None else (lambda *a, **k: None)
     path, _size, present = volume_status(base)
     cache = None
     if not present:
         if not download:
             raise FileNotFoundError("the CCF annotation volume is not in the atlas cache")
-        AbcProjectCache = import_project_cache()
+        AbcProjectCache = import_project_cache(say=stage)
+        stage("Getting the list of atlas files")
         cache = AbcProjectCache.from_cache_dir(base)
+        total = where = None
+        try:
+            attributes = cache.cache._manifest.get_file_attributes(directory=VOLUME_DIRECTORY, file_name=VOLUME_FILE_NAME)
+            total, where = int(attributes.file_size), Path(attributes.local_path)
+        except Exception:
+            pass
+        bytes_fn = note_fn = None
+        if where is not None:
+            try:
+                import resumable_download
+                bytes_fn = lambda: resumable_download.downloaded_bytes(where)
+                note_fn = lambda: resumable_download.status_note(where)
+            except Exception:
+                total = None
+        stage("Downloading the CCF volume", total=total, bytes_fn=bytes_fn, note_fn=note_fn)
         path = Path(cache.get_data_path(directory=VOLUME_DIRECTORY, file_name=VOLUME_FILE_NAME))
+    stage("Reading the volume")
     volume = np.ascontiguousarray(read_nifti_volume(path))
     if tuple(volume.shape) != CCF_SHAPE:   # not VOLUME_SHAPE: that follows the atlas on screen
         raise ValueError(f"unexpected annotation volume shape {volume.shape}")
 
     table = None
+    stage("Getting the region names and colors")
     try:
         AbcProjectCache = import_project_cache()
         if cache is None:
@@ -1471,6 +1555,7 @@ class CCFBrowser:
         self.work = queue.Queue()
         self.busy_label, self.progress_text = '', ''
         self.busy_overlay = ''         # "Loading CSV…" / "Loading Atlas…", drawn over the middle of the picture while it lasts
+        self.load_progress = None      # a LoadProgress while the atlas loads: the note then also has the stage, a bar and the time
         self.autoload = []             # (slot, path) from the last session, loaded one after another
         self.build_ui()
         self.info = InfoWindow(self)
@@ -2585,12 +2670,41 @@ class CCFBrowser:
         width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
         if width < 10 or height < 10:
             return
+        progress = self.load_progress
+        if progress is not None:
+            self.draw_load_progress(progress, width, height)
+            return
         item = self.canvas.create_text(width // 2, height // 2, text=self.busy_overlay, fill='white', tags='busy',
                                        font=('Segoe UI', 22, 'bold'))
         x0, y0, x1, y1 = self.canvas.bbox(item)
         box = self.canvas.create_rectangle(x0 - 24, y0 - 14, x1 + 24, y1 + 14, fill='#202020', outline='#808080',
                                            tags='busy')
         self.canvas.tag_raise(item, box)
+
+    def draw_load_progress(self, progress, width, height):
+        """The note while the atlas loads: its title, the stage, a bar (filling for a download of known size, else moving back and forth) and the time."""
+        cx, cy = width // 2, height // 2
+        bar_w = min(420, max(200, width - 120))
+        title = self.canvas.create_text(cx, cy - 42, text=self.busy_overlay, fill='white', tags='busy', font=('Segoe UI', 20, 'bold'))
+        stage, time_line = progress.lines()
+        stage_item = self.canvas.create_text(cx, cy - 6, text=stage, fill='white', tags='busy', font=('Segoe UI', 11), width=bar_w)
+        top = cy + 18
+        self.canvas.create_rectangle(cx - bar_w // 2, top, cx + bar_w // 2, top + 14, fill='#404040', outline='#808080', tags='busy')
+        fraction = progress.fraction()
+        if fraction is not None:
+            if fraction > 0:
+                self.canvas.create_rectangle(cx - bar_w // 2, top, cx - bar_w // 2 + int(bar_w * fraction), top + 14, fill='#4a90e2', outline='', tags='busy')
+        else:
+            width_of_block = bar_w // 4
+            phase = (time.monotonic() * 0.8) % 2.0                 # (to and fro: a bar that cannot say how far it has got, only that it is going)
+            phase = phase if phase <= 1.0 else 2.0 - phase
+            left = cx - bar_w // 2 + int((bar_w - width_of_block) * phase)
+            self.canvas.create_rectangle(left, top, left + width_of_block, top + 14, fill='#4a90e2', outline='', tags='busy')
+        time_item = self.canvas.create_text(cx, top + 34, text=time_line, fill='#d0d0d0', tags='busy', font=('Segoe UI', 11))
+        x0, y0, x1, y1 = self.canvas.bbox('busy')
+        box = self.canvas.create_rectangle(min(x0, cx - bar_w // 2) - 24, y0 - 14, max(x1, cx + bar_w // 2) + 24, y1 + 14, fill='#202020', outline='#808080',
+                                           tags='busy')
+        self.canvas.tag_lower(box, title)                            # (under all the rest of the note, over the picture)
 
     def run_in_thread(self, label, function, on_done, overlay=''):
         """Run `function()` on a thread; `on_done(result, error)` runs on the main thread when it finishes. `overlay`,
@@ -2615,6 +2729,7 @@ class CCFBrowser:
                 on_done, result, error = self.work.get_nowait()
                 self.busy_label = ''
                 self.busy_overlay = ''
+                self.load_progress = None
                 self.update_cursors()
                 self.message.configure(text="")
                 on_done(result, error)
@@ -2623,6 +2738,8 @@ class CCFBrowser:
         except queue.Empty:
             if self.busy_label:
                 self.message.configure(text=f"{self.busy_label} {self.progress_text}")
+                if self.load_progress is not None:
+                    self.draw_busy_overlay()                 # (the stage, bar and times move on)
         self.root.after(100, self.poll_work)
 
     # ---- the atlas
@@ -2639,8 +2756,9 @@ class CCFBrowser:
             return
         path, size, present = volume_status(base)
         download = not present          # (it comes with the MERFISH browser's first download; else, a few MB, fetched without asking)
+        self.load_progress = progress = LoadProgress()
         self.run_in_thread("Loading the CCF atlas…" if present else "Downloading the CCF volume…",
-                           lambda: load_atlas(base, download), self.atlas_ready, overlay="Loading Atlas…")
+                           lambda: load_atlas(base, download, progress), self.atlas_ready, overlay="Loading Atlas…")
 
     def atlas_ready(self, result, error):
         if error is not None:

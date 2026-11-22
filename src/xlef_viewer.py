@@ -3446,7 +3446,8 @@ class ThumbGrid(ttk.Frame):
         self.canvas.configure(yscrollcommand=sb.set)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.rows = []            # ("project", name, its list item), ("folder", name, its list item) or ("image", item, name, tag)
+        self.rows = []            # ("project", name, its list item), ("folder", name, its list item), ("image", item, name, tag), or
+                                  # ("loading", text, its project's list item): a tile with `text`, under a project still being read
         self.thumbs = {}          # item -> (PhotoImage or None, state, PIL image or None, the orient() the PhotoImage was made with)
         self.dimmed = set()       # items whose names are dimmed (nothing of the image in memory yet: see set_dimmed)
         self.selected = None
@@ -3612,6 +3613,17 @@ class ThumbGrid(ttk.Frame):
                                   width=max(width - 2 * self.GAP, 40), tags=(f"proj:{row[2]}",))
                 y = c.bbox(t)[3] + 8
                 continue
+            if row[0] == "loading":                 # (a placeholder tile, with no picture: the project is still being read)
+                x = x0 + col * (tile_w + self.GAP)
+                self.tile_y[("loading", row[2])] = y              # (for see: scrolled to while it is read)
+                c.create_rectangle(x, y, x + tile_w, y + tile_h, fill=PAL["placeholder"], outline=PAL["tile_line"], width=2,
+                                   dash=(4, 3), tags=(f"loading:{row[2]}",))
+                c.create_text(x + tile_w / 2, y + tile_h / 2, text=row[1], fill=PAL["placeholder_fg"], font=("Segoe UI", 10, "italic"),
+                              tags=(f"loading:{row[2]}",))
+                col += 1
+                if col == self.cols:
+                    y, col = y + tile_h + self.GAP, 0
+                continue
             if row[0] == "folder":
                 if col:
                     y, col = y + tile_h + self.GAP, 0
@@ -3646,6 +3658,8 @@ class ThumbGrid(ttk.Frame):
         if self.is_unsaved is None:
             return
         for row in self.rows:
+            if row[0] == "loading":
+                continue
             item = row[1] if row[0] == "image" else row[2]
             tag = f"name:{item}" if row[0] == "image" else f"proj:{item}" if row[0] == "project" else f"fold:{item}"
             t = c.find_withtag(tag)
@@ -3867,6 +3881,7 @@ class XlefViewer:
         self.prefetch_full = None    # the view whose layers did not all fit in the memory for kept views (not tried again until it changes)
         self.download_queue = []     # list items whose full resolution is to be downloaded from OneDrive (see download_full_res)
         self.download_progress = {}  # list item -> "waiting" or percent, while it is queued or downloading
+        self.loading_rows = {}       # project -> its "Loading..." row in the list, while its experiment is read (see open_xlef)
         self.download_thread = self.download_stop = None
         self.pyramid_job = self.pyramid_thread = None       # the pyramids being made, if any (see make_pyramids)
         self.canvas_message = ""
@@ -4513,6 +4528,7 @@ class XlefViewer:
         self.tree.tag_configure("dim", foreground=PAL["dim"])             # (an image with nothing of it in memory yet)
         self.tree.tag_configure("cloud_dim", foreground=PAL["link_dim"])
         self.tree.tag_configure("project", font=("Segoe UI", 10, "bold"))
+        self.tree.tag_configure("loading", foreground=PAL["placeholder_fg"], font=("Segoe UI", 9, "italic"))     # (a project still being read)
         for bar in getattr(self, "list_bars", {}).values():
             bar.configure(background=PAL["placeholder"])
         if getattr(self, "unsaved_marks", None) or getattr(self, "list_bars", None):
@@ -4840,11 +4856,15 @@ class XlefViewer:
         name = os.path.splitext(os.path.basename(path))[0]
         pid = self.tree.insert("", tk.END, text=f"{name}   (loading...)", open=True, tags=("project",))
         self.projects[pid] = {"path": path, "name": name, "offer_pyramids": offer_pyramids}
-        self.tree.see(pid)
+        # Until it is read (a large .lif on a hard disk can take a while: its contents are listed through the whole file), a "Loading..."
+        # row under its name in the list, and a "Loading..." tile under its heading among the thumbnails (see _grid_rows_all).
+        self.loading_rows[pid] = self.tree.insert(pid, tk.END, text="Loading...", tags=("loading",))
+        self.tree.see(self.loading_rows[pid])
         if self.img is None:
             self.show_message("Loading...")
-        if not self.entries:
-            self.thumb_grid.set_items([], message="Loading...")
+        self.thumb_grid.set_items(self._grid_rows_all(), keep=True)
+        if self.thumbs_shown:
+            self.root.after_idle(lambda: self.thumb_grid.see(("loading", pid)))
         self._update_title()
         self.status.config(text=f"Reading {os.path.basename(path)} ...")
 
@@ -4857,11 +4877,15 @@ class XlefViewer:
         threading.Thread(target=work, daemon=True).start()
 
     def _experiment_read(self, pid, path, experiment, error):
+        placeholder = self.loading_rows.pop(pid, None)
         if pid not in self.projects:            # (closed while it was read)
             return
+        if placeholder is not None and self.tree.exists(placeholder):
+            self.tree.delete(placeholder)
         if error is not None:
             self.tree.delete(pid)
             self.projects.pop(pid)
+            self.thumb_grid.set_items(self._grid_rows_all(), message="No images" if self.projects else "Open an experiment", keep=True)
             self._update_title()
             if self.img is None:
                 self.show_message("")
@@ -5418,7 +5442,10 @@ class XlefViewer:
         for pid in self.tree.get_children(""):
             if pid in self.projects:
                 rows.append(("project", self.projects[pid]["name"], pid))
-                rows.extend(self._grid_rows(pid))
+                if pid in self.loading_rows:
+                    rows.append(("loading", "Loading...", pid))       # (still being read: see open_xlef)
+                else:
+                    rows.extend(self._grid_rows(pid))
         return rows
 
     def _grid_rows(self, parent, path=()):
@@ -5775,6 +5802,9 @@ class XlefViewer:
 
     def on_select(self, event=None):
         sel = self.tree.selection()
+        if sel and sel[0] in self.loading_rows.values():           # (the "Loading..." row: nothing to show yet)
+            self.tree.selection_remove(sel[0])
+            return
         if sel:
             self.thumb_grid.set_selected(sel[0])
             project = self._project_of(sel[0])
@@ -8911,7 +8941,7 @@ class XlefViewer:
     def _tree_menu(self, event):
         """Right-click in the list: the menu for that row, its top at the middle of the row (so it is plain which row it is for)."""
         item = self.tree.identify_row(event.y)
-        if item:
+        if item and item not in self.loading_rows.values():
             box = self.tree.bbox(item)
             y = self.tree.winfo_rooty() + box[1] + box[3] // 2 if box else event.y_root
             self._item_menu(item, event.x_root, y)

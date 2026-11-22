@@ -1927,9 +1927,25 @@ class OpenImage:
         self.pyramid = self.usable_level(OVERVIEW_MAX)
         if self.pyramid is not None:
             self.ov_step = self.pyramid[1]
+        self.max_z = entry.nz if entry.nz > 1 else None     # a z-stack's max projection: kept as one more "plane", after the last
+
+    def layers(self, z):
+        """The real planes that plane z is made of: all of them for the max projection (see max_z), else z itself."""
+        return range(self.entry.nz) if z == self.max_z else (z,)
+
+    def files_of(self, z, c, files=None):
+        """The files that plane (z, c) is read from (of `files`, a pyramid level's; default: the image's own), those that are named."""
+        files = self.entry.files if files is None else files
+        return [f for f in (files.get((k, c)) for k in self.layers(z)) if f]
+
+    def file_of(self, z, c):
+        """A file of plane (z, c) (the first plane's, for the max projection), or None: for what is asked of the drive (its speed, ...)."""
+        return self.entry.files.get((self.layers(z)[0], c))
 
     def is_compressed(self, z, c):
         """Plane (z, c) is in a compressed TIFF: reading any of it decodes the whole plane (seconds). Asked once, from the file's header."""
+        if z == self.max_z:
+            return any(self.is_compressed(k, c) for k in self.layers(z))
         key = (z, c)
         if key not in self.compressed:
             path = self.entry.files.get(key)
@@ -1992,6 +2008,8 @@ class OpenImage:
         a = self.planes.get(key)
         if a is not None:
             return a
+        if z == self.max_z:
+            return self._max_plane(c, stale, keep)
         path = self.entry.files.get(key)
         if path is None:
             return None
@@ -2022,6 +2040,25 @@ class OpenImage:
                 self.planes[key] = a
         return a
 
+    def _max_plane(self, c, stale, keep):
+        """Channel c's max projection, whole: the brightest value of each pixel over all the planes, read one plane at a time (none of
+        them kept), and kept as the current layer's decoded plane is (see plane)."""
+        out = None
+        for k in self.layers(self.max_z):
+            a = self.planes.get((k, c))
+            if a is None:
+                a = self.plane(k, c, stale=stale, keep=False)
+            if a is None:
+                return None
+            out = np.array(a) if out is None else np.maximum(out, a, out=out)
+        if keep and out is not None:
+            for k in [k for k in self.decoded if k[0] != self.max_z]:
+                self.decoded.discard(k)
+                self.planes.pop(k, None)
+            self.decoded.add((self.max_z, c))
+            self.planes[(self.max_z, c)] = out
+        return out
+
     def overview(self, z, c, progress=None, stale=None):
         """Channel c's overview for plane z (read once). progress(fraction), if given, is called as it is read from the image itself.
         stale(), if given, says whether the read is no longer wanted: asked when a compressed plane's turn to be decoded comes (see
@@ -2031,6 +2068,16 @@ class OpenImage:
         have = self.overviews if step == self.ov_step else self.stashed.get(step, {})
         if key in have:
             return have[key]
+        if z == self.max_z:                 # (the max of the planes' overviews, each kept: the z slider then moves to any of them at once)
+            zs = self.layers(z)
+            small = None
+            for i, k in enumerate(zs):
+                a = self.overview(k, c, None if progress is None else (lambda f, i=i: progress((i + f) / len(zs))), stale)
+                if a is None:
+                    return None
+                small = np.array(a) if small is None else np.maximum(small, a, out=small)
+            self._keep_overview(z, c, small, step)
+            return small
         small = self._from_pyramid(c, z=z) if self.pyramid is not None else None
         if small is None:
             small = read_plain_rows(self.entry.files.get(key), step, progress=progress,      # (several rows at once)
@@ -2086,6 +2133,14 @@ class OpenImage:
         values with LAS X's fixed gamma (see PYRAMID_GAMMA): the image's own files are not touched. None if the level can't be used (the
         overview is then read from the image itself)."""
         level, s = level_step or self.pyramid
+        if z == self.max_z:
+            out = None
+            for k in self.layers(z):
+                a = self._from_pyramid(c, level_step, k)
+                if a is None:
+                    return None
+                out = a if out is None else np.maximum(out, a, out=out)
+            return out
         try:
             small = read_whole(level.files[(z, c)], level.pages.get((z, c)))
         except (OSError, ValueError, KeyError):
@@ -2109,7 +2164,11 @@ class OpenImage:
         return sum(a.nbytes for a in self.overviews.values()) + sum(a.nbytes for d in self.stashed.values() for a in d.values())
 
     def raw_layout(self, z, c):
-        """(offset, dtype) of channel c's plane z when it can be read row by row from its file (see raw_layout), else None; asked once."""
+        """(offset, dtype) of channel c's plane z when it can be read row by row from its file (see raw_layout), else None; asked once.
+        The max projection: the first plane's, if every plane can be read so."""
+        if z == self.max_z:
+            got = [self.raw_layout(k, c) for k in self.layers(z)]
+            return got[0] if all(g is not None for g in got) else None
         key = (z, c)
         if key not in self.layouts:
             self.layouts[key] = raw_layout(self.entry.files.get(key), self.entry.pages.get(key), (self.entry.height, self.entry.width))
@@ -2117,10 +2176,29 @@ class OpenImage:
 
     def level_layout(self, level, z, c):
         """(offset, dtype) of a pyramid level's channel c, layer z, read row by row (see raw_layout), else None; asked once."""
+        if z == self.max_z:
+            got = [self.level_layout(level, k, c) for k in self.layers(z)]
+            return got[0] if all(g is not None for g in got) else None
         key = (id(level), z, c)
         if key not in self.layouts:
             self.layouts[key] = raw_layout(level.files.get((z, c)), level.pages.get((z, c)), (level.height, level.width))
         return self.layouts[key]
+
+    def row_reader(self, z, c):
+        """A reader of rows of plane (z, c) from the image's own files (see _RowReader; the max projection: a _MaxRowReader over all the
+        planes), or None if it can't be read row by row."""
+        if self.raw_layout(z, c) is None:
+            return None
+        readers = [_RowReader(self.entry.files[(k, c)], *self.raw_layout(k, c), self.entry.width) for k in self.layers(z)]
+        return readers[0] if len(readers) == 1 else _MaxRowReader(readers)
+
+    def level_reader(self, level, z, c, step):
+        """As row_reader, from a pyramid level (see _LevelRowReader)."""
+        if self.level_layout(level, z, c) is None or len(self.files_of(z, c, level.files)) != len(self.layers(z)):
+            return None
+        readers = [_LevelRowReader(level.files[(k, c)], *self.level_layout(level, k, c), level.width, step,
+                                   self.entry.channels[c].max_value) for k in self.layers(z)]
+        return readers[0] if len(readers) == 1 else _MaxRowReader(readers)
 
     def close(self):
         self.planes.clear()
@@ -2437,6 +2515,27 @@ class _LevelRowReader(_RowReader):
         return super().cost(n, step // self.level_step)
 
 
+class _MaxRowReader:
+    """Rows of a max projection: the same part of a row read from each plane (see _RowReader), the brightest value of each pixel."""
+
+    def __init__(self, readers):
+        self.readers = readers
+        self.out_dtype = readers[0].out_dtype
+
+    def row(self, r, x0, n, step):
+        out = np.array(self.readers[0].row(r, x0, n, step))
+        for reader in self.readers[1:]:
+            np.maximum(out, reader.row(r, x0, n, step), out=out)
+        return out
+
+    def cost(self, n, step):
+        return sum(reader.cost(n, step) for reader in self.readers)
+
+    def close(self):
+        for reader in self.readers:
+            reader.close()
+
+
 def read_level_crop(img, level, z, channels, step, rect):
     """The view rect = (i0, j0, i1, j1: columns and rows of a [::step, ::step] array, `step` being the level's) of layer z from a pyramid
     level, in the image's own values: a list with an array for each of `channels` (None for the others). None if a channel's level file
@@ -2445,10 +2544,9 @@ def read_level_crop(img, level, z, channels, step, rect):
     rows, cols = j1 - j0, i1 - i0
     out = [None] * len(img.entry.channels)
     for c in channels:
-        layout = img.level_layout(level, z, c)
-        if layout is None or level.files.get((z, c)) is None:
+        reader = img.level_reader(level, z, c, step)
+        if reader is None:
             return None
-        reader = _LevelRowReader(level.files[(z, c)], layout[0], layout[1], level.width, step, img.entry.channels[c].max_value)
         try:
             futures = [_READ_POOL.submit(reader.row, (j0 + k) * step, i0 * step, cols, step) for k in range(rows)]
             a = np.empty((rows, cols), reader.out_dtype)
@@ -4081,6 +4179,19 @@ class XlefViewer:
         # plane. (Planes are numbered from 1 everywhere they are shown; self.z, and the files' keys, count from 0.)
         self.z_frame = ttk.Frame(mid)
         ttk.Label(self.z_frame, text="Z plane").pack(side=tk.TOP)
+        self.z_max = tk.BooleanVar(value=False)     # the max projection on show (self.z is then OpenImage.max_z); carried to other stacks
+        self.z_max_plane = 0                        # the plane the slider was left at when the max projection was switched on
+        # (a real button, filled in while on, as the List / Thumbnails toggle: ttk's Toolbutton looks like a label on Windows)
+        self.z_max_button = ColorButton(self.z_frame, text="Max", bd=2, padx=6, pady=1, cursor="hand2",
+                                        command=lambda: (self.z_max.set(not self.z_max.get()), self.toggle_max()))
+        self.z_max_button.pack(side=tk.TOP, pady=(0, 2))
+        self.z_max.trace_add("write", lambda *a: style_toggle(self.z_max_button, self.z_max.get()))
+        style_toggle(self.z_max_button, False)
+        Tooltip(self.z_max_button, lambda: "Maximum intensity projection: shows each pixel's brightest value across all "
+                                           f"{self.img.entry.nz if self.img else 'the'} planes of the z-stack, in every channel.\n"
+                                           "Click again, or move the plane slider, to go back to a single plane. It stays on for the "
+                                           "next z-stack you open.\n"
+                                           "Reading it reads every plane, so sharp views take longer to come in.")
         self.z_up = ttk.Button(self.z_frame, text="▲", width=3, command=lambda: self.step_z(-1))
         self.z_up.pack(side=tk.TOP)
         Tooltip(self.z_up, "Previous plane (one closer to plane 1)")
@@ -4548,6 +4659,7 @@ class XlefViewer:
                 w.configure(background=PAL["bg"])
         self._tree_tag_colors()
         self.show_view_mode()
+        style_toggle(self.z_max_button, self.z_max.get())
         self.set_tool(self.tool)
         if self.img:
             for i in range(len(self.ch_widgets)):
@@ -5846,7 +5958,8 @@ class XlefViewer:
         kept = self.kept_images.pop(entry, None)        # (seen recently, or loaded in the background: its picture is in memory)
         self._kept_changed()
         self._close_image()
-        self.z = min(self.z, entry.nz - 1)
+        plane = min(self.z_max_plane if self.z_max.get() else self.z, entry.nz - 1)
+        self.z = entry.nz if self.z_max.get() and entry.nz > 1 else plane      # (entry.nz: the max projection, see OpenImage.max_z)
         instant = kept is not None and kept.has_all(self.z)
         if instant:
             self.img = kept
@@ -5869,7 +5982,8 @@ class XlefViewer:
         self._update_annotations_check()
         if entry.nz > 1:
             self.z_scale.config(to=entry.nz)
-            self.z_var.set(self.z + 1)
+            self.z_max_plane = plane
+            self.z_var.set(plane + 1)
             self.z_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 4), before=self.ch_frame)
         else:
             self.z_frame.pack_forget()
@@ -5900,7 +6014,7 @@ class XlefViewer:
         self.loading = True
         self._update_cursor()
         n = len(img.entry.channels)
-        plane = f", z {z + 1}" if img.entry.nz > 1 else ""          # (numbered from 1, as the slider is)
+        plane = (", max projection" if z == img.max_z else f", z {z + 1}") if img.entry.nz > 1 else ""      # (numbered from 1, as the slider is)
 
         def on_disk():
             """For the status bar once it is read (asked of the files there, in the background: a round trip each on a network drive)."""
@@ -5993,6 +6107,8 @@ class XlefViewer:
     def _missing_note(img, z, c):
         """Why channel c of plane z couldn't be read (asked of the disk: os.path.exists only, no download)."""
         e = img.entry
+        if z == img.max_z:                  # (the max projection: the first plane missing a file, if any)
+            z = next((k for k in img.layers(z) if not os.path.exists(e.files.get((k, c)) or "")), 0)
         path = e.files.get((z, c))
         if path is None:
             return f"Can't show {e.name}: its metadata names no image file for channel {c + 1}."
@@ -6005,17 +6121,48 @@ class XlefViewer:
 
     # --- channel controls
 
+    CH_LABEL_FONT = ("Segoe UI", 8)
+
+    @staticmethod
+    def short_channel_names(names, fits):
+        """Each channel's name as its column has room for (`fits(text)`: True if it does; None, a channel LAS X left unnamed: ""): whole
+        if it fits, else its beginning and "…". Where that leaves two alike (Channel1, Channel2 -> "Chan…" twice), the end that tells
+        them apart is kept as well: the trailing number, else the last letter ("Ch…1", "Ch…2")."""
+        def cut(name, tail=""):
+            for n in range(len(name) - len(tail) - 1, 0, -1):
+                text = name[:n].rstrip() + "…" + tail
+                if fits(text):
+                    return text
+            return name[:1] + "…" + tail
+
+        out = ["" if n is None else n if fits(n) else cut(n) for n in names]
+        alike = [n is not None and out[i] != n and out.count(out[i]) > 1 for i, n in enumerate(names)]
+        for i, n in enumerate(names):
+            if alike[i]:
+                m = re.search(r"\d+$", n)
+                out[i] = cut(n, m.group() if m and len(m.group()) < len(n) else n[-1])
+        return out
+
+    def _channel_labels(self, slider_width):
+        """The text above each channel's swatch: its name, shortened to the column's width (see short_channel_names)."""
+        font = tkfont.Font(root=self.root, font=self.CH_LABEL_FONT)
+        return self.short_channel_names([ch.name if ch.named else None for ch in self.img.entry.channels],
+                                        lambda text: font.measure(text) <= slider_width - 4)     # (a ttk.Label is a few pixels wider than its text)
+
     def _build_channel_controls(self):
         for w in self.ch_frame.winfo_children():
             w.destroy()
         self.ch_widgets = []
+        labels = None
         for i, (ch, st) in enumerate(zip(self.img.entry.channels, self.ch_settings)):
-            # One column per channel: its swatch (its color and number; click to switch the channel on/off, grey when off), then its
-            # black/white slider standing up, with the white level above and the black level below.
+            # One column per channel: its name (as much as fits), its swatch (its color and number; click to switch the channel on/off,
+            # grey when off), then its black/white slider standing up, with the white level above and the black level below.
             f = ttk.Frame(self.ch_frame)
             f.pack(side=tk.LEFT, fill=tk.Y, padx=2, pady=2)
             color = self._swatch_color(i)
             on = tk.BooleanVar(value=st["on"])
+            label = ttk.Label(f, font=self.CH_LABEL_FONT, anchor=tk.CENTER)
+            label.pack(fill=tk.X)
             swatch = tk.Label(f, text=str(i + 1), width=3, font=("Segoe UI", 9, "bold"), cursor="hand2", relief=tk.RAISED, bd=1)
             swatch.pack(pady=(0, 2))
             swatch.bind("<Button-1>", lambda e, i=i: self.toggle_channel(i))
@@ -6031,6 +6178,11 @@ class XlefViewer:
             slider.bind("<Double-Button-1>", lambda e, i=i, s=slider: (s.undo_press(), self.pick_channel_color(i)))
             Tooltip(slider, name + "Right-click to change its color.", at_pointer=True)  # (as the swatch's, less showing and hiding; at the
                                                                                          # pointer: the slider is tall)
+            if labels is None:
+                labels = self._channel_labels(slider.winfo_reqwidth())
+            label.configure(text=labels[i] or " ")      # (" ": an unnamed channel's column as tall as the others)
+            if ch.named:
+                Tooltip(label, name.rstrip("\n"))
             swatch.color = color
             swatch.keep_colors = True       # (styled by _show_channel_state)
             self.ch_widgets.append((on, slider, swatch))
@@ -6159,15 +6311,42 @@ class XlefViewer:
         if self.img:
             self._contrast_change([(i, ch.saved_black, ch.saved_white) for i, ch in enumerate(self.img.entry.channels)])
 
+    def _layer_words(self, z=None):
+        """"Layer 3 of 12", or "Max projection of 12 layers": for the status line."""
+        z = self.z if z is None else z
+        nz = self.img.entry.nz
+        return f"Max projection of {nz} layers" if z == self.img.max_z else f"Layer {z + 1} of {nz}"
+
+    def toggle_max(self):
+        """The Max button: the z-stack's max projection (see OpenImage.max_z), or back to the plane the slider is at."""
+        if not self.img or self.img.max_z is None:
+            self.z_max.set(False)
+            return
+        if self.z_max.get():
+            self.z_max_plane = self.z
+            self._go_to_z(self.img.max_z)
+        else:
+            self._go_to_z(self.z_var.get() - 1)
+
     def step_z(self, delta):
-        """The z buttons: one plane up or down (not past the first or last)."""
+        """The z buttons: one plane up or down (not past the first or last); from the max projection, from the slider's plane."""
         if self.img and self.img.entry.nz > 1:
-            shown = min(max(self.z + 1 + delta, 1), self.img.entry.nz)
+            here = self.z_var.get() - 1 if self.z_max.get() else self.z
+            self.z_max.set(False)
+            shown = min(max(here + 1 + delta, 1), self.img.entry.nz)
             self.z_var.set(shown)
             self.on_z(shown)
 
     def on_z(self, value):
         z = int(float(value)) - 1          # (the slider counts planes from 1)
+        if self.z_max.get():
+            if z == self.z_max_plane:
+                return                      # (not moved: the slider's value set again)
+            self.z_max.set(False)           # (the slider moved: back to one plane)
+        self._go_to_z(z)
+
+    def _go_to_z(self, z):
+        """Show plane z (or the max projection: OpenImage.max_z)."""
         if TRACE_PATH and self.img and z != self.z:
             trace(f"on_z {self.z + 1} -> {z + 1}: previews in for it: {self.img.has_all(z)}, complete: {self.img.complete(z)}")
         if self.img and z != self.z:
@@ -6179,7 +6358,7 @@ class XlefViewer:
             self._use_prefetched_previews(z)
             if self.img.has_all(z) and (self.img.complete(z) or not self._want_sharp_level(self.img)):
                 # (a note left by a layer the slider passed on the way, "reading when the slider stops", would stay: nothing reads now)
-                self.status.config(text=f"Layer {z + 1} of {self.img.entry.nz}")
+                self.status.config(text=self._layer_words(z))
                 # A read of the layer passed on the way is stale now and ends without saying so (see _load_overviews): its "loading" would
                 # stay, with the hourglass, and keep the sharp view of this layer from being drawn (see redraw).
                 self.loading = False
@@ -6188,7 +6367,8 @@ class XlefViewer:
             else:
                 # Dragging the slider passes every plane on the way: reading each (hundreds of MB, for a compressed stack) would bury the
                 # one that is wanted. The read starts when the slider has rested for a moment.
-                self.status.config(text=f"z = {z + 1}: reading when the slider stops ...")
+                self.status.config(text=("Max projection: reading every plane ..." if z == self.img.max_z
+                                         else f"z = {z + 1}: reading when the slider stops ..."))
                 self.z_job = self.root.after(Z_SETTLE_MS, self._load_overviews_for_z, self.generation)
                 if any(r["entry"] is self.img.entry and r["key"][1] == z for r in self.regions):
                     # A sharp view of this layer was read ahead: drawn now (it also becomes the kept view, which the previews' redraws
@@ -7152,7 +7332,7 @@ class XlefViewer:
         self.hires_progress = None
         self.hires_label = ("Loading full resolution..." if step == 1 else "Loading a sharper image...") if level is None             else "Loading a sharper view..."
         if level is None:
-            where = f"Layer {self.z + 1} of {self.img.entry.nz}; " if self.img.entry.nz > 1 else ""
+            where = f"{self._layer_words()}; " if self.img.entry.nz > 1 else ""
             self.status.config(text=f"{where}reading this view at {_resolution_text(step)} ...")
         self._update_cursor()
         gen, img, z = self.generation, self.img, self.z
@@ -7180,14 +7360,11 @@ class XlefViewer:
                 band = max(8, -(-rows // DETAIL_BANDS))
                 for c in need:
                     if level is not None:
-                        f = level.files.get((z, c))
-                        layout = img.level_layout(level, z, c)
-                        readers[c] = (_LevelRowReader(f, layout[0], layout[1], level.width, step, img.entry.channels[c].max_value)
-                                      if layout is not None else None)
+                        f = level.files.get((img.layers(z)[0], c))
+                        readers[c] = img.level_reader(level, z, c, step)
                     else:
-                        f = img.entry.files[(z, c)]
-                        layout = img.raw_layout(z, c)
-                        readers[c] = _RowReader(f, layout[0], layout[1], img.entry.width) if layout is not None else None
+                        f = img.file_of(z, c)
+                        readers[c] = img.row_reader(z, c)
                     files[c] = f
                 arrays = [None] * n
                 if level is None and all(readers[c] is None for c in need):
@@ -7257,7 +7434,7 @@ class XlefViewer:
         else None. Not for online-only files: finding out whether they are compressed means reading their header, and OneDrive answers
         a read of any part of a file only once it has downloaded all of it (minutes, for a large one, with the window frozen)."""
         img, z = self.img, self.z
-        if level is not None or any((f := img.entry.files.get((z, c))) and is_online_only(f) for c in need):
+        if level is not None or any(is_online_only(f) for c in need for f in img.files_of(z, c)):
             return None
         if not any((z, c) not in img.planes and img.is_compressed(z, c) for c in need):
             return None
@@ -7514,8 +7691,8 @@ class XlefViewer:
             shown = pyr[1]                                           # (the sharper copy's pixels in view are in)
         level_helps = pyr is not None and pyr[1] < shown
         if level_helps:
-            level, n = pyr[0], len(img.entry.channels)
-            f = level.files.get((self.z, 0)) or level.files.get((0, 0))
+            level, n = pyr[0], len(img.entry.channels) * len(img.layers(self.z))     # (the max projection: every plane is read)
+            f = level.files.get((img.layers(self.z)[0], 0)) or level.files.get((0, 0))
             slow = self._slow(SPEED.estimate(f, level.width * level.height * n, 3 * n) if f else None, LEVEL_BUDGET, f)
             if not slow:
                 return (pyr[1], level) if step >= pyr[1] else (step, None)
@@ -7533,10 +7710,11 @@ class XlefViewer:
         as Settings and the project's note say ("Fast storage: sharper pictures are read as soon as you zoom in"), not by this view's
         read. (Judged by the view's own read, a large window on a fast drive counted as slow: at 29% on a 2560 x 1440 screen a view is
         ~80 MB, over READ_BUDGET, so the preview stood in, with only the middle sharp, from the view before.)"""
-        f = self.img.entry.files.get((self.z, need[0])) if need else None
+        f = self.img.file_of(self.z, need[0]) if need else None
         if f is None:
             return False
-        return self._slow(SPEED.estimate(f, 32e6, 12), LEVEL_BUDGET, f)
+        k = len(self.img.layers(self.z))           # (the max projection: every plane is read)
+        return self._slow(SPEED.estimate(f, 32e6 * k, 12 * k), LEVEL_BUDGET, f)
 
     def _probe_speed(self, entry):
         """Measure, in the background, the storage of this image's full-resolution files if it is due (see StorageSpeed)."""
@@ -7666,7 +7844,7 @@ class XlefViewer:
         it starts again once the new layer's view is in. A view that was read from a pyramid level is read from the other layers' levels."""
         img, cache = self.img, self.detail_cache
         e = img.entry if img is not None else None
-        if (e is None or e.nz < 2 or self.loading or cache is None or cache["key"][0] != id(img)
+        if (e is None or e.nz < 2 or self.loading or cache is None or cache["key"][0] != id(img) or self.z == img.max_z
                 or cache["key"][1] != self.z or not self.settings.get("preload_layers", True)):
             return
         if level is _SAME:
@@ -7684,7 +7862,7 @@ class XlefViewer:
         self.prefetch_token += 1
         if not order:
             self.prefetch = {"sig": sig, "token": self.prefetch_token, "state": "done", "tail": tail}
-            self.status.config(text=f"Layer {self.z + 1} of {e.nz}; all layers of this view are ready")
+            self.status.config(text=f"{self._layer_words()}; all layers of this view are ready")
             return
         token = self.prefetch_token
         self.prefetch = {"sig": sig, "token": token, "state": "running", "order": order, "step": tail[4], "tail": tail}
@@ -7782,12 +7960,12 @@ class XlefViewer:
         if self.prefetch is not None and self.prefetch.get("state") == "running":
             return
         what = "all layers can be scrolled through" if k == total else f"previews of the other layers read: {k} of {total}"
-        self.status.config(text=f"Layer {self.z + 1} of {self.img.entry.nz}; {what}")
+        self.status.config(text=f"{self._layer_words()}; {what}")
 
     def _prefetch_note(self, order, done):
         """The status line while layers are read ahead: the layer shown, the layer being read now (both numbered from 1), and how many
         of the layers still to be read, that one included, are unread."""
-        return (f"Layer {self.z + 1} of {self.img.entry.nz}; reading layer {order[done] + 1} at "
+        return (f"{self._layer_words()}; reading layer {order[done] + 1} at "
                 f"{_resolution_text(self.prefetch['step'])} ({len(order) - done} unread, nearest layers first)")
 
     def _prefetch_result(self, kind, token, data):
@@ -7797,7 +7975,7 @@ class XlefViewer:
             return
         if kind == "prefetch_done":
             p["state"] = "done"
-            self.status.config(text=data or f"Layer {self.z + 1} of {self.img.entry.nz}; all layers of this view are ready: the z slider "
+            self.status.config(text=data or f"{self._layer_words()}; all layers of this view are ready: the z slider "
                                     f"shows them at once")
             return
         key, arrays, k, total = data
@@ -7809,7 +7987,7 @@ class XlefViewer:
             self.prefetch_token += 1
             p["state"] = "full"
             self.prefetch_full = (id(self.img), tuple(key[2:]))
-            self.status.config(text=f"Layer {self.z + 1} of {self.img.entry.nz}; read {k - 1} of {total} other layers of this view, "
+            self.status.config(text=f"{self._layer_words()}; read {k - 1} of {total} other layers of this view, "
                                     f"then the memory for previews was full (Settings: raise it to keep more)")
             return
         self.regions.append({"entry": self.img.entry, "key": key, "arrays": arrays, "bytes": size})
@@ -8215,7 +8393,7 @@ class XlefViewer:
         if self.full_res_ok is True:
             return True
         e = self.img.entry
-        ask = [f for f in {e.files.get((self.z, c)) for c in range(len(e.channels))} if f and needs_asking(f)]
+        ask = [f for f in {f for c in range(len(e.channels)) for f in self.img.files_of(self.z, c)} if needs_asking(f)]
         if not ask:
             return True
         item = next((i for i, x in self.entries.items() if x is e), None)
@@ -9467,7 +9645,7 @@ class XlefViewer:
         size = f"{e.width} x {e.height} px"
         if e.pixel_um:
             size += f", {e.pixel_um:.3f} µm/px"
-        z = f", z {self.z + 1}/{e.nz}" if e.nz > 1 else ""
+        z = (f", max projection of {e.nz} planes" if self.z == self.img.max_z else f", z {self.z + 1}/{e.nz}") if e.nz > 1 else ""
         if not self.loading:
             self.status.config(text=f"{e.name}   {size}{z}   zoom {self.scale * 100:.1f}%" + ("      " + self._preload_full_text()
                                                                                           if self.preload_full else ""))

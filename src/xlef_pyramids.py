@@ -54,6 +54,8 @@ def level_sizes(width, height):
 
 def why_not(entry, is_online_only):
     """None if `entry` (an ImageEntry) can get a pyramid, else the reason it cannot (for the list the user is shown)."""
+    if getattr(entry, "vsi", None):
+        return "it is in an Olympus .vsi file, which has its own pyramid"
     if entry.read_only or entry.lif_block is not None:
         return "its data is inside a .lif file"
     if entry.problem:

@@ -36,6 +36,9 @@ if errorlevel 1 (
 REM tkinterdnd2 (dragging .xlef files onto the window) is optional: the viewer works without it.
 "%PYTHON_CMD%" -c "import tkinterdnd2" >nul 2>&1
 if errorlevel 1 "%PYTHON_CMD%" "%~dp0src\keep_awake.py" install tkinterdnd2 >nul 2>&1
+REM slideio (opening Olympus .vsi files) is optional too: without it, a .vsi says what to install.
+"%PYTHON_CMD%" -c "import slideio" >nul 2>&1
+if errorlevel 1 "%PYTHON_CMD%" "%~dp0src\keep_awake.py" install slideio >nul 2>&1
 
 REM Once everything is in place, start it with pythonw.exe (no console window), and close this window. Its output goes to a log file
 REM (%LOCALAPPDATA%\JhouLab\logs\xlef_viewer.log), and errors are shown in a message box: see app_identity.py.

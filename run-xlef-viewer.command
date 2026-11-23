@@ -14,6 +14,8 @@ if ! "$PYTHON_CMD" -c "import numpy, tifffile, PIL, imagecodecs" >/dev/null 2>&1
 fi
 # tkinterdnd2 (dragging .xlef files onto the window) is optional: the viewer works without it.
 "$PYTHON_CMD" -c "import tkinterdnd2" >/dev/null 2>&1 || "$PYTHON_CMD" keep_awake.py install tkinterdnd2 >/dev/null 2>&1
+# slideio (opening Olympus .vsi files) is optional too: without it, a .vsi says what to install.
+"$PYTHON_CMD" -c "import slideio" >/dev/null 2>&1 || "$PYTHON_CMD" keep_awake.py install slideio >/dev/null 2>&1
 hand_off_to_app "numpy, tifffile, PIL, imagecodecs"     # (started by its app to set up: the app runs it from here: see terminal_window.sh)
 
 if ! "$PYTHON_CMD" xlef_viewer.py "$@"; then

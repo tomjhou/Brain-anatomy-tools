@@ -616,6 +616,11 @@ def start_auto_update(root, button, helpers):
         root.destroy()
         restart()
 
+    def failed(text):
+        """The update could not be applied: the button says so, and clicking it tells why (see check_for_update)."""
+        button.update_error = text
+        button.config(text=app_update.AUTO_FAILED_LABEL, state=tk.NORMAL)
+
     app_update.AutoUpdate(root, {
         "busy": lambda: str(button.cget("state")) == "disabled",
         "blocked": blocked,
@@ -623,6 +628,7 @@ def start_auto_update(root, button, helpers):
         "keep_open": lambda: ("the atlas is still downloading (" + helpers["atlas_download_running"]() + "), and restarting would stop it")
                       if (helpers or {}).get("atlas_download_running", lambda: None)() else None,
         "restart": restart_now,
+        "failed": failed,
     }).start()
 
 
@@ -633,6 +639,14 @@ def check_for_update(root, button, changes=None, helpers=None):
     prompt_startup_panel_tk (the restart question says if the atlas download is running)."""
     import app_update
     done = queue.Queue()
+    error = getattr(button, "update_error", None)
+    if error:                                       # (the automatic update failed: why, first; Yes goes on to check and update again)
+        button.update_error = None
+        with question():
+            again = messagebox.askyesno("Update failed", error + "\n\nTry the update again now?", icon="warning", parent=root)
+        button.config(text=getattr(button, "idle_text", "Check for updates"))
+        if not again:
+            return
 
     def work(job, *args):
         try:

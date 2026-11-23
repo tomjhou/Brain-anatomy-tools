@@ -5,7 +5,10 @@ list. An image's TIFFs are opened when it is selected, memory-mapped, and only t
 view of a 680 MB image reads a few tens of MB. OneDrive/SharePoint data: a file that is online-only is downloaded IN FULL as soon as any byte
 of it is read, so the list marks such images and the viewer asks before opening one.
 
-Usage:  python xlef_viewer.py [file.xlef]
+Also opens, read only: a LAS X .lif (see load_lif), and an Olympus cellSens / VS200 .vsi, each scanned region of the slide an image (see
+load_vsi and vsi_reader; needs the slideio package).
+
+Usage:  python xlef_viewer.py [file.xlef | file.lif | file.vsi]
 
 Metadata used: <Frame File=...> per channel (and z), ChannelScalingInfo (LAS X contrast), WideFieldChannelInfo UserDefName (channel
 names), DimensionDescription (size, pixel size). Test headless: build XlefViewer(), root.withdraw(), patch canvas.winfo_width/height,
@@ -81,6 +84,7 @@ from open_file_dialog import ask_open_file
 import leica_luts           # (LAS X's colour maps, sampled: see lut_table)
 import app_update          # (the Update menu)
 import xlef_pyramids        # (pyramids for an experiment that has none: see XlefViewer.make_pyramids)
+import vsi_reader           # (Olympus cellSens .vsi files, read with slideio: see load_vsi)
 import lif_to_xlef          # (a .lif saved as an .xlef, which can be edited: see XlefViewer.save_as_xlef)
 from color_button import ColorButton
 from tooltip import Tooltip, place_on_monitor, monitor_area, tip_window, show_tip_window, watch_pointer
@@ -438,6 +442,7 @@ def needs_asking(path):
 class Channel:
     def __init__(self, name, lut, max_value, black, white, named=True):
         self.name, self.max_value = name, max_value
+        self.saved_name = name   # (as in the file: the name may be changed in the viewer, see LutChooser)
         self.lut = self.saved_lut = lut      # LAS X's colour map (LUTName): may be changed in the viewer; saved_lut is the file's
         self.named = named       # the name is from LAS X (False: made up here, e.g. "Channel 1 (Blue)")
         self.black, self.white = black, white        # display range, in pixel values: LAS X's, or as changed in the viewer
@@ -471,9 +476,11 @@ class ImageEntry:
         self.saved_name = name   # its name in the file (self.name may be a rename not saved yet)
         self.parent_file = None  # the .xlef/.xlcf whose <Children> refer to this image's .xlif (None: unknown)
         self.flipped = self.saved_flipped = False    # "Flip this section": as changed in the viewer / as in the file (see write_flip)
-        self.rotated = self.saved_rotated = False    # "Rotate this section 180°": the same way
+        self.rotated = self.saved_rotated = 0        # "Rotate +90°": quarter turns clockwise (0-3), the same way
         self.lif_block = None    # its data block, when it is an image in a .lif (or a pyramid level in a .lifext; see load_lif)
         self.read_only = False   # from a .lif: shown, never written (changes made in the viewer are only for viewing)
+        self.vsi = None          # (.vsi path, scene index) when it is a scanned region of an Olympus .vsi (read only; see load_vsi)
+        self.sidecar = None      # a .vsi's: the file next to it that its edits are saved in, as they can't go into it (see write_vsi_edits)
 
     @property
     def path(self):
@@ -484,18 +491,28 @@ class ImageEntry:
         return any(c.lut != c.saved_lut for c in self.channels)
 
     @property
+    def channel_names_changed(self):
+        return any(c.name != c.saved_name for c in self.channels)
+
+    @property
     def contrast_changed(self):
         return any((c.black, c.white) != (c.saved_black, c.saved_white) for c in self.channels)
 
     @property
     def flip_changed(self):
-        """Its flip or its 180° rotation was changed (both are written by write_flip)."""
+        """Its flip or its turn (Rotate +90°) was changed (both are written by write_flip)."""
         return self.flipped != self.saved_flipped or self.rotated != self.saved_rotated
 
     @property
+    def edited(self):
+        """Changed in the viewer since it was read (whether or not that can be saved: see unsaved)."""
+        return (self.annotations_changed or self.name != self.saved_name or self.luts_changed or self.contrast_changed
+                or self.flip_changed or self.channel_names_changed)
+
+    @property
     def unsaved(self):
-        return not self.read_only and (self.annotations_changed or self.name != self.saved_name or self.luts_changed
-                                       or self.contrast_changed or self.flip_changed)
+        """Changed, and Save would write it: into its .xlif, or a .vsi's into its sidecar (a .lif's are only for viewing)."""
+        return (not self.read_only or self.sidecar is not None) and self.edited
 
     def all_files(self):
         return sorted(set(self.files.values()))
@@ -515,6 +532,7 @@ class FolderEntry:
         self.annotations_changed = False
         self.order_changed = False   # what it lists, or their order, changed in the viewer (dragged, deleted) and not saved yet
         self.read_only = False       # from a .lif (path None, too: nothing is dragged into or out of it)
+        self.vsi = False             # an Olympus .vsi (read only too, and no .xlef to save it as)
 
     @property
     def unsaved(self):
@@ -831,7 +849,13 @@ def _image_entry(name, path, element, image, base_dir, lif=None):
     entry.annotations = [a for a in (Annotation.from_element(an) for an in element.iter("Annotation")) if a is not None]
     mine = next((at for at in element.iter("Attachment") if at.get("Name") == VIEWER_ATTACHMENT), None)
     entry.flipped = entry.saved_flipped = mine is not None and mine.get("FlipX") == "1"
-    entry.rotated = entry.saved_rotated = mine is not None and mine.get("Rotate180") == "1"
+    entry.rotated = entry.saved_rotated = _quarter_turns(mine)
+    renamed = _channel_names(mine)               # (channels renamed in this viewer: see write_channel_names)
+    if renamed and len(renamed) == len(entry.channels):
+        for ch, nm in zip(entry.channels, renamed):
+            if nm:
+                ch.name = ch.saved_name = nm
+                ch.named = True
     tile = next(element.iter("Tile"), None)
     try:
         if tile is not None:
@@ -911,11 +935,12 @@ def storage_notes(entries, path):
     download it), and whether LAS X made pyramids (see pyramid_note). A list of lines."""
     shown = [e for e in entries if e.width and e.files]
     n = len(shown)
-    kinds = {"raw": [], "ome": [], "tiff": []}
+    kinds = {"raw": [], "ome": [], "tiff": [], "vsi": []}
     for e in shown:
         raw = e.lif_block is not None or any(isinstance(p, RawPlane) for p in e.pages.values())
-        kinds["raw" if raw else "ome" if e.pages else "tiff"].append(e)
-    names = {"raw": "raw data (.lof / .lif)", "ome": "OME-TIFF (all channels in one file)", "tiff": "separate TIFFs (one per channel and layer)"}
+        kinds["vsi" if e.vsi else "raw" if raw else "ome" if e.pages else "tiff"].append(e)
+    names = {"raw": "raw data (.lof / .lif)", "ome": "OME-TIFF (all channels in one file)", "tiff": "separate TIFFs (one per channel and layer)",
+             "vsi": "Olympus .vsi (JPEG 2000 tiles in .ets files, with a pyramid)"}
     present = [k for k in kinds if kinds[k]]
     lines = []
     if present:
@@ -937,7 +962,9 @@ def storage_notes(entries, path):
         lines.append(f"Compression: {text}" + (f" (looked at {looked} of {len(tiffs)} images)" if len(tiffs) > looked and tiffs else ""))
     elif tiffs:
         lines.append("Compression: not checked (the files are online-only)")
-    if n:
+    if n and len(kinds["vsi"]) == n:            # (a .vsi has its own pyramid, in its .ets files; LAS X's kind is not asked about)
+        lines.append("Pyramids: yes (the .vsi's own)")
+    elif n:
         lines.append("Pyramids: " + pyramid_note(path, n).replace("Yes", "yes").replace("No", "none"))
     return lines
 
@@ -1157,7 +1184,7 @@ def _read_text(path):
 def _write_text(path, new_text, bom):
     """Write a LAS X file the careful way: a copy of it as it was before the viewer first changed it is kept next to it (BACKUP_SUFFIX),
     and the new text goes to a temporary file first, which then replaces the old one. Returns the backup's path."""
-    if path.lower().endswith((".lif", ".lifext", ".lof")):
+    if path.lower().endswith((".lif", ".lifext", ".lof", ".vsi", ".ets")):
         raise ValueError(f"{os.path.basename(path)} is read only here")       # (never written into: see ImageEntry.read_only)
     path = _real_case(path)          # (so that the file keeps its name exactly as it is: LAS X's references are lower case)
     backup =next((path + s for s in OLD_BACKUP_SUFFIXES if os.path.exists(path + s)), path + BACKUP_SUFFIX)
@@ -1255,7 +1282,7 @@ READING_MODES = {"auto": "Automatic (based on file read speed)", "sharp": "Alway
 READING_NOTE = (f"Automatic: on slower drives or network shares (speed < {32 / LEVEL_BUDGET:.0f} MB/s), images at middle zoom levels\n"     # (as _measured_slow)
                 "may show at lower resolution to reduce disk reads. On fast drives, sharp pictures are read at once.\n"
                 "Always the sharpest: read as soon as more detail would show. Save reading: always the slower-connection way.")
-FLIP_NOTE = ("On: flip/mirror and 180° rotation status is saved into the section's metadata (.xlif) in a custom field, so it goes\n"
+FLIP_NOTE = ("On: flip/mirror and rotation status is saved into the section's metadata (.xlif) in a custom field, so it goes\n"
              "with the files to other computers. LAS X keeps this field when it saves (tested with LAS X 6.2), but doesn't read it.\n"
              "Off: flip and rotation status are kept on this computer only, and LAS X's files are unmodified.")
 BAD_NAME_CHARS = '\\/:*?"<>|'
@@ -1319,18 +1346,72 @@ def write_contrast(path, ranges, tops):
     return _write_text(path, new_text, bom)
 
 
-def write_flip(path, flipped, rotated=False):
-    """Write "Flip this section" and "Rotate this section 180°" into an image's .xlif, in this viewer's own attachment (LAS X has no
-    flip of its own; it keeps an attachment it doesn't know when it saves the file again):  <Attachment Name="JhouXlefViewer"
-    Application="JhouXlefViewer" Version="1.0" FlipX="1" Rotate180="0" />  ("0" when not). Added before </Image> if the file has
-    none. Checked to read back; backed up (see _write_text)."""
+def _quarter_turns(attachment):
+    """The section's turn (quarter turns clockwise, 0-3) from this viewer's attachment in its .xlif (see write_flip): Rotate="90" (its
+    degrees), or, as earlier versions wrote it, Rotate180="1"; 0 without either."""
+    if attachment is None:
+        return 0
+    deg = attachment.get("Rotate")
+    if deg is not None:
+        try:
+            return int(round(float(deg) / 90)) % 4
+        except ValueError:
+            return 0
+    return 2 if attachment.get("Rotate180") == "1" else 0
+
+
+def _channel_names(attachment):
+    """The channel names written by write_channel_names into this viewer's attachment ("" for one left as LAS X has it), or None."""
+    raw = attachment.get("ChannelNames") if attachment is not None else None
+    if not raw:
+        return None
+    try:
+        names = json.loads(raw)
+        return [str(n) for n in names] if isinstance(names, list) else None
+    except ValueError:
+        return None
+
+
+def write_channel_names(path, names):
+    """Write the channels' names (as renamed in the viewer) into an image's .xlif: into this viewer's attachment (ChannelNames, a JSON
+    list: what the viewer reads), and, for a widefield image, as LAS X's own UserDefName of each channel's <WideFieldChannelInfo> too
+    (every one listed for it: LAS X lists the active channel twice), so that LAS X shows them. Checked to read back; backed up."""
     text, bom = _read_text(path)
-    values = {"FlipX": "1" if flipped else "0", "Rotate180": "1" if rotated else "0"}
+    ids = sorted({m.group(1) for m in re.finditer(r'<WideFieldChannelInfo\b[^>]*\bChannel="([^"]*)"', text)},
+                 key=lambda k: int(k) if k.isdigit() else 1 << 30)
+    if len(ids) == len(names):
+        def one(m):
+            tag = m.group(0)
+            cid = re.search(r'\bChannel="([^"]*)"', tag).group(1)
+            value = _xml_attr(names[ids.index(cid)])
+            new, n = re.subn(r'\bUserDefName="[^"]*"', lambda _: f'UserDefName="{value}"', tag)     # (a function: a \ in it is kept)
+            return new if n else tag[:-1].rstrip("/").rstrip() + f' UserDefName="{value}"' + ("/>" if tag.endswith("/>") else ">")
+        text = re.sub(r'<WideFieldChannelInfo\b[^>]*\bChannel="[^"]*"[^>]*>', one, text)
+    return _write_viewer_attachment(path, {"ChannelNames": json.dumps(list(names))}, text, bom)
+
+
+def write_flip(path, flipped, rotated=0):
+    """Write "Flip this section" and its turn (Rotate +90°: `rotated` quarter turns clockwise) into an image's .xlif, in this viewer's
+    own attachment (LAS X has no flip of its own; it keeps an attachment it doesn't know when it saves the file again):
+    <Attachment Name="JhouXlefViewer" Application="JhouXlefViewer" Version="1.0" FlipX="1" Rotate="90" Rotate180="0" />  (Rotate180,
+    for earlier versions, which read only that: "1" when turned 180°). Added before </Image> if the file has none. Checked to read
+    back; backed up (see _write_text)."""
+    q = int(rotated) % 4
+    return _write_viewer_attachment(path, {"FlipX": "1" if flipped else "0", "Rotate": str(q * 90), "Rotate180": "1" if q == 2 else "0"})
+
+
+def _write_viewer_attachment(path, values, text=None, bom=None):
+    """Set these attributes of this viewer's own <Attachment> in an image's .xlif (made, before </Image>, if there is none), the
+    others it has left as they are; `text` (and bom): the file's text with other changes made already (default: as it is on disk).
+    Checked to read back; backed up (see _write_text)."""
+    if text is None:
+        text, bom = _read_text(path)
     m = re.search(rf'<Attachment\b[^>]*\bName="{VIEWER_ATTACHMENT}"[^>]*>', text)
     if m:
         tag = m.group(0)
         for attr, value in values.items():
-            tag, n = re.subn(rf'\b{attr}="[^"]*"', f'{attr}="{value}"', tag)
+            value = _xml_attr(value)                # (e.g. ChannelNames: JSON, with quotes)
+            tag, n = re.subn(rf'\b{attr}="[^"]*"', lambda _: f'{attr}="{value}"', tag)     # (a function: a \ in it is kept)
             if n == 0:
                 tag = tag[:-1].rstrip("/").rstrip() + f' {attr}="{value}"' + (" />" if tag.endswith("/>") else ">")
         new_text = text[:m.start()] + tag + text[m.end():]
@@ -1340,12 +1421,12 @@ def write_flip(path, flipped, rotated=False):
             raise ValueError("no <Image> element in the file")
         nl = "\r\n" if "\r\n" in text else "\n"
         new_text = (text[:close.start()] + close.group(1) + "  " + f'<Attachment Name="{VIEWER_ATTACHMENT}" Application='
-                    f'"{VIEWER_ATTACHMENT}" Version="1.0"' + "".join(f' {a}="{v}"' for a, v in values.items()) + ' />' + nl
+                    f'"{VIEWER_ATTACHMENT}" Version="1.0"' + "".join(f' {a}="{_xml_attr(v)}"' for a, v in values.items()) + ' />' + nl
                     + text[close.start():])
     back = [{a: at.get(a) for a in values} for at in ET.fromstring(new_text.encode("utf-8")).iter("Attachment")
             if at.get("Name") == VIEWER_ATTACHMENT]
     if back != [values]:
-        raise ValueError("the flip did not read back as written")
+        raise ValueError("it did not read back as written")
     return _write_text(path, new_text, bom)
 
 
@@ -1648,6 +1729,15 @@ def _dec(v, digits=1):
 def image_properties(entry, experiment_path):
     """What LAS X's Properties window shows for an image, read from its .xlif: {"header": [(label, value)], "sections": [(title,
     [lines])], "stamps": [(frame, relative s, clock, date)]}. Parts LAS X stores only as codes this viewer can't name are left out."""
+    if entry.vsi:                   # (an Olympus .vsi: what slideio gives, no LAS X metadata)
+        header = [("Image", entry.name), ("File Location", entry.vsi[0]),
+                  ("Dimensions", f"{entry.width} x {entry.height} px" + (f", {entry.nz} z planes" if entry.nz > 1 else ""))]
+        if entry.pixel_um:
+            header.append(("Pixel size", f"{entry.pixel_um:.4f} µm"))
+        if entry.full_bytes:
+            header.append(("Size", f"{entry.full_bytes / 1e6:,.1f} MB"))
+        lines = [f"{c.name}: shown {c.black} to {c.white} (of 0 to {c.max_value})" for c in entry.channels]
+        return {"header": header, "sections": [("Channels (display limits from cellSens)", lines)], "stamps": []}
     root = ET.parse(entry.xlif_path).getroot()
     el = root.find("Element")
     n = len(entry.channels)
@@ -1886,10 +1976,147 @@ def load_lif(path):
     return project
 
 
+VSI_EDITS_SUFFIX = ".edits.json"     # a .vsi's sidecar: "Image_B3.vsi.edits.json" next to "Image_B3.vsi"
+
+
+def vsi_edits_path(vsi):
+    """Where the edits made in the viewer to a .vsi's sections are saved: a small file next to it (see write_vsi_edits)."""
+    return vsi + VSI_EDITS_SUFFIX
+
+
+def _vsi_state(entry):
+    """What of a .vsi section the sidecar keeps: its name, flip, turn, each channel's name, color map and contrast, and its
+    annotations (in this viewer's terms: their attributes and vertices, as in LAS X's files)."""
+    return {"name": entry.name, "flipped": bool(entry.flipped), "rotated": int(entry.rotated) % 4,
+            "channels": [{"name": c.name, "lut": c.lut, "black": int(c.black), "white": int(c.white)} for c in entry.channels],
+            "annotations": [{"attrs": dict(a.attrs), "verts": [list(v) for v in a.verts]} for a in entry.annotations]}
+
+
+def _vsi_changes(entry):
+    """The section's state (see _vsi_state), only what differs from the .vsi itself (vsi_original): what its sidecar keeps."""
+    now, orig = _vsi_state(entry), entry.vsi_original
+    out = {k: now[k] for k in ("name", "flipped", "rotated") if now[k] != orig[k]}
+    chans = [{k: c[k] for k in c if c[k] != o[k]} for c, o in zip(now["channels"], orig["channels"])]
+    if any(chans):
+        out["channels"] = chans
+    if now["annotations"]:
+        out["annotations"] = now["annotations"]
+    return out
+
+
+def read_vsi_edits(vsi):
+    """The sidecar of a .vsi, as written by write_vsi_edits ({"scenes": [...]}), or None if there is none. ValueError if it is there
+    but can't be read."""
+    path = vsi_edits_path(vsi)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        raise ValueError(f"{os.path.basename(path)} can't be read: {e}")
+    if not isinstance(data, dict) or not isinstance(data.get("scenes"), list):
+        raise ValueError(f"{os.path.basename(path)} is not an edits file of this viewer")
+    return data
+
+
+def apply_vsi_edits(entry, scene):
+    """Show a .vsi section as its sidecar's entry `scene` says (see _vsi_changes), as saved."""
+    if "name" in scene:
+        entry.name = entry.saved_name = str(scene["name"])
+    if "flipped" in scene:
+        entry.flipped = entry.saved_flipped = bool(scene["flipped"])
+    if "rotated" in scene:
+        entry.rotated = entry.saved_rotated = int(scene["rotated"]) % 4
+    for ch, c in zip(entry.channels, scene.get("channels") or []):
+        if "name" in c:
+            ch.name = ch.saved_name = str(c["name"])
+            ch.named = True
+        if "lut" in c:
+            ch.lut = ch.saved_lut = str(c["lut"])
+        if "black" in c or "white" in c:
+            black, white = int(c.get("black", ch.black)), int(c.get("white", ch.white))
+            ch.black, ch.white = ch.saved_black, ch.saved_white = max(0, black), min(ch.max_value, max(black + 1, white))
+    notes = [Annotation({str(k): str(v) for k, v in a["attrs"].items()}, [tuple(map(float, v)) for v in a["verts"]])
+             for a in scene.get("annotations") or [] if isinstance(a, dict) and "attrs" in a and "verts" in a]
+    entry.annotations = notes
+
+
+def write_vsi_edits(vsi, entries):
+    """Save the edits of these sections of a .vsi (all of it that is open: see XlefViewer.save_annotations) into its sidecar, the .vsi
+    itself untouched: for each, only what differs from the .vsi (see _vsi_changes), with its scene's index and name in the .vsi (a
+    section whose scene isn't that one any more is left as it was). Sections the file has and these aren't are kept. Written to a
+    temporary file first and checked to read back, then moved over the old one (whose copy is kept as .bak, as an .xlif's is)."""
+    path = vsi_edits_path(vsi)
+    old = read_vsi_edits(vsi) or {"scenes": []}
+    mine = {e.vsi[1]: e for e in entries}
+    scenes = [sc for sc in old["scenes"] if isinstance(sc, dict) and sc.get("index") not in mine]
+    for index, e in sorted(mine.items()):
+        changes = _vsi_changes(e)
+        if changes:
+            scenes.append({"index": index, "scene": e.vsi_scene, **changes})
+    scenes.sort(key=lambda sc: sc.get("index", 0))
+    data = {"about": f"Edits made in the JhouLab XLEF viewer to {os.path.basename(vsi)}, which the viewer never changes. Each scene: its "
+                     "index and name in the .vsi, and only what differs from the .vsi (names, flip, turn in quarter turns clockwise, "
+                     "channels' names, color maps and contrast, annotations: LAS X's attributes, vertices in metres from the centre).",
+            "version": 1, "scenes": scenes}
+    text = json.dumps(data, indent=1, ensure_ascii=False)
+    if json.loads(text) != data:
+        raise ValueError("the edits did not read back as written")
+    if not scenes and not os.path.exists(path):
+        return None
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text + "\n")
+    if os.path.exists(path):
+        shutil.copy2(path, path + BACKUP_SUFFIX)
+    os.replace(tmp, path)
+    return path
+
+
+def load_vsi(path):
+    """An Olympus cellSens / VS200 .vsi as a FolderEntry, as load_lif gives a .lif: an ImageEntry for each scanned region (scene) of
+    the slide, its channels named as in cellSens and with the contrast (display limits) set there, colored by their names (see
+    vsi_reader.lut_for). Read only. Its pixels are read with slideio (see vsi_reader), from the .ets files next to it."""
+    if not vsi_reader.available():
+        raise RuntimeError(vsi_reader.MISSING)
+    project = FolderEntry(os.path.splitext(os.path.basename(path))[0])
+    project.read_only = project.vsi = True
+    for sc in vsi_reader.describe(path):
+        entry = ImageEntry(sc["name"], path)
+        entry.vsi, entry.read_only = (path, sc["index"]), True
+        entry.width, entry.height, entry.nz, entry.pixel_um = sc["width"], sc["height"], sc["nz"], sc["pixel_um"]
+        entry.vsi_dtype = sc["dtype"]
+        entry.full_bytes = sc["bytes"]
+        for name, top, black, white in sc["channels"]:
+            ch = Channel(name, vsi_reader.lut_for(name), top, black, white)
+            entry.channels.append(ch)
+        entry.files = {(z, c): path for z in range(entry.nz) for c in range(len(entry.channels))}     # (for what is asked of the
+        entry.sidecar = vsi_edits_path(path)                                                            # file: online-only, ...)
+        entry.vsi_scene, entry.vsi_original = sc["name"], _vsi_state(entry)
+        project.children.append(entry)
+    try:                            # (edits saved before, in the sidecar: see write_vsi_edits)
+        edits = read_vsi_edits(path)
+    except ValueError as e:
+        print(f"Not used: {e}")
+        edits = None
+    for scene in (edits or {}).get("scenes", []):
+        e = next((x for x in project.children if isinstance(scene, dict) and x.vsi[1] == scene.get("index")
+                  and x.vsi_scene == scene.get("scene")), None)
+        if e is not None:
+            apply_vsi_edits(e, scene)
+        else:
+            print(f"Not used: {os.path.basename(vsi_edits_path(path))} has edits of scene {scene.get('index')} "
+                  f"({scene.get('scene')!r}), which the .vsi doesn't have")
+    return project
+
+
 def load_experiment(path):
-    """The .xlef (or .lif, see load_lif) as a FolderEntry (its images and sub-folders)."""
+    """The .xlef (or .lif, see load_lif; or an Olympus .vsi, see load_vsi) as a FolderEntry (its images and sub-folders)."""
     if path.lower().endswith(".lif"):
         return load_lif(path)
+    if path.lower().endswith(".vsi"):
+        return load_vsi(path)
     entry = load_entry(path)
     if isinstance(entry, FolderEntry):
         entry.name = entry.saved_name = os.path.splitext(os.path.basename(path))[0]     # (the project: not renamed in the viewer)
@@ -1925,6 +2152,8 @@ class OpenImage:
         self.step_lock = threading.Lock()
         self.layouts = {}        # (z, c) -> where its file keeps the pixels, or None (see raw_layout)
         self.ov_step = max(1, int(np.ceil(max(entry.width, entry.height) / OVERVIEW_MAX)))
+        if entry.vsi:                           # (a power of 2: read from the .vsi's pyramid in place, see vsi_reader's note)
+            self.ov_step = vsi_reader.pow2_above(self.ov_step)
         self.pyramid = self.usable_level(OVERVIEW_MAX)
         if self.pyramid is not None:
             self.ov_step = self.pyramid[1]
@@ -1945,6 +2174,8 @@ class OpenImage:
 
     def is_compressed(self, z, c):
         """Plane (z, c) is in a compressed TIFF: reading any of it decodes the whole plane (seconds). Asked once, from the file's header."""
+        if self.entry.vsi:
+            return False                    # (tiles, read a block at a time: nothing is decoded whole, see vsi_reader.BlockReader)
         if z == self.max_z:
             return any(self.is_compressed(k, c) for k in self.layers(z))
         key = (z, c)
@@ -2009,6 +2240,8 @@ class OpenImage:
         a = self.planes.get(key)
         if a is not None:
             return a
+        if self.entry.vsi:
+            return None                     # (never whole: read in blocks, see row_reader)
         if z == self.max_z:
             return self._max_plane(c, stale, keep)
         path = self.entry.files.get(key)
@@ -2077,6 +2310,13 @@ class OpenImage:
                 if a is None:
                     return None
                 small = np.array(a) if small is None else np.maximum(small, a, out=small)
+            self._keep_overview(z, c, small, step)
+            return small
+        if self.entry.vsi:                  # (from the .vsi's own pyramid: see vsi_reader)
+            e = self.entry
+            small = vsi_reader.overview(*e.vsi, c, z, e.width, e.height, step)
+            if progress is not None:
+                progress(1.0)
             self._keep_overview(z, c, small, step)
             return small
         small = self._from_pyramid(c, z=z) if self.pyramid is not None else None
@@ -2167,6 +2407,8 @@ class OpenImage:
     def raw_layout(self, z, c):
         """(offset, dtype) of channel c's plane z when it can be read row by row from its file (see raw_layout), else None; asked once.
         The max projection: the first plane's, if every plane can be read so."""
+        if self.entry.vsi:
+            return ("vsi", None)            # (read row by row too: see row_reader)
         if z == self.max_z:
             got = [self.raw_layout(k, c) for k in self.layers(z)]
             return got[0] if all(g is not None for g in got) else None
@@ -2188,6 +2430,10 @@ class OpenImage:
     def row_reader(self, z, c):
         """A reader of rows of plane (z, c) from the image's own files (see _RowReader; the max projection: a _MaxRowReader over all the
         planes), or None if it can't be read row by row."""
+        e = self.entry
+        if e.vsi:
+            readers = [vsi_reader.BlockReader(*e.vsi, c, k, e.width, e.height, e.vsi_dtype) for k in self.layers(z)]
+            return readers[0] if len(readers) == 1 else _MaxRowReader(readers)
         if self.raw_layout(z, c) is None:
             return None
         readers = [_RowReader(self.entry.files[(k, c)], *self.raw_layout(k, c), self.entry.width) for k in self.layers(z)]
@@ -3216,6 +3462,8 @@ def _old_thumb_path(entry, size):
         h.update(f"{os.path.normcase(f)}|{st.st_size}|{st.st_mtime_ns}".encode())
     if entry.lif_block:
         h.update(f"|{entry.lif_block}".encode())
+    if entry.vsi:                    # (the scenes of a .vsi share its one file)
+        h.update(f"|vsi{entry.vsi[1]}".encode())
     return os.path.join(THUMB_CACHE, h.hexdigest() + ".png")
 
 
@@ -3229,6 +3477,8 @@ def _thumb_cache_path(entry, size):
         h.update(f"{os.path.normcase(f)}|{st.st_size}|{st.st_mtime_ns}".encode())
     if entry.lif_block:              # (the images of a .lif share its one file)
         h.update(f"|{entry.lif_block}".encode())
+    if entry.vsi:                    # (and the scenes of a .vsi)
+        h.update(f"|vsi{entry.vsi[1]}".encode())
     return os.path.join(THUMB_CACHE, h.hexdigest() + ".npz")
 
 
@@ -3334,6 +3584,9 @@ def thumb_arrays(entry, size=THUMB_SIZE, preview=None):
             arrays.append(None)
             continue
         page = source.pages.get((0, c))                         # (one of an OME-TIFF's pages, a .lof's channel, or None)
+        if entry.vsi:                                           # (from its smallest pyramid level that is large enough)
+            arrays.append(vsi_reader.overview(*entry.vsi, c, 0, entry.width, entry.height, vsi_reader.pow2_below(step)))
+            continue
         small = read_plain_rows(f, step, page=page)             # (several rows at once)
         if small is None:
             try:
@@ -3524,6 +3777,12 @@ def slide_layout(entries):
     return ov, extent(ov), boxes
 
 
+def turned(image, quarters):
+    """A PIL image turned `quarters` quarter turns clockwise."""
+    q = int(quarters) % 4
+    return image.transpose((Image.ROTATE_270, Image.ROTATE_180, Image.ROTATE_90)[q - 1]) if q else image
+
+
 class ThumbGrid(ttk.Frame):
     """The images as a grid of thumbnails (folders as headings), in the order of the list. Clicking one calls on_click(item); the arrow keys
     move through them. Thumbnails arrive later, with set_thumb()."""
@@ -3637,16 +3896,16 @@ class ThumbGrid(ttk.Frame):
         self._draw_picture(item)
 
     def _orient(self, item):
-        return self.orient(item) if self.orient is not None else (False, False, "")
+        return self.orient(item) if self.orient is not None else (False, 0, "")
 
     def _photo(self, image, o):
-        """The thumbnail as the view shows the image: mirrored and/or turned (a 180° turn is both mirrors)."""
+        """The thumbnail as the view shows the image: o = (mirrored left-right, quarter turns clockwise, badge): turned, then mirrored
+        (see XlefViewer._orient_picture)."""
         if image is None:
             return None
+        image = turned(image, o[1])
         if o[0]:
             image = image.transpose(Image.FLIP_LEFT_RIGHT)
-        if o[1]:
-            image = image.transpose(Image.FLIP_TOP_BOTTOM)
         return ImageTk.PhotoImage(image, master=self.canvas)
 
     def update_orientation(self, items=None):
@@ -3942,6 +4201,7 @@ class XlefViewer:
         self.full_res_ok = None      # (see show_entry)
         self.contrast_step, self.contrast_job = None, None     # (the slider drag being made: one Undo step; see _set_lo_hi)
         self.history = []            # changes that Undo goes back through: ("ann", entry), ("lut", [(entry, channel, old map)]),
+                                     # ("chname", [(entry, channel, old name)]),
                                      # ("range", [(entry, channel, old black, old white)]),
                                      # ("move", (item, old parent, old index)) or ("delete", (item, entry, old parent, old index))
         self.home = {}               # list item -> the project it was read from (an image dragged to another moves there on Save)
@@ -4170,13 +4430,18 @@ class XlefViewer:
                                      "(Save writes it into the section's .xlif, so it goes with the files; or, see Settings, it is kept on this "
                                      "computer). With \"Flip all "
                                      "sections\" ticked too, it is shown unflipped. Only the view is flipped, not the image.")
-        self.rotate_one = tk.BooleanVar(value=False)
-        self.rotate_one_check = ttk.Checkbutton(side, text="Rotate this section 180°", variable=self.rotate_one,
-                                                command=lambda: self.on_flip_one_toggle("rotated"), state=tk.DISABLED)
-        self.rotate_one_check.pack(anchor=tk.W, pady=(0, 4))
-        Tooltip(self.rotate_one_check, "Show this section turned upside down (top for bottom and left for right, with its annotations), "
-                                       "e.g. one placed on the slide the other way round. Saved like \"Flip this section\" (see "
-                                       "Settings). Only the view is rotated, not the image.")
+        self.rotate_one = tk.IntVar(value=0)        # the section's turn: quarter turns clockwise (0-3)
+        rot_row = ttk.Frame(side)
+        rot_row.pack(anchor=tk.W, pady=(0, 4))
+        self.rotate_button = ttk.Button(rot_row, text="Rotate +90°", command=self.rotate_section, state=tk.DISABLED)
+        self.rotate_button.pack(side=tk.LEFT)
+        self.rotate_label = ttk.Label(rot_row, text="", style="Muted.TLabel")
+        self.rotate_label.pack(side=tk.LEFT, padx=(6, 0))
+        self.rotate_one.trace_add("write", lambda *a: self.rotate_label.configure(
+            text=f"turned {self.rotate_one.get() % 4 * 90}°" if self.rotate_one.get() % 4 else ""))
+        Tooltip(self.rotate_button, "Turn this section a quarter turn clockwise (with its annotations): click again for 180°, 270°, and "
+                                    "back to as it was. E.g. for one placed on the slide another way round. Saved like \"Flip this "
+                                    "section\" (see Settings). Only the view is turned, not the image.")
         mid = ttk.Frame(side)
         mid.pack(fill=tk.BOTH, expand=True)
         # A z-stack's plane slider, left of the channels' sliders: vertical, plane 1 at the top, with a button at each end to move by one
@@ -4372,14 +4637,15 @@ class XlefViewer:
         e = self.img.entry
         cw, ch = self.canvas_size()
         ix0, iy0, ix1, iy1 = self._view_corners()
-        sx = lambda x: round(self._fx((x - self.cx) * self.scale + cw / 2))
-        sy = lambda y: round(self._fy((y - self.cy) * self.scale + ch / 2))
+        sx = lambda x: round((x - self.cx) * self.scale + cw / 2)          # (in the view's frame: turned and mirrored when drawn)
+        sy = lambda y: round((y - self.cy) * self.scale + ch / 2)
         top, bottom = max(0, min(sy(0), sy(e.height))), min(ch, max(sy(0), sy(e.height)))
         left, right = max(0, min(sx(0), sx(e.width))), min(cw, max(sx(0), sx(e.width)))
+        line = lambda a, b: self.canvas.create_line(*self._to_screen(*a), *self._to_screen(*b), fill=PIXEL_GRID_COLOR, tags="pixelgrid")
         for x in range(max(0, int(np.ceil(ix0))), min(e.width, int(ix1)) + 1):
-            self.canvas.create_line(sx(x), top, sx(x), bottom, fill=PIXEL_GRID_COLOR, tags="pixelgrid")
+            line((sx(x), top), (sx(x), bottom))
         for y in range(max(0, int(np.ceil(iy0))), min(e.height, int(iy1)) + 1):
-            self.canvas.create_line(left, sy(y), right, sy(y), fill=PIXEL_GRID_COLOR, tags="pixelgrid")
+            line((left, sy(y)), (right, sy(y)))
 
     # --- settings window, color theme
 
@@ -4717,7 +4983,7 @@ class XlefViewer:
 
     def _start_auto_update(self):
         app_update.AutoUpdate(self.root, {"busy": lambda: getattr(self, "updating", False), "blocked": self._auto_blocked,
-                                          "status": self._auto_status, "keep_open": self._auto_keep_open,
+                                          "status": self._auto_status, "keep_open": self._auto_keep_open, "failed": self._auto_failed,
                                           "restart": self._auto_restart}).start()
 
     def _auto_blocked(self):
@@ -4758,6 +5024,22 @@ class XlefViewer:
         else:
             self.update_menu.entryconfigure(0, label="Restart the viewer now", state=tk.NORMAL,
                                             command=lambda: self._restart_over(self._on_top()))
+
+    def _auto_failed(self, text):
+        """The automatic update could not be applied: the menu says so ("Update failed"), and its item tells why (and can try again)."""
+        self.auto_update_error = text
+        self.menubar.entryconfigure(self.update_menu_index, label="Update failed")
+        self.update_menu.entryconfigure(0, label="Why the automatic update failed...", state=tk.NORMAL, command=self._show_auto_failure)
+
+    def _show_auto_failure(self):
+        """Update > Why the automatic update failed: the reason; Yes tries the update again now (as Update from GitHub does)."""
+        text = getattr(self, "auto_update_error", None) or "The automatic update could not be applied."
+        again = messagebox.askyesno("Update failed", text + "\n\nTry the update again now?", icon="warning", parent=self._on_top())
+        self.auto_update_error = None
+        self.update_menu.entryconfigure(0, state=tk.NORMAL, command=self.update_app)
+        self._update_menu_label(getattr(self, "update_count", 0))
+        if again:
+            self.update_app()
 
     def _auto_restart(self):
         self._restart_over(self._on_top())
@@ -4954,7 +5236,8 @@ class XlefViewer:
     def _ask_open_file(self, details):
         return ask_open_file(
             self.root, self.settings["recent_files"], title="Open a Leica experiment", noun="experiment",
-            filetypes=[("Leica experiment", "*.xlef *.xlif *.lif"), ("All files", "*.*")],
+            filetypes=[("Leica experiment or Olympus .vsi", "*.xlef *.xlif *.lif *.vsi"), ("Leica experiment", "*.xlef *.xlif *.lif"),
+                       ("Olympus cellSens", "*.vsi"), ("All files", "*.*")],
             columns=[("name", "Experiment", 280, "w", True), ("images", "Images", 70, "e", False), ("pyramid", "Pyramid", 80, "w", False),
                      ("folder", "Folder", 420, "w", True), ("when", "Modified", 130, "w", False)],
             details=details, on_remove=self.remove_recent, drop=self.dnd_files is not None,
@@ -5026,8 +5309,8 @@ class XlefViewer:
             messagebox.showerror("XLEF viewer", read_error_text(path, error), parent=self.root)
             return
         self.add_recent(path)
-        self.tree.item(pid, text=self.projects[pid]["name"] + ("   (.lif: read only)" if experiment.read_only else ""))
         self.projects[pid]["root"] = experiment
+        self.tree.item(pid, text=self._project_label(pid))
         experiment.path = None if experiment.read_only else path      # (no file of its own: nothing is dragged into or out of it)
         self._fill_tree(pid, experiment)
         self._measure_sizes(pid)
@@ -5233,7 +5516,7 @@ class XlefViewer:
 
     def _is_lif_project(self, pid):
         root = self.projects.get(pid, {}).get("root")
-        return root is not None and root.read_only
+        return root is not None and root.read_only and not root.vsi
 
     def save_as_xlef_command(self):
         """File > Save as .xlef...: for the .lif of the selected row, or the only experiment open."""
@@ -5247,7 +5530,7 @@ class XlefViewer:
         """The images of .lif project `pid` changed while it was viewed (annotations, color maps, contrast, flips: kept only for
         viewing, as nothing is written into a .lif), by item."""
         return {i: e for i, e in self._entries_of(pid).items()
-                if e.annotations_changed or e.luts_changed or e.contrast_changed or e.flip_changed}
+                if e.annotations_changed or e.luts_changed or e.contrast_changed or e.flip_changed or e.channel_names_changed}
 
     def _xlef_copy_of(self, lif_path):
         """The .xlef this .lif was saved as (where Save as .xlef put it, remembered in the settings; or the default place beside it,
@@ -5420,6 +5703,8 @@ class XlefViewer:
                                                                  [c.max_value for c in e.channels])))
             if e.flip_changed:
                 steps.append(("flip", lambda: write_flip(target, e.flipped, e.rotated)))
+            if e.channel_names_changed:
+                steps.append(("channel names", lambda: write_channel_names(target, [c.name for c in e.channels])))
             for what, step in steps:            # (each run here, before the next image: the lambdas use this one's e and target)
                 try:
                     step()
@@ -5445,8 +5730,8 @@ class XlefViewer:
 
         def work():
             for e in entries:
-                if e.lif_block:          # (a .lif's images share its one file: their sizes came from its metadata)
-                    continue
+                if e.lif_block or e.vsi:     # (a .lif's images share its one file: their sizes came from its metadata; a .vsi's
+                    continue                 # scenes, from their .ets files)
                 total = 0
                 for f in e.all_files():
                     try:
@@ -5691,7 +5976,8 @@ class XlefViewer:
         if getattr(obj, "annotations_changed", False):
             what.append("annotations")
         if isinstance(obj, ImageEntry):
-            what += ["color maps"] * obj.luts_changed + ["contrast"] * obj.contrast_changed + ["flip"] * (obj.flipped != obj.saved_flipped) + ["rotation"] * (obj.rotated != obj.saved_rotated)
+            what += (["channel names"] * obj.channel_names_changed + ["color maps"] * obj.luts_changed + ["contrast"] * obj.contrast_changed
+                     + ["flip"] * (obj.flipped != obj.saved_flipped) + ["rotation"] * (obj.rotated != obj.saved_rotated))
         if getattr(obj, "order_changed", False):
             what.append("the order of what it holds")
         return what
@@ -5784,13 +6070,21 @@ class XlefViewer:
         elif sel:
             self.tree.see(sel[0])
 
+    def _project_label(self, pid):
+        """A project's name as the list and the thumbnails' heading show it: with "(.lif: read only)" or "(.vsi: read only)" after it
+        when nothing is written into its file."""
+        root = self.projects[pid].get("root")
+        if root is None or not root.read_only:
+            return self.projects[pid]["name"]
+        return self.projects[pid]["name"] + ("   (.vsi)" if root.vsi else "   (.lif: read only)")      # (a .vsi's edits: in its sidecar)
+
     def _grid_rows_all(self):
         """The thumbnail grid's rows: each open project under a heading of its own (a line across, its name), then its folders and
         images."""
         rows = []
         for pid in self.tree.get_children(""):
             if pid in self.projects:
-                rows.append(("project", self.projects[pid]["name"], pid))
+                rows.append(("project", self._project_label(pid), pid))
                 if pid in self.loading_rows:
                     rows.append(("loading", "Loading...", pid))       # (still being read: see open_xlef)
                 else:
@@ -5949,6 +6243,13 @@ class XlefViewer:
                         return                          # (memory for kept images is full)
                     arrays, last = [], -1
                     for c, f in enumerate(files):
+                        if entry.vsi:                   # (from its pyramid, at the preview's step: see vsi_reader.overview)
+                            if wait(entry) in ("stop", "skip"):
+                                break
+                            arrays.append(vsi_reader.overview(*entry.vsi, c, 0, entry.width, entry.height, step))
+                            self.results.put(("preload_progress", gen, (item, int(100 * (c + 1) / n))))
+                            continue
+
                         def progress(frac, c=c):
                             nonlocal last
                             pct = int(100 * (c + frac) / n)
@@ -6113,8 +6414,8 @@ class XlefViewer:
         self.photo = None
         self.flip_one.set(False)
         self.flip_one_check.configure(state=tk.DISABLED)        # (no section shown)
-        self.rotate_one.set(False)
-        self.rotate_one_check.configure(state=tk.DISABLED)
+        self.rotate_one.set(0)
+        self.rotate_button.configure(state=tk.DISABLED)
         self.last_view_rgb = self.base_view = None
         self.shrunk.clear()
         self.selected = self.ann_drag = self.hover_ann = None
@@ -6214,7 +6515,7 @@ class XlefViewer:
         self.flip_one.set(self._section_flipped(entry))
         self.flip_one_check.configure(state=tk.NORMAL)
         self.rotate_one.set(self._section_flipped(entry, "rotated"))
-        self.rotate_one_check.configure(state=tk.NORMAL)
+        self.rotate_button.configure(state=tk.NORMAL)
         self._build_channel_controls()
         self._update_annotations_check()
         if entry.nz > 1:
@@ -6418,14 +6719,85 @@ class XlefViewer:
             if labels is None:
                 labels = self._channel_labels(slider.winfo_reqwidth())
             label.configure(text=labels[i] or " ")      # (" ": an unnamed channel's column as tall as the others)
-            if ch.named:
-                Tooltip(label, name.rstrip("\n"))
+            label.configure(cursor="xterm")
+            label.bind("<Double-Button-1>", lambda e, i=i: self.rename_channel(i))
+            Tooltip(label, name + "Double-click to rename this channel (in every section that has it).")
             swatch.color = color
             swatch.keep_colors = True       # (styled by _show_channel_state)
             self.ch_widgets.append((on, slider, swatch))
             self._show_channel_state(i)
         if self.split:
             self._layout_panels()           # (this image's channels, each in a panel)
+
+    def rename_channel(self, i):
+        """Double-click on a channel's name above its swatch: a small box to rename it, in every section of this project that has a
+        channel of that name (wherever it is in their list: the name, not the number, says which channel it is). Undoable (Ctrl+Z, all
+        at once), and written by Save (into each .xlif, or a .vsi's edits file)."""
+        if self.img is None or i >= len(self.img.entry.channels):
+            return
+        entry, old = self.img.entry, self.img.entry.channels[i].name
+        pid = self._project_of(self._item_of(entry))
+        others = list(self._entries_of(pid).values()) if pid else [entry]
+        having = [e for e in others if any(c.name == old for c in e.channels)]
+        lacking = len(others) - len(having)
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"Rename channel {i + 1}")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        body = ttk.Frame(dlg, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+        name = tk.StringVar(dlg, old)
+        box = ttk.Entry(body, textvariable=name, width=36)
+        box.pack(fill=tk.X)
+        n = len(having)
+        note = (f"Renames \"{old}\" in {'this section' if n == 1 else f'all {n} sections'} of this project that "
+                f"{'has' if n == 1 else 'have'} a channel of that name.")
+        if lacking:
+            note += f" {lacking} other section{'s' * (lacking != 1)} {'has' if lacking == 1 else 'have'} none, and {'is' if lacking == 1 else 'are'} left as {'it is' if lacking == 1 else 'they are'}."
+        ttk.Label(body, text=note, wraplength=300, justify=tk.LEFT, style="Muted.TLabel").pack(anchor=tk.W, pady=(6, 0))
+        buttons = ttk.Frame(body)
+        buttons.pack(fill=tk.X, pady=(10, 0))
+
+        def done():
+            new = name.get().strip()
+            dlg.destroy()
+            if not new or new == old:
+                return
+            changes = []
+            for e in having:
+                for k, c in enumerate(e.channels):
+                    if c.name == old:
+                        changes.append((e, k, old))
+                        c.name, c.named = new, True
+            self.history = self.history[-199:] + [("chname", changes)]
+            self._channel_names_changed({e for e, _, _ in changes})
+            m = len({e for e, _, _ in changes})
+            self.status.config(text=f"Channel \"{old}\" renamed \"{new}\" in {m} section{'s' * (m != 1)}: not saved yet "
+                                    "(Save writes it; Ctrl+Z undoes it)")
+        ttk.Button(buttons, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Rename", command=done).pack(side=tk.RIGHT, padx=(0, 6))
+        dlg.bind("<Return>", lambda e: done())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        try:
+            x, y = self.ch_widgets[i][2].winfo_rootx(), self.ch_widgets[i][2].winfo_rooty()
+            dlg.geometry(f"+{max(0, x - 340)}+{max(0, y - 20)}")      # (by the channel's column, to its left)
+        except (tk.TclError, IndexError):
+            pass
+        box.focus_set()
+        box.select_range(0, tk.END)
+        dlg.grab_set()
+        self.rename_dialog = dlg                # (for tests)
+        return dlg
+
+    def _channel_names_changed(self, changed):
+        """After channels of these images were renamed (or that was undone): the channel controls of the image on screen (the names
+        above the swatches, the tips), the list's "unsaved" marks and Save."""
+        if self.img is not None and self.img.entry in changed:
+            self._build_channel_controls()
+            self.redraw()
+        for e in changed:
+            self._label_item(self._item_of(e))
+        self._update_annotations_check()
 
     def _show_channel_state(self, i):
         """A channel's swatch in its color (number in black or white, whichever reads), or grey when it is switched off; its slider too."""
@@ -6630,7 +7002,10 @@ class XlefViewer:
     # --- view geometry
 
     def canvas_size(self):
-        return max(self.canvas.winfo_width(), 1), max(self.canvas.winfo_height(), 1)
+        """The size of the view, as it is worked out (unturned): the canvas's, the other way round when the section is turned a
+        quarter (see _quarter; screen_size is the canvas's own)."""
+        w, h = max(self.canvas.winfo_width(), 1), max(self.canvas.winfo_height(), 1)
+        return (h, w) if self._quarter() % 2 else (w, h)
 
     def clamp_view(self):
         """No zooming out past the fit view, no panning past the image edges."""
@@ -6668,10 +7043,10 @@ class XlefViewer:
     def _set_zoom(self, scale, sx=None, sy=None):
         """The view's geometry for zoom_to, not drawn: True if it changed (False at the zoom limit already)."""
         cw, ch = self.canvas_size()
-        sx = cw / 2 if sx is None else sx
-        sy = ch / 2 if sy is None else sy
+        sx = self.screen_size()[0] / 2 if sx is None else sx
+        sy = self.screen_size()[1] / 2 if sy is None else sy
         ix, iy = self.screen_to_image(sx, sy)
-        sx, sy = self._fx(sx), self._fy(sy)
+        sx, sy = self._from_screen(sx, sy)
         before = (self.scale, self.cx, self.cy)
         self.scale = scale
         self.clamp_view()
@@ -6685,16 +7060,8 @@ class XlefViewer:
 
     def screen_to_image(self, sx, sy):
         cw, ch = self.canvas_size()
-        sx, sy = self._fx(sx), self._fy(sy)
+        sx, sy = self._from_screen(sx, sy)
         return self.cx + (sx - cw / 2) / self.scale, self.cy + (sy - ch / 2) / self.scale
-
-    def _fx(self, x):
-        """Flip left-right: canvas x <-> where it would be unflipped (the view is worked out unflipped, and mirrored when drawn)."""
-        return self.canvas_size()[0] - x if self._flipped() else x
-
-    def _fy(self, y):
-        """Rotated 180°: canvas y <-> where it would be unrotated (as _fx, top for bottom)."""
-        return self.canvas_size()[1] - y if self._flipped_y() else y
 
     def _view_corners(self):
         """The image points at the canvas's top-left and bottom-right corners, as if unflipped (ix0 <= ix1 either way)."""
@@ -6709,18 +7076,16 @@ class XlefViewer:
             self.redraw()
 
     def _orientation(self, entry):
-        """(flipped, rotated 180°) of a section as it is shown when opened (see _section_flipped), without changing anything: this
-        computer's note if there is one (kept, or not saved into the file yet), else the entry's."""
-        out = []
-        for kind in ("flipped", "rotated"):
-            note = self._flip_note(entry, kind)
-            out.append(bool(getattr(entry, kind) if note is None else note))
-        return tuple(out)
+        """(flipped, quarter turns clockwise) of a section as it is shown when opened (see _section_flipped), without changing anything:
+        this computer's note if there is one (kept, or not saved into the file yet), else the entry's."""
+        notes = [self._flip_note(entry, kind) for kind in ("flipped", "rotated")]
+        flipped = bool(entry.flipped if notes[0] is None else notes[0])
+        return flipped, int(entry.rotated if notes[1] is None else notes[1]) % 4
 
     def _orientation_words(self, entry, long=False):
-        """A section's own flip and rotation, as words after its name ("flipped", "rotated 180°", both), or "" for neither."""
-        flipped, rotated = self._orientation(entry)
-        words = ["flipped" + (" left for right" if long else "")] * flipped + ["rotated 180°"] * rotated
+        """A section's own flip and turn, as words after its name ("flipped", "rotated 90°", both), or "" for neither."""
+        flipped, q = self._orientation(entry)
+        words = ["flipped" + (" left for right" if long else "")] * flipped + [f"rotated {q * 90}°"] * bool(q)
         return (" and " if long else ", ").join(words)
 
     def _thumb_orient(self, item):
@@ -6728,38 +7093,49 @@ class XlefViewer:
         ("Flip all sections" included; the badge is the section's own flip and rotation only)."""
         e = self.entries.get(item)
         if e is None:
-            return False, False, ""
-        flipped, rotated = self._orientation(e)
-        badge = ", ".join(["flipped"] * flipped + ["180°"] * rotated)
-        return bool(self.flip_x.get()) ^ flipped ^ rotated, rotated, badge
+            return False, 0, ""
+        flipped, q = self._orientation(e)
+        badge = ", ".join(["flipped"] * flipped + [f"{q * 90}°"] * bool(q))
+        return bool(self.flip_x.get()) ^ flipped, (-q) % 4 if flipped else q, badge
 
     @staticmethod
     def _flip_key(entry):
-        return os.path.normcase(os.path.normpath(entry.xlif_path))
+        key = os.path.normcase(os.path.normpath(entry.xlif_path))
+        return key + f"#{entry.vsi[1]}" if entry.vsi else key           # (the scenes of a .vsi share its one file)
 
     def _flip_in_files(self):
         """Settings: "Flip this section" is saved into the section's .xlif (see write_flip), not kept on this computer."""
         return self.settings.get("flip_in_files", True)
 
     def _flip_note(self, entry, kind="flipped"):
-        """This computer's note of the section's flip (kind "flipped") or 180° rotation ("rotated"), by its .xlif's path (in the
-        settings: "flipped_sections" / "unflipped_sections", "rotated_sections" / "unrotated_sections"): True, False, or None (none).
-        Kept while they aren't saved into the files, or by an earlier version."""
+        """This computer's note of the section's flip (kind "flipped": True, False) or turn ("rotated": quarter turns clockwise, 0-3),
+        by its .xlif's path, or None (none). In the settings: "flipped_sections" / "unflipped_sections"; "rotation_sections" {path:
+        quarter turns} (and, from earlier versions, "rotated_sections" / "unrotated_sections": 180° / none). Kept while they aren't
+        saved into the files, or by an earlier version."""
         key = self._flip_key(entry)
-        return (True if key in self.settings.get(f"{kind}_sections", []) else
-                False if key in self.settings.get(f"un{kind}_sections", []) else None)
+        if kind == "rotated" and key in self.settings.get("rotation_sections", {}):
+            return int(self.settings["rotation_sections"][key]) % 4
+        on = (True if key in self.settings.get(f"{kind}_sections", []) else
+              False if key in self.settings.get(f"un{kind}_sections", []) else None)
+        return on if kind != "rotated" or on is None else (2 if on else 0)
 
     def _set_flip_note(self, entry, on, kind="flipped"):
-        """Note the section's flip (or rotation, see _flip_note) on this computer (None: forget the note)."""
+        """Note the section's flip (or turn, see _flip_note) on this computer (None: forget the note)."""
         key = self._flip_key(entry)
         for name in (f"{kind}_sections", f"un{kind}_sections"):
             if key in self.settings.get(name, []):
                 self.settings[name] = [k for k in self.settings[name] if k != key]
+        if kind == "rotated":
+            turns = self.settings.setdefault("rotation_sections", {})
+            turns.pop(key, None)
+            if on is not None:
+                turns[key] = int(on) % 4
+            return
         if on is not None:
             self.settings.setdefault(f"{kind}_sections" if on else f"un{kind}_sections", []).append(key)
 
     def _section_flipped(self, entry, kind="flipped"):
-        """Whether the section is shown flipped (kind "flipped") or rotated 180° ("rotated"). Saved into the files (the setting): as in
+        """Whether the section is shown flipped (kind "flipped"), or its quarter turns ("rotated"). Saved into the files (the setting): as in
         its .xlif, or as changed here and not saved yet; a note on this computer (from an earlier version, or from when the setting was
         off) counts as such a change, until Save writes it into the file. Else: this computer's note, or, without one, the .xlif's."""
         note = self._flip_note(entry, kind)
@@ -6774,13 +7150,26 @@ class XlefViewer:
             self._update_annotations_check()
         return getattr(entry, kind)
 
+    def rotate_section(self):
+        """Rotate +90°: the section a quarter turn further clockwise (after 270°, back to 0), about the middle of the view; the whole
+        section in view again if it was (the view's shape turns with it)."""
+        if not self.img:
+            return
+        fitted = self.scale <= self.fit_scale * (1 + 1e-6)
+        self.rotate_one.set((self.rotate_one.get() + 1) % 4)
+        if fitted:
+            self.fit(redraw=False)
+        else:
+            self.clamp_view()
+        self.on_flip_one_toggle("rotated")
+
     def on_flip_one_toggle(self, kind="flipped"):
-        """"Flip this section" (or "Rotate this section 180°", kind "rotated"): written into its .xlif by Save (until then, marked
+        """"Flip this section" (or its turn, kind "rotated": see rotate_section): written into its .xlif by Save (until then, marked
         unsaved), or, with that setting off, noted on this computer at once."""
         if not self.img:
             return
         e = self.img.entry
-        on = (self.flip_one if kind == "flipped" else self.rotate_one).get()
+        on = self.flip_one.get() if kind == "flipped" else self.rotate_one.get() % 4
         if self._flip_in_files():
             setattr(e, kind, on)
             self._set_flip_note(e, None, kind)
@@ -6789,6 +7178,8 @@ class XlefViewer:
         else:
             self._set_flip_note(e, None if on == getattr(e, kind) else on, kind)
             self._label_item(self._item_of(e))
+        if kind == "rotated":                       # (its thumbnail turns too: the flip's is redrawn by _label_item)
+            self.thumb_grid.update_orientation([self._item_of(e)])
         self.redraw()
 
     def set_flip_in_files(self, on):
@@ -6811,21 +7202,69 @@ class XlefViewer:
         self._update_annotations_check()
 
     def _flipped(self):
-        """The view is mirrored left for right: by "Flip all sections", "Flip this section" and "Rotate this section 180°" (a 180°
-        turn is a left-right mirror and a top-bottom one), an odd number of them (two flip it back)."""
+        """The view is mirrored left for right: by "Flip all sections" or "Flip this section" (both: not mirrored)."""
         shown = self.img is not None
-        return bool(self.flip_x.get()) ^ (shown and bool(self.flip_one.get())) ^ (shown and bool(self.rotate_one.get()))
+        return bool(self.flip_x.get()) ^ (shown and bool(self.flip_one.get()))
 
-    def _flipped_y(self):
-        """The view is mirrored top for bottom: "Rotate this section 180°" (with the left-right mirror of _flipped)."""
-        return self.img is not None and bool(self.rotate_one.get())
+    def _quarter(self):
+        """The view's turn, in quarter turns clockwise (0-3), applied before the mirror of _flipped. The section is flipped by its own
+        "Flip this section" first, then turned by Rotate +90°, then mirrored by "Flip all sections": with its own flip, the turn goes
+        the other way before that mirror (a mirror then a turn is the turn the other way, then the mirror), so that each click of
+        Rotate +90° turns the picture clockwise on the screen (counterclockwise only with "Flip all sections": all of it mirrored)."""
+        if self.img is None:
+            return 0
+        q = int(self.rotate_one.get()) % 4
+        return (-q) % 4 if self.flip_one.get() else q
+
+    def screen_size(self):
+        """The canvas's own size (canvas_size is the view's: the other way round when the view is turned a quarter)."""
+        return max(self.canvas.winfo_width(), 1), max(self.canvas.winfo_height(), 1)
+
+    def _to_screen(self, x, y):
+        """A point of the view (worked out unturned and unmirrored, in a canvas_size() frame) -> where it is on the canvas: turned
+        (_quarter), then mirrored (_flipped). The view's pictures are turned and mirrored the same way (see _orient_picture)."""
+        vw, vh = self.canvas_size()
+        q = self._quarter()
+        if q == 1:
+            x, y = vh - y, x
+        elif q == 2:
+            x, y = vw - x, vh - y
+        elif q == 3:
+            x, y = y, vw - x
+        if self._flipped():
+            x = self.screen_size()[0] - x
+        return x, y
+
+    def _from_screen(self, x, y):
+        """A canvas point (the pointer's, ...) -> the point of the view it shows (the inverse of _to_screen)."""
+        if self._flipped():
+            x = self.screen_size()[0] - x
+        vw, vh = self.canvas_size()
+        q = self._quarter()
+        if q == 1:
+            x, y = y, vh - x
+        elif q == 2:
+            x, y = vw - x, vh - y
+        elif q == 3:
+            x, y = vw - y, x
+        return x, y
+
+    def _orient_picture(self, im):
+        """A picture of the view (a PIL image in the view's frame) as the canvas shows it: turned, then mirrored (see _to_screen)."""
+        im = turned(im, self._quarter())
+        return im.transpose(Image.FLIP_LEFT_RIGHT) if self._flipped() else im
+
+    def _orient_place(self, left, top, w, h):
+        """Where a w x h picture at (left, top) of the view goes on the canvas (its top-left corner), once turned and mirrored."""
+        (x0, y0), (x1, y1) = self._to_screen(left, top), self._to_screen(left + w, top + h)
+        return min(x0, x1), min(y0, y1)
 
     def show_message(self, text):
         """Words in the middle of the image area ("Loading...", ...) until a picture replaces them (any drawing clears the canvas)."""
         self.canvas_message = text
         self._each_canvas(lambda: self.canvas.delete("all"))
         if text:
-            cw, ch = self.canvas_size()
+            cw, ch = self.screen_size()
             self.canvas.create_text(cw / 2, ch / 2, text=text, fill="#b0b0b0", font=("Segoe UI", 16), tags="message",
                                     width=max(cw - 60, 200), justify=tk.CENTER)
 
@@ -7004,11 +7443,8 @@ class XlefViewer:
                 t0 = self._lap(times, "kept", t0)
             self._glide_paste(frame, im, base_map, cw, ch, base_rect)
             t0 = self._lap(times, "scale", t0)
-            if self._flipped():
-                frame = frame.transpose(Image.FLIP_LEFT_RIGHT)
-            if self._flipped_y():
-                frame = frame.transpose(Image.FLIP_TOP_BOTTOM)
-            if self._flipped() or self._flipped_y():
+            if self._flipped() or self._quarter():
+                frame = self._orient_picture(frame)
                 t0 = self._lap(times, "flip", t0)
             frames.append(frame)
         photos = self.glide_photos
@@ -7167,8 +7603,9 @@ class XlefViewer:
             return
         x0, y0, cx0, cy0 = self.drag
         self._moving()
-        self.cx = cx0 - (event.x - x0) / self.scale * (-1 if self._flipped() else 1)
-        self.cy = cy0 - (event.y - y0) / self.scale * (-1 if self._flipped_y() else 1)
+        (ax, ay), (bx, by) = self._from_screen(x0, y0), self._from_screen(event.x, event.y)     # (the drag in the view's frame)
+        self.cx = cx0 - (bx - ax) / self.scale
+        self.cy = cy0 - (by - ay) / self.scale
         self.clamp_view()
         self.redraw(preview_only=True)
 
@@ -7309,7 +7746,8 @@ class XlefViewer:
         half a pixel in, not half a block, so the array lies (st - 1) / 2 image pixels up and left of the blocks. A pyramid level's
         pixel (read at the level's own step) is the whole block's (see _note_level)."""
         _, _, i0, j0, _, _, st, _ = key
-        off = (self.key_level.get((key[0],) + tuple(key[2:]), 1) - st) / 2
+        whole = st if self.img is not None and key[0] == id(self.img) and self.img.entry.vsi else 1     # (a .vsi's pixels: the whole
+        off = (self.key_level.get((key[0],) + tuple(key[2:]), whole) - st) / 2                         # block's, see vsi_reader)
         return i0 * st + off, j0 * st + off
 
     def _note_level(self, key, level_step):
@@ -7330,7 +7768,7 @@ class XlefViewer:
     def _ov_offset(self):
         """(See _origin) for the previews: none if they come from the pyramid; else, read as every ov_step-th pixel, (1 - ov_step) / 2."""
         img = self.img
-        return 0.0 if img.pyramid is not None else (1 - img.ov_step) / 2
+        return 0.0 if img.pyramid is not None or img.entry.vsi else (1 - img.ov_step) / 2      # (a .vsi's: the whole block's too)
 
     def _view_rect(self, step):
         """The visible part of the image, in units of `step` image pixels (i0, j0, i1, j1: columns/rows of a [::step, ::step] array),
@@ -7468,6 +7906,8 @@ class XlefViewer:
             self._draw_load_note()
             return
         step = max(1, int(1 / self.scale))
+        if self.img.entry.vsi:                  # (a power of 2: read from the .vsi's pyramid in place, see vsi_reader's note)
+            step = vsi_reader.pow2_below(step)
         need = [c for c in range(n) if luts[c] is not None]           # (the channels to read for a sharp view, if one is needed)
         plan = self._read_plan(s, step, need) if not preview_only and not self.loading and step < s else True
         detail, level = plan is not True, None
@@ -7579,6 +8019,8 @@ class XlefViewer:
         key = (id(img), z, i0, j0, i1, j1, step, place)
         if level is not None:
             self._note_level(key, round(img.entry.width / level.width))
+        elif img.entry.vsi:                     # (each pixel the whole block's, as a pyramid level's: see vsi_reader)
+            self._note_level(key, step)
         smooth = self.scale * step < 1
 
         self._stash_partial()
@@ -8122,8 +8564,7 @@ class XlefViewer:
                         return None          # (not a plain file: this layer is left out)
                     reader = _LevelRowReader(level.files[(z, c)], layout[0], layout[1], level.width, step, e.channels[c].max_value)
                 else:
-                    layout = img.raw_layout(z, c)
-                    reader = _RowReader(e.files[(z, c)], layout[0], layout[1], e.width) if layout is not None else None
+                    reader = img.row_reader(z, c)
                 if reader is not None:
                     try:
                         futures = [_READ_POOL.submit(reader.row, (j0 + k) * step, i0 * step, cols, step) for k in range(rows)]
@@ -8329,14 +8770,11 @@ class XlefViewer:
         same size as the new picture is reused (pasted into: ~20 ms less at full screen than making a new one)."""
         self.base_view = {"ims": ims, "left": left, "top": top, "scale": self.scale, "cx": self.cx, "cy": self.cy,
                           "size": self.canvas_size(), "img": self.img}
-        if self._flipped():
-            ims = [im.transpose(Image.FLIP_LEFT_RIGHT) for im in ims]
-            left = self.canvas_size()[0] - left - ims[0].width
-        if self._flipped_y():                       # (rotated 180°: mirrored top for bottom too)
-            ims = [im.transpose(Image.FLIP_TOP_BOTTOM) for im in ims]
-            top = self.canvas_size()[1] - top - ims[0].height
+        if self._flipped() or self._quarter():      # (turned and mirrored as the view is: see _to_screen)
+            left, top = self._orient_place(left, top, ims[0].width, ims[0].height)
+            ims = [self._orient_picture(im) for im in ims]
         self.fast_shown, self.fast_now = self.fast_now, False
-        self.last_view = (ims, left, top, self.canvas_size(), self.panel_cols)
+        self.last_view = (ims, left, top, self.screen_size(), self.panel_cols)
         self.last_view_rgb = ims[0]
         t0 = time.perf_counter()
         old = getattr(self, "photos", None) or []
@@ -8400,7 +8838,7 @@ class XlefViewer:
                 if (self.z, self.panel_channels[here]) in self.img.overviews:
                     return
                 note = "Pending..."
-        cw, ch = self.canvas_size()
+        cw, ch = self.screen_size()
         t = c.create_text(cw / 2, ch / 2, text=note, fill="#e0e0e0", font=("Segoe UI", 16), tags="loadnote")
         x0, y0, x1, y1 = c.bbox(t)
         c.tag_lower(c.create_rectangle(x0 - 14, y0 - 8, x1 + 14, y1 + 8, fill="#202020", outline="#606060", tags="loadnote"), t)
@@ -8423,12 +8861,18 @@ class XlefViewer:
         self.save_button.configure(state=tk.NORMAL if changed else tk.DISABLED)
         self.unsaved_label.configure(text="unsaved changes" if changed else "")
 
+    def _text_anchor(self):
+        """The corner of a text annotation that is at its point: the one the image's top-left corner turns into (the text stays
+        upright, and lies the side of its point it does in the image)."""
+        (x0, y0), (x1, y1) = self._to_screen(0, 0), self._to_screen(1, 1)
+        return ("n" if y1 > y0 else "s") + ("w" if x1 > x0 else "e")
+
     def m_to_screen(self, p):
         """Metres from the image centre (annotation coordinates) -> canvas pixels."""
         e = self.img.entry
         cw, ch = self.canvas_size()
         px, py = e.width / 2 + p[0] * 1e6 / e.pixel_um, e.height / 2 + p[1] * 1e6 / e.pixel_um
-        return self._fx((px - self.cx) * self.scale + cw / 2), self._fy((py - self.cy) * self.scale + ch / 2)
+        return self._to_screen((px - self.cx) * self.scale + cw / 2, (py - self.cy) * self.scale + ch / 2)
 
     def screen_to_m(self, sx, sy):
         e = self.img.entry
@@ -8468,8 +8912,7 @@ class XlefViewer:
             pts = [self.m_to_screen(p) for p in a.points()]
             col = a.color
             if a.kind == "text":
-                t = c.create_text(*pts[0], text=a.text, fill=col, font=a.font, anchor=("s" if self._flipped_y() else "n") + ("e" if self._flipped() else "w"),
-                                  tags=tags)
+                t = c.create_text(*pts[0], text=a.text, fill=col, font=a.font, anchor=self._text_anchor(), tags=tags)
                 if a.attrs.get("showBorder") == "True":
                     c.create_rectangle(*c.bbox(t), outline=col, tags=tags)
             elif a.kind in ("rectangle", "ellipse") and len(pts) >= 3:
@@ -8708,7 +9151,7 @@ class XlefViewer:
         c.delete("hiresnote")
         if not getattr(self, "hires_note", False):
             return
-        cw, ch = self.canvas_size()
+        cw, ch = self.screen_size()
         done = getattr(self, "hires_progress", None)
         text = getattr(self, "hires_label", "Loading full resolution...") + (f" {int(100 * done)}%" if done else "")
         t = c.create_text(cw / 2, ch / 2, text=text, fill="#e0e0e0", font=("Segoe UI", 16),
@@ -8939,6 +9382,12 @@ class XlefViewer:
                 self._contrast_settled({e for e, _, _, _ in data})
                 self.status.config(text=f"Undone: contrast change on {data[0][0].name}")
                 return
+            if kind == "chname":
+                for e, i, old in data:
+                    e.channels[i].name = old
+                self._channel_names_changed({e for e, _, _ in data})
+                self.status.config(text=f"Undone: renaming channel {data[0][2]!r} in {len({e for e, _, _ in data})} section(s)")
+                return
             if kind == "lut":
                 for e, i, old in data:
                     e.channels[i].lut = old
@@ -8955,11 +9404,7 @@ class XlefViewer:
         """After colour maps of these images changed (picked, or undone): the image on screen and its channel controls, the list's
         "unsaved" marks, Save, and their thumbnails."""
         if self.img is not None and self.img.entry in changed:
-            for i in range(len(self.ch_widgets)):
-                on, slider, swatch = self.ch_widgets[i]
-                swatch.color = self._swatch_color(i)
-                slider.set_color(swatch.color)
-                self._show_channel_state(i)
+            self._build_channel_controls()         # (their colors, and names: above the swatches, in the tips)
             self.redraw()
         items = [self._item_of(e) for e in changed]
         for item in items:
@@ -9018,6 +9463,17 @@ class XlefViewer:
             a.color = color
             self._changed()
 
+    def _mark_saved(self, e):
+        """Everything of this image as it is now is what its file (or a .vsi's sidecar) has."""
+        e.annotations_changed = False
+        e.saved_name = e.name
+        e.saved_flipped, e.saved_rotated = e.flipped, e.rotated
+        self._set_flip_note(e, None)
+        self._set_flip_note(e, None, "rotated")
+        for c in e.channels:
+            c.saved_lut, c.saved_name = c.lut, c.name
+            c.saved_black, c.saved_white = c.black, c.white
+
     def _linked_projects(self, pids):
         """`pids` and every project linked to them by an image dragged between projects (both ends are saved together: each one's
         list refers to it)."""
@@ -9043,6 +9499,11 @@ class XlefViewer:
         deleted = {i: e for i, e in self.deleted.items() if self.home.get(i) in only}
         if not items and not deleted:
             return
+        # A .vsi's sections: all their edits go into its sidecar at once (see write_vsi_edits); everything else into LAS X's files.
+        side = [(i, o) for i, o in items if isinstance(o, ImageEntry) and o.sidecar is not None]
+        items_lasx = [(i, o) for i, o in items if not (isinstance(o, ImageEntry) and o.sidecar is not None)]
+        items_all, items = items, items_lasx
+        names = [(i, o) for i, o in items if isinstance(o, ImageEntry) and o.channel_names_changed]
         notes = [(i, o) for i, o in items if o.annotations_changed]
         maps = [(i, o) for i, o in items if isinstance(o, ImageEntry) and o.luts_changed]
         ranges = [(i, o) for i, o in items if isinstance(o, ImageEntry) and o.contrast_changed]
@@ -9058,6 +9519,7 @@ class XlefViewer:
                    ([f"the color maps of {len(maps)} image{'s' * (len(maps) != 1)}"] if maps else []) + \
                    ([f"the contrast of {len(ranges)} image{'s' * (len(ranges) != 1)}"] if ranges else []) + \
                    ([f"the flip or rotation of {len(flips)} image{'s' * (len(flips) != 1)}"] if flips else []) + \
+                   ([f"the channel names of {len(names)} image{'s' * (len(names) != 1)}"] if names else []) + \
                    ([f"{len(renames)} rename{'s' * (len(renames) != 1)}" + (" (files and folders on disk too)" if on_disk else "")]
                     if renames else []) + (["the new order of the list"] if reordered else [])
             extra = ((f"\n\n{n_away} image{'s' * (n_away != 1)} dragged into another project move{'s' * (n_away == 1)} there, files "
@@ -9065,14 +9527,37 @@ class XlefViewer:
                      + (f"\n\nDeleted: {', '.join(e.name for e in list(deleted.values())[:5])}"
                         f"{' and more' if n_del > 5 else ''}. Their files go to the Recycle Bin (on a network drive, which has "
                         f"none: into a \"Deleted by XLEF viewer\" folder in the experiment's folder)." if n_del else ""))
-            if not messagebox.askokcancel(
-                    "Save changes into LAS X's files",
-                    f"This writes {' and '.join(what)} into LAS X's files. An adjacent backup file will be kept "
-                    f"(ending in {BACKUP_SUFFIX}).{extra}\n\nMake sure this experiment is not also open in LAS X, which may otherwise overwrite "
-                    f"these changes with its own copy.", parent=self.root):
+            vsi_note = (f"The edits of {len(side)} section{'s' * (len(side) != 1)} of Olympus .vsi files go into a small file next to "
+                        f"each .vsi (named like it, ending in {VSI_EDITS_SUFFIX}); the .vsi itself is never changed." if side else "")
+            if not what and side:
+                text = vsi_note
+            else:
+                text = (f"This writes {' and '.join(what)} into LAS X's files. An adjacent backup file will be kept (ending in "
+                        f"{BACKUP_SUFFIX}).{extra}" + (f"\n\n{vsi_note}" if vsi_note else "") + "\n\nMake sure this experiment is "
+                        "not also open in LAS X, which may otherwise overwrite these changes with its own copy.")
+            if not messagebox.askokcancel("Save changes", text, parent=self.root):
                 return
             self.save_warned = True
         failed = []
+        by_vsi = {}
+        for item, e in side:
+            by_vsi.setdefault(os.path.normcase(e.vsi[0]), []).append(e)
+        for key, mine in by_vsi.items():
+            vsi = mine[0].vsi[0]
+            together = [x for x in self.entries.values() if x.vsi and os.path.normcase(x.vsi[0]) == key]    # (every open scene of it)
+            try:
+                write_vsi_edits(vsi, together)
+                for e in together:
+                    self._mark_saved(e)
+            except Exception as err:
+                failed.append(f"edits of {os.path.basename(vsi)} (into {os.path.basename(vsi_edits_path(vsi))}): {err}")
+        for item, e in names:
+            try:
+                write_channel_names(e.xlif_path, [c.name for c in e.channels])
+                for c in e.channels:
+                    c.saved_name = c.name
+            except Exception as err:
+                failed.append(f"channel names of {e.name}: {err}")
         for item, e in notes:
             try:
                 write_annotations(e.xlif_path, e.annotations)
@@ -9129,11 +9614,15 @@ class XlefViewer:
                     o.saved_name = o.name
                 except Exception as err:
                     failed.append(f"{o.saved_name} -> {o.name}: {err}")
+        items = items_all
         for item, _ in items:
             self._label_item(item)
         self._update_annotations_check()
+        if self.img is not None and self.img.entry in {o for _, o in side}:
+            self._build_channel_controls()          # (its channels' names, as saved)
         done = max(len(items) + binned + aside - len(failed), 0)
-        self.status.config(text=f"Saved {done} change{'s' * (done != 1)} into LAS X's files" + (f"; {len(failed)} failed" if failed else "")
+        where = "into LAS X's files" if not side else "into the .vsi edits file" if not items_lasx else "into LAS X's files and .vsi edits files"
+        self.status.config(text=f"Saved {done} change{'s' * (done != 1)} {where}" + (f"; {len(failed)} failed" if failed else "")
                                 + (f". {binned} deleted image{'s' * (binned != 1)} moved to the Recycle Bin" if binned else "")
                                 + (f". {aside} deleted image{'s' * (aside != 1)} moved to the \"Deleted by XLEF viewer\" folder "
                                    "(this drive has no Recycle Bin)" if aside else ""))
@@ -9148,7 +9637,7 @@ class XlefViewer:
                 e.annotations_changed = False
             reread |= {self._project_of(i) for i, _ in renames} - {None}
         if reread:
-            self.history = [h for h in self.history if h[0] in ("ann", "lut", "range")]
+            self.history = [h for h in self.history if h[0] in ("ann", "lut", "range", "chname")]
         for pid in [p for p in self.projects if p in reread]:      # (paths or contents changed: read those experiments again)
             path = self.projects[pid]["path"]
             self.close_project(pid, ask=False)
@@ -9544,7 +10033,7 @@ class XlefViewer:
         keeps the old one."""
         self.rename_job = None
         obj = self.entries.get(item) or self.folders.get(item)
-        if obj is not None and obj.read_only:
+        if obj is not None and obj.read_only and getattr(obj, "sidecar", None) is None:
             self.status.config(text=f"{obj.name} is in a .lif file, which this viewer only reads: it can't be renamed here "
                                     "(File > Save as .xlef makes a copy that can be edited)")
             return
@@ -9623,7 +10112,7 @@ class XlefViewer:
                 continue
             obj.order_changed = self._shown_children(item) != obj.children
             if item in self.projects:
-                self.tree.item(item, text=self.projects[item]["name"])
+                self.tree.item(item, text=self._project_label(item))
                 self._place_unsaved_mark(item)
             else:
                 self._label_item(item)
@@ -9641,6 +10130,10 @@ class XlefViewer:
         entry = self.entries.get(item)
         parent = self.tree.parent(item)
         container = self._container(parent)
+        if entry is not None and entry.vsi:
+            messagebox.showinfo("Can't delete", "This is a scanned region of an Olympus .vsi file, which this viewer never changes.",
+                                parent=self.root)
+            return
         if entry is not None and entry.read_only:
             messagebox.showinfo("Can't delete", "This image is in a .lif file, which this viewer only reads.\n\n"
                                                 "File > Save as .xlef makes a copy that can be edited.", parent=self.root)
@@ -9873,7 +10366,7 @@ class XlefViewer:
         e = self.img.entry
         if not e.pixel_um or (self.drawing_panel or 0) != 0:
             return
-        cw, ch = self.canvas_size()
+        cw, ch = self.screen_size()
         um = nice_length(cw / 5 / self.scale * e.pixel_um)
         px = um / e.pixel_um * self.scale
         x, y = 16, ch - 20
@@ -10205,7 +10698,8 @@ class LutChooser:
 
     def apply(self, everywhere):
         """Use the choice for this section, or for the same channel of every section of this project (an image whose channel has the
-        map already is left as it is). Undoable (Ctrl+Z), and written into each image's .xlif by Save."""
+        map already is left as it is). Undoable (Ctrl+Z), and written into each image's .xlif by Save. (A channel's name is changed
+        elsewhere: double-click it above its swatch, see XlefViewer.rename_channel.)"""
         name = self.ch.lut
         changes = [(self.entry, self.i, self.original)] if name != self.original else []
         if everywhere:

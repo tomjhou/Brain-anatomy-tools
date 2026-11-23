@@ -20,7 +20,7 @@ ns.ensure_packages({"PIL": "pillow"})
 
 AUTO_UPDATE_NOTE = ("Applies to all the Brain-anatomy-tools apps on this computer. The assembler updates only while this start window is\n"
                     "showing, never while a tool is open. Off: the Check for updates button only says that updates are available.")
-UPDATES = {"started": False, "done": False, "changes": None, "auto_tried": False}    # (the check at launch: once per run, not per start window)
+UPDATES = {"started": False, "done": False, "changes": None, "auto_tried": False, "error": None}    # (the check at launch: once per run, not per start window)
 
 
 def _updater():
@@ -75,8 +75,16 @@ def _idle_text(changes):
 def check_for_update(root, button, app_update):
     """The start window's Check for updates button: looks on GitHub for newer commits (in a thread: the network), says what is new, and on a
     yes brings the apps' folder up to date (git pull for a clone, else GitHub's ZIP: see app_update.py) and offers to restart the assembler.
-    Changes the check at launch found are asked about at once, without looking again."""
+    Changes the check at launch found are asked about at once, without looking again. After a failed automatic update, it first says
+    why (see _update_buttons)."""
     done = queue.Queue()
+    error = UPDATES.get("error")
+    if error:
+        UPDATES["error"] = None
+        again = messagebox.askyesno("Update failed", error + "\n\nTry the update again now?", icon="warning", parent=root)
+        button.config(text=_idle_text(UPDATES["changes"]))
+        if not again:
+            return
 
     def work(job, *args):
         try:
@@ -191,6 +199,12 @@ def _update_buttons(root, header, app_update):
         root.destroy()
         restart()
 
+    def failed(text):
+        """The update could not be applied: the button says so (in later start windows of this run too), and clicking it tells why."""
+        UPDATES["error"] = text
+        button.config(text=app_update.AUTO_FAILED_LABEL, state=tk.NORMAL)
+        _starts(root, True)
+
     def wait():
         if not root.winfo_exists():
             return
@@ -198,11 +212,11 @@ def _update_buttons(root, header, app_update):
             root.after(500, wait)
             return
         if str(button.cget("state")) != "disabled":
-            button.config(text=_idle_text(UPDATES["changes"]))
+            button.config(text=app_update.AUTO_FAILED_LABEL if UPDATES.get("error") else _idle_text(UPDATES["changes"]))
         if UPDATES["changes"] and app_update.auto_update_enabled() and not UPDATES["auto_tried"]:
             UPDATES["auto_tried"] = True
             app_update.AutoUpdate(root, {"busy": lambda: str(button.cget("state")) == "disabled", "blocked": blocked, "status": status,
-                                         "keep_open": lambda: None, "restart": restart_now}).start()
+                                         "keep_open": lambda: None, "restart": restart_now, "failed": failed}).start()
     root.after(500, wait)
 
 

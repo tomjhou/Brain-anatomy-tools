@@ -509,6 +509,16 @@ def set_auto_update(on):
         pass
 
 
+AUTO_FAILED_LABEL = "Update failed: click for why"      # (the apps' update button after a failed automatic update)
+
+
+def failure_text(message):
+    """What a failed automatic update says when it is asked about: git's (or the download's) reason, and what happens next."""
+    return ("The automatic update found new changes on GitHub, but could not apply them:\n\n" + str(message).strip() + "\n\n"
+            "Nothing was changed. It is tried again each time the app starts. In a git clone, files changed in the apps' folder itself "
+            "(or commits that are not on GitHub) stop it: commit, stash or undo those changes, and it goes through.")
+
+
 class AutoUpdate:
     """With the setting on, at launch, once watch_for_update has found changes: downloads them without a dialog, then restarts the app. Every
     app gives it its own hooks, so that the same logic serves them all:
@@ -516,7 +526,9 @@ class AutoUpdate:
       blocked()     -> True while a dialog has the input (the update waits: it would end the dialog's window);
       status(text)  -> shows `text` where the app says an update is available (a button, a menu), or restores the usual text for None;
       keep_open()   -> None, or why the app must not be restarted now (the atlas is downloading): it stays as it is, the new version runs at the next start;
-      restart()     -> ends this run and starts the app again.
+      restart()     -> ends this run and starts the app again;
+      failed(text)  -> (optional) the update could not be applied (e.g. changes in the apps' folder clash with it): `text` says why, for the
+                       app to show where it says an update is available (without the hook: status(None), and only the console says why).
     A class with methods that are scheduled again, not a function that schedules itself: such a function is a reference cycle that keeps the window
     alive after it is closed (see UpdateWatch)."""
 
@@ -555,7 +567,7 @@ class AutoUpdate:
                     return
                 if not ok:
                     print(f"The automatic update could not be applied: {value}")
-                    hooks["status"](None)
+                    self._failed(value)
                     return
                 self.pulled = True
             if self.pulled:
@@ -572,6 +584,16 @@ class AutoUpdate:
             self.root.after(300, self.step)
         except Exception as e:
             print(f"The automatic update stopped: {type(e).__name__}: {e}")
+            try:
+                self._failed(f"{type(e).__name__}: {e}")
+            except Exception:
+                pass
+
+    def _failed(self, message):
+        if self.hooks.get("failed"):
+            self.hooks["failed"](failure_text(message))
+        else:
+            self.hooks["status"](None)
 
     def work(self):
         try:

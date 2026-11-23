@@ -81,6 +81,7 @@ from open_file_dialog import ask_open_file
 import leica_luts           # (LAS X's colour maps, sampled: see lut_table)
 import app_update          # (the Update menu)
 import xlef_pyramids        # (pyramids for an experiment that has none: see XlefViewer.make_pyramids)
+import lif_to_xlef          # (a .lif saved as an .xlef, which can be edited: see XlefViewer.save_as_xlef)
 from color_button import ColorButton
 from tooltip import Tooltip, place_on_monitor, monitor_area, tip_window, show_tip_window, watch_pointer
 
@@ -3982,6 +3983,7 @@ class XlefViewer:
         self.loading_rows = {}       # project -> its "Loading..." row in the list, while its experiment is read (see open_xlef)
         self.download_thread = self.download_stop = None
         self.pyramid_job = self.pyramid_thread = None       # the pyramids being made, if any (see make_pyramids)
+        self.xlef_job = self.xlef_thread = None             # a .lif being saved as an .xlef, if any (see save_as_xlef)
         self.canvas_message = ""
         self.thumbs_go = threading.Event()      # cleared while a chosen image loads: the thumbnail thread waits, so the image comes first
         self.thumbs_go.set()
@@ -4003,6 +4005,8 @@ class XlefViewer:
         fm.add_command(label="Save view as PNG...", command=self.save_view)
         fm.add_command(label=PYRAMID_MENU, command=self.make_pyramids_command)
         self.pyramid_menu_index = fm.index("end")
+        fm.add_command(label=SAVE_XLEF_MENU, command=self.save_as_xlef_command)
+        self.xlef_menu_index = fm.index("end")
         fm.add_command(label="Test drive speed...", command=self.test_drive_speed)
         fm.add_separator()
         fm.add_command(label="Quit", command=self.quit)
@@ -4903,9 +4907,15 @@ class XlefViewer:
             return
         self._save_settings()
         self.generation += 1
+        if self.xlef_job is not None and not asked and not messagebox.askyesno(
+                "Quit", "A .lif is being saved as .xlef. Stop that and quit? (What has been written is taken back.)", parent=self.root):
+            return
         if self.pyramid_job is not None:               # (stopped, and what it had written taken back, before the window goes)
             self.pyramid_job.cancel.set()
             self.pyramid_thread.join(10)
+        if self.xlef_job is not None:                  # (likewise)
+            self.xlef_job.cancel.set()
+            self.xlef_thread.join(10)
         if self.img:
             self.img.close()
         self.root.destroy()
@@ -4952,7 +4962,7 @@ class XlefViewer:
                                      "viewer shows these smaller copies instead of reading the full-resolution image, so it displays much "
                                      "faster at low magnification.\n\nYes: every image has one. No: none do. \"5 of 29\": only some."})
 
-    def open_xlef(self, path, offer_pyramids=True):
+    def open_xlef(self, path, offer_pyramids=True, offer_copy=True):
         path = os.path.normpath(path)
         if not os.path.isfile(path):
             messagebox.showerror("XLEF viewer", f"File not found:\n{path}", parent=self.root)
@@ -4962,6 +4972,17 @@ class XlefViewer:
                 self.tree.selection_set(pid)
                 self.tree.see(pid)
                 return
+        if offer_copy and path.lower().endswith(".lif"):  # (saved as an .xlef before, see save_as_xlef: that copy can be edited)
+            copy_path = self._xlef_copy_of(path)
+            if copy_path:
+                pick = ask_choice(self.root, "Open the .xlef copy?",
+                                  f"This .lif was saved as an .xlef, which can be edited and opens more quickly:\n\n{copy_path}",
+                                  [("Open the .xlef", "xlef"), ("Open the .lif (read only)", "lif")])
+                if pick is None:
+                    return
+                if pick == "xlef":
+                    self.open_xlef(copy_path, offer_pyramids=offer_pyramids)
+                    return
         # Several projects can be open: each is a branch of the list (and a group of thumbnails). The new one's metadata (the .xlef and
         # .xlif files, a few hundred KB each) is read in the background, so that the window stays alive on a slow drive;
         # _experiment_read() takes it from there.
@@ -5074,6 +5095,13 @@ class XlefViewer:
         else:
             label, usable = f"Make pyramids for \"{name}\"...", True
         self.file_menu.entryconfigure(self.pyramid_menu_index, label=label, state=tk.NORMAL if usable else tk.DISABLED)
+        if pid is None or not self._is_lif_project(pid):
+            label, usable = SAVE_XLEF_MENU, False
+        elif self.xlef_job is not None:
+            label, usable = f"Save \"{name}\" as .xlef... (being saved)", False
+        else:
+            label, usable = f"Save \"{name}\" as .xlef (to edit it)...", True
+        self.file_menu.entryconfigure(self.xlef_menu_index, label=label, state=tk.NORMAL if usable else tk.DISABLED)
 
     def make_pyramids_command(self):
         """File > Make pyramids for "name"...: for the experiment of the selected row, or the only one open."""
@@ -5200,6 +5228,223 @@ class XlefViewer:
                               [("Open it", "open"), ("Not now", None)]) == "open":
                     self.open_xlef(state["result"], offer_pyramids=False)
         poll()
+
+    # --- a .lif saved as an .xlef (this viewer only reads a .lif: the copy can be edited)
+
+    def _is_lif_project(self, pid):
+        root = self.projects.get(pid, {}).get("root")
+        return root is not None and root.read_only
+
+    def save_as_xlef_command(self):
+        """File > Save "name" as .xlef...: for the .lif of the selected row, or the only experiment open."""
+        pid = self._pyramid_project()
+        if pid is None or not self._is_lif_project(pid):
+            messagebox.showinfo("Save as .xlef", "Open a .lif file, and select it or one of its images, first.", parent=self.root)
+            return
+        self.save_as_xlef(pid)
+
+    def _viewing_edits(self, pid):
+        """The images of .lif project `pid` changed while it was viewed (annotations, color maps, contrast, flips: kept only for
+        viewing, as nothing is written into a .lif), by item."""
+        return {i: e for i, e in self._entries_of(pid).items()
+                if e.annotations_changed or e.luts_changed or e.contrast_changed or e.flip_changed}
+
+    def _xlef_copy_of(self, lif_path):
+        """The .xlef this .lif was saved as (where Save as .xlef put it, remembered in the settings; or the default place beside it,
+        lif_to_xlef.target_paths), if it is still there; or None."""
+        saved = self.settings.get("xlef_copies", {}).get(os.path.normcase(os.path.abspath(lif_path)))
+        if saved and os.path.isfile(saved):
+            return saved
+        return lif_to_xlef.existing_copy(lif_path)
+
+    def _remember_xlef_copy(self, lif_path, xlef_path):
+        copies = self.settings.setdefault("xlef_copies", {})
+        copies[os.path.normcase(os.path.abspath(lif_path))] = xlef_path
+        for k in [k for k, v in copies.items() if not os.path.isfile(v)]:     # (copies deleted since)
+            del copies[k]
+        self._save_settings()
+
+    def _ask_xlef_target(self, lif_path):
+        """A save dialog for the new folder's name (proposed: the .lif's name, beside it); (the new .xlef, its folder) as
+        lif_to_xlef.chosen_paths makes them, or None if cancelled. Asks again for a folder that is there already with files in it."""
+        _, proposed = lif_to_xlef.target_paths(lif_path)
+        here, name = os.path.dirname(proposed), os.path.basename(proposed)
+        while True:
+            chosen = filedialog.asksaveasfilename(
+                parent=self.root, title="Save as .xlef: name the new folder for the copy",
+                initialdir=here, initialfile=name, defaultextension=".xlef",
+                filetypes=[("LAS X experiment", "*.xlef")], confirmoverwrite=False)
+            if not chosen:
+                return None
+            try:
+                return lif_to_xlef.chosen_paths(chosen)
+            except ValueError as e:
+                messagebox.showerror("Save as .xlef", str(e), parent=self.root)
+                here, name = os.path.dirname(os.path.abspath(chosen)), os.path.splitext(os.path.basename(chosen))[0]
+
+    def save_as_xlef(self, pid):
+        """Ask where (a save dialog for the new folder's name, see _ask_xlef_target), then save .lif project `pid` as an .xlef in that
+        folder (see lif_to_xlef), in the background, with a window to show how far it has got; then write into the copy what was
+        changed while viewing the .lif, and offer to open it."""
+        if self.xlef_job is not None:
+            messagebox.showinfo("Save as .xlef", "A .lif is being saved as .xlef already.", parent=self.root)
+            return
+        path, name = self.projects[pid]["path"], self.projects[pid]["name"]
+        copy_path = self._xlef_copy_of(path)
+        if copy_path:
+            pick = ask_choice(self.root, "Saved as .xlef already", f"This .lif was saved as an .xlef before:\n\n{copy_path}",
+                              [("Open it", "open"), ("Save another copy", "again"), ("Cancel", None)])
+            if pick == "open":
+                self._open_copy_instead(pid, copy_path)
+            if pick != "again":
+                return
+        target = self._ask_xlef_target(path)
+        if target is None:
+            return
+        xlef, folder = target
+        try:
+            need = lif_to_xlef.needed_bytes(path)
+            where = folder
+            while not os.path.isdir(where) and os.path.dirname(where) != where:     # (the nearest folder there is: the new one isn't yet)
+                where = os.path.dirname(where)
+            free = shutil.disk_usage(where).free
+        except OSError as e:
+            messagebox.showerror("Save as .xlef", f"Can't find out how much room there is in {folder}:\n\n{e}", parent=self.root)
+            return
+        if free < need + (1 << 30):
+            messagebox.showerror("Save as .xlef", f"Not enough room on that drive: the copy needs about {size_text(need)}, "
+                                                  f"and {size_text(free)} is free.", parent=self.root)
+            return
+        seconds = need / XLEF_COPY_RATE
+        time_text = "a minute or two" if seconds < 90 else f"roughly {max(2, round(seconds / 60))} minutes"
+        edits = self._viewing_edits(pid)
+        message = (f"This writes a copy of \"{name}\" as an .xlef experiment, in this folder:\n\n{folder}\n\n"
+                   f"Every image's pixels are copied into TIFF files, as LAS X saves an .xlef (LAS X's reduced copies too), so it takes "
+                   f"about {size_text(need)} of disk space and {time_text} on a hard disk.\n\n"
+                   f"The .lif itself is not changed. The copy can be edited and saved (annotations, color maps, contrast, flips, names, "
+                   f"the order of the list), opens more quickly, and opens in LAS X too."
+                   + (f"\n\nWhat was changed while viewing the .lif ({len(edits)} image{'s' * (len(edits) != 1)}) is written into the copy."
+                      if edits else ""))
+        if ask_choice(self.root, "Save as .xlef?", message, [("Save as .xlef", "save"), ("Cancel", None)]) != "save":
+            return
+        self._run_save_as_xlef(pid, xlef)
+
+    def _run_save_as_xlef(self, pid, xlef_path):
+        """Save the .lif as an .xlef in a thread and show a window with the progress and a Cancel button; when done, write the viewing
+        edits into the copy and offer to open it in place of the .lif."""
+        state = {"done": 0, "total": 0, "name": "", "finished": False, "result": None, "error": None}
+        lif_path = self.projects[pid]["path"]
+        job = lif_to_xlef.Job(lif_path, progress=lambda d, t, n: state.update(done=d, total=t, name=n), xlef_path=xlef_path)
+
+        def work():
+            try:
+                state["result"] = job.run()
+            except lif_to_xlef.Cancelled:
+                state["result"] = None
+            except Exception as e:
+                state["error"] = e
+            state["finished"] = True
+        self.xlef_job = job
+        self.xlef_thread = threading.Thread(target=work, daemon=True)
+        started = time.monotonic()
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Saving as .xlef")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        body = ttk.Frame(dlg, padding=14)
+        body.pack(fill=tk.BOTH, expand=True)
+        label = ttk.Label(body, text="Starting ...", width=66)
+        label.pack(anchor=tk.W)
+        bar = ttk.Progressbar(body, length=460, maximum=1000)
+        bar.pack(fill=tk.X, pady=(8, 8))
+        ttk.Label(body, text="The .lif itself is not changed. Stopping takes back what has been written.",
+                  style="Muted.TLabel").pack(anchor=tk.W)
+        button = ttk.Button(body, text="Cancel", command=job.cancel.set)
+        button.pack(side=tk.RIGHT, pady=(10, 0))
+        dlg.protocol("WM_DELETE_WINDOW", job.cancel.set)
+        dlg.geometry(f"+{self.root.winfo_rootx() + 200}+{self.root.winfo_rooty() + 160}")
+        self.xlef_thread.start()
+
+        def clock(s):
+            s = int(s)
+            return f"{s // 60}:{s % 60:02d}"
+
+        def poll():
+            done, total = state["done"], state["total"]
+            seconds = time.monotonic() - started
+            bar["value"] = 1000 * done / total if total else 0
+            left = f", about {clock(seconds * (total - done) / done)} left" if done and seconds > 5 else ""
+            if job.cancel.is_set():
+                text = "Stopping ..."
+            elif total:
+                text = f"{state['name']}: {done / 1e9:.1f} of {total / 1e9:.1f} GB"
+            else:
+                text = "Reading the .lif ..."
+            label.config(text=f"{text}   ({clock(seconds)}{left})")
+            self.status.config(text=f"Saving as .xlef: {done / 1e9:.1f} of {total / 1e9:.1f} GB ...")
+            if not state["finished"]:
+                self.root.after(300, poll)
+                return
+            dlg.destroy()
+            self.xlef_job = self.xlef_thread = None
+            if state["error"] is not None:
+                self.status.config(text="Saving as .xlef failed")
+                messagebox.showerror("Save as .xlef", "The .lif could not be saved as .xlef (what was written is taken back):\n\n"
+                                                      f"{state['error']}", parent=self.root)
+                return
+            if state["result"] is None:
+                self.status.config(text="Saving as .xlef stopped; nothing was kept")
+                return
+            self._remember_xlef_copy(lif_path, state["result"])
+            failed = self._copy_viewing_edits(pid, job.written) if pid in self.projects else []
+            self.status.config(text=f"Saved as .xlef in {clock(seconds)}")
+            if failed:
+                messagebox.showerror("Save as .xlef", "The copy was made, but these changes made while viewing the .lif could not be "
+                                                      "written into it:\n\n" + "\n".join(failed[:12]), parent=self.root)
+            n_lof = len(job.lof_images)
+            raw = (f"\n\n{n_lof} image{'s' * (n_lof != 1)} that can't be split into one TIFF per channel (colour, tiles or time series) "
+                   f"{'were' if n_lof != 1 else 'was'} saved as LAS X's .lof files instead." if n_lof else "")
+            if ask_choice(self.root, "Saved as .xlef", f"Saved in {clock(seconds)}:\n\n{state['result']}{raw}\n\n"
+                          "Open it now in place of the .lif?", [("Open it", "open"), ("Not now", None)]) == "open":
+                self._open_copy_instead(pid, state["result"])
+        poll()
+
+    def _copy_viewing_edits(self, pid, written):
+        """Write what was changed while viewing .lif project `pid` into the images' new .xlif files (written: the .lif's UniqueIDs ->
+        those files, see lif_to_xlef.Job). The list of what failed."""
+        failed = []
+        for e in self._viewing_edits(pid).values():
+            target = written.get(getattr(e, "ref_uuid", "") or "")
+            if target is None:
+                failed.append(f"{e.name}: not found in the copy")
+                continue
+            steps = []
+            if e.annotations_changed:
+                steps.append(("annotations", lambda: write_annotations(target, e.annotations)))
+            if e.luts_changed:
+                steps.append(("color maps", lambda: write_luts(target, [c.lut for c in e.channels])))
+            if e.contrast_changed:
+                steps.append(("contrast", lambda: write_contrast(target, [(c.black, c.white) for c in e.channels],
+                                                                 [c.max_value for c in e.channels])))
+            if e.flip_changed:
+                steps.append(("flip", lambda: write_flip(target, e.flipped, e.rotated)))
+            for what, step in steps:            # (each run here, before the next image: the lambdas use this one's e and target)
+                try:
+                    step()
+                except Exception as err:
+                    failed.append(f"{what} of {e.name}: {err}")
+            try:
+                if os.path.exists(target + BACKUP_SUFFIX):       # (a copy of the file just made, from before these: nothing to go back to)
+                    os.remove(target + BACKUP_SUFFIX)
+            except OSError:
+                pass
+        return failed
+
+    def _open_copy_instead(self, pid, xlef_path):
+        """Close .lif project `pid` (nothing in it is saved: it is only read) and open its .xlef copy."""
+        if pid in self.projects:
+            self.close_project(pid, ask=False)
+        self.open_xlef(xlef_path, offer_pyramids=False)
 
     def _measure_sizes(self, pid):
         """The size of each of the project's images at full resolution (its channel TIFFs), read in the background from the file
@@ -9129,6 +9374,8 @@ class XlefViewer:
             if "root" in self.projects[pid] and self.pyramid_job is None and self._pyramid_candidates(pid)[0]:
                 menu.add_command(label=f"Make pyramids for {self.projects[pid]['name']}...",
                                  command=lambda: self.make_pyramids(pid))
+            if self._is_lif_project(pid) and self.xlef_job is None:
+                menu.add_command(label=f"Save {self.projects[pid]['name']} as .xlef (to edit it)...", command=lambda: self.save_as_xlef(pid))
             menu.add_command(label=f"Save project {self.projects[pid]['name']}", command=lambda: self.save_annotations([pid]),
                              state=tk.NORMAL if self._unsaved_names(pid) else tk.DISABLED)
             menu.add_command(label=f"Close project {self.projects[pid]['name']}", command=lambda: self.close_project(pid))
@@ -9306,7 +9553,8 @@ class XlefViewer:
         self.rename_job = None
         obj = self.entries.get(item) or self.folders.get(item)
         if obj is not None and obj.read_only:
-            self.status.config(text=f"{obj.name} is in a .lif file, which this viewer only reads: it can't be renamed here")
+            self.status.config(text=f"{obj.name} is in a .lif file, which this viewer only reads: it can't be renamed here "
+                                    "(File > Save as .xlef makes a copy that can be edited)")
             return
         box = self.tree.bbox(item)
         if obj is None or not box:
@@ -9402,7 +9650,8 @@ class XlefViewer:
         parent = self.tree.parent(item)
         container = self._container(parent)
         if entry is not None and entry.read_only:
-            messagebox.showinfo("Can't delete", "This image is in a .lif file, which this viewer only reads.", parent=self.root)
+            messagebox.showinfo("Can't delete", "This image is in a .lif file, which this viewer only reads.\n\n"
+                                                "File > Save as .xlef makes a copy that can be edited.", parent=self.root)
             return
         if entry is None or container is None or container.path is None:
             messagebox.showerror("Can't delete", "The file that lists this image is unreadable, so it can't be deleted here.",
@@ -9987,6 +10236,8 @@ class LutChooser:
 
 
 PYRAMID_MENU = "Make pyramids for the selected experiment..."
+SAVE_XLEF_MENU = "Save the selected .lif as .xlef (to edit it)..."
+XLEF_COPY_RATE = 100e6      # bytes/s copying a .lif to an .xlef beside it, for the estimate (measured 2026-11: ~110 MB/s on one hard disk)
 PYRAMID_LATER_TIP = ("If this button is clicked, this experiment won't be offered pyramids again when opened. You can still make them later by "
                      "right-clicking the experiment in the list, or from the File > Make pyramids menu.")
 

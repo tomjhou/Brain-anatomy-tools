@@ -5267,7 +5267,8 @@ class XlefViewer:
     def _ask_xlef_target(self, lif_path):
         """A dialog for the folder to put the copy in (proposed: the .lif's own); the copy goes in a new folder in it named after the
         .lif, as LAS X lays out an experiment (see lif_to_xlef.paths_in). (the new .xlef, its folder), or None if cancelled."""
-        chosen = filedialog.askdirectory(parent=self.root, title="Save as .xlef: choose where to put the copy (a new folder is made in it)",
+        stem = os.path.splitext(os.path.basename(lif_path))[0]
+        chosen = filedialog.askdirectory(parent=self.root, title=f"Save as .xlef: choose the folder to make the new folder \"{stem}\" in",
                                          initialdir=os.path.dirname(os.path.abspath(lif_path)), mustexist=True)
         if not chosen:
             return None

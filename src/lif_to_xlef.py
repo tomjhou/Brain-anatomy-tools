@@ -51,26 +51,20 @@ def target_paths(lif_path):
         n += 1
 
 
-def chosen_paths(chosen):
-    """(the new .xlef, its folder) for a name chosen in a save dialog, "<dir>/<name>" or "<dir>/<name>.xlef": <dir>/<name>/<name>.xlef,
-    as LAS X lays out an experiment; or <dir>/<name>.xlef if <dir> is itself an empty folder called <name> (made in the dialog).
-    The folder must be new or empty (ValueError otherwise)."""
-    chosen = os.path.abspath(chosen)
-    here, name = os.path.dirname(chosen), os.path.basename(chosen)
-    if name.lower().endswith(".xlef"):
-        name = name[:-5]
-    name = name.strip().rstrip(".")
-    if not name:
-        raise ValueError("Choose a name for the new folder.")
-    if os.path.basename(here).lower() == name.lower() and os.path.isdir(here) and not os.listdir(here):
-        folder = here
-    else:
-        folder = os.path.join(here, name)
-    if os.path.isfile(folder):
-        raise ValueError(f"There is a file called \"{name}\" there already: choose another name.")
-    if os.path.isdir(folder) and os.listdir(folder):
-        raise ValueError(f"There is a folder \"{name}\" there already, with files in it: choose another name, or an empty folder.")
-    return os.path.join(folder, name + ".xlef"), folder
+def paths_in(lif_path, parent):
+    """(the new .xlef, its folder) for the .lif at lif_path, in the folder `parent` chosen for it: <parent>/<name>/<name>.xlef, as
+    beside the .lif (target_paths); <name> (2), <name> (3), ... if a folder <name> with files in it is there already. If `parent` is
+    itself an empty folder called <name> (made in the dialog for it), the copy goes straight into it."""
+    parent = os.path.abspath(parent)
+    stem = os.path.splitext(os.path.basename(lif_path))[0]
+    if os.path.basename(parent).lower() == stem.lower() and os.path.isdir(parent) and not os.listdir(parent):
+        return os.path.join(parent, stem + ".xlef"), parent
+    n = 1
+    while True:
+        folder = os.path.join(parent, stem if n == 1 else f"{stem} ({n})")
+        if not os.path.exists(folder) or (os.path.isdir(folder) and not os.listdir(folder)):
+            return os.path.join(folder, stem + ".xlef"), folder
+        n += 1
 
 
 def existing_copy(lif_path):
@@ -311,7 +305,7 @@ class Job:
     deleted again. After run(): written[UniqueID] is the new .xlif/.xlcf of each of the .lif's elements (and the experiment's .xlef)."""
 
     def __init__(self, lif_path, progress=None, cancel=None, xlef_path=None):
-        """xlef_path: where the new .xlef goes (its folder holds the rest, see chosen_paths); target_paths() if None."""
+        """xlef_path: where the new .xlef goes (its folder holds the rest, see paths_in); target_paths() if None."""
         self.lif_path = os.path.abspath(lif_path)
         self.progress = progress
         self.cancel = cancel or threading.Event()

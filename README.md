@@ -52,7 +52,7 @@ A fast viewer and organizer for Leica LAS X experiments (`.xlef` projects, and `
 - **Organize**: rename images and folders, put them in a different order, move them to another experiment, or delete them.
 - **Save back into LAS X's own files**, so LAS X shows the same changes. A backup of each changed file is kept. Close the experiment in
   LAS X before saving. (`.lif` files are read only: File > Save as .xlef copies one into an `.xlef` experiment, in a new folder
-  you name (beside the `.lif` unless you choose another place), laid out as LAS X saves one, which can be edited and opens in LAS X too. It needs about as much disk space as the `.lif`.)
+  named after it, in the folder you choose (the `.lif`'s own, to start with), laid out as LAS X saves one, which can be edited and opens in LAS X too. It needs about as much disk space as the `.lif`.)
 
 To open an experiment, use File > Open, or drag its `.xlef` file onto the window.
 

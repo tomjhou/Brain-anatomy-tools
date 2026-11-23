@@ -5098,9 +5098,9 @@ class XlefViewer:
         if pid is None or not self._is_lif_project(pid):
             label, usable = SAVE_XLEF_MENU, False
         elif self.xlef_job is not None:
-            label, usable = f"Save \"{name}\" as .xlef... (being saved)", False
+            label, usable = "Save as .xlef (being saved)...", False
         else:
-            label, usable = f"Save \"{name}\" as .xlef (to edit it)...", True
+            label, usable = "Save as .xlef (for faster editing)...", True
         self.file_menu.entryconfigure(self.xlef_menu_index, label=label, state=tk.NORMAL if usable else tk.DISABLED)
 
     def make_pyramids_command(self):
@@ -5236,7 +5236,7 @@ class XlefViewer:
         return root is not None and root.read_only
 
     def save_as_xlef_command(self):
-        """File > Save "name" as .xlef...: for the .lif of the selected row, or the only experiment open."""
+        """File > Save as .xlef...: for the .lif of the selected row, or the only experiment open."""
         pid = self._pyramid_project()
         if pid is None or not self._is_lif_project(pid):
             messagebox.showinfo("Save as .xlef", "Open a .lif file, and select it or one of its images, first.", parent=self.root)
@@ -5265,26 +5265,17 @@ class XlefViewer:
         self._save_settings()
 
     def _ask_xlef_target(self, lif_path):
-        """A save dialog for the new folder's name (proposed: the .lif's name, beside it); (the new .xlef, its folder) as
-        lif_to_xlef.chosen_paths makes them, or None if cancelled. Asks again for a folder that is there already with files in it."""
-        _, proposed = lif_to_xlef.target_paths(lif_path)
-        here, name = os.path.dirname(proposed), os.path.basename(proposed)
-        while True:
-            chosen = filedialog.asksaveasfilename(
-                parent=self.root, title="Save as .xlef: name the new folder for the copy",
-                initialdir=here, initialfile=name, defaultextension=".xlef",
-                filetypes=[("LAS X experiment", "*.xlef")], confirmoverwrite=False)
-            if not chosen:
-                return None
-            try:
-                return lif_to_xlef.chosen_paths(chosen)
-            except ValueError as e:
-                messagebox.showerror("Save as .xlef", str(e), parent=self.root)
-                here, name = os.path.dirname(os.path.abspath(chosen)), os.path.splitext(os.path.basename(chosen))[0]
+        """A dialog for the folder to put the copy in (proposed: the .lif's own); the copy goes in a new folder in it named after the
+        .lif, as LAS X lays out an experiment (see lif_to_xlef.paths_in). (the new .xlef, its folder), or None if cancelled."""
+        chosen = filedialog.askdirectory(parent=self.root, title="Save as .xlef: choose where to put the copy (a new folder is made in it)",
+                                         initialdir=os.path.dirname(os.path.abspath(lif_path)), mustexist=True)
+        if not chosen:
+            return None
+        return lif_to_xlef.paths_in(lif_path, chosen)
 
     def save_as_xlef(self, pid):
-        """Ask where (a save dialog for the new folder's name, see _ask_xlef_target), then save .lif project `pid` as an .xlef in that
-        folder (see lif_to_xlef), in the background, with a window to show how far it has got; then write into the copy what was
+        """Ask where (the folder to put the copy's own new folder in, see _ask_xlef_target), then save .lif project `pid` as an .xlef
+        there (see lif_to_xlef), in the background, with a window to show how far it has got; then write into the copy what was
         changed while viewing the .lif, and offer to open it."""
         if self.xlef_job is not None:
             messagebox.showinfo("Save as .xlef", "A .lif is being saved as .xlef already.", parent=self.root)
@@ -9375,7 +9366,7 @@ class XlefViewer:
                 menu.add_command(label=f"Make pyramids for {self.projects[pid]['name']}...",
                                  command=lambda: self.make_pyramids(pid))
             if self._is_lif_project(pid) and self.xlef_job is None:
-                menu.add_command(label=f"Save {self.projects[pid]['name']} as .xlef (to edit it)...", command=lambda: self.save_as_xlef(pid))
+                menu.add_command(label="Save as .xlef (for faster editing)...", command=lambda: self.save_as_xlef(pid))
             menu.add_command(label=f"Save project {self.projects[pid]['name']}", command=lambda: self.save_annotations([pid]),
                              state=tk.NORMAL if self._unsaved_names(pid) else tk.DISABLED)
             menu.add_command(label=f"Close project {self.projects[pid]['name']}", command=lambda: self.close_project(pid))
@@ -10236,7 +10227,7 @@ class LutChooser:
 
 
 PYRAMID_MENU = "Make pyramids for the selected experiment..."
-SAVE_XLEF_MENU = "Save the selected .lif as .xlef (to edit it)..."
+SAVE_XLEF_MENU = "Save as .xlef (for faster editing)..."
 XLEF_COPY_RATE = 100e6      # bytes/s copying a .lif to an .xlef beside it, for the estimate (measured 2026-11: ~110 MB/s on one hard disk)
 PYRAMID_LATER_TIP = ("If this button is clicked, this experiment won't be offered pyramids again when opened. You can still make them later by "
                      "right-clicking the experiment in the list, or from the File > Make pyramids menu.")

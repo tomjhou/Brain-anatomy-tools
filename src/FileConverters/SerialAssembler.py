@@ -73,11 +73,10 @@ def _idle_text(changes):
 
 
 def check_for_update(root, button, app_update):
-    """The start window's Check for updates button: looks on GitHub for newer commits (in a thread: the network), says what is new, and on a
-    yes brings the apps' folder up to date (git pull for a clone, else GitHub's ZIP: see app_update.py) and offers to restart the assembler.
+    """The start window's Check for updates button: looks on GitHub for newer commits, says what is new, and on a yes brings the apps' folder up to
+    date and offers to restart the assembler (app_update.UpdateCheck does it, for all the apps: what is the assembler's own is the hooks below).
     Changes the check at launch found are asked about at once, without looking again. After a failed automatic update, it first says
     why (see _update_buttons)."""
-    done = queue.Queue()
     error = UPDATES.get("error")
     if error:
         UPDATES["error"] = None
@@ -86,72 +85,24 @@ def check_for_update(root, button, app_update):
         if not again:
             return
 
-    def work(job, *args):
-        try:
-            done.put((True, job(*args)))
-        except app_update.UpdateError as e:
-            done.put((False, str(e)))
-        except Exception as e:                      # (anything unforeseen: still reported, not a button stuck on "Checking…")
-            done.put((False, f"{type(e).__name__}: {e}"))
-
-    def run(job, *args, then, label):
-        button.config(text=label, state=tk.DISABLED)
-        _starts(root, job is not app_update.pull)
-        root.config(cursor="watch")
-        threading.Thread(target=work, args=(job,) + args, daemon=True).start()
-
-        def poll():
-            if not root.winfo_exists():
-                return
-            try:
-                ok, value = done.get_nowait()
-            except queue.Empty:
-                root.after(100, poll)
-                return
-            then(ok, value)
-        poll()
-
-    def finish(text=None, error=False):
-        button.config(text=_idle_text(UPDATES["changes"]), state=tk.NORMAL)
-        _starts(root, True)
-        root.config(cursor="")
-        if text:
-            (messagebox.showerror if error else messagebox.showinfo)("Update", text, parent=root)
-
-    def checked(ok, value):
-        if not ok:
-            return finish(value, True)
-        UPDATES["changes"] = value
-        if not value:
-            return finish(app_update.newest_text(folder))
-        shown = "\n".join("  • " + line for line in value[:12]) + (f"\n  ... and {len(value) - 12} more" if len(value) > 12 else "")
-        news = f"{len(value)} new change{'s' if len(value) != 1 else ''} on GitHub:\n\n{shown}\n\n"
-        reason = app_update.no_pull_reason(folder)
-        if reason:                                  # (a git clone, and no git: what is new, and how to get it)
-            return finish(news + reason)
-        root.config(cursor="")
-        if not messagebox.askyesno("Update", news + "Download them now?", parent=root):
-            return finish()
-        run(app_update.pull, folder, then=pulled, label="Updating…")
-
-    def pulled(ok, value):
-        if not ok:
-            return finish(value, True)
-        UPDATES["changes"] = None
-        finish()
-        if messagebox.askyesno("Update", "Updated. The new version runs after the assembler restarts.\n\nRestart it now?", parent=root):
-            root.destroy()
-            restart()
-
-    try:
-        folder = app_update.repo_root()
-    except app_update.UpdateError as e:
-        return finish(str(e), True)
-    if UPDATES["changes"]:
+    def busy(label, updating):
+        if label is None:
+            button.config(text=_idle_text(UPDATES["changes"]), state=tk.NORMAL)
+            _starts(root, True)
+            return
         button.config(state=tk.DISABLED)
-        checked(True, UPDATES["changes"])
-        return
-    run(app_update.check, folder, then=checked, label="Checking…")
+        if label:
+            button.config(text=label.replace("...", "\u2026"))
+        _starts(root, not updating)
+
+    def found(changes):
+        UPDATES["changes"] = changes or None
+
+    def restart_assembler(parent):
+        root.destroy()
+        restart()
+
+    app_update.UpdateCheck(root, "assembler", {"busy": busy, "found": found, "restart": restart_assembler}).start(UPDATES["changes"] or None)
 
 
 def settings_dialog(root, app_update):

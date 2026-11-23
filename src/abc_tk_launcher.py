@@ -633,12 +633,11 @@ def start_auto_update(root, button, helpers):
 
 
 def check_for_update(root, button, changes=None, helpers=None):
-    """The launch screen's Update… button: looks on GitHub for newer commits (in a thread: the network), says what is new, and on a yes
-    brings the apps' folder up to date (git pull for a clone, else GitHub's ZIP: see app_update.py) and offers to restart the browser.
+    """The launch screen's Update... button: looks on GitHub for newer commits, says what is new, and on a yes brings the apps' folder up to date
+    and offers to restart the browser (app_update.UpdateCheck does it, for all the apps: what is the launch screen's own is the hooks below).
     `changes`: those the check at launch already found: the question is asked at once, without looking again. `helpers`: as for
     prompt_startup_panel_tk (the restart question says if the atlas download is running)."""
     import app_update
-    done = queue.Queue()
     error = getattr(button, "update_error", None)
     if error:                                       # (the automatic update failed: why, first; Yes goes on to check and update again)
         button.update_error = None
@@ -647,35 +646,6 @@ def check_for_update(root, button, changes=None, helpers=None):
         button.config(text=getattr(button, "idle_text", "Check for updates"))
         if not again:
             return
-
-    def work(job, *args):
-        try:
-            done.put((True, job(*args)))
-        except app_update.UpdateError as e:
-            done.put((False, str(e)))
-        except Exception as e:                      # (anything unforeseen: still reported, not a button stuck on "Checking…")
-            done.put((False, f"{type(e).__name__}: {e}"))
-
-    def run(job, *args, then, label):
-        button.config(text=label, state=tk.DISABLED)
-        root.config(cursor="watch")
-        threading.Thread(target=work, args=(job,) + args, daemon=True).start()
-
-        def poll():
-            try:
-                ok, value = done.get_nowait()
-            except queue.Empty:
-                root.after(100, poll)
-                return
-            then(ok, value)
-        poll()
-
-    def finish(text=None, error=False):
-        button.config(text=getattr(button, "idle_text", "Check for updates"), state=tk.NORMAL)
-        root.config(cursor="")
-        if text:
-            with question():
-                (messagebox.showerror if error else messagebox.showinfo)("Update", text, parent=dialog_parent())
 
     def dialog_parent():
         """The window a question goes over: the dialog that has the input (e.g. the project list), else the launch screen; a question over
@@ -688,58 +658,35 @@ def check_for_update(root, button, changes=None, helpers=None):
             pass
         return root
 
-    def checked(ok, value):
-        if not ok:
-            return finish(value, True)
-        if not value:
+    def busy(label, updating):
+        if label is None:
+            button.config(text=getattr(button, "idle_text", "Check for updates"), state=tk.NORMAL)
+        elif label == "":
+            button.config(state=tk.DISABLED)
+        else:
+            button.config(text=label.replace("...", "\u2026"), state=tk.DISABLED)
+
+    def found(new_changes):
+        if not new_changes:
             button.idle_text = "Check for updates"
-            return finish(app_update.newest_text(folder))
-        shown = "\n".join("  • " + line for line in value[:12]) + (f"\n  ... and {len(value) - 12} more" if len(value) > 12 else "")
-        news = f"{len(value)} new change{'s' if len(value) != 1 else ''} on GitHub:\n\n{shown}\n\n"
-        reason = app_update.no_pull_reason(folder)
-        if reason:                                  # (a git clone, and no git: what is new, and how to get it)
-            return finish(news + reason)
-        root.config(cursor="")
-        with question():
-            yes = messagebox.askyesno("Update", news + "Download them now?", parent=dialog_parent())
-        if not yes:
-            return finish()
-        run(app_update.pull, folder, then=pulled, label="Updating…")
 
-    def pulled(ok, value):
-        if not ok:
-            return finish(value, True)
-        button.idle_text = "Check for updates"
-        finish()
+    def keep_open():
+        # (restarting would pause the download of the atlas until the next start: so no restart is offered while it is going)
         downloading = (helpers or {}).get("atlas_download_running", lambda: None)()
-        if downloading:
-            # (restarting would pause the download of the atlas until the next start: so no restart is offered while it is going)
-            with question():
-                messagebox.showinfo("Update", "Updated. The new version runs the next time the browser starts.\n\n"
-                                    f"The atlas is still downloading ({downloading}), so the browser is not restarted now: that would stop the "
-                                    "download. Close the browser after the download has finished.", parent=dialog_parent())
-            return
-        with question():
-            yes = messagebox.askyesno("Update", "Updated. The new version runs after the browser restarts.\n\nRestart it now?", parent=dialog_parent())
-        if yes:
-            top = dialog_parent()
-            if top is not root:
-                top.destroy()                               # (a dialog waiting for its window to close: it ends first)
+        return (f"The atlas is still downloading ({downloading}), so the browser is not restarted now: that would stop the download. "
+                "Close the browser after the download has finished.") if downloading else None
 
-            def go():
-                root.destroy()
-                restart()
-            root.after(100, go)
+    def restart_browser(parent):
+        if parent is not root:
+            parent.destroy()                        # (a dialog waiting for its window to close: it ends first)
 
-    try:
-        folder = app_update.repo_root()
-    except app_update.UpdateError as e:
-        return finish(str(e), True)
-    if changes:
-        button.config(state=tk.DISABLED)
-        checked(True, changes)
-        return
-    run(app_update.check, folder, then=checked, label="Checking…")
+        def go():
+            root.destroy()
+            restart()
+        root.after(100, go)
+
+    app_update.UpdateCheck(root, "browser", {"busy": busy, "found": found, "parent": dialog_parent, "question": question,
+                                             "keep_open": keep_open, "restart": restart_browser}).start(changes)
 
 
 def restart():

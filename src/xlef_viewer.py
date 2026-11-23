@@ -5112,76 +5112,17 @@ class XlefViewer:
             self.update_menu.entryconfigure(0, label="Check GitHub now...")
 
     def update_app(self, changes=None):
-        """Update > Update from GitHub: looks for newer commits (in a thread: the network), says what is new, and on a yes pulls them and
-        offers to restart the viewer. changes: those already found (by the check at launch): not looked for again."""
-        if getattr(self, "updating", False):
-            return
-        self.updating = True
-        done = queue.Queue()
+        """Update > Update from GitHub: looks for newer commits, says what is new, and on a yes pulls them and offers to restart the viewer
+        (app_update.UpdateCheck does it, for all the apps: what is the viewer's own is the hooks below). changes: those already found (by the
+        check at launch): not looked for again."""
+        if getattr(self, "update_check", None) is None:
+            def busy(label, updating):
+                self.status.config(text="" if label is None else "Updating ..." if updating else "Checking GitHub for updates ..." if label else "")
 
-        def work(job, *args):
-            try:
-                done.put((True, job(*args)))
-            except app_update.UpdateError as e:
-                done.put((False, str(e)))
-            except Exception as e:                      # (anything unforeseen: still reported, not a frozen "Checking ...")
-                done.put((False, f"{type(e).__name__}: {e}"))
-
-        def run(job, *args, then):
-            threading.Thread(target=work, args=(job,) + args, daemon=True).start()
-
-            def poll():
-                try:
-                    ok, value = done.get_nowait()
-                except queue.Empty:
-                    self.root.after(100, poll)
-                    return
-                then(ok, value)
-            poll()
-
-        def finish(text=None, error=False):
-            self.updating = False
-            self.root.config(cursor="")
-            if text:
-                (messagebox.showerror if error else messagebox.showinfo)("Update", text, parent=self._on_top())
-
-        def checked(ok, value):
-            if not ok:
-                return finish(value, True)
-            self._update_menu_label(len(value))
-            if not value:
-                return finish(app_update.newest_text(root))
-            shown = "\n".join("  • " + line for line in value[:12]) + (f"\n  ... and {len(value) - 12} more" if len(value) > 12 else "")
-            news = f"{len(value)} new change{'s' if len(value) != 1 else ''} on GitHub:\n\n{shown}\n\n"
-            reason = app_update.no_pull_reason(root)
-            if reason:                                  # (a git clone, and no git: what is new, and how to get it)
-                return finish(news + reason)
-            self.root.config(cursor="")
-            if not messagebox.askyesno("Update", news + "Download them now?", parent=self._on_top()):
-                return finish()
-            self.status.config(text="Updating ...")
-            self.root.config(cursor="watch")
-            run(app_update.pull, root, then=pulled)
-
-        def pulled(ok, value):
-            self.status.config(text="")
-            if not ok:
-                return finish(value, True)
-            self._update_menu_label(0)
-            finish()
-            top = self._on_top()
-            if messagebox.askyesno("Update", "Updated. The new version runs after the viewer restarts.\n\nRestart it now?", parent=top):
-                self._restart_over(top)
-
-        try:
-            root = app_update.repo_root()
-        except app_update.UpdateError as e:
-            return finish(str(e), True)
-        if changes:
-            return checked(True, list(changes))
-        self.status.config(text="Checking GitHub for updates ...")
-        self.root.config(cursor="watch")
-        run(app_update.check, root, then=lambda ok, value: (self.status.config(text=""), checked(ok, value)))
+            self.update_check = app_update.UpdateCheck(self.root, "viewer", {
+                "busy": busy, "found": lambda new_changes: self._update_menu_label(len(new_changes)), "parent": self._on_top,
+                "restart": self._restart_over})
+        self.update_check.start(changes)
 
     def quit(self, asked=False):
         """Closes the viewer, after asking about unsaved changes (asked: that was done already, as for an update's restart)."""

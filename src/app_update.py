@@ -8,7 +8,8 @@
   the folder (the .venv, caches, settings, anything added) is touched.
 
 repo_root() says which folder (and the way), check() and pull() use the network (slowly), so call them from a thread; relaunch()
-starts the app again."""
+starts the app again. UpdateCheck is the manual "Check for updates" of every app (the questions, the pull, the restart), AutoUpdate the
+automatic one at launch: an app gives each its hooks and has no update dialog of its own."""
 import glob
 import json
 import os
@@ -608,3 +609,118 @@ class AutoUpdate:
             self.result.put((False, str(e)))
         except Exception as e:
             self.result.put((False, f"{type(e).__name__}: {e}"))
+
+
+class UpdateCheck:
+    """The manual "Check for updates" of an app, the same in all of them: looks on GitHub for newer commits (in a thread: the network), says what is
+    new or that this is the newest version (and which), asks whether to download the new ones, does, and asks about restarting the app. What differs
+    between the apps is given as hooks, a dict of functions (every one is optional):
+      busy(label, updating)  the app's button, menu or status line shows the work: label "Checking...", "Updating..." (updating True: the program
+                             files are being replaced: nothing may be started meanwhile), "" (disabled, the text as it is: a question is up), or None
+                             (idle again);
+      found(changes)         the list of new changes GitHub has (empty: none, or just installed), for the app to word its button or menu by;
+      parent()               the window a question goes over (default: the app's window);
+      question()             a context manager around a question that is up (so that automatic updates wait: see AutoUpdate's blocked);
+      keep_open()            None, or the sentence saying why the app must not be restarted now (an atlas is downloading): the update then waits for
+                             the next start, and no restart is offered;
+      restart(parent)        ends this run and starts the app again (`parent` is the window the question went over).
+    A class with methods that are scheduled again, not a function that schedules itself: such a function is a reference cycle that keeps the window
+    alive after it is closed (see UpdateWatch)."""
+
+    def __init__(self, root, app, hooks=None):
+        """`app`: what the app is called in its messages ("browser", "assembler", "viewer")."""
+        self.root, self.app, self.hooks = root, app, hooks or {}
+        self.active = False
+        self.folder = None
+        self.done = queue.Queue()
+
+    def hook(self, name, *args, default=None):
+        fn = self.hooks.get(name)
+        return fn(*args) if fn is not None else default
+
+    def parent(self):
+        return self.hook("parent") or self.root
+
+    def say(self, kind, text, **options):
+        """A message box ("showinfo", "showerror", "askyesno") over the right window; its answer."""
+        from tkinter import messagebox
+        import contextlib
+        guard = self.hook("question") or contextlib.nullcontext()
+        with guard:
+            return getattr(messagebox, kind)("Update", text, parent=self.parent(), **options)
+
+    def start(self, changes=None):
+        """Begins: `changes` are those a check at launch found (not looked for again: the question is asked at once)."""
+        if self.active:
+            return
+        self.active = True
+        try:
+            self.folder = repo_root()
+        except UpdateError as e:
+            return self.finish(str(e), True)
+        if changes:
+            self.hook("busy", "", False)
+            return self.checked(True, list(changes))
+        self.run(check, self.checked, "Checking...", False)
+
+    def run(self, job, then, label, updating):
+        self.hook("busy", label, updating)
+        self.root.config(cursor="watch")
+
+        def work():
+            try:
+                self.done.put((True, job(self.folder)))
+            except UpdateError as e:
+                self.done.put((False, str(e)))
+            except Exception as e:                      # (anything unforeseen: still reported, not a button stuck on "Checking...")
+                self.done.put((False, f"{type(e).__name__}: {e}"))
+        threading.Thread(target=work, daemon=True).start()
+        self.root.after(100, lambda: self.poll(then))
+
+    def poll(self, then):
+        try:
+            if not self.root.winfo_exists():
+                return                                  # (the window was closed meanwhile)
+            ok, value = self.done.get_nowait()
+        except queue.Empty:
+            self.root.after(100, lambda: self.poll(then))
+            return
+        except Exception:
+            return
+        then(ok, value)
+
+    def finish(self, text=None, error=False):
+        self.hook("busy", None, False)
+        self.root.config(cursor="")
+        self.active = False
+        if text:
+            self.say("showerror" if error else "showinfo", text)
+
+    def checked(self, ok, changes):
+        if not ok:
+            return self.finish(changes, True)
+        self.hook("found", changes)
+        if not changes:
+            return self.finish(newest_text(self.folder))
+        shown = "\n".join("  \u2022 " + line for line in changes[:12]) + (f"\n  ... and {len(changes) - 12} more" if len(changes) > 12 else "")
+        news = f"{len(changes)} new change{'s' if len(changes) != 1 else ''} on GitHub:\n\n{shown}\n\n"
+        reason = no_pull_reason(self.folder)
+        if reason:                                      # (a git clone, and no git: what is new, and how to get it)
+            return self.finish(news + reason)
+        self.root.config(cursor="")
+        if not self.say("askyesno", news + "Download them now?"):
+            return self.finish()
+        self.run(pull, self.pulled, "Updating...", True)
+
+    def pulled(self, ok, report):
+        if not ok:
+            return self.finish(report, True)
+        self.hook("found", [])
+        self.finish()
+        why_not = self.hook("keep_open")
+        if why_not:
+            # (restarting would stop what is going on, which continues at the next start: so no restart is offered now)
+            self.say("showinfo", f"Updated. The new version runs the next time the {self.app} starts.\n\n{why_not}")
+            return
+        if self.say("askyesno", f"Updated. The new version runs after the {self.app} restarts.\n\nRestart it now?"):
+            self.hook("restart", self.parent())

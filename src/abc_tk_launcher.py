@@ -693,7 +693,7 @@ def check_for_update(root, button, changes=None, helpers=None):
             return finish(value, True)
         if not value:
             button.idle_text = "Check for updates"
-            return finish("You have the newest version.")
+            return finish(app_update.newest_text(folder))
         shown = "\n".join("  • " + line for line in value[:12]) + (f"\n  ... and {len(value) - 12} more" if len(value) > 12 else "")
         news = f"{len(value)} new change{'s' if len(value) != 1 else ''} on GitHub:\n\n{shown}\n\n"
         reason = app_update.no_pull_reason(folder)

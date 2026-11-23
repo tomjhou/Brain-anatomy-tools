@@ -307,6 +307,12 @@ def version_text(root=None):
     return f"{shown + '  ' if shown else ''}(commit {sha[:7]}{', branch ' + branch if branch else ''})"
 
 
+def newest_text(root=None):
+    """What an app's "Check for updates" says when there is nothing new: that this is the newest version, and which version that is (see version_text:
+    the date and time of its commit, in this computer's time, its id and, in a clone, the branch)."""
+    return "You have the newest version.\n\nThis version: " + version_text(root)
+
+
 def _context():
     """Certificates to check GitHub's with: the system's together with certifi's. The system's matter on a computer of an organization that inspects its
     traffic: its own certificate is in Windows' store and not in certifi's, so with certifi's alone every check failed ("unable to get local issuer

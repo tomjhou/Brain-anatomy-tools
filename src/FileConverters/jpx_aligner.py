@@ -353,6 +353,31 @@ def install_crash_log():
     sys.excepthook, threading.excepthook = hook, thread_hook
 
 
+def polygon_contains(points, x, y):
+    """Whether the point (x, y) is inside the polygon whose corners are the rows of `points` (the even-odd rule)."""
+    px, py = points[:, 0], points[:, 1]
+    qx, qy = np.roll(px, -1), np.roll(py, -1)
+    crosses = (py > y) != (qy > y)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        x_at = px + (y - py) * (qx - px) / (qy - py)
+    return bool(np.count_nonzero(crosses & (x < x_at)) % 2)
+
+
+def polygon_area(points):
+    x, y = points[:, 0], points[:, 1]
+    return abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))) / 2.0
+
+
+def distance_to_polygon(points, x, y):
+    """How far the point (x, y) is from the polygon's outline (the nearest point on any of its edges)."""
+    a, b = points, np.roll(points, -1, axis=0)
+    ab = b - a
+    length2 = np.maximum((ab ** 2).sum(axis=1), 1e-12)
+    u = np.clip(((np.array([x, y]) - a) * ab).sum(axis=1) / length2, 0.0, 1.0)
+    nearest = a + ab * u[:, None]
+    return float(np.hypot(nearest[:, 0] - x, nearest[:, 1] - y).min())
+
+
 class ExportProgressDialog:
     """The window shown while a JPX is written: what is being done (the text the status bar has), a bar, and a Cancel button."""
 
@@ -621,7 +646,7 @@ class Aligner:
         self.thumb_job = None
         self.frame_previews = set()  # indices of sections whose preview is the JPX's own frame (not rendered from a source image)
         self.cur = 0
-        self.undo = []              # steps: each a list of (section index, Edit before the change)
+        self.undo = []              # steps, newest last: an alignment edit is a list of (section frame, Edit before the change); an outline edit is ("outline", section frame, its outline before the change)
         self.drag = None
         self.view = None            # (scale view px per canvas px, ox, oy)
         self.fitted = True          # the view is the fit-to-window one (not panned or zoomed by hand since)
@@ -631,7 +656,6 @@ class Aligner:
         self.sel_vertices = set()   # indices of the selected vertices of that outline (red squares)
         self.odrag = None           # an outline gesture in progress (moving vertices, or a rubber band)
         self.prov_sel = set()       # vertices inside the rubber band while it is being dragged
-        self.outline_undo = []      # steps of the Drawing panel's Undo: (section index, its outline before the change)
         self.last_ref = None        # the comparison section and opacity of the last redraw, for the overlay
         self.last_alpha = 0.75
         self.var_draw_info = tk.StringVar(self.root, "")
@@ -749,9 +773,6 @@ class Aligner:
         draw.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
         ttk.Label(draw, textvariable=self.var_draw_info, justify=tk.LEFT).pack(anchor="w")
         ttk.Label(draw, textvariable=self.var_draw_sel, justify=tk.LEFT).pack(anchor="w", padx=(18, 0))
-        self.button_undo_outline = ttk.Button(draw, text="Undo", command=self.undo_outline, state="disabled")
-        self.button_undo_outline.pack(anchor="w", pady=(4, 4))
-        Tooltip(self.button_undo_outline, "Undo most recent change to section outline")
         ttk.Label(draw, foreground="gray30", justify=tk.LEFT,
                   text="click an outline: select it\nthen: drag a square = move it\n"
                        "drag a box = select squares\ndrag a selection = move the group\n"
@@ -766,6 +787,10 @@ class Aligner:
         # alike). Packed above the label when there is a picture to show.
         self.thumb_canvas = tk.Canvas(left, bg="black", highlightthickness=0)
         self.thumb_shown = False
+        self.thumb_regions = []     # (section index, its outline as drawn on the slide picture), for a click on the picture to select a section
+        self.thumb_canvas.bind("<Button-1>", self.on_thumb_click)
+        self.thumb_canvas.bind("<Motion>", self.on_thumb_motion)
+        Tooltip(self.thumb_canvas, "The slide scan. Click a section's outline to select that section.")
         order = ttk.Frame(left)   # under the list (packed before it, so the list takes what is left)
         order.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
         for text, command, tip in (
@@ -826,9 +851,18 @@ class Aligner:
         self.button_cancel.pack(side=tk.RIGHT, padx=5)
         # The status text, or (instead of it, while there is one) a hint about what is under the pointer on the image.
         self.var_hint = tk.StringVar(self.root, "")
-        self.status_label = ttk.Label(bottom, textvariable=self.var_status, anchor="w")
-        self.hint_label = ttk.Label(bottom, textvariable=self.var_hint, anchor="w", foreground="#0050a0")
-        self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # Two lines tall whatever the text is: the status is of two lines at times (while loading: "Preparing load..." for each slide scan, then one
+        # line, then two again) and the hint is one, and a bar that changed height made the picture above it, which is fitted to its height, jump.
+        status_box = ttk.Frame(bottom)
+        status_box.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        probe = ttk.Label(status_box, text="x\nx")
+        probe.update_idletasks()
+        status_box.configure(height=probe.winfo_reqheight())
+        probe.destroy()
+        status_box.pack_propagate(False)
+        self.status_label = ttk.Label(status_box, textvariable=self.var_status, anchor="w")
+        self.hint_label = ttk.Label(status_box, textvariable=self.var_hint, anchor="w", foreground="#0050a0")
+        self.status_label.pack(side=tk.TOP, fill=tk.X)
 
         for seq, fn in (("<Control-o>", self.open_dialog), ("<Control-s>", self.export_dialog),
                         ("<Control-z>", self.do_undo)):
@@ -877,8 +911,8 @@ class Aligner:
         ttk.Button(ab, text="Apply", command=self.apply_entries).pack(fill=tk.BOTH, expand=True)
         undo = ttk.Button(ab, text="Undo", command=self.do_undo)
         undo.pack(fill=tk.BOTH, expand=True)
-        Tooltip(undo, "Undoes the last alignment edit (rotation, shift, flip). Shortcut: Ctrl+Z.\n"
-                      "Outline edits have their own Undo, in the Outline drawing panel.")
+        Tooltip(undo, "Undoes the last change: an alignment edit (rotation, shift, flip) or a change to a section's outline (drawing, moving or "
+                      "deleting vertices), the most recent first. Shortcut: Ctrl+Z.")
         bf = ttk.Frame(f)
         bf.grid(row=5, column=0, columnspan=4, pady=(6, 0))
         for text, deg in (("-1°", -1), ("-0.1°", -0.1), ("+0.1°", 0.1), ("+1°", 1)):   # (+ is clockwise)
@@ -891,7 +925,7 @@ class Aligner:
         Tooltip(reset_button, "Removes this section's rotation, shift and flip, so it goes back to its original alignment: the one NeuroInfo "
                               "gave it (recovered from its case file and reconstruction .xml), or, for sections made from slide scans in "
                               "steps 1-3, the unrotated placement at the middle of the canvas. If the file you opened was exported from here "
-                              "with edits, this goes back past them too. It does not change the outline (that has its own Undo). "
+                              "with edits, this goes back past them too. It does not change the outline. "
                               "Undo brings the edits back.", wraplength=320)
         # (wrapped, so that a long note cannot widen the panel at the expense of the picture)
         self.label_detail = ttk.Label(f, text="", foreground="gray30", justify=tk.LEFT,
@@ -1092,10 +1126,10 @@ class Aligner:
         self.var_hint.set(text)
         if text and not self.hint_label.winfo_ismapped():
             self.status_label.pack_forget()
-            self.hint_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            self.hint_label.pack(side=tk.TOP, fill=tk.X)
         elif not text and self.hint_label.winfo_ismapped():
             self.hint_label.pack_forget()
-            self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            self.status_label.pack(side=tk.TOP, fill=tk.X)
 
     def modifier_lost(self):
         """The window lost the keyboard focus: any key released elsewhere is not seen, so forget Shift and Ctrl."""
@@ -1392,7 +1426,6 @@ class Aligner:
         self.thumb_photos = {}
         self.draw_thumbnail()
         self.undo = []
-        self.outline_undo = []
         self.sel_outline, self.sel_vertices, self.odrag = False, set(), None
         self.cur = 0
         self.view = None
@@ -1929,17 +1962,42 @@ class Aligner:
         c.config(width=photo.width(), height=photo.height())
         c.delete("all")
         c.create_image(0, 0, image=photo, anchor="nw")
+        self.thumb_regions = []
         for s in self.stack.sections:
             if s.source_path != path or s.czi_origin is None or not len(s.case_points):
                 continue
             X = s.case_points[:, 0] / self.stack.pixel_um + s.czi_origin[0]
             Y = -s.case_points[:, 1] / self.stack.pixel_um + s.czi_origin[1]
             pts = np.column_stack([(X - gx0) / k, (Y - gy0) / k])
+            self.thumb_regions.append((s.index, pts))
             here = s is sec
             c.create_polygon(*pts.ravel().tolist(), outline="#ff3030" if here else "#a08000", fill="", width=2 if here else 1)
             if here:
                 cx, cy = pts.mean(0)
                 c.create_text(cx, cy, text=str(s.index + 1), fill="#ff3030", font=("Segoe UI", 11, "bold"))
+
+    THUMB_NEAR_PX = 10      # a click this close to a section's outline (outside it) still picks it
+
+    def thumb_section_at(self, x, y):
+        """The index of the section whose outline is under the point (x, y) of the slide picture: the smallest one that contains it (they can lie
+        one in another); else the nearest outline within THUMB_NEAR_PX; None if there is none."""
+        inside = [(polygon_area(pts), i) for i, pts in self.thumb_regions if len(pts) >= 3 and polygon_contains(pts, x, y)]
+        if inside:
+            return min(inside)[1]
+        near = [(distance_to_polygon(pts, x, y), i) for i, pts in self.thumb_regions if len(pts) >= 2]
+        near = [n for n in near if n[0] <= self.THUMB_NEAR_PX]
+        return min(near)[1] if near else None
+
+    def on_thumb_click(self, event):
+        """A click on the slide picture selects the section whose outline is there."""
+        i = self.thumb_section_at(event.x, event.y)
+        if i is not None and self.stack and 0 <= i < len(self.stack.sections) and i != self.cur:
+            self.select(i)
+
+    def on_thumb_motion(self, event):
+        """A hand over a section that a click would select."""
+        hand = self.thumb_section_at(event.x, event.y) is not None
+        self.thumb_canvas.config(cursor="hand2" if hand else "")
 
     def update_sections_title(self):
         """"Sections", with how many pictures have been loaded while they are loading."""
@@ -2151,6 +2209,9 @@ class Aligner:
         if not self.stack or self.busy or not self.undo:
             return
         step = self.undo.pop()
+        if isinstance(step, tuple):                         # an outline edit: the section's outline as it was
+            self.undo_outline_step(step)
+            return
         done = []
         for frame, e in step:
             s = self.by_frame(frame)
@@ -2249,8 +2310,16 @@ class Aligner:
         self.stack.deleted += 1
         self.previews.pop(s.frame, None)
         self.frame_previews.discard(s.frame)
-        self.undo = [step for step in ([(f, e) for f, e in step if f != s.frame] for step in self.undo) if step]
-        self.outline_undo = [u for u in self.outline_undo if u[0] != s.frame]
+        kept = []
+        for step in self.undo:
+            if isinstance(step, tuple):                     # (an outline step: ("outline", frame, points))
+                if step[1] != s.frame:
+                    kept.append(step)
+            else:
+                step = [(f, e) for f, e in step if f != s.frame]
+                if step:
+                    kept.append(step)
+        self.undo = kept
         self.renumber()
         self.update_sections_title()
         self.cur = min(i, len(secs) - 1)
@@ -2646,14 +2715,14 @@ class Aligner:
         return ("edge", best[1], best[2]) if best else None
 
     def push_outline_undo(self, sec):
-        self.outline_undo.append((sec.frame, sec.case_points.copy()))
-        if len(self.outline_undo) > 500:
-            self.outline_undo.pop(0)
+        """Remember the section's outline as it is, before a change to it, as a step of the one Undo history (with the alignment edits)."""
+        self.undo.append(("outline", sec.frame, sec.case_points.copy()))
+        if len(self.undo) > 500:
+            self.undo.pop(0)
 
-    def undo_outline(self):
-        if not self.outline_undo or not self.stack or self.busy:
-            return
-        frame, points = self.outline_undo.pop()
+    def undo_outline_step(self, step):
+        """Undo of an outline edit: put the section's outline back as it was, and show that section."""
+        _tag, frame, points = step
         sec = self.by_frame(frame)
         if sec is None:
             return
@@ -2669,7 +2738,7 @@ class Aligner:
         """White squares on the current outline's vertices while it is selected or the pointer is within reach of it (the
         preview of what a click would select); selected vertices are red, the one under the pointer is orange and larger.
         `provisional` replaces the selection while a rubber band is being dragged. Also updates the Drawing panel's text
-        (two lines, so the panel never needs to be wider) and its Undo button."""
+        (two lines, so the panel never needs to be wider)."""
         self.refresh_canvas_cursor()   # (the selection or the hover changed)
         if self.sync_picture_to_selection():
             return
@@ -2702,7 +2771,6 @@ class Aligner:
             info, sel_text = f"Outline selected: {n} vertices", (f"{sel} selected" if sel else "")
         self.var_draw_info.set(info)
         self.var_draw_sel.set(sel_text)
-        self.button_undo_outline.config(state="normal" if self.outline_undo and self.stack else "disabled")
 
     def on_hover(self, event):
         """The pointer moved over the image (no button down): note whether it is within reach of the current outline's vertex
@@ -2853,7 +2921,7 @@ class Aligner:
             whole, asked = True, True   # (that question already was the warning)
         if whole and not asked and not messagebox.askyesno(
                 "Delete the whole outline?", f"Delete the entire outline of section {sec.index + 1} ({n} vertices)?"
-                "\n\nThe Undo button in the Outline drawing panel can bring it back.", icon="warning", parent=self.root):
+                "\n\nUndo (Ctrl+Z) can bring it back.", icon="warning", parent=self.root):
             return
         self.push_outline_undo(sec)
         if whole:
@@ -3101,7 +3169,6 @@ class Aligner:
         self.stack = stack
         self.previews, self.view, self.cur = keep_previews, keep_view, cur
         self.undo = []
-        self.outline_undo = []
         self.sel_outline, self.sel_vertices, self.odrag = False, set(), None
         self.root.title(f"JPX aligner - {os.path.basename(out)}")
         self.refresh_list()

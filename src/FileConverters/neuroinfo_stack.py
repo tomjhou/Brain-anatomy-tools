@@ -1976,7 +1976,7 @@ def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progr
                             # (the first section takes the longest: the scan is searched for where it lies, and the others then
                             # only have to be checked at the place it showed; so that the wait is not taken for the speed of the rest)
                             text = ("Preparing load: locating sections on slide scan\n"
-                                    "(the first section takes longest, the rest go quickly)...")
+                                    "(the first section of each scan takes longest, the rest go quickly)...")
                         else:
                             text = (f"Locating section {min(active) + 1} of {len(stack.sections)} on the slide scan..."
                                     if active else "Locating sections on the slide scan...")

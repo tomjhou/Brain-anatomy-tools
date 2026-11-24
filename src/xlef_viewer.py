@@ -6472,10 +6472,24 @@ class XlefViewer:
             size = size_text(sum(os.path.getsize(f) for f in ask))
             if not messagebox.askyesno("Download from OneDrive?",
                                        f"{len(ask)} of {entry.name}'s files ({size}) are online-only.\n\n"
-                                       "Viewing the image makes OneDrive download them in full. Continue?", parent=self.root):
+                                       "Viewing the image makes OneDrive download them in full."
+                                       + self._no_pyramid_note(entry) + "\n\nContinue?", parent=self.root):
                 self.status.config(text=f"{entry.name} not opened (online-only).")
                 return
         self.show_entry(entry, full_res_ok=True if ask else None)
+
+    def _no_pyramid_note(self, entry):
+        """For the download question when opening `entry`: why its full files are needed (LAS X made no pyramid for it), and a reminder
+        that the viewer can make one, once they are downloaded (right-click on the project). "" when it has a pyramid, or can't get one
+        (a .lif, .vsi, a small image...: see xlef_pyramids.why_not; online-only files don't count, they are about to be downloaded)."""
+        if entry.pyramid is not None or xlef_pyramids.why_not(entry, lambda f: False) is not None:
+            return ""
+        pid = self._project_of(self._item_of(entry))
+        name = self.projects[pid]["name"] if pid in self.projects else "the project"
+        return ("\n\nThis section has no pyramid (the small copies that the list's thumbnail and the zoomed-out view are made from, "
+                "without downloading the full image). Once its files are downloaded, you can make one: right-click on the project "
+                f"and choose \"Make pyramids for {name}...\" (it makes a copy of the project, {name}{xlef_pyramids.SUFFIX}.xlef, "
+                "to open instead from then on).")
 
     def _files_to_ask(self, entry):
         """The large online-only files (see needs_asking) that showing `entry` would read: none when its pyramid can be used (its

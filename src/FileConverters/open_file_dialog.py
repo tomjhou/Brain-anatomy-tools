@@ -20,6 +20,7 @@ import queue
 import re
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 
 from color_button import ColorButton
@@ -36,6 +37,30 @@ def sort_key(text):
     20:42" by date and time, "Image 2" before "Image 10")."""
     parts = re.split(r"(\d+(?:\.\d+)?)", text.replace(",", "").lower())
     return [(0, float(p), "") if i % 2 else (1, 0.0, p) for i, p in enumerate(parts) if p]
+
+
+def share_width(total, needs, bases, stretch, least=40):
+    """The columns' widths, adding up to `total`: each gets the width its text needs (needs) when there is room for them all, the rest
+    going to the stretching columns (in proportion to their usual widths, bases); when there isn't, the short ones still get theirs and
+    the long ones share what is left equally (each cut to the same width, the "water level"), none below `least`."""
+    n = len(needs)
+    needs = [max(least, int(w)) for w in needs]
+    if total >= sum(needs):
+        grow = [i for i in range(n) if stretch[i]] or list(range(n))
+        spare, weight = total - sum(needs), sum(bases[i] for i in grow) or 1
+        widths = list(needs)
+        for i in grow:
+            widths[i] += int(spare * bases[i] / weight)
+    else:
+        lo, hi = least, max(needs)
+        while hi - lo > 1:                       # (the level: the widest a column may be, so that they all fit)
+            mid = (lo + hi) // 2
+            lo, hi = (mid, hi) if sum(min(w, mid) for w in needs) <= total else (lo, mid)
+        widths = [min(w, lo) for w in needs]
+    left = total - sum(widths)                   # (rounding: to the widest stretching column, so the list is filled exactly)
+    if left > 0:
+        widths[max(range(n), key=lambda i: (stretch[i], widths[i]))] += left
+    return widths
 
 
 def ask_open_file(parent, recent, *, title="Open", noun="file", filetypes=(("All files", "*.*"),), columns=DEFAULT_COLUMNS, details=None,
@@ -109,7 +134,8 @@ def ask_open_file(parent, recent, *, title="Open", noun="file", filetypes=(("All
     # ---- the recent-files panel
     keys = [c[0] for c in columns]
     detail_keys = [k for k in keys if k not in ("name", "folder")]
-    tree = ttk.Treeview(recent_panel, columns=keys, show="headings", selectmode="browse", height=min(max(len(paths), 4), 12))
+    holder = ttk.Frame(recent_panel)      # (its size doesn't follow the list's widths, set by fit_columns: else the dialog would shrink to them)
+    tree = ttk.Treeview(holder, columns=keys, show="headings", selectmode="browse", height=min(max(len(paths), 4), 12))
     headings = {c[0]: c[1] for c in columns}
     order = {"key": None, "down": False}            # (the column the list is sorted by: None, the recent order, newest first)
 
@@ -140,9 +166,33 @@ def ask_open_file(parent, recent, *, title="Open", noun="file", filetypes=(("All
 
     for key, heading, width, anchor, stretch in columns:
         tree.heading(key, text=heading, command=lambda k=key: sort_by(k))
-        tree.column(key, width=width, anchor=anchor, stretch=stretch)
+        tree.column(key, width=width, anchor=anchor, stretch=False)     # (the widths are shared out by fit_columns, not by the Treeview)
     if heading_tips:
         HeadingTips(tree, heading_tips)
+    cell_font = tkfont.nametofont(ttk.Style(dlg).lookup("Treeview", "font") or "TkDefaultFont")
+    head_font = tkfont.nametofont(ttk.Style(dlg).lookup("Treeview.Heading", "font") or "TkHeadingFont")
+    fitted = {"total": None, "needs": None}
+
+    def fit_columns(event=None):
+        """Share the list's width among the columns by what their text needs (see share_width): widening the window widens the columns
+        whose text is cut off first. Again when the window is resized, and when the details come in."""
+        try:
+            total = tree.winfo_width()
+            if total < 50:
+                return
+            needs = []
+            for key, heading, *_ in columns:
+                texts = [tree.set(i, key) for i in tree.get_children()]
+                needs.append(max([head_font.measure(heading + "  ▼") + 16] + [cell_font.measure(t) + 14 for t in texts]))
+            if (total, needs) == (fitted["total"], fitted["needs"]):
+                return
+            fitted["total"], fitted["needs"] = total, needs
+            widths = share_width(total - 4, needs, [c[2] for c in columns], [c[4] for c in columns])
+            for (key, *_), w in zip(columns, widths):
+                tree.column(key, width=w)
+        except tk.TclError:
+            pass                                     # (the dialog was closed)
+    tree.bind("<Configure>", fit_columns, add="+")
 
     def row_values(path, fill):
         return tuple(os.path.basename(path) if k == "name" else os.path.dirname(path) if k == "folder" else fill for k in keys)
@@ -178,10 +228,15 @@ def ask_open_file(parent, recent, *, title="Open", noun="file", filetypes=(("All
                 return                                   # (the dialog was closed)
             if changed and order["key"] in detail_keys:
                 resort()                                 # (sorted by a detail still coming in: the new ones put in their place)
+            if changed:
+                fit_columns()                            # (their widths, for the new texts)
             if dlg.winfo_exists():
                 dlg.after(100, show_details)
         dlg.after(50, show_details)
     tree.pack(fill=tk.BOTH, expand=True)
+    holder.configure(width=tree.winfo_reqwidth(), height=tree.winfo_reqheight())
+    holder.pack_propagate(False)
+    holder.pack(fill=tk.BOTH, expand=True)
     ttk.Label(recent_panel, text=f"Double-click {a_noun}, or select it and click Open. Click a heading to sort by it (again: the other way; a third time: "
                                     "the recent order).", foreground=hint, wraplength=760, justify=tk.LEFT).pack(anchor="w", pady=(4, 0))
     if paths:

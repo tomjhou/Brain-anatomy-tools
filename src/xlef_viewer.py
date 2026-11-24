@@ -836,6 +836,7 @@ def _image_entry(name, path, element, image, base_dir, lif=None):
             names = by_lut.get(ch.lut.lower(), set())
             if len(names) == 1 and not names & taken and sum(c.lut.lower() == ch.lut.lower() for c in entry.channels) == 1:
                 ch.name, ch.named = names.pop(), True
+                ch.saved_name = ch.name     # (read from the file, not a rename: nothing to save)
                 taken.add(ch.name)
         dye = dyes.get(ch.name) if ch.named else None
         if dye and dye.lower() != ch.name.lower():

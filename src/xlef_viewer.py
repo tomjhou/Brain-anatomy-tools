@@ -86,6 +86,7 @@ import app_update          # (the Update menu)
 import xlef_pyramids        # (pyramids for an experiment that has none: see XlefViewer.make_pyramids)
 import vsi_reader           # (Olympus cellSens .vsi files, read with slideio: see load_vsi)
 import lif_to_xlef          # (a .lif saved as an .xlef, which can be edited: see XlefViewer.save_as_xlef)
+import focus_stack          # (extended focus from a z-stack's planes: see OpenImage.efi_z)
 from color_button import ColorButton
 from tooltip import Tooltip, place_on_monitor, monitor_area, tip_window, show_tip_window, watch_pointer
 
@@ -2093,6 +2094,9 @@ def load_vsi(path):
             entry.channels.append(ch)
         entry.files = {(z, c): path for z in range(entry.nz) for c in range(len(entry.channels))}     # (for what is asked of the
         entry.sidecar = vsi_edits_path(path)                                                            # file: online-only, ...)
+        entry.vsi_efi = sc.get("efi")       # (the EFI image cellSens saved with this region, if any: see OpenImage.saved_efi_z)
+        if entry.vsi_efi:
+            entry.files.update({(entry.nz + 2, c): path for c in range(len(entry.channels))})
         entry.vsi_scene, entry.vsi_original = sc["name"], _vsi_state(entry)
         project.children.append(entry)
     try:                            # (edits saved before, in the sidecar: see write_vsi_edits)
@@ -2157,11 +2161,41 @@ class OpenImage:
         self.pyramid = self.usable_level(OVERVIEW_MAX)
         if self.pyramid is not None:
             self.ov_step = self.pyramid[1]
-        self.max_z = entry.nz if entry.nz > 1 else None     # a z-stack's max projection: kept as one more "plane", after the last
+        # A z-stack's planes made of all its planes, each kept as one more "plane" after the last: its max projection (the brightest
+        # value of each pixel), and its extended focus (each pixel from the plane where it is sharpest: see focus_stack); and a .vsi
+        # region's extended focus as cellSens saved it (read from its own file: see vsi_reader's EFI).
+        self.max_z = entry.nz if entry.nz > 1 else None
+        self.efi_z = entry.nz + 1 if entry.nz > 1 else None
+        self.saved_efi_z = entry.nz + 2 if getattr(entry, "vsi_efi", None) else None
+
+    def combined(self, z):
+        """Plane z is made of all the real planes (the max projection, or the computed extended focus)."""
+        return z is not None and z in (self.max_z, self.efi_z)
 
     def layers(self, z):
-        """The real planes that plane z is made of: all of them for the max projection (see max_z), else z itself."""
-        return range(self.entry.nz) if z == self.max_z else (z,)
+        """The real planes that plane z is made of: all of them for the max projection and extended focus (see max_z), else z itself."""
+        return range(self.entry.nz) if self.combined(z) else (z,)
+
+    def combine(self, z, arrays):
+        """The planes' arrays (of the same part, at the same step) made into combined plane z: their max, or their extended focus."""
+        if z == self.efi_z:
+            return focus_stack.focus_stack(arrays)
+        out = np.array(arrays[0])
+        for a in arrays[1:]:
+            np.maximum(out, a, out=out)
+        return out
+
+    def _vsi_z(self, z):
+        """The z that vsi_reader reads plane z as: its EFI for the saved extended focus."""
+        return vsi_reader.EFI if z is not None and z == self.saved_efi_z else z
+
+    def _combined_reader(self, z, readers):
+        """One row reader for combined plane z from a reader per real plane."""
+        if len(readers) == 1:
+            return readers[0]
+        if z == self.efi_z:
+            return focus_stack.BlockFocusReader(readers, self.entry.width, self.entry.height)
+        return _MaxRowReader(readers)
 
     def files_of(self, z, c, files=None):
         """The files that plane (z, c) is read from (of `files`, a pyramid level's; default: the image's own), those that are named."""
@@ -2176,7 +2210,7 @@ class OpenImage:
         """Plane (z, c) is in a compressed TIFF: reading any of it decodes the whole plane (seconds). Asked once, from the file's header."""
         if self.entry.vsi:
             return False                    # (tiles, read a block at a time: nothing is decoded whole, see vsi_reader.BlockReader)
-        if z == self.max_z:
+        if self.combined(z):
             return any(self.is_compressed(k, c) for k in self.layers(z))
         key = (z, c)
         if key not in self.compressed:
@@ -2242,8 +2276,8 @@ class OpenImage:
             return a
         if self.entry.vsi:
             return None                     # (never whole: read in blocks, see row_reader)
-        if z == self.max_z:
-            return self._max_plane(c, stale, keep)
+        if self.combined(z):
+            return self._combined_plane(z, c, stale, keep)
         path = self.entry.files.get(key)
         if path is None:
             return None
@@ -2274,23 +2308,28 @@ class OpenImage:
                 self.planes[key] = a
         return a
 
-    def _max_plane(self, c, stale, keep):
-        """Channel c's max projection, whole: the brightest value of each pixel over all the planes, read one plane at a time (none of
-        them kept), and kept as the current layer's decoded plane is (see plane)."""
-        out = None
-        for k in self.layers(self.max_z):
+    def _combined_plane(self, z, c, stale, keep):
+        """Channel c of combined plane z (max projection or extended focus), whole: the max read one plane at a time (none of them kept);
+        the extended focus from all of them; kept as the current layer's decoded plane is (see plane)."""
+        out, got = None, []
+        for k in self.layers(z):
             a = self.planes.get((k, c))
             if a is None:
                 a = self.plane(k, c, stale=stale, keep=False)
             if a is None:
                 return None
-            out = np.array(a) if out is None else np.maximum(out, a, out=out)
+            if z == self.max_z:
+                out = np.array(a) if out is None else np.maximum(out, a, out=out)
+            else:
+                got.append(a)
+        if z == self.efi_z:
+            out = focus_stack.focus_stack(got)
         if keep and out is not None:
-            for k in [k for k in self.decoded if k[0] != self.max_z]:
+            for k in [k for k in self.decoded if k[0] != z]:
                 self.decoded.discard(k)
                 self.planes.pop(k, None)
-            self.decoded.add((self.max_z, c))
-            self.planes[(self.max_z, c)] = out
+            self.decoded.add((z, c))
+            self.planes[(z, c)] = out
         return out
 
     def overview(self, z, c, progress=None, stale=None):
@@ -2302,19 +2341,20 @@ class OpenImage:
         have = self.overviews if step == self.ov_step else self.stashed.get(step, {})
         if key in have:
             return have[key]
-        if z == self.max_z:                 # (the max of the planes' overviews, each kept: the z slider then moves to any of them at once)
+        if self.combined(z):                # (made from the planes' overviews, each kept: the z slider then moves to any of them at once)
             zs = self.layers(z)
-            small = None
+            smalls = []
             for i, k in enumerate(zs):
                 a = self.overview(k, c, None if progress is None else (lambda f, i=i: progress((i + f) / len(zs))), stale)
                 if a is None:
                     return None
-                small = np.array(a) if small is None else np.maximum(small, a, out=small)
+                smalls.append(a)
+            small = self.combine(z, smalls)
             self._keep_overview(z, c, small, step)
             return small
         if self.entry.vsi:                  # (from the .vsi's own pyramid: see vsi_reader)
             e = self.entry
-            small = vsi_reader.overview(*e.vsi, c, z, e.width, e.height, step)
+            small = vsi_reader.overview(*e.vsi, c, self._vsi_z(z), e.width, e.height, step)
             if progress is not None:
                 progress(1.0)
             self._keep_overview(z, c, small, step)
@@ -2374,14 +2414,14 @@ class OpenImage:
         values with LAS X's fixed gamma (see PYRAMID_GAMMA): the image's own files are not touched. None if the level can't be used (the
         overview is then read from the image itself)."""
         level, s = level_step or self.pyramid
-        if z == self.max_z:
-            out = None
+        if self.combined(z):
+            got = []
             for k in self.layers(z):
                 a = self._from_pyramid(c, level_step, k)
                 if a is None:
                     return None
-                out = a if out is None else np.maximum(out, a, out=out)
-            return out
+                got.append(a)
+            return self.combine(z, got)
         try:
             small = read_whole(level.files[(z, c)], level.pages.get((z, c)))
         except (OSError, ValueError, KeyError):
@@ -2409,7 +2449,7 @@ class OpenImage:
         The max projection: the first plane's, if every plane can be read so."""
         if self.entry.vsi:
             return ("vsi", None)            # (read row by row too: see row_reader)
-        if z == self.max_z:
+        if self.combined(z):
             got = [self.raw_layout(k, c) for k in self.layers(z)]
             return got[0] if all(g is not None for g in got) else None
         key = (z, c)
@@ -2419,7 +2459,7 @@ class OpenImage:
 
     def level_layout(self, level, z, c):
         """(offset, dtype) of a pyramid level's channel c, layer z, read row by row (see raw_layout), else None; asked once."""
-        if z == self.max_z:
+        if self.combined(z):
             got = [self.level_layout(level, k, c) for k in self.layers(z)]
             return got[0] if all(g is not None for g in got) else None
         key = (id(level), z, c)
@@ -2432,12 +2472,12 @@ class OpenImage:
         planes), or None if it can't be read row by row."""
         e = self.entry
         if e.vsi:
-            readers = [vsi_reader.BlockReader(*e.vsi, c, k, e.width, e.height, e.vsi_dtype) for k in self.layers(z)]
-            return readers[0] if len(readers) == 1 else _MaxRowReader(readers)
+            readers = [vsi_reader.BlockReader(*e.vsi, c, self._vsi_z(k), e.width, e.height, e.vsi_dtype) for k in self.layers(z)]
+            return self._combined_reader(z, readers)
         if self.raw_layout(z, c) is None:
             return None
         readers = [_RowReader(self.entry.files[(k, c)], *self.raw_layout(k, c), self.entry.width) for k in self.layers(z)]
-        return readers[0] if len(readers) == 1 else _MaxRowReader(readers)
+        return self._combined_reader(z, readers)
 
     def level_reader(self, level, z, c, step):
         """As row_reader, from a pyramid level (see _LevelRowReader)."""
@@ -2445,7 +2485,7 @@ class OpenImage:
             return None
         readers = [_LevelRowReader(level.files[(k, c)], *self.level_layout(level, k, c), level.width, step,
                                    self.entry.channels[c].max_value) for k in self.layers(z)]
-        return readers[0] if len(readers) == 1 else _MaxRowReader(readers)
+        return self._combined_reader(z, readers)
 
     def close(self):
         self.planes.clear()
@@ -4453,19 +4493,31 @@ class XlefViewer:
         # plane. (Planes are numbered from 1 everywhere they are shown; self.z, and the files' keys, count from 0.)
         self.z_frame = ttk.Frame(mid)
         ttk.Label(self.z_frame, text="Z plane").pack(side=tk.TOP)
-        self.z_max = tk.BooleanVar(value=False)     # the max projection on show (self.z is then OpenImage.max_z); carried to other stacks
-        self.z_max_plane = 0                        # the plane the slider was left at when the max projection was switched on
-        # (a real button, filled in while on, as the List / Thumbnails toggle: ttk's Toolbutton looks like a label on Windows)
-        self.z_max_button = ColorButton(self.z_frame, text="Max", bd=2, padx=6, pady=1, cursor="hand2",
-                                        command=lambda: (self.z_max.set(not self.z_max.get()), self.toggle_max()))
-        self.z_max_button.pack(side=tk.TOP, pady=(0, 2))
-        self.z_max.trace_add("write", lambda *a: style_toggle(self.z_max_button, self.z_max.get()))
-        style_toggle(self.z_max_button, False)
-        Tooltip(self.z_max_button, lambda: "Maximum intensity projection: shows each pixel's brightest value across all "
-                                           f"{self.img.entry.nz if self.img else 'the'} planes of the z-stack, in every channel.\n"
-                                           "Click again, or move the plane slider, to go back to a single plane. It stays on for the "
-                                           "next z-stack you open.\n"
-                                           "Reading it reads every plane, so sharp views take longer to come in.")
+        # What the z-stack shows besides its single planes, one at a time: its max projection, its extended focus computed from the
+        # planes, or (a .vsi region) the extended focus cellSens saved. Carried to the next image (see _z_for_mode).
+        self.z_mode = "plane"
+        self.z_max_plane = 0                        # the plane the slider was left at when one of them was switched on
+        nz_text = lambda: self.img.entry.nz if self.img else "the"
+        again = ("Click again, or move the plane slider, to go back to a single plane. It stays on for the next z-stack you open.\n")
+        self.z_mode_buttons = {}
+        for mode, text, tip in (
+                ("max", "Max", lambda: "Maximum intensity projection: shows each pixel's brightest value across all "
+                                       f"{nz_text()} planes of the z-stack, in every channel.\n" + again +
+                                       "Reading it reads every plane, so sharp views take longer to come in."),
+                ("efi", "EFI", lambda: "Extended focus, computed here: each pixel is taken from the plane where it is sharpest (the one "
+                                       f"with the most fine detail around it) of all {nz_text()} planes, channel by channel, for a "
+                                       "picture in focus throughout.\n" + again +
+                                       "Reading it reads every plane and compares them, so sharp views take longer to come in."),
+                ("saved", "Saved EFI", lambda: "The extended-focus image that cellSens saved in the .vsi with this scanned region. It "
+                                               "can be blurry or blocky where the scan didn't save it fully: EFI computes one from the "
+                                               "planes instead.\nClick again, or move the plane slider, to go back to a single plane. "
+                                               "It stays on for the next image that has one; one without shows EFI.")):
+            # (a real button, filled in while on, as the List / Thumbnails toggle: ttk's Toolbutton looks like a label on Windows)
+            b = ColorButton(self.z_frame, text=text, bd=2, padx=6, pady=1, cursor="hand2", command=lambda m=mode: self.toggle_z_mode(m))
+            b.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
+            style_toggle(b, False)
+            Tooltip(b, tip)
+            self.z_mode_buttons[mode] = b
         self.z_up = ttk.Button(self.z_frame, text="▲", width=3, command=lambda: self.step_z(-1))
         self.z_up.pack(side=tk.TOP)
         Tooltip(self.z_up, "Previous plane (one closer to plane 1)")
@@ -4934,7 +4986,7 @@ class XlefViewer:
                 w.configure(background=PAL["bg"])
         self._tree_tag_colors()
         self.show_view_mode()
-        style_toggle(self.z_max_button, self.z_max.get())
+        self._style_z_buttons()
         self.set_tool(self.tool)
         if self.img:
             for i in range(len(self.ch_widgets)):
@@ -6442,8 +6494,8 @@ class XlefViewer:
         kept = self.kept_images.pop(entry, None)        # (seen recently, or loaded in the background: its picture is in memory)
         self._kept_changed()
         self._close_image()
-        plane = min(self.z_max_plane if self.z_max.get() else self.z, entry.nz - 1)
-        self.z = entry.nz if self.z_max.get() and entry.nz > 1 else plane      # (entry.nz: the max projection, see OpenImage.max_z)
+        plane = min(self.z_max_plane if self.z_mode != "plane" else self.z, entry.nz - 1)
+        self.z = self._z_for_mode(entry, self.z_mode, plane)                  # (a combined plane after the last: see OpenImage.max_z)
         instant = kept is not None and kept.has_all(self.z)
         if instant:
             self.img = kept
@@ -6464,13 +6516,19 @@ class XlefViewer:
         self.rotate_button.configure(state=tk.NORMAL)
         self._build_channel_controls()
         self._update_annotations_check()
-        if entry.nz > 1:
+        if entry.nz > 1 or getattr(entry, "vsi_efi", None):
             self.z_scale.config(to=entry.nz)
             self.z_max_plane = plane
             self.z_var.set(plane + 1)
+            for b in self.z_mode_buttons.values():
+                b.pack_forget()
+            for mode, b in self.z_mode_buttons.items():         # (only those this image has, in order, above the slider)
+                if (entry.nz > 1) if mode != "saved" else bool(getattr(entry, "vsi_efi", None)):
+                    b.pack(side=tk.TOP, fill=tk.X, pady=(0, 2), before=self.z_up)
             self.z_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 4), before=self.ch_frame)
         else:
             self.z_frame.pack_forget()
+        self._style_z_buttons()
         self.fit(redraw=False)
         if instant and self.img.complete(self.z):
             self.loading = False
@@ -6498,7 +6556,7 @@ class XlefViewer:
         self.loading = True
         self._update_cursor()
         n = len(img.entry.channels)
-        plane = (", max projection" if z == img.max_z else f", z {z + 1}") if img.entry.nz > 1 else ""      # (numbered from 1, as the slider is)
+        plane = self._z_label(img, z)
 
         def on_disk():
             """For the status bar once it is read (asked of the files there, in the background: a round trip each on a network drive)."""
@@ -6591,7 +6649,7 @@ class XlefViewer:
     def _missing_note(img, z, c):
         """Why channel c of plane z couldn't be read (asked of the disk: os.path.exists only, no download)."""
         e = img.entry
-        if z == img.max_z:                  # (the max projection: the first plane missing a file, if any)
+        if img.combined(z):                 # (made of all the planes: the first plane missing a file, if any)
             z = next((k for k in img.layers(z) if not os.path.exists(e.files.get((k, c)) or "")), 0)
         path = e.files.get((z, c))
         if path is None:
@@ -6867,39 +6925,83 @@ class XlefViewer:
         if self.img:
             self._contrast_change([(i, ch.saved_black, ch.saved_white) for i, ch in enumerate(self.img.entry.channels)])
 
+    def _z_kind(self, img=None, z=None):
+        """What plane z of the image shows: "plane", "max" (projection), "efi" (extended focus computed here) or "saved" (cellSens's)."""
+        img = self.img if img is None else img
+        z = self.z if z is None else z
+        if img is None:
+            return "plane"
+        return "max" if z == img.max_z else "efi" if z == img.efi_z else "saved" if z == img.saved_efi_z else "plane"
+
+    @staticmethod
+    def _z_for_mode(entry, mode, plane):
+        """The plane to show of `entry` for z_mode `mode` (a combined one after its last: see OpenImage.max_z), else `plane`: the saved
+        extended focus if it has one (else the computed one, if it is a z-stack), ..."""
+        nz = entry.nz
+        if mode == "saved" and getattr(entry, "vsi_efi", None):
+            return nz + 2
+        if mode in ("saved", "efi") and nz > 1:
+            return nz + 1
+        if mode == "max" and nz > 1:
+            return nz
+        return plane
+
+    def _z_label(self, img, z):
+        """", z 3", ", max projection", ...: what is shown of a z-stack, for the status line ("" for a single plane)."""
+        kind = self._z_kind(img, z)
+        if kind == "plane":
+            return f", z {z + 1}" if img.entry.nz > 1 else ""        # (numbered from 1, as the slider is)
+        return {"max": ", max projection", "efi": ", extended focus", "saved": ", extended focus saved by cellSens"}[kind]
+
     def _layer_words(self, z=None):
-        """"Layer 3 of 12", or "Max projection of 12 layers": for the status line."""
+        """"Layer 3 of 12", "Max projection of 12 layers", ...: for the status line."""
         z = self.z if z is None else z
         nz = self.img.entry.nz
-        return f"Max projection of {nz} layers" if z == self.img.max_z else f"Layer {z + 1} of {nz}"
+        kind = self._z_kind(z=z)
+        return {"max": f"Max projection of {nz} layers", "efi": f"Extended focus, computed from {nz} layers",
+                "saved": "Extended focus, as saved by cellSens"}.get(kind, f"Layer {z + 1} of {nz}")
 
-    def toggle_max(self):
-        """The Max button: the z-stack's max projection (see OpenImage.max_z), or back to the plane the slider is at."""
-        if not self.img or self.img.max_z is None:
-            self.z_max.set(False)
+    def _style_z_buttons(self):
+        """The Max / EFI / Saved EFI button of what is shown filled in."""
+        kind = self._z_kind()
+        for mode, b in self.z_mode_buttons.items():
+            style_toggle(b, mode == kind)
+
+    def toggle_z_mode(self, mode):
+        """The Max, EFI and Saved EFI buttons: show that (see OpenImage.max_z), or, if it is on show, go back to the slider's plane."""
+        if not self.img:
             return
-        if self.z_max.get():
-            self.z_max_plane = self.z
-            self._go_to_z(self.img.max_z)
-        else:
+        if self._z_kind() == mode:
+            self.z_mode = "plane"
             self._go_to_z(self.z_var.get() - 1)
+        else:
+            target = self._z_for_mode(self.img.entry, mode, None)
+            if target is None:
+                return
+            if self._z_kind() == "plane":
+                self.z_max_plane = self.z
+            self.z_mode = mode
+            self._go_to_z(target)
+        self._style_z_buttons()
 
     def step_z(self, delta):
-        """The z buttons: one plane up or down (not past the first or last); from the max projection, from the slider's plane."""
+        """The z buttons: one plane up or down (not past the first or last); from a combined plane, from the slider's plane."""
         if self.img and self.img.entry.nz > 1:
-            here = self.z_var.get() - 1 if self.z_max.get() else self.z
-            self.z_max.set(False)
+            here = self.z_var.get() - 1 if self._z_kind() != "plane" else self.z
+            self.z_mode = "plane"
             shown = min(max(here + 1 + delta, 1), self.img.entry.nz)
             self.z_var.set(shown)
             self.on_z(shown)
+            self._style_z_buttons()
 
     def on_z(self, value):
         z = int(float(value)) - 1          # (the slider counts planes from 1)
-        if self.z_max.get():
+        if self._z_kind() != "plane":
             if z == self.z_max_plane:
                 return                      # (not moved: the slider's value set again)
-            self.z_max.set(False)           # (the slider moved: back to one plane)
+            self.z_mode = "plane"           # (the slider moved: back to one plane)
         self._go_to_z(z)
+        self._style_z_buttons()
 
     def _go_to_z(self, z):
         """Show plane z (or the max projection: OpenImage.max_z)."""
@@ -6923,8 +7025,11 @@ class XlefViewer:
             else:
                 # Dragging the slider passes every plane on the way: reading each (hundreds of MB, for a compressed stack) would bury the
                 # one that is wanted. The read starts when the slider has rested for a moment.
-                self.status.config(text=("Max projection: reading every plane ..." if z == self.img.max_z
-                                         else f"z = {z + 1}: reading when the slider stops ..."))
+                kind = self._z_kind(z=z)
+                self.status.config(text={"max": "Max projection: reading every plane ...",
+                                         "efi": "Extended focus: reading every plane ...",
+                                         "saved": "Extended focus saved by cellSens: reading ..."}.get(
+                                             kind, f"z = {z + 1}: reading when the slider stops ..."))
                 self.z_job = self.root.after(Z_SETTLE_MS, self._load_overviews_for_z, self.generation)
                 if any(r["entry"] is self.img.entry and r["key"][1] == z for r in self.regions):
                     # A sharp view of this layer was read ahead: drawn now (it also becomes the kept view, which the previews' redraws
@@ -8473,7 +8578,7 @@ class XlefViewer:
         it starts again once the new layer's view is in. A view that was read from a pyramid level is read from the other layers' levels."""
         img, cache = self.img, self.detail_cache
         e = img.entry if img is not None else None
-        if (e is None or e.nz < 2 or self.loading or cache is None or cache["key"][0] != id(img) or self.z == img.max_z
+        if (e is None or e.nz < 2 or self.loading or cache is None or cache["key"][0] != id(img) or self.z >= e.nz
                 or cache["key"][1] != self.z or not self.settings.get("preload_layers", True)):
             return
         if level is _SAME:
@@ -10441,7 +10546,7 @@ class XlefViewer:
         size = f"{e.width} x {e.height} px"
         if e.pixel_um:
             size += f", {e.pixel_um:.3f} µm/px"
-        z = (f", max projection of {e.nz} planes" if self.z == self.img.max_z else f", z {self.z + 1}/{e.nz}") if e.nz > 1 else ""
+        z = self._z_label(self.img, self.z) + (f"/{e.nz}" if self._z_kind() == "plane" and e.nz > 1 else "")
         if not self.loading:
             self.status.config(text=f"{e.name}   {size}{z}   zoom {self.scale * 100:.1f}%" + ("      " + self._preload_full_text()
                                                                                           if self.preload_full else ""))

@@ -13,11 +13,18 @@ of a pixel. Any other step is scaled from the next coarser level, and comes out 
 2026-11-22: 0.9 px at step 15, i.e. 13 full-resolution pixels; 0.2 px at step 3), which showed as the picture jumping when zoomed. A part
 of the image is read as a whole number of steps across, for the same reason (scaled to fit, a width that isn't was stretched).
 One slideio Slide per file, shared by all the threads that read from it (checked 2026-11-22: 8 threads reading one scene at once got
-the same pixels as reading one block at a time, and in a third of the time)."""
+the same pixels as reading one block at a time, and in a third of the time).
+
+EFI (extended focus imaging): a region scanned with EFI has, besides its z-stack, one more stack ("..._EFI_01", stack type 32 in the
+metadata): one plane, made by cellSens from the sharpest parts of the z planes, the same size and channels as the z-stack. slideio
+lists these only as aux images that are all named "EFI texture map" (and gives the last one, whichever is asked for), so they are read
+here from their .ets files (see EtsFile): describe() gives each scene's ("efi"), and z = EFI reads that plane wherever a z is taken."""
+import collections
 import json
 import math
 import os
 import re
+import struct
 import threading
 
 import numpy as np
@@ -32,6 +39,8 @@ MISSING = ("Reading Olympus .vsi files needs the Python package slideio, which i
            "or install it yourself with:  python -m pip install slideio\nThen restart the viewer.")
 
 BLOCK = 512                      # the side of the blocks BlockReader reads, in pixels at its step (the .ets tiles are 512 x 512)
+EFI = -1                         # the z of a scene's EFI plane (see the module's note)
+EFI_STACK_TYPE = "32"            # a volume's "Stack type" for an EFI image (64: a z-stack; 4: a focus map; ...)
 
 # The color map for a channel, from its name (cellSens names them by filter or dye): the first pattern that matches.
 _LUTS = ((r"dapi|hoechst|\b405\b|blue", "Blue"),
@@ -42,6 +51,8 @@ _LUTS = ((r"dapi|hoechst|\b405\b|blue", "Blue"),
 
 _SLIDES = {}
 _SLIDES_LOCK = threading.Lock()
+_EFI_FILES = {}                  # (normcase path, scene index) -> that scene's EFI .ets file (set by describe)
+_ETS = {}                        # normcase .ets path -> EtsFile
 
 
 def available():
@@ -101,16 +112,19 @@ def _leaves(node):
 
 
 def _volume_info(volume):
-    """(stack name, [(black, white) per channel, in order]) of a volume: cellSens's display limits, "(0.000000, 16812.000000)"."""
-    name, limits = None, []
+    """(stack name, [(black, white) per channel, in order], stack type) of a volume: cellSens's display limits, "(0.000000,
+    16812.000000)"; the type a string ("64": a z-stack, "32": an EFI image, ...)."""
+    name, limits, kind = None, [], None
     for key, value in _leaves(volume):
         if key == "Stack name" and name is None:
             name = value
+        elif key == "Stack type" and kind is None:
+            kind = str(value)
         elif key == "Display limits":
             m = re.match(r"\(\s*([-\d.]+)\s*,\s*([-\d.]+)\s*\)", str(value))
             if m:
                 limits.append((float(m.group(1)), float(m.group(2))))
-    return name, limits
+    return name, limits, kind
 
 
 def _ets_file(path, volume_index, n_volumes, n_image_stacks):
@@ -152,13 +166,15 @@ def describe(path):
     # Each scene's volume in the metadata: the next one of the same stack name that has a display limit for each of its channels.
     used = set()
     for sc in scenes:
-        for k, (name, limits) in enumerate(infos):
-            if k not in used and name == sc["name"] and len(limits) >= len(sc["names"]):
+        for k, (name, limits, kind) in enumerate(infos):
+            if k not in used and name == sc["name"] and len(limits) >= len(sc["names"]) and kind != EFI_STACK_TYPE:
                 used.add(k)
                 sc["volume"] = k
                 break
-    image_stacks = sum(1 for name, limits in infos if limits)
+    image_stacks = sum(1 for name, limits, kind in infos if limits and kind != EFI_STACK_TYPE)
+    efis = [k for k, (name, limits, kind) in enumerate(infos) if kind == EFI_STACK_TYPE]
     for sc in scenes:
+        sc["efi"] = _efi_of(path, sc, infos, efis, len(scenes))
         k = sc.pop("volume")
         limits = infos[k][1] if k is not None else []
         sc["channels"] = []
@@ -174,11 +190,144 @@ def describe(path):
     return scenes
 
 
+def _efi_of(path, sc, infos, efis, n_scenes):
+    """The EFI .ets file of scene `sc` (a dict of describe's), or None: the EFI volume named as its z-stack with "EFI" for "Z"
+    ("..._Z_02" -> "..._EFI_02"), else, with as many EFI volumes as scenes, the one in the same place in the file; only if its tiles
+    are the scene's size and channels."""
+    name = re.sub(r"_Z_(\d+)$", r"_EFI_\1", sc["name"])
+    k = next((k for k in efis if infos[k][0] == name and name != sc["name"]), None)
+    if k is None and len(efis) == n_scenes:
+        k = efis[sc["index"]]
+    if k is None:
+        return None
+    ets = _ets_file(path, k, len(infos), 0)
+    try:
+        f = _ets(ets) if ets else None
+    except (OSError, ValueError):
+        return None
+    if f is None or f.channels != len(sc["names"]) or not f.fits(sc["width"], sc["height"]):
+        return None
+    _EFI_FILES[(os.path.normcase(os.path.abspath(path)), sc["index"])] = ets
+    return ets
+
+
+# ------------------------------------------------------------------------------------------------------------------------ EFI .ets
+
+def _ets(path):
+    key = os.path.normcase(os.path.abspath(path))
+    with _SLIDES_LOCK:
+        f = _ETS.get(key)
+        if f is None:
+            f = _ETS[key] = EtsFile(path)
+        return f
+
+
+class EtsFile:
+    """A one-plane .ets file (an EFI image: see the module's note), read here without slideio: a "SIS" header, an "ETS" header (the
+    tiles' size, compression, ...), and a table of its tiles, each (column, row, channel, pyramid level) -> where its compressed bytes
+    are. Level L is the image at 1/2^L. A tile that isn't in the table (empty glass, left out by cellSens) reads as 0. Tiles are JPEG
+    2000 (compression 3), decoded with imagecodecs; the latest ones decoded are kept."""
+
+    KEEP = 96                    # decoded tiles kept (512 x 512 x 2 bytes: 48 MB)
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.cache = collections.OrderedDict()
+        with open(path, "rb") as f:
+            head = f.read(64)
+            magic, _, _, ndim, ets_at, ets_size, _, table_at, n = struct.unpack_from("<4sIIIQIIQI", head, 0)
+            if magic[:3] != b"SIS" or ndim != 4:
+                raise ValueError(f"{path}: not a one-plane .ets file")
+            f.seek(ets_at)
+            ets = f.read(ets_size)
+            emagic, _, self.pixel_type, comps, _, self.compression, _, self.tile_w, self.tile_h = struct.unpack_from("<4s8I", ets, 0)
+            if emagic[:3] != b"ETS" or comps != 1 or self.compression != 3:
+                raise ValueError(f"{path}: tiles of {comps} components, compression {self.compression}: not read here")
+            f.seek(table_at)
+            table = f.read(n * 36)                       # (per tile: 4 bytes, 4 coordinates, its offset (8) and size (4), 4 bytes)
+        self.tiles = {}
+        for k in range(n):
+            col, row, c, level, offset, size = struct.unpack_from("<4IQI", table, k * 36 + 4)
+            self.tiles[(col, row, c, level)] = (offset, size)
+        self.channels = 1 + max(c for _, _, c, _ in self.tiles)
+        self.levels = 1 + max(L for _, _, _, L in self.tiles)
+        self.cols = 1 + max(x for x, _, _, L in self.tiles if L == 0)
+        self.rows = 1 + max(y for _, y, _, L in self.tiles if L == 0)
+        self.dtype = np.dtype("uint16") if self.pixel_type == 4 else np.dtype("uint8")
+
+    def fits(self, width, height):
+        """Its full-resolution tiles cover an image of width x height (and no more than a tile beyond it)."""
+        return math.ceil(width / self.tile_w) >= self.cols and math.ceil(height / self.tile_h) >= self.rows
+
+    def _tile(self, col, row, c, level):
+        key = (col, row, c, level)
+        with self.lock:
+            a = self.cache.get(key)
+            if a is not None:
+                self.cache.move_to_end(key)
+                return a
+            where = self.tiles.get(key)
+            if where is None:
+                return None
+            with open(self.path, "rb") as f:
+                f.seek(where[0])
+                data = f.read(where[1])
+        import imagecodecs
+        a = imagecodecs.jpeg2k_decode(data)
+        while a.ndim > 2:
+            a = a[..., 0]
+        with self.lock:
+            self.cache[key] = a
+            while len(self.cache) > self.KEEP:
+                self.cache.popitem(last=False)
+        return a
+
+    def read(self, c, rect, size=None):
+        """Channel c, the part rect = (x, y, w, h) of the image in full-resolution pixels, at `size` (w, h) (None: full resolution): from
+        the pyramid level with at least that much detail (as slideio reads a scene), then scaled to `size` if it isn't that level's own."""
+        x, y, w, h = (int(v) for v in rect)
+        sw, sh = (w, h) if not size or not size[0] else (int(size[0]), int(size[1]) or max(1, round(h * size[0] / w)))
+        level = 0
+        while level + 1 < self.levels and (w >> (level + 1)) >= sw and (h >> (level + 1)) >= sh:
+            level += 1
+        f = 1 << level
+        x0, y0 = x // f, y // f
+        x1, y1 = max(x0 + 1, -(-(x + w) // f)), max(y0 + 1, -(-(y + h) // f))
+        out = np.zeros((y1 - y0, x1 - x0), self.dtype)
+        tw, th = self.tile_w, self.tile_h
+        for row in range(y0 // th, (y1 - 1) // th + 1):
+            for col in range(x0 // tw, (x1 - 1) // tw + 1):
+                t = self._tile(col, row, c, level)
+                if t is None:
+                    continue
+                tx, ty = col * tw, row * th
+                ax, ay = max(x0, tx), max(y0, ty)
+                bx, by = min(x1, tx + t.shape[1]), min(y1, ty + t.shape[0])
+                if bx > ax and by > ay:
+                    out[ay - y0:by - y0, ax - x0:bx - x0] = t[ay - ty:by - ty, ax - tx:bx - tx]
+        if out.shape != (sh, sw):
+            from PIL import Image
+            out = np.asarray(Image.fromarray(out).resize((sw, sh), Image.BOX))
+        return out
+
+
+def efi_file(path, index):
+    """Scene `index`'s EFI .ets file (see describe), or None."""
+    return _EFI_FILES.get((os.path.normcase(os.path.abspath(path)), index))
+
+
 # ------------------------------------------------------------------------------------------------------------------------ pixels
 
 def read(path, index, c, z, rect, size=None):
     """Channel c of plane z of scene `index`, the part rect = (x, y, w, h) of it in full-resolution pixels, at `size` (w, h) (None:
-    full resolution): slideio reads it from the pyramid level that has that much detail, scaled to `size`."""
+    full resolution): slideio reads it from the pyramid level that has that much detail, scaled to `size`. z = EFI: the scene's EFI
+    plane (see EtsFile)."""
+    if z == EFI:
+        ets = efi_file(path, index)
+        if ets is None:
+            raise OSError(f"{os.path.basename(path)}: scene {index + 1} has no EFI image")
+        return _ets(ets).read(c, rect, size)
     sc = _scene(path, index)
     a = sc.read_block(tuple(int(v) for v in rect), size=(0, 0) if size is None else tuple(int(v) for v in size),
                       channel_indices=[c], slices=(z, z + 1))

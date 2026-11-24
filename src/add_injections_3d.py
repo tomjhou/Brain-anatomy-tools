@@ -408,7 +408,27 @@ def default_surgeries(last_used):
     return last or ''
 
 
-def open_window():
+def bring_forward(root):
+    """Puts the window in the middle of the monitor the pointer is on and in front of the others. Started by the surgery
+    viewer's server (a background program), it would otherwise open behind the browser: Windows only lets the program in
+    front raise a window, but a moment of "always on top" is allowed."""
+    try:
+        import screen_area
+        screen_area.center_on_home(root, vertical=1 / 3)
+    except Exception:
+        pass
+    root.lift()
+    try:
+        root.attributes('-topmost', True)
+        root.after(400, lambda: root.attributes('-topmost', False))
+    except Exception:
+        pass
+    root.focus_force()
+
+
+def open_window(surgeries=None):
+    """The window. `surgeries` (a CSV path) fills in the surgery list, as the surgery viewer's Show in 3D button does;
+    otherwise the newest export in Downloads or the last list used."""
     import threading
     import tkinter as tk
     from tkinter import filedialog, ttk
@@ -419,7 +439,7 @@ def open_window():
     frame.pack(fill='both', expand=True)
     frame.columnconfigure(1, weight=1)
     page_var = tk.StringVar(root, last.get('page', ''))
-    csv_var = tk.StringVar(root, default_surgeries(last))
+    csv_var = tk.StringVar(root, str(surgeries) if surgeries else default_surgeries(last))
     radius_var = tk.StringVar(root, f"{last.get('radius', DEFAULT_RADIUS_MM):g}")
     status_var = tk.StringVar(root, "")
     out_var = tk.StringVar(root, "")
@@ -447,8 +467,9 @@ def open_window():
     ttk.Button(frame, text="Browse...", command=lambda: browse(
         csv_var, "Choose the surgery viewer's Export CSV", [("CSV file", "*.csv"), ("All files", "*.*")])).grid(row=2, column=2, pady=(10, 4))
     ttk.Label(frame, foreground='#555555', text=(
-        "In the surgery viewer, filter the list to the injections you want, then click Export CSV.\n"
-        "The newest export in Downloads is filled in for you.")).grid(row=3, column=1, sticky='w', padx=6)
+        "The surgery viewer's current list (from its Show in 3D button)." if surgeries else
+        "In the surgery viewer, filter the list to the injections you want, then click Show in 3D\n"
+        "(or Export CSV: the newest export in Downloads is filled in for you).")).grid(row=3, column=1, sticky='w', padx=6)
 
     row = ttk.Frame(frame)
     row.grid(row=4, column=1, sticky='w', padx=6, pady=(12, 0))
@@ -502,6 +523,7 @@ def open_window():
 
     make.config(command=run)
     root.bind('<Return>', lambda _e: run())
+    root.after_idle(lambda: bring_forward(root))
     root.mainloop()
 
 
@@ -509,6 +531,10 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if not argv:
         return open_window()
+    if argv[0] == '--window':      # the surgery viewer: --window --surgeries LIST.csv
+        w = argparse.ArgumentParser(prog='add_injections_3d.py --window')
+        w.add_argument('--surgeries', help="the surgery list to fill in")
+        return open_window(w.parse_args(argv[1:]).surgeries)
     p = argparse.ArgumentParser(description="Draw the surgery viewer's injection sites as white balls in an ABC browser 3D page "
                                             "(with no arguments: a window to choose the files).")
     p.add_argument('page', help="a 3D page (.html) written by the ABC atlas browser")

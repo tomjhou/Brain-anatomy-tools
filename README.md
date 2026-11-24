@@ -71,9 +71,9 @@ C57BL6J-638850):
 - Compute a UMAP of the selected cells, and see it beside maps of the sections.
 - Color the cells by cell type (at any level of the atlas' taxonomy) or by the expression of any gene, including the imputed genes.
 - Export the cells' coordinates, e.g. to plot them in the CCF browser.
-- Add the lab's injection sites to a 3D page as white balls: export the (filtered) list from the
-  JhouLab surgery viewer with Export CSV, then double-click `extra-tools/run-add-injections.bat`
-  (`.command` on a Mac), choose the page and the list, and click Make page. It writes `PAGE_injections.html`
+- Add the lab's injection sites to a 3D page as white balls: in the JhouLab surgery viewer, filter the
+  list and click Show in 3D (or Export CSV, then double-click `extra-tools/run-add-injections.bat`,
+  `.command` on a Mac). In the window, choose the page and click Make page. It writes `PAGE_injections.html`
   and opens it. (Or from a terminal: `python src/add_injections_3d.py PAGE.html SURGERIES.csv`.)
   The stereotaxic-to-CCF conversion is approximate; the script's docstring says exactly how each column is used.
 

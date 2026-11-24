@@ -4371,15 +4371,19 @@ class XlefViewer:
         Tooltip(self.annotations_check, "Show the lines, shapes and text drawn on this image in LAS X (and here). The tools after it "
                                         "draw new ones.")
         self.tool_buttons = {}
-        for tool, text, tip in (("select", "Select", "Select an annotation to move it (drag it), resize it (its corners), rotate it (the "
-                                 "round handle) or delete it. Double-click a text to change its words or color. Dragging elsewhere moves the view."),
-                                ("rectangle", "Rectangle", "Draw a rectangle: drag from one corner to the other"),
-                                ("ellipse", "Ellipse", "Draw an ellipse or circle: drag across it"),
-                                ("measure", "Measure", "Draw a measuring line (its length is shown): drag from one end to the other"),
-                                ("line", "Line", "Draw a line: drag from one end to the other"),
-                                ("arrow", "Arrow", "Draw an arrow: drag from its tail to its head"),
-                                ("text", "Text", "Add text: click where its top-left corner goes")):
-            b = ColorButton(bar, text=text, bd=2, padx=8, pady=1, cursor="hand2", command=lambda t=tool: self.set_tool(t))
+        again = " Click it again to go back to moving the view (no tool chosen)."
+        for tool, text, tip in (("select", "Select", "Select annotations: click one to select it, then drag it to move it, its corners to "
+                                 "resize it, or the round handle to rotate it. Drag a box around several to select them all; Shift+click "
+                                 "adds or removes one. Several selected move together (drag any of them), take a new color together "
+                                 "(the color button) and are deleted together. Double-click a text to change its words or color." + again),
+                                ("rectangle", "Rectangle", "Draw a rectangle: drag from one corner to the other." + again),
+                                ("ellipse", "Ellipse", "Draw an ellipse or circle: drag across it." + again),
+                                ("measure", "Measure", "Draw a measuring line (its length is shown): drag from one end to the other." + again),
+                                ("line", "Line", "Draw a line: drag from one end to the other." + again),
+                                ("arrow", "Arrow", "Draw an arrow: drag from its tail to its head." + again),
+                                ("text", "Text", "Add text: click where its top-left corner goes." + again)):
+            b = ColorButton(bar, text=text, bd=2, padx=8, pady=1, cursor="hand2",
+                            command=lambda t=tool: self.set_tool(None if self.tool == t else t))
             b.pack(side=tk.LEFT, padx=(0, 2))
             Tooltip(b, tip)
             self.tool_buttons[tool] = b
@@ -4392,8 +4396,9 @@ class XlefViewer:
         self.color_button.keep_colors = True
         self.color_button.pack(side=tk.LEFT, padx=(0, 2))
         Tooltip(self.color_button, "Color of new shapes and lines (red at first), and of the selected one. With Text chosen, or a text "
-                                   "selected: the color of new text (white at first), and of the selected text.")
-        for text, cmd, tip in (("Delete", self.delete_annotation, "Delete the selected annotation (or press Delete)"),
+                                   "selected: the color of new text (white at first), and of the selected text. With several "
+                                   "selected: the color of them all.")
+        for text, cmd, tip in (("Delete", self.delete_annotation, "Delete the selected annotation, or all of those selected (or press Delete)"),
                                ("Undo", self.undo_annotation, "Undo the last change: annotations or color maps, on any image (Ctrl+Z)")):
             b = ttk.Button(bar, text=text, command=cmd)
             b.pack(side=tk.LEFT, padx=(4, 0))
@@ -4410,7 +4415,7 @@ class XlefViewer:
                             "ticked is flipped back. Only the view is flipped: the files, and annotations drawn while flipped, keep the "
                             "image's own left and right.")
         self.unsaved_label.pack(side=tk.RIGHT, padx=6)
-        self.tool, self.selected, self.ann_drag, self.save_warned = "select", None, None, False
+        self.tool, self.selected, self.ann_drag, self.save_warned = None, None, None, False
 
         # Right of the image: the channels side by side (checkbox, name, vertical black/white slider, Auto), then the buttons for all.
         view_row = ttk.Frame(right)
@@ -4507,8 +4512,8 @@ class XlefViewer:
         self._bind_view_canvas(self.canvas)
         self.root.bind("<Delete>", lambda e: None if isinstance(e.widget, (tk.Entry, tk.Text)) else self.delete_annotation())
         self.root.bind(f"<{SHORTCUT}-z>", lambda e: None if isinstance(e.widget, tk.Text) else self.undo_annotation())
-        self.root.bind("<Escape>", lambda e: (setattr(self, "selected", None), self.set_tool("select"), self._draw_annotations()))
-        self.set_tool("select")
+        self.root.bind("<Escape>", lambda e: (setattr(self, "selected", None), self.set_tool(None), self._draw_annotations()))
+        self.set_tool(None)
         self.root.bind(f"<{SHORTCUT}-o>", lambda e: self.ask_open())
         self.root.bind("<Home>", lambda e: self.fit())
         for k in range(1, 10):
@@ -7516,6 +7521,9 @@ class XlefViewer:
         if self.ann_drag:
             self.ann_release(event)
         else:
+            if self.drag and abs(event.x - self.drag[0]) < 4 and abs(event.y - self.drag[1]) < 4 and self._selection():
+                self.selected = None             # (a click, not a drag, beside the annotations: none selected)
+                self._draw_annotations()
             self.pan_end(event)
 
     def _hover_handles(self, sx, sy):
@@ -8790,7 +8798,7 @@ class XlefViewer:
         self.settings["show_annotations"] = self.show_annotations.get()
         if not self.show_annotations.get():
             self.selected = None
-            self.set_tool("select")
+            self.set_tool(None)
         self._draw_annotations()
 
     def _update_annotations_check(self):
@@ -8884,6 +8892,11 @@ class XlefViewer:
                     c.create_oval(x - 5, y - 5, x + 5, y + 5, fill="white", outline="black", tags="ann")
                 else:
                     c.create_rectangle(x - 4, y - 4, x + 4, y + 4, fill="white", outline="black", tags="ann")
+        for g in self.group:                         # (several selected: a dashed box around each)
+            if g.visible and g in self.img.entry.annotations:
+                box = c.bbox(f"a{self.img.entry.annotations.index(g)}")
+                if box:
+                    c.create_rectangle(box[0] - 4, box[1] - 4, box[2] + 4, box[3] + 4, outline="white", dash=(3, 3), tags="ann")
         h = getattr(self, "hover_ann", None)
         if h is not None and h is not a and h.visible and h in self.img.entry.annotations:
             b = Annotation(h.attrs, h.verts)
@@ -9055,8 +9068,8 @@ class XlefViewer:
         busy = self.loading or getattr(self, "detail_pending", False)
         for c in self.canvases:
             over = getattr(self, "over_handle", None)
-            c.configure(cursor="watch" if busy else "hand2" if over == "handle" else "fleur" if over == "move" or self.tool == "select"
-                        else "crosshair")
+            c.configure(cursor="watch" if busy else "hand2" if over == "handle" else "fleur" if over == "move" or self.tool is None
+                        else "arrow" if self.tool == "select" else "crosshair")
         self._hires_note_timer()
 
     def _hires_note_timer(self):
@@ -9100,15 +9113,60 @@ class XlefViewer:
         x0, y0, x1, y1 = c.bbox(t)
         c.tag_lower(c.create_rectangle(x0 - 14, y0 - 8, x1 + 14, y1 + 8, fill="#202020", outline="#606060", tags="hiresnote"), t)
 
+    @property
+    def selected(self):
+        """The one annotation selected (its handles shown), or None (none, or several: self.group). Setting it empties self.group."""
+        return getattr(self, "_selected", None)
+
+    @selected.setter
+    def selected(self, a):
+        self._selected, self.group = a, []
+
+    def _selection(self):
+        """The annotations selected on the image shown: the group, or the one."""
+        anns = self.img.entry.annotations if self.img else []
+        if self.group:
+            return [a for a in self.group if a in anns]
+        return [self.selected] if self.selected is not None and self.selected in anns else []
+
+    def _set_selection(self, chosen):
+        """Select these annotations: one gets its handles (self.selected), several are a group (self.group)."""
+        anns = self.img.entry.annotations if self.img else []
+        chosen = [a for a in dict.fromkeys(chosen) if a in anns]
+        if len(chosen) == 1:
+            if chosen[0] is not self.selected:
+                self._normalize_rotation(chosen[0])
+            self.selected = chosen[0]
+        else:
+            self.selected = None
+            self.group = chosen
+
+    def _in_box(self, c, x0, y0, x1, y1):
+        """The visible annotations wholly inside the box (x0, y0)-(x1, y1) on canvas c: a shape's or line's outline, a text's box."""
+        x0, x1, y0, y1 = min(x0, x1), max(x0, x1), min(y0, y1), max(y0, y1)
+        out = []
+        for k, a in enumerate(self.img.entry.annotations):
+            if not a.visible:
+                continue
+            if a.kind == "text":
+                box = c.bbox(f"a{k}")
+                pts = [(box[0], box[1]), (box[2], box[3])] if box else []
+            else:
+                pts = [self.m_to_screen(p) for p in a.points()]
+            if pts and all(x0 <= x <= x1 and y0 <= y <= y1 for x, y in pts):
+                out.append(a)
+        return out
+
     def set_tool(self, tool):
-        """Choose a tool. It stays chosen for one annotation after another (Select, or Escape, to go back to selecting)."""
+        """Choose a tool (None: none, dragging moves the view). It stays chosen for one annotation after another (its button again, or
+        Escape, to go back to none)."""
         self.tool = tool
         for name, b in self.tool_buttons.items():
             on = name == tool
             style_toggle(b, on)
         self._update_cursor()
         self._show_color()
-        if tool != "select" and not self.show_annotations.get():
+        if tool is not None and not self.show_annotations.get():
             self.show_annotations.set(True)
             self.on_annotations_toggle()
 
@@ -9153,7 +9211,15 @@ class XlefViewer:
         if not self.img or not self.img.entry.pixel_um or not self.show_annotations.get():
             return False
         p = self.screen_to_m(event.x, event.y)
+        shift = bool(event.state & 0x0001) and self.tool in (None, "select")
         grab = self._handle_at(event.x, event.y)
+        if grab is not None and shift:               # (Shift+click on one: added to the selection, or taken out of it)
+            sel = self._selection()
+            self._set_selection([x for x in sel if x is not grab[1]] if grab[1] in sel else sel + [grab[1]])
+            self._draw_annotations()
+            return True
+        if grab is not None and grab[0] == "move" and grab[1] in self.group:
+            return self._start_group_move(p)
         if grab is not None:                         # (whatever the tool: a handle is grabbed, not drawn from)
             name, a = grab
             if a is not self.selected:
@@ -9184,21 +9250,48 @@ class XlefViewer:
             self.selected = a
             self.ann_drag = ("draw", p, a)
             return True
+        if self.tool is None:                    # (no tool: the view moves, unless an outline or handle was grabbed above)
+            return False
         hit = self._hit(event.x, event.y)
-        if hit is not None and hit is not self.selected:
+        if shift and hit is not None:
+            sel = self._selection()
+            self._set_selection([x for x in sel if x is not hit] if hit in sel else sel + [hit])
+            self._draw_annotations()
+            return True
+        if hit is not None and hit in self.group:
+            return self._start_group_move(p)
+        if hit is None:                          # (Select on nothing: a box is dragged, to select what is inside it)
+            self.ann_drag = ("box", (event.x, event.y), event.widget, self._selection() if shift else [])
+            if not shift:
+                self.selected = None
+                self._draw_annotations()
+            return True
+        if hit is not self.selected:
             self._normalize_rotation(hit)        # (same shape on screen; its handles then sit on its own corners and top)
         self.selected = hit
         self._draw_annotations()
-        if hit is None:
-            return False
         self._remember()
         self.ann_drag = ("move", p, Annotation(hit.attrs, hit.verts), hit)
         return True
 
+    def _start_group_move(self, p):
+        """Start moving the selected group (a press on one of them at p, in metres)."""
+        self._remember()
+        self.ann_drag = ("group", p, [Annotation(a.attrs, a.verts) for a in self.group], list(self.group))
+        return True
+
     def ann_motion(self, event):
         mode, p0 = self.ann_drag[0], self.ann_drag[1]
+        if mode == "box":
+            (x0, y0), c = p0, self.ann_drag[2]
+            c.delete("selbox")
+            c.create_rectangle(x0, y0, event.x, event.y, outline="white", dash=(4, 4), tags="selbox")
+            return
         p = self.screen_to_m(event.x, event.y)
-        if mode == "draw":
+        if mode == "group":
+            for orig, a in zip(self.ann_drag[2], self.ann_drag[3]):
+                a.set_pose((orig.center[0] + p[0] - p0[0], orig.center[1] + p[1] - p0[1]))
+        elif mode == "draw":
             a = self.ann_drag[2]
             if a.kind in TWO_POINT:
                 a.set_pose(((p0[0] + p[0]) / 2, (p0[1] + p[1]) / 2), 0)
@@ -9231,6 +9324,22 @@ class XlefViewer:
 
     def ann_release(self, event):
         mode = self.ann_drag[0]
+        if mode == "box":
+            _, (x0, y0), c, before = self.ann_drag
+            self.ann_drag = None
+            c.delete("selbox")
+            inside = [] if abs(event.x - x0) < 4 and abs(event.y - y0) < 4 else self._in_box(c, x0, y0, event.x, event.y)
+            self._set_selection(before + [a for a in inside if a not in before])
+            self._draw_annotations()
+            return
+        if mode == "group":
+            origs, anns = self.ann_drag[2], self.ann_drag[3]
+            self.ann_drag = None
+            if all(o.attrs == a.attrs and o.verts == a.verts for o, a in zip(origs, anns)):
+                self._forget_remember(self.img.entry)       # (nothing moved)
+            else:
+                self._changed()
+            return
         a = self.ann_drag[2] if mode == "draw" else self.ann_drag[3]
         self.ann_drag = None
         e = self.img.entry
@@ -9265,9 +9374,11 @@ class XlefViewer:
         self.fit()
 
     def delete_annotation(self, event=None):
-        if self.img and self.selected in self.img.entry.annotations:
+        sel = self._selection()
+        if sel:
             self._remember()
-            self.img.entry.annotations.remove(self.selected)
+            for a in sel:
+                self.img.entry.annotations.remove(a)
             self.selected = None
             self._changed()
 
@@ -9378,8 +9489,11 @@ class XlefViewer:
 
     def _color_is_text(self):
         """The color button stands for text's color (with Text chosen, or a text selected), else for shapes' and lines'."""
+        group = getattr(self, "group", None)
+        if group:
+            return all(a.kind == "text" for a in group)
         a = getattr(self, "selected", None)
-        return self.tool == "text" or (self.tool == "select" and a is not None and a.kind == "text")
+        return self.tool == "text" or (self.tool in (None, "select") and a is not None and a.kind == "text")
 
     def _show_color(self):
         color = self.text_color if self._color_is_text() else self.ann_color
@@ -9398,6 +9512,12 @@ class XlefViewer:
         else:
             self.ann_color = color
         self._show_color()
+        if self.group and self._selection():         # (several selected: all of them take it)
+            self._remember()
+            for a in self._selection():
+                a.color = color
+            self._changed()
+            return
         a = self.selected
         if self.img and a in self.img.entry.annotations and (a.kind == "text") == text:
             self._remember()

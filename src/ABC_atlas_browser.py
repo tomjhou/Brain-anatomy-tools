@@ -2021,6 +2021,29 @@ THREED_WEB_LEGEND_ROUTER_SCRIPT = """
     return carryOn;
   });
   gd.on('plotly_legenddoubleclick', function () { return gd.__legendRoutes.length ? false : true; });
+  // Hover through the background: plotly finds what is under the pointer by drawing every object into a pick buffer, nearest
+  // wins, whether or not the object shows hover text. So the translucent brain surface (hoverinfo 'skip') would hide the
+  // cells inside it from the pointer. Objects whose trace skips hover are left out of that pass (their drawPick removed, which
+  // gl-plot3d checks), and the pick buffer is redrawn. Again after each plot: showing a trace from the legend makes its
+  // objects anew. (add_injections_3d.py carries the same code for pages written before this.)
+  gd.__hoverPassThrough = function () {
+    var scene = gd._fullLayout && gd._fullLayout.scene && gd._fullLayout.scene._scene;
+    if (!scene || !scene.traces || !scene.glplot) return;
+    var changed = false;
+    Object.keys(scene.traces).forEach(function (uid) {
+      var trace = scene.traces[uid];
+      if (!trace || !trace.data || trace.data.hoverinfo !== 'skip') return;
+      Object.keys(trace).forEach(function (key) {
+        var object = trace[key];
+        if (object && typeof object === 'object' && typeof object.drawPick === 'function') { object.drawPick = null; changed = true; }
+      });
+    });
+    if (changed) scene.glplot.update();
+  };
+  ['plotly_afterplot', 'plotly_restyle'].forEach(function (name) {
+    gd.on(name, function () { setTimeout(gd.__hoverPassThrough, 0); });
+  });
+  gd.__hoverPassThrough();
 })();
 """
 

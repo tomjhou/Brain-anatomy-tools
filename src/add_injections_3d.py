@@ -295,6 +295,30 @@ PAGE_SCRIPT = """
     Plotly.addTraces(gd, {type: 'mesh3d', x: x, y: y, z: z, i: i, j: j, k: k, color: data.color, opacity: 1,
                           flatshading: false, lighting: {ambient: 0.55, diffuse: 0.8, specular: 0.3, roughness: 0.5},
                           name: data.name, showlegend: true, text: text, hoverinfo: 'text'});
+    if (!gd.__hoverPassThrough) passThrough(gd);   // (newer pages do this themselves)
+  }
+  // Hover through the background, for pages written before the ABC browser did it (the same code as its
+  // THREED_WEB_LEGEND_ROUTER_SCRIPT): objects whose trace skips hover are left out of plotly's pick pass, so the
+  // translucent brain surface no longer hides the balls and cells inside it from the pointer.
+  function passThrough(gd) {
+    gd.__hoverPassThrough = function () {
+      var scene = gd._fullLayout && gd._fullLayout.scene && gd._fullLayout.scene._scene;
+      if (!scene || !scene.traces || !scene.glplot) return;
+      var changed = false;
+      Object.keys(scene.traces).forEach(function (uid) {
+        var trace = scene.traces[uid];
+        if (!trace || !trace.data || trace.data.hoverinfo !== 'skip') return;
+        Object.keys(trace).forEach(function (key) {
+          var object = trace[key];
+          if (object && typeof object === 'object' && typeof object.drawPick === 'function') { object.drawPick = null; changed = true; }
+        });
+      });
+      if (changed) scene.glplot.update();
+    };
+    ['plotly_afterplot', 'plotly_restyle'].forEach(function (name) {
+      gd.on(name, function () { setTimeout(gd.__hoverPassThrough, 0); });
+    });
+    gd.__hoverPassThrough();
   }
   add();
 })();

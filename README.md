@@ -72,8 +72,9 @@ C57BL6J-638850):
 - Color the cells by cell type (at any level of the atlas' taxonomy) or by the expression of any gene, including the imputed genes.
 - Export the cells' coordinates, e.g. to plot them in the CCF browser.
 - Add the lab's injection sites to a 3D page as white balls: export the (filtered) list from the
-  JhouLab surgery viewer with Export CSV, then run
-  `python src/add_injections_3d.py PAGE.html SURGERIES.csv`. It writes `PAGE_injections.html`.
+  JhouLab surgery viewer with Export CSV, then double-click `extra-tools/run-add-injections.bat`
+  (`.command` on a Mac), choose the page and the list, and click Make page. It writes `PAGE_injections.html`
+  and opens it. (Or from a terminal: `python src/add_injections_3d.py PAGE.html SURGERIES.csv`.)
   The stereotaxic-to-CCF conversion is approximate; the script's docstring says exactly how each column is used.
 
 The first time, it asks where to keep the atlas download. Choose a drive with plenty of room: the download can reach about 80 GB (9 GB for the core atlas, 50 GB for the imputed gene dataset, and room for newer atlas releases).

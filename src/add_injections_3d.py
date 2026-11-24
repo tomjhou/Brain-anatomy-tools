@@ -315,27 +315,188 @@ def add_to_page(page_text, sites, radius, color=BALL_COLOR):
     return page_text[:at] + script + page_text[at:]
 
 
+def output_path(page):
+    """Where the page with the balls goes: PAGE_injections.html beside PAGE (PAGE itself if it already is one)."""
+    page = Path(page)
+    return page.with_name(re.sub(r'_injections$', '', page.stem) + '_injections.html')
+
+
+def make_page(page, surgeries, out=None, radius=DEFAULT_RADIUS_MM):
+    """Write the page with the balls. Returns (out path, the lines to report); raises ValueError when there is nothing
+    to draw or the page is not a 3D page."""
+    page = Path(page)
+    out = Path(out) if out else output_path(page)
+    text = page.read_text(encoding='utf-8')
+    if 'plotly' not in text[:20000].lower():
+        raise ValueError(f"{page.name} does not look like a 3D page from the ABC browser (no plotly in it).")
+    bregma = bregma_in_ccf()
+    volume_path = find_annotation_volume()
+    brain_top = BrainTop(read_nifti_volume(volume_path)) if volume_path else None
+    report = []
+    if brain_top is None:
+        report.append("The CCF annotation volume was not found in the atlas cache: surface-zeroed DVs are taken from bregma.")
+    sites, skipped = injection_sites(read_csv(surgeries), bregma, brain_top)
+    if not sites:
+        raise ValueError("No mouse injection sites with coordinates in that surgery list.")
+    out.write_text(add_to_page(text, sites, radius), encoding='utf-8')
+    left_out = ', '.join(f"{n} {why}" for why, n in skipped.items() if n)
+    report.insert(0, f"{len(sites)} balls written to {out}" + (f" (left out: {left_out})" if left_out else ""))
+    report.append(f"Bregma in the CCF: AP {bregma[0]:g}, DV {bregma[1]:g}, ML {bregma[2]:g} mm")
+    return out, report
+
+
+# ---------- the window (run-add-injections.bat / .command) ----------
+LAST_USED_FILE = SRC / 'cache_local' / 'add_injections_3d.json'
+
+
+def load_last_used():
+    try:
+        value = json.loads(LAST_USED_FILE.read_text(encoding='utf-8'))
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_last_used(values):
+    try:
+        LAST_USED_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LAST_USED_FILE.write_text(json.dumps(values, indent=1), encoding='utf-8')
+    except OSError:
+        pass
+
+
+def newest_export(folder=Path.home() / 'Downloads'):
+    """The surgery viewer's newest Export CSV in `folder` (jhoulab-surgeries-*.csv), or None."""
+    found = sorted(Path(folder).glob('jhoulab-surgeries-*.csv'), key=lambda p: p.stat().st_mtime)
+    return found[-1] if found else None
+
+
+def default_surgeries(last_used):
+    """The newest export in Downloads when it is newer than the last list used (a fresh export is the usual next
+    step), else the last list used."""
+    last = last_used.get('surgeries')
+    newest = newest_export()
+    try:
+        if newest and (not last or not Path(last).exists() or newest.stat().st_mtime > Path(last).stat().st_mtime):
+            return str(newest)
+    except OSError:
+        pass
+    return last or ''
+
+
+def open_window():
+    import threading
+    import tkinter as tk
+    from tkinter import filedialog, ttk
+    last = load_last_used()
+    root = tk.Tk()
+    root.title("Injection sites in a 3D page")
+    frame = ttk.Frame(root, padding=14)
+    frame.pack(fill='both', expand=True)
+    frame.columnconfigure(1, weight=1)
+    page_var = tk.StringVar(root, last.get('page', ''))
+    csv_var = tk.StringVar(root, default_surgeries(last))
+    radius_var = tk.StringVar(root, f"{last.get('radius', DEFAULT_RADIUS_MM):g}")
+    status_var = tk.StringVar(root, "")
+    out_var = tk.StringVar(root, "")
+
+    def show_out(*_args):
+        out_var.set(f"Writes {output_path(page_var.get()).name} beside the page." if page_var.get().strip() else "")
+    page_var.trace_add('write', show_out)
+    show_out()
+
+    def browse(var, title, types):
+        current = Path(var.get()) if var.get().strip() else None
+        path = filedialog.askopenfilename(parent=root, title=title, filetypes=types,
+                                          initialdir=str(current.parent) if current and current.parent.exists() else None)
+        if path:
+            var.set(path)
+
+    ttk.Label(frame, text="3D page").grid(row=0, column=0, sticky='w', pady=4)
+    ttk.Entry(frame, textvariable=page_var, width=70).grid(row=0, column=1, sticky='ew', padx=6)
+    ttk.Button(frame, text="Browse...", command=lambda: browse(
+        page_var, "Choose a 3D page from the ABC browser", [("3D page", "*.html"), ("All files", "*.*")])).grid(row=0, column=2)
+    ttk.Label(frame, textvariable=out_var, foreground='#555555').grid(row=1, column=1, sticky='w', padx=6)
+
+    ttk.Label(frame, text="Surgery list").grid(row=2, column=0, sticky='w', pady=(10, 4))
+    ttk.Entry(frame, textvariable=csv_var, width=70).grid(row=2, column=1, sticky='ew', padx=6, pady=(10, 4))
+    ttk.Button(frame, text="Browse...", command=lambda: browse(
+        csv_var, "Choose the surgery viewer's Export CSV", [("CSV file", "*.csv"), ("All files", "*.*")])).grid(row=2, column=2, pady=(10, 4))
+    ttk.Label(frame, foreground='#555555', text=(
+        "In the surgery viewer, filter the list to the injections you want, then click Export CSV.\n"
+        "The newest export in Downloads is filled in for you.")).grid(row=3, column=1, sticky='w', padx=6)
+
+    row = ttk.Frame(frame)
+    row.grid(row=4, column=1, sticky='w', padx=6, pady=(12, 0))
+    ttk.Label(row, text="Ball radius (mm)").pack(side='left')
+    ttk.Spinbox(row, textvariable=radius_var, from_=0.02, to=1.0, increment=0.05, width=6).pack(side='left', padx=6)
+
+    buttons = ttk.Frame(frame)
+    buttons.grid(row=5, column=0, columnspan=3, sticky='e', pady=(14, 0))
+    make = ttk.Button(buttons, text="Make page")
+    make.pack(side='left')
+    ttk.Button(buttons, text="Close", command=root.destroy).pack(side='left', padx=(8, 0))
+    status = ttk.Label(frame, textvariable=status_var, wraplength=620, justify='left')
+    status.grid(row=6, column=0, columnspan=3, sticky='w', pady=(10, 0))
+
+    def run():
+        page, surgeries = page_var.get().strip().strip('"'), csv_var.get().strip().strip('"')
+        try:
+            radius = float(radius_var.get())
+            if not 0 < radius <= 2:
+                raise ValueError
+        except ValueError:
+            status_var.set("Enter the ball radius as a number of mm (e.g. 0.15).")
+            return
+        for label, path in (("3D page", page), ("surgery list", surgeries)):
+            if not path or not Path(path).is_file():
+                status_var.set(f"Choose the {label} first (no file at '{path}')." if path else f"Choose the {label} first.")
+                return
+        make.state(['disabled'])
+        root.config(cursor='watch')
+        status_var.set("Working... (a large page takes a few seconds)")
+        save_last_used({'page': page, 'surgeries': surgeries, 'radius': radius})
+
+        def work():
+            try:
+                out, report = make_page(page, surgeries, radius=radius)
+                result = ('ok', out, report)
+            except Exception as e:
+                result = ('error', None, [str(e)])
+            root.after(0, lambda: finished(*result))
+        threading.Thread(target=work, daemon=True).start()
+
+    def finished(kind, out, report):
+        make.state(['!disabled'])
+        root.config(cursor='')
+        if kind == 'ok':
+            status_var.set('\n'.join(report) + "\nOpening it in your browser.")
+            import webbrowser
+            webbrowser.open(Path(out).resolve().as_uri())
+        else:
+            status_var.set("Could not make the page: " + report[0])
+
+    make.config(command=run)
+    root.bind('<Return>', lambda _e: run())
+    root.mainloop()
+
+
 def main(argv=None):
-    p = argparse.ArgumentParser(description="Draw the surgery viewer's injection sites as white balls in an ABC browser 3D page.")
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv:
+        return open_window()
+    p = argparse.ArgumentParser(description="Draw the surgery viewer's injection sites as white balls in an ABC browser 3D page "
+                                            "(with no arguments: a window to choose the files).")
     p.add_argument('page', help="a 3D page (.html) written by the ABC atlas browser")
     p.add_argument('surgeries', help="the surgery viewer's Export CSV file")
     p.add_argument('-o', '--out', help="the page to write (default: PAGE_injections.html beside PAGE)")
     p.add_argument('--radius', type=float, default=DEFAULT_RADIUS_MM, help=f"ball radius in mm (default {DEFAULT_RADIUS_MM})")
     a = p.parse_args(argv)
-    page = Path(a.page)
-    out = Path(a.out) if a.out else page.with_name(re.sub(r'_injections$', '', page.stem) + '_injections.html')
-    bregma = bregma_in_ccf()
-    volume_path = find_annotation_volume()
-    brain_top = BrainTop(read_nifti_volume(volume_path)) if volume_path else None
-    if brain_top is None:
-        print("The CCF annotation volume was not found in the atlas cache: surface-zeroed DVs are taken from bregma.")
-    sites, skipped = injection_sites(read_csv(a.surgeries), bregma, brain_top)
-    if not sites:
-        sys.exit("No mouse injection sites with coordinates in that file.")
-    out.write_text(add_to_page(page.read_text(encoding='utf-8'), sites, a.radius), encoding='utf-8')
-    left_out = ', '.join(f"{n} {why}" for why, n in skipped.items() if n)
-    print(f"{len(sites)} balls written to {out}" + (f" (left out: {left_out})" if left_out else ""))
-    print(f"Bregma in the CCF: AP {bregma[0]:g}, DV {bregma[1]:g}, ML {bregma[2]:g} mm")
+    try:
+        out, report = make_page(a.page, a.surgeries, a.out, a.radius)
+    except ValueError as e:
+        sys.exit(str(e))
+    print('\n'.join(report))
     return out
 
 

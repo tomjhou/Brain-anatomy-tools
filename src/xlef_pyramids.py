@@ -10,7 +10,8 @@ The experiment's own files are left alone. Beside <name>.xlef it writes
                                         back at the originals (the pixels are not copied), each image that gets a pyramid also naming it
     <name>_pyramid/Pyramid/             the levels' TIFFs (8-bit, uncompressed, so that rows can be read straight from them)
     <name>_pyramid/Pyramid/Metadata/    and their .xlif files
-The levels are encoded the way LAS X's are: level = 255 * (original / max) ** (1 / 1.8) (see xlef_viewer.PYRAMID_GAMMA)."""
+The levels are encoded the way LAS X's are: level = 255 * (original / max) ** (1 / gamma), gamma 1.8 for a 12-bit image and 2.48 for a
+16-bit one (see gamma_for)."""
 
 import concurrent.futures
 import os
@@ -22,7 +23,16 @@ from urllib.parse import quote, unquote
 import numpy as np
 import tifffile
 
-GAMMA = 1.8
+GAMMA = 1.8             # LAS X's 8-bit pyramid levels of a 12-bit image (or one of fewer bits: not measured, assumed the same)
+GAMMA_16 = 2.48         # ... and of a 16-bit one (e.g. Lightning's output)
+
+
+def gamma_for(max_value):
+    """LAS X's gamma for the pyramid levels of an image whose values go up to max_value: level = 255 * (original / max) ** (1 / gamma).
+    Measured 2026-11-24 against block means of the full resolution, LAS X 1.9: 12-bit (max 4095) 1.807 in each of 4 channels (median
+    error 1-4 of 4095); 16-bit (max 65535, Lightning SVCC and LVCC) 2.483-2.486 in each of 8 channels (median error 7-22 of 65535; with
+    1.8, 1100-3700: the low-resolution view was 2-4x too bright). Images of 13 to 15 bits: not measured (taken as 16-bit)."""
+    return GAMMA_16 if max_value > 4095 else GAMMA
 SMALLEST = 512          # levels are made until the longest side of the next would be under this
 MIN_IMAGE = 1024        # an image whose longest side is less than this gets no pyramid: its own overview is small already
 SUFFIX = "_pyramid"
@@ -105,7 +115,7 @@ def _write_text(path, text, bom=True):
 
 def _gamma_table(top):
     """8-bit pyramid value for each value 0..top of the image."""
-    return np.rint(255 * (np.arange(top + 1, dtype=np.float64) / top) ** (1 / GAMMA)).astype(np.uint8)
+    return np.rint(255 * (np.arange(top + 1, dtype=np.float64) / top) ** (1 / gamma_for(top))).astype(np.uint8)
 
 
 def first_level(plane, size, table):

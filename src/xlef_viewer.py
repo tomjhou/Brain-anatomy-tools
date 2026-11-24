@@ -241,21 +241,34 @@ def style_theme(root, name, native):
         style.map("TButton", background=[("disabled", p["bg"]), ("pressed", "#555555"), ("active", p["idle_hover"])])
         style.configure("Treeview", background=p["field"], fieldbackground=p["field"], foreground=p["field_fg"])
         style.map("Treeview", background=[("selected", p["selected"])], foreground=[("selected", "white")])
-        style.configure("TCheckbutton", indicatorbackground=p["field"], indicatorforeground=p["fg"])
-        style.map("TCheckbutton", indicatorbackground=[("disabled", p["bg"]), ("active", p["idle_hover"])])
-        style.configure("TRadiobutton", indicatorbackground=p["field"], indicatorforeground=p["fg"])
+        # (clam's own map turns a disabled one's box or circle light grey, #dcdad5: on this dark theme that reads as highlighted, not
+        # greyed out. Disabled: the box or circle in the background color, its mark and text grey.)
+        for kind in ("TCheckbutton", "TRadiobutton"):
+            style.configure(kind, indicatorbackground=p["field"], indicatorforeground=p["fg"])
+            style.map(kind, indicatorbackground=[("disabled", p["bg"]), ("active", p["idle_hover"])],
+                      indicatorforeground=[("disabled", "#777777")])
         style.configure("TLabelframe", bordercolor="#555555")
         style.configure("TNotebook", background=p["bg"], bordercolor="#555555")
         style.configure("TNotebook.Tab", background=p["idle"], foreground=p["fg"], bordercolor="#555555", padding=(10, 3))
         style.map("TNotebook.Tab", background=[("selected", p["bg"]), ("active", p["idle_hover"])])
         style.configure("TScrollbar", background=p["idle"], troughcolor=p["field"], arrowcolor=p["fg"], bordercolor="#444444")
         style.configure("TEntry", fieldbackground=p["field"], foreground=p["field_fg"])
+        # (clam's own map gives a read-only combobox a light grey field, #dcdad5, under this theme's light text: unreadable until it
+        # has the focus. Its field, arrow button and drop-down list in this theme's colors instead.)
+        style.configure("TCombobox", fieldbackground=p["field"], foreground=p["field_fg"], background=p["idle"], arrowcolor=p["fg"],
+                        bordercolor="#555555", selectbackground=p["field"], selectforeground=p["field_fg"])
+        style.map("TCombobox", fieldbackground=[("readonly", "focus", p["selected"]), ("readonly", p["field"]), ("disabled", p["bg"])],
+                  foreground=[("readonly", "focus", "white"), ("disabled", "#777777")],
+                  selectbackground=[("readonly", "focus", p["selected"])], selectforeground=[("readonly", "focus", "white")],
+                  background=[("active", p["idle_hover"]), ("pressed", p["idle_hover"])], arrowcolor=[("disabled", "#777777")],
+                  bordercolor=[("focus", p["selected"])])
         style.configure("TSeparator", background="#555555")
         style.configure("Sash", sashthickness=6, gripcount=0, background=p["bg"])
         for key, value in (("*Background", p["bg"]), ("*Foreground", p["fg"]), ("*activeBackground", p["idle_hover"]),
                            ("*activeForeground", p["fg"]), ("*highlightBackground", p["bg"]), ("*troughColor", p["field"]),
                            ("*Text.Background", p["field"]), ("*Text.Foreground", p["field_fg"]), ("*insertBackground", p["fg"]),
-                           ("*selectBackground", p["selected"]), ("*selectForeground", "white"), ("*Entry.Background", p["field"])):
+                           ("*selectBackground", p["selected"]), ("*selectForeground", "white"), ("*Entry.Background", p["field"]),
+                           ("*TCombobox*Listbox.background", p["field"]), ("*TCombobox*Listbox.foreground", p["field_fg"])):
             root.option_add(key, value)
     for name_, key in (("Muted.TLabel", "muted"), ("Link.TLabel", "link"), ("Warn.TLabel", "warn")):
         style.configure(name_, foreground=PAL[key])
@@ -914,8 +927,20 @@ def pyramid_note(path, n_images):
             groups = _lif_header(os.path.splitext(path)[0] + ".lifext")[0].findall("ChildrenOf")
             k = sum(1 for g in groups if any("_pmd_" in (e.get("Name") or "") for e in g.findall("Element")))
         else:
-            names = os.listdir(os.path.join(os.path.dirname(path), "Pyramid", "Metadata"))
-            k = sum(1 for f in names if f.lower().endswith("_pmd_0.xlif"))
+            # LAS X's levels are in the Pyramid folder beside the .xlef. A copy made by Make pyramids (<name>_pyramid.xlef, beside the
+            # experiment) uses those too, and has its own for the images LAS X made none for, in <name>_pyramid/Pyramid.
+            folders = [os.path.join(os.path.dirname(path), "Pyramid", "Metadata")]
+            base = os.path.splitext(path)[0]
+            if base.endswith(xlef_pyramids.SUFFIX):
+                folders.append(os.path.join(base, "Pyramid", "Metadata"))
+            images = set()
+            for folder in folders:          # (either may be missing: LAS X made none, or this isn't a copy)
+                try:
+                    names = os.listdir(folder)
+                except OSError:
+                    continue
+                images |= {f.lower()[:-len("_pmd_0.xlif")] for f in names if f.lower().endswith("_pmd_0.xlif")}
+            k = len(images)
     except (OSError, ValueError, ET.ParseError):
         return "No"
     return "No" if k == 0 else "Yes" if k >= n_images else f"{k} of {n_images}"
@@ -2797,7 +2822,7 @@ class _LevelRowReader(_RowReader):
 
     def __init__(self, path, offset, dtype, width, level_step, max_value):
         super().__init__(path, offset, dtype, width)
-        self.level_step, self.lut = level_step, np.round(max_value * (np.arange(256) / 255) ** PYRAMID_GAMMA).astype(np.uint16)
+        self.level_step, self.lut = level_step, pyramid_lut(max_value)
         self.out_dtype = self.lut.dtype
 
     def row(self, r, x0, n, step):
@@ -3518,6 +3543,8 @@ def _thumb_cache_path(entry, size):
     is each channel's small grey picture (see thumb_arrays): contrast, colors and channel switches are applied when it is shown, so
     they don't change it."""
     h = hashlib.sha1(f"{size}|channels-1".encode())     # (the second part changes whenever thumbnails are saved differently)
+    if any(c.max_value > 4095 for c in entry.channels):  # (an image of more than 12 bits: those saved before 2026-11-24 used the
+        h.update(b"|gamma-by-depth")                     # 12-bit gamma for its pyramid, too bright; see xlef_pyramids.gamma_for)
     for f in entry.all_files():
         st = os.stat(f)
         h.update(f"{os.path.normcase(f)}|{st.st_size}|{st.st_mtime_ns}".encode())
@@ -3528,14 +3555,19 @@ def _thumb_cache_path(entry, size):
     return os.path.join(THUMB_CACHE, h.hexdigest() + ".npz")
 
 
-PYRAMID_GAMMA = 1.8      # LAS X's 8-bit pyramid levels: level = 255 * (original / max) ** (1 / 1.8) (measured 2026-10-29: fit 1.804,
-                         # median error 4.6 of 4095 over 6 sections x 4 channels, LAS X 1.15)
+PYRAMID_GAMMA = xlef_pyramids.GAMMA     # LAS X's 8-bit pyramid levels of a 12-bit image: level = 255 * (original / max) ** (1 / 1.8)
+                         # (measured 2026-10-29: fit 1.804, median error 4.6 of 4095 over 6 sections x 4 channels, LAS X 1.15). A 16-bit
+                         # image's levels have a gamma of their own (2.48): see xlef_pyramids.gamma_for, which says which.
+
+
+def pyramid_lut(max_value):
+    """The image's own value (0..max_value) for each of a pyramid level's 256 values, undoing LAS X's gamma for that bit depth."""
+    return np.round(max_value * (np.arange(256) / 255) ** xlef_pyramids.gamma_for(max_value)).astype(np.uint16)
 
 
 def pyramid_to_original(small, max_value):
     """A pyramid level's 8-bit values as the image's own values (0..max_value), undoing LAS X's gamma."""
-    lut = np.round(max_value * (np.arange(256) / 255) ** PYRAMID_GAMMA).astype(np.uint16)
-    return lut[small]
+    return pyramid_lut(max_value)[small]
 
 
 _PYRAMID_LEVELS = {}      # normcase(.xlif path) -> its ImageEntry (None: no such file)
@@ -5422,11 +5454,14 @@ class XlefViewer:
         new_xlef, _ = xlef_pyramids.project_files(path)
         if os.path.isfile(new_xlef):
             pick = ask_choice(self.root, "Pyramids made already",
-                              f"{os.path.basename(new_xlef)} is beside this experiment: it is a copy with pyramids made earlier.",
-                              [("Open it", "open"), ("Make them again", "again")]
+                              f"{os.path.basename(new_xlef)} is beside this experiment: it is a copy with pyramids made earlier.\n\n"
+                              f"Opening it closes \"{name}\" first (asking to save any unsaved changes, which go into \"{name}\" "
+                              "only), so that the two copies are not open side by side: they share the same full-resolution images, "
+                              "but changes in one are not seen in the other.",
+                              [("Close this and open it", "open"), ("Make them again", "again")]
                               + ([("Don't ask again", "never", PYRAMID_LATER_TIP)] if offered else []))
             if pick == "open":
-                self.open_xlef(new_xlef, offer_pyramids=False)
+                self._open_pyramid_project(pid, new_xlef)
                 return
             if pick == "never":
                 self.settings.setdefault("pyramid_declined", []).append(os.path.normcase(path))
@@ -5449,8 +5484,11 @@ class XlefViewer:
             f"and the original project will not be altered. Both projects will refer to the same full-resolution images, so they must stay where they are, and neither project should move or rename them. Annotations "
             f"and other changes made later in either project won't be visible in the other."
             + (f"\n\nNot made: {len(cannot)} image{'s' * (len(cannot) != 1)} (online-only, inside a .lif file, or small already)." if cannot else ""))
+        unsaved = bool(self._unsaved_names(pid) or self._linked_projects([pid]) - {pid})
+        if unsaved:                     # (the new project is copied from the files: changes not saved yet wouldn't be in it)
+            message += (f"\n\n\"{name}\" has unsaved changes. They are saved first, so that the new project has them too.")
         pick = ask_choice(self.root, "Make pyramids?", message,
-                          [("Make pyramids", "make"), ("Not now" if offered else "Cancel", None)]
+                          [("Save, then make pyramids" if unsaved else "Make pyramids", "make"), ("Not now" if offered else "Cancel", None)]
                           + ([("Don't ask again for this experiment", "never", PYRAMID_LATER_TIP)] if offered else []))
         if pick == "never":
             self.settings.setdefault("pyramid_declined", []).append(os.path.normcase(path))
@@ -5458,7 +5496,26 @@ class XlefViewer:
             self.status.config(text="Pyramids can still be made later: File > Make pyramids for this experiment")
         if pick != "make":
             return
+        if unsaved:
+            self.save_annotations([pid])
+            if pid not in self.projects or self._unsaved_names(pid) or self._linked_projects([pid]) - {pid}:
+                self.status.config(text="Pyramids not made: the changes were not all saved")
+                return              # (its confirmation cancelled, or a file could not be written)
+            can = [e for e in self._pyramid_candidates(pid)[0]]     # (the project may have been read again: its entries anew)
+            if not can:
+                return
         self._run_pyramids(pid, can, new_xlef)
+
+    def _open_pyramid_project(self, pid, new_xlef):
+        """Open the copy with pyramids in place of experiment `pid`: `pid` is closed first (asking to save anything not saved yet; Cancel
+        there leaves both as they are), so that the two copies, which share the same full-resolution images, are not open side by side
+        (changes in one are not seen in the other)."""
+        if pid in self.projects:
+            self.close_project(pid)
+            if pid in self.projects:
+                self.status.config(text=f"{os.path.basename(new_xlef)} not opened: {self.projects[pid]['name']} is still open")
+                return
+        self.open_xlef(new_xlef, offer_pyramids=False)
 
     def _run_pyramids(self, pid, entries, new_xlef):
         """Make the pyramids in a thread and show a window with the progress and a Cancel button; when done, offer to open the result."""
@@ -5516,10 +5573,18 @@ class XlefViewer:
                 self.status.config(text="Making pyramids stopped; nothing was kept")
             else:
                 self.status.config(text=f"Pyramids made in {seconds // 60}:{seconds % 60:02d}")
+                old = self.projects[pid]["name"] if pid in self.projects else None
+                close = (f"\n\nOpening it closes \"{old}\" first, so that the two copies are not open side by side (they share the same "
+                         "full-resolution images, but changes in one are not seen in the other). "
+                         + ("It has changes made since the pyramids were started: you are asked whether to save them, but saved now "
+                            "they go into the original project only, not the new one."
+                            if self._unsaved_names(pid) or self._linked_projects([pid]) - {pid} else "")
+                         if old else "").rstrip()
                 if ask_choice(self.root, "Pyramids made", f"Made pyramids for {len(entries)} image{'s' * (len(entries) != 1)} in "
-                              f"{seconds // 60}:{seconds % 60:02d}.\n\nThe new project is {state['result']}\n\nOpen it now?",
-                              [("Open it", "open"), ("Not now", None)]) == "open":
-                    self.open_xlef(state["result"], offer_pyramids=False)
+                              f"{seconds // 60}:{seconds % 60:02d}.\n\nThe new project is {state['result']}{close}\n\nOpen it now "
+                              "(use it from now on, in place of the original)?",
+                              [("Close the original and open it" if old else "Open it", "open"), ("Not now", None)]) == "open":
+                    self._open_pyramid_project(pid, state["result"])
         poll()
 
     # --- a .lif saved as an .xlef (this viewer only reads a .lif: the copy can be edited)
@@ -5825,14 +5890,13 @@ class XlefViewer:
         linked = self._linked_projects([pid]) - {pid}
         if ask and (changed or linked):
             name = self.projects[pid]["name"]
-            names = (f"{', '.join(changed[:5])}{' and more' if len(changed) > 5 else ''} "
-                     f"{'has' if len(changed) == 1 else 'have'} unsaved changes" if changed
+            names = ("These have unsaved changes:\n\n" + "\n".join(self._unsaved_summary([pid])) if changed
                      else f"Images were dragged between {name} and another project")
             those, its = ("that project", "its") if len(linked) == 1 else ("those projects", "their")
             also = (f"\n\nImages were dragged between {name} and {', '.join(self.projects[p]['name'] for p in linked)}: "
                     f"saving saves {those} too, and not saving reloads {those} from {its} files, losing {its} unsaved changes."
                     if linked else "")
-            answer = ask_choice(self.root, "Unsaved changes", f"{names}.{also}\n\nSave before closing {name}?",
+            answer = ask_choice(self.root, "Unsaved changes", f"{names}{'' if changed else '.'}{also}\n\nSave before closing {name}?",
                                 [("Save", "save"), ("Don't save", "discard"), ("Cancel", None)])
             if answer is None:
                 return
@@ -10535,6 +10599,27 @@ class XlefViewer:
     def _all_unsaved_names(self):
         return [o.name for o in self._all_objects() if o.unsaved] + [e.name + " (deleted)" for e in self.deleted.values()]
 
+    def _unsaved_summary(self, pids=None, limit=8):
+        """What isn't saved yet, for the questions on closing a project or the viewer: one line per image, folder or project (of `pids`,
+        or of every open project), e.g. "• Section 3: annotations, contrast", the same words as the note on its red * (_unsaved_what);
+        deleted images too. At most `limit` lines, then "• and N more". Named with their project when several are open."""
+        pids = [p for p in self.projects if pids is None or p in pids]
+        several = len(self.projects) > 1
+        lines = []
+        for pid in pids:
+            for item in [pid] + list(self._project_items(pid)):
+                if item == pid or item in self.entries or item in self.folders:
+                    if not self._is_unsaved(item):
+                        continue
+                    obj = self.projects[pid]["root"] if item == pid else (self.entries.get(item) or self.folders.get(item))
+                    what = self._unsaved_what(item) or ["changed"]
+                    where = f" ({self.projects[pid]['name']})" if several and item != pid else ""
+                    lines.append(f"• {obj.name}{where}: {', '.join(what)}")
+            lines += [f"• {e.name}: deleted" for i, e in self.deleted.items() if self.home.get(i) == pid]
+        if len(lines) > limit:
+            lines = lines[:limit - 1] + [f"• and {len(lines) - limit + 1} more"]
+        return lines
+
     def saved_or_discarded(self):
         """Before closing the viewer: True if there are no unsaved changes (renames, annotations, ...), or the user chose Save (and
         everything was saved: see save_annotations) or Don't save. False for Cancel, or if Save left something unsaved (its own
@@ -10542,9 +10627,9 @@ class XlefViewer:
         changed = self._all_unsaved_names()
         if not changed:
             return True
-        names = ", ".join(changed[:5]) + (f" and {len(changed) - 5} more" if len(changed) > 5 else "")
+        lines = self._unsaved_summary()
         answer = ask_choice(self.root, "Unsaved changes",
-                            f"{names} {'has' if len(changed) == 1 else 'have'} unsaved changes.\n\nSave them before closing?",
+                            "These have unsaved changes:\n\n" + "\n".join(lines) + "\n\nSave them before closing?",
                             [("Save", "save"), ("Don't save", "discard"), ("Cancel", None)])
         if answer == "save":
             self.save_annotations()
@@ -10752,7 +10837,10 @@ class XlefViewer:
 
     # --- exporting a picture (see image_export)
 
-    EXPORT_FORMATS = (("png", "PNG"), ("jpeg", "JPEG"), ("tiff", "TIFF"), ("svg", "SVG (vector scale bar)"))
+    EXPORT_FORMATS = (("png", "PNG"), ("jpeg", "JPEG"), ("tiff", "TIFF"), ("svg", "SVG"))
+    EXPORT_NOTES = {"png": "lossless", "jpeg": "smaller file", "tiff": "lossless, any size", "svg": "editable vectors"}   # (after the
+                                                                                     # name in the dialog: the file dialog has the name only)
+    JPEG_QUALITY = 95        # (at first; then as last used)
 
     def _export_area(self, area):
         """The part of the image to export, in its pixels (x0, y0, x1, y1): all of it, or what the view shows (as unturned)."""
@@ -10763,6 +10851,60 @@ class XlefViewer:
         x0, y0 = max(0, int(np.floor(ix0))), max(0, int(np.floor(iy0)))
         x1, y1 = min(e.width, int(np.ceil(ix1))), min(e.height, int(np.ceil(iy1)))
         return x0, y0, max(x1, x0 + 1), max(y1, y0 + 1)
+
+    def _exportable_annotations(self):
+        """The image's annotations an export can include: the visible ones (it needs the pixel size to place them)."""
+        e = self.img.entry if self.img else None
+        return [a for a in e.annotations if a.visible] if e is not None and e.pixel_um else []
+
+    def _export_shapes(self, step, x0, y0, w, h):
+        """The visible annotations as image_export's shapes, in the exported picture's pixels (the part from (x0, y0), w x h at `step`,
+        turned and mirrored as on screen). Sizes as on screen relative to the picture: lines, arrowheads and text are drawn at a fixed
+        size on screen whatever the zoom, so in the picture they are that size times its pixels per screen pixel (1 / (step * zoom))."""
+        e = self.img.entry
+        q, flipped = self._quarter(), self._flipped()
+        k = 1 / (step * self.scale) if self.scale else 1 / step
+        try:
+            pt = self.root.winfo_fpixels("1p")              # (screen pixels per point: Tk's text sizes are points)
+        except tk.TclError:
+            pt = 96 / 72
+        anchor = self._text_anchor()
+
+        def place(p):
+            px, py = e.width / 2 + p[0] * 1e6 / e.pixel_um, e.height / 2 + p[1] * 1e6 / e.pixel_um
+            return image_export.orient_point((px - x0) / step, (py - y0) / step, w, h, q, flipped)
+
+        shapes = []
+        for a in self._exportable_annotations():
+            pts = [place(p) for p in a.points()]
+            col = a.color
+            name, size, weight = a.font
+            text = {"kind": "text", "color": col, "size": max(1.0, abs(size) * (pt if size > 0 else 1) * k), "bold": weight == "bold"}
+            if a.kind == "text":
+                shapes.append(dict(text, x=pts[0][0], y=pts[0][1], text=a.text, anchor=anchor,
+                                   border=a.attrs.get("showBorder") == "True"))
+            elif a.kind in ("rectangle", "ellipse") and len(pts) >= 3:
+                shapes.append({"kind": "polygon", "points": pts, "color": col, "width": 2 * k})
+            elif len(pts) >= 2:
+                shapes.append({"kind": "line", "points": pts, "color": col, "width": 2 * k})
+                if a.kind == "arrow":                       # (as Tk's arrowshape (14, 16, 5) on a 2 px line)
+                    (xa, ya), (xb, yb) = pts[-2], pts[-1]
+                    d = max(np.hypot(xb - xa, yb - ya), 1e-9)
+                    ux, uy = (xb - xa) / d, (yb - ya) / d
+                    bx, by, half = xb - ux * 16 * k, yb - uy * 16 * k, 6 * k
+                    shapes.append({"kind": "head", "color": col,
+                                   "points": [(xb, yb), (bx - uy * half, by + ux * half), (bx + uy * half, by - ux * half)]})
+                if a.kind == "measure" and len(pts) == 2:
+                    (xa, ya), (xb, yb) = pts
+                    d = max(np.hypot(xb - xa, yb - ya), 1e-9)
+                    nx, ny = -(yb - ya) / d * 6 * k, (xb - xa) / d * 6 * k
+                    if a.attrs.get("showLineEnds") == "True":
+                        for x, y in pts:
+                            shapes.append({"kind": "line", "points": [(x - nx, y - ny), (x + nx, y + ny)], "color": col, "width": 2 * k})
+                    label = a.length_label()
+                    if label:
+                        shapes.append(dict(text, x=(xa + xb) / 2 + 10 * k, y=(ya + yb) / 2, text=label, anchor="w"))
+        return shapes
 
     def _export_steps(self, area):
         """[(step, x0, y0, width, height)] for the resolutions offered: full resolution, 1/2, 1/4, ... (powers of 2: a .vsi's pyramid
@@ -10813,21 +10955,53 @@ class XlefViewer:
         ttk.Label(body, text="Resolution").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=(8, 0))
         res = ttk.Combobox(body, state="readonly", width=44)
         res.grid(row=2, column=1, sticky="w", pady=(8, 0))
-        bar_check = ttk.Checkbutton(body, text="Scale bar (bottom left)", variable=bar)
-        bar_check.grid(row=3, column=1, sticky="w", pady=(8, 0))
+        extras = ttk.Frame(body)
+        extras.grid(row=3, column=1, sticky="w", pady=(8, 0))
+        bar_check = ttk.Checkbutton(extras, text="Scale bar (bottom left)", variable=bar)
+        bar_check.pack(side=tk.LEFT)
         if not e.pixel_um:
             bar_check.configure(state=tk.DISABLED)
             Tooltip(bar_check, "This image's pixel size isn't known, so it can't have a scale bar.")
+        n_ann = len(self._exportable_annotations())
+        anns = tk.BooleanVar(dlg, n_ann > 0 and self.settings.get("export_annotations", self.show_annotations.get()))
+        ann_check = ttk.Checkbutton(extras, text=f"Annotations ({n_ann})" if n_ann else "Annotations", variable=anns)
+        ann_check.pack(side=tk.LEFT, padx=(16, 0))
+        if n_ann:
+            Tooltip(ann_check, "The image's annotations (shapes, lines, arrows, measurements, text), drawn as on screen: their lines "
+                               "and text the same size relative to the picture as they look now. In an SVG they stay vector shapes "
+                               "and text, editable e.g. in Illustrator or Inkscape.")
+        else:
+            ann_check.configure(state=tk.DISABLED)
+            Tooltip(ann_check, "This image has no annotations shown." if e.pixel_um else
+                               "This image's pixel size isn't known, so its annotations can't be placed.")
         ttk.Label(body, text="Format").grid(row=4, column=0, sticky="nw", padx=(0, 12), pady=(8, 0))
         fmt_box = ttk.Frame(body)
         fmt_box.grid(row=4, column=1, sticky="w", pady=(8, 0))
         fmt_buttons = {}
+        try:
+            q0 = min(100, max(1, int(self.settings.get("export_jpeg_quality", self.JPEG_QUALITY))))
+        except (TypeError, ValueError):
+            q0 = self.JPEG_QUALITY
+        quality = tk.StringVar(dlg, str(q0))
         for key, label in self.EXPORT_FORMATS:
-            b = ttk.Radiobutton(fmt_box, text=label, variable=fmt, value=key)
-            b.pack(anchor="w")
+            row = ttk.Frame(fmt_box)
+            row.pack(anchor="w", fill=tk.X)
+            b = ttk.Radiobutton(row, text=f"{label} ({self.EXPORT_NOTES[key]})", variable=fmt, value=key)
+            b.pack(side=tk.LEFT)
             fmt_buttons[key] = b
-        Tooltip(fmt_buttons["svg"], "The picture with the scale bar and its label as vector graphics (a line and text that stay sharp "
-                                    "and can be edited, e.g. in Illustrator or Inkscape). Needs Scale bar ticked.")
+            if key == "jpeg":           # (its quality: shown only while JPEG is chosen, see update)
+                q_box = ttk.Frame(row)
+                ttk.Label(q_box, text="Quality").pack(side=tk.LEFT, padx=(12, 4))
+                q_spin = ttk.Spinbox(q_box, from_=1, to=100, increment=1, width=5, textvariable=quality)
+                q_spin.pack(side=tk.LEFT)
+                ttk.Label(q_box, text="(1-100)", style="Muted.TLabel").pack(side=tk.LEFT, padx=(4, 0))
+                Tooltip(q_spin, "JPEG quality, 1 to 100: higher keeps more detail and makes a larger file. 95 (at first) is hard to "
+                                "tell from lossless; 75-85 gives a much smaller file with little visible loss.")
+        Tooltip(fmt_buttons["png"], "Lossless (every pixel exactly as mixed), and widely readable. Large pictures make large files.")
+        Tooltip(fmt_buttons["jpeg"], "Lossy compression: a much smaller file, with slight loss of detail (set by Quality).")
+        Tooltip(fmt_buttons["svg"], "The picture with the scale bar and the annotations as vector graphics (lines, shapes and text that "
+                                    "stay sharp and can be edited, e.g. in Illustrator or Inkscape). Needs Scale bar or Annotations "
+                                    "ticked.")
         Tooltip(fmt_buttons["tiff"], "Uncompressed, with the pixel size in it; any size (written straight into the file: a whole "
                                      "slide at full resolution too).")
         note = ttk.Label(body, text="", wraplength=420, justify=tk.LEFT)
@@ -10854,17 +11028,33 @@ class XlefViewer:
             state["steps"] = steps
             res.current(pick)
 
+        def jpeg_quality():
+            """The Quality box's value, 1-100, or None if it isn't one."""
+            try:
+                v = int(quality.get().strip())
+            except ValueError:
+                return None
+            return v if 1 <= v <= 100 else None
+
         def update(*_):
             if state["area"] != area.get():
                 state["area"] = area.get()
                 choices()
-            if not bar.get() and fmt.get() == "svg":
+            vectors = (bar.get() and bool(e.pixel_um)) or (anns.get() and n_ann > 0)     # (what an SVG has as vectors)
+            if not vectors and fmt.get() == "svg":
                 fmt.set("png")
-            fmt_buttons["svg"].configure(state=tk.NORMAL if bar.get() and e.pixel_um else tk.DISABLED)
+            fmt_buttons["svg"].configure(state=tk.NORMAL if vectors else tk.DISABLED)
+            if fmt.get() == "jpeg":
+                if not q_box.winfo_manager():
+                    q_box.pack(side=tk.LEFT)
+            elif q_box.winfo_manager():
+                q_box.pack_forget()
             step, _, _, w, h = state["steps"][res.current()]
             q = self._quarter()
             fw, fh = (h, w) if q % 2 else (w, h)
             why = image_export.fits(fmt.get(), fw, fh)
+            if not why and fmt.get() == "jpeg" and jpeg_quality() is None:
+                why = "JPEG quality must be a whole number from 1 to 100"
             mb = fw * fh * 3 / 1e6
             size = f"{mb / 1000:.1f} GB" if mb >= 1000 else f"{mb:.0f} MB"
             text = f"{fw:,} x {fh:,} pixels ({size} uncompressed), turned and flipped as on screen."
@@ -10881,18 +11071,26 @@ class XlefViewer:
                                                 filetypes=[(dict(self.EXPORT_FORMATS)[fmt.get()], "*" + ext)])
             if not path:
                 return
+            q = jpeg_quality() or self.JPEG_QUALITY
             self.settings.update(export_area=area.get(), export_scale_bar=bar.get(), export_format=fmt.get(),
                                  export_folder=os.path.dirname(path))
+            if fmt.get() == "jpeg":
+                self.settings["export_jpeg_quality"] = q
+            if n_ann:
+                self.settings["export_annotations"] = anns.get()
             self._save_settings()
+            shapes = self._export_shapes(step, x0, y0, w, h) if anns.get() and n_ann else []
             dlg.destroy()
-            self._run_export(path, fmt.get(), step, x0, y0, w, h, bar.get() and bool(e.pixel_um))
+            self._run_export(path, fmt.get(), step, x0, y0, w, h, bar.get() and bool(e.pixel_um), quality=q, shapes=shapes)
 
         export_button = ttk.Button(buttons, text="Export...", command=go)
         export_button.pack(side=tk.RIGHT)
         ttk.Button(buttons, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT, padx=(0, 6))
         area.trace_add("write", update)
         bar.trace_add("write", update)
+        anns.trace_add("write", update)
         fmt.trace_add("write", update)
+        quality.trace_add("write", update)
         res.bind("<<ComboboxSelected>>", update)
         update()
         dlg.bind("<Escape>", lambda ev: dlg.destroy())
@@ -10901,10 +11099,11 @@ class XlefViewer:
         self.export_dialog = dlg                # (for tests)
         return dlg
 
-    def _run_export(self, path, fmt, step, x0, y0, w, h, scale_bar):
+    def _run_export(self, path, fmt, step, x0, y0, w, h, scale_bar, quality=JPEG_QUALITY, shapes=()):
         """Write the export in a thread, with a window showing how far it has got and a Cancel button: the channels switched on read a
         band of rows at a time at `step` (each from the shown plane, max projection or extended focus: see OpenImage.row_reader), mixed
-        in their colors and contrast, turned and mirrored as on screen (see image_export.export)."""
+        in their colors and contrast, turned and mirrored as on screen (see image_export.export). quality: a JPEG's, 1-100. shapes:
+        the annotations to include (see _export_shapes)."""
         img, z, e = self.img, self.z, self.img.entry
         on = [c for c, st in enumerate(self.ch_settings) if st["on"]]
         luts = make_luts(e.channels, self.ch_settings)
@@ -10936,7 +11135,8 @@ class XlefViewer:
             try:
                 state["result"] = image_export.export(path, fmt, w, h, read_band, quarter, flipped,
                                                       e.pixel_um * step if e.pixel_um else None, scale_bar,
-                                                      progress=lambda d, t: state.update(done=d, total=t), cancel=stop.is_set)
+                                                      progress=lambda d, t: state.update(done=d, total=t), cancel=stop.is_set,
+                                                      quality=quality, shapes=shapes)
             except image_export.Cancelled:
                 pass
             except Exception as ex:

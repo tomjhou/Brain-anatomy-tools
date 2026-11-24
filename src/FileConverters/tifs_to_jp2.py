@@ -978,7 +978,7 @@ class Jp2Gui:
 
     def browse_input(self):
         from tkinter import filedialog
-        d = filedialog.askdirectory(initialdir=self.var_input.get() or None,
+        d = filedialog.askdirectory(parent=self.root, initialdir=self.var_input.get() or None,
                                     title="Folder containing the per-channel TIFFs")
         if d:
             self.var_input.set(os.path.normpath(d))
@@ -986,7 +986,7 @@ class Jp2Gui:
 
     def browse_output(self):
         from tkinter import filedialog
-        d = filedialog.askdirectory(initialdir=self.output_dir() or None,
+        d = filedialog.askdirectory(parent=self.root, initialdir=self.output_dir() or None,
                                     title="Folder to write .jp2 files into")
         if d:
             self.var_output.set(os.path.normpath(d))

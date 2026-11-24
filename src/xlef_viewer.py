@@ -6726,7 +6726,8 @@ class XlefViewer:
         dlg.bind("<Escape>", lambda e: dlg.destroy())
         try:
             x, y = self.ch_widgets[i][2].winfo_rootx(), self.ch_widgets[i][2].winfo_rooty()
-            dlg.geometry(f"+{max(0, x - 340)}+{max(0, y - 20)}")      # (by the channel's column, to its left)
+            dlg.geometry(f"+{x - 340}+{y - 20}")      # (by the channel's column, to its left)
+            self._keep_on_screen(dlg)       # (on the viewer's monitor: one left of the main monitor has negative x, so not max(0, x))
         except (tk.TclError, IndexError):
             pass
         box.focus_set()

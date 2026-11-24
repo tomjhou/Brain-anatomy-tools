@@ -85,7 +85,7 @@ class gui(basic_gui):
     def start_convert_folder(self):
 
         # self.root.attributes('-topmost', True)  # Opened windows will be above all windows
-        folder_path = filedialog.askdirectory()
+        folder_path = filedialog.askdirectory(parent=self.root)
 
         if folder_path == '':
             print('\nNo folder chosen.\n')

@@ -50,6 +50,8 @@ A fast viewer and organizer for Leica LAS X experiments (`.xlef` projects, and `
   a histogram) and its color.
 - **Z-stacks**: step through the planes, or see them merged: their max projection, or their extended focus (EFI: each pixel from
   the plane where it is sharpest). For an Olympus `.vsi` scanned with EFI, the extended-focus image cellSens saved can be shown too.
+- **Export a picture** (the Export button) of the channels switched on, as PNG, JPEG, TIFF, or SVG with a vector scale bar: the
+  whole image or the view on screen, at the resolution you choose, with or without a scale bar.
 - **Annotate**: see the measuring lines, arrows, shapes and text added in LAS X, and add or edit your own.
 - **Organize**: rename images and folders, put them in a different order, move them to another experiment, or delete them.
 - **Save back into LAS X's own files**, so LAS X shows the same changes. A backup of each changed file is kept. Close the experiment in

@@ -87,6 +87,7 @@ import xlef_pyramids        # (pyramids for an experiment that has none: see Xle
 import vsi_reader           # (Olympus cellSens .vsi files, read with slideio: see load_vsi)
 import lif_to_xlef          # (a .lif saved as an .xlef, which can be edited: see XlefViewer.save_as_xlef)
 import focus_stack          # (extended focus from a z-stack's planes: see OpenImage.efi_z)
+import image_export         # (Export: PNG, JPEG, TIFF or SVG of the picture, see XlefViewer.export_image)
 from color_button import ColorButton
 from tooltip import Tooltip, place_on_monitor, monitor_area, tip_window, show_tip_window, watch_pointer
 
@@ -389,6 +390,11 @@ def reveal_in_file_manager(path, select=True):
         subprocess.Popen(["open", "-R", path] if select else ["open", path])
     else:
         subprocess.Popen(["xdg-open", os.path.dirname(path) if select else path])
+
+
+def file_stem(name):
+    """`name` made fit for a file name: the characters Windows doesn't allow (\\ / : * ? " < > |) as "_"."""
+    return re.sub(r'[\\/:*?"<>|]+', "_", name).strip() or "image"
 
 
 WINDOW_FRAME = (16, 40)      # (pixels the title bar and borders add to a window's size, beyond what Tk's geometry counts)
@@ -4302,7 +4308,8 @@ class XlefViewer:
         fm = tk.Menu(menu, tearoff=0, postcommand=self._update_file_menu)
         self.file_menu = fm
         fm.add_command(label="Open (recent or browse)...", accelerator="Ctrl+O", command=self.ask_open)
-        fm.add_command(label="Save view as PNG...", command=self.save_view)
+        fm.add_command(label="Export image (PNG, JPEG, TIFF, SVG)...", command=self.export_image)
+        fm.add_command(label="Save view as PNG (as on screen)...", command=self.save_view)
         fm.add_command(label=PYRAMID_MENU, command=self.make_pyramids_command)
         self.pyramid_menu_index = fm.index("end")
         fm.add_command(label=SAVE_XLEF_MENU, command=self.save_as_xlef_command)
@@ -4448,6 +4455,11 @@ class XlefViewer:
         settings_button = ttk.Button(bar, text=SETTINGS_NAME, command=self.open_settings)
         settings_button.pack(side=tk.RIGHT)
         Tooltip(settings_button, "Settings: color theme, zoomed-in pixels, renaming")
+        export_button = ttk.Button(bar, text="Export...", command=self.export_image)
+        export_button.pack(side=tk.RIGHT, padx=(0, 6))
+        Tooltip(export_button, "Save a picture of this image, with the channels switched on in their colors and contrast, as PNG, "
+                               "JPEG, TIFF or SVG: the whole image or the view on screen, at the resolution you choose, with or "
+                               "without a scale bar")
         self.flip_x = tk.BooleanVar(value=self.settings.get("flip_left_right", False))
         flip_check = ttk.Checkbutton(bar, text="Flip all sections", variable=self.flip_x, command=self.on_flip_toggle)
         flip_check.pack(side=tk.RIGHT, padx=(0, 8))
@@ -10737,6 +10749,242 @@ class XlefViewer:
             self.speed_seen = SPEED.measured
             self.root.after(0, self._ask_about_slow_drives)       # (not from inside this loop: the question waits for an answer)
         self.root.after(30, self._poll_results)
+
+    # --- exporting a picture (see image_export)
+
+    EXPORT_FORMATS = (("png", "PNG"), ("jpeg", "JPEG"), ("tiff", "TIFF"), ("svg", "SVG (vector scale bar)"))
+
+    def _export_area(self, area):
+        """The part of the image to export, in its pixels (x0, y0, x1, y1): all of it, or what the view shows (as unturned)."""
+        e = self.img.entry
+        if area == "whole":
+            return 0, 0, e.width, e.height
+        ix0, iy0, ix1, iy1 = self._view_corners()
+        x0, y0 = max(0, int(np.floor(ix0))), max(0, int(np.floor(iy0)))
+        x1, y1 = min(e.width, int(np.ceil(ix1))), min(e.height, int(np.ceil(iy1)))
+        return x0, y0, max(x1, x0 + 1), max(y1, y0 + 1)
+
+    def _export_steps(self, area):
+        """[(step, x0, y0, width, height)] for the resolutions offered: full resolution, 1/2, 1/4, ... (powers of 2: a .vsi's pyramid
+        reads them as they are) down to a few hundred pixels across; x0, y0 the area's corner, a multiple of the step."""
+        x0, y0, x1, y1 = self._export_area(area)
+        out, step = [], 1
+        while True:
+            ax0, ay0 = x0 // step * step, y0 // step * step
+            w, h = -(-(x1 - ax0) // step), -(-(y1 - ay0) // step)
+            out.append((step, ax0, ay0, w, h))
+            if max(w, h) <= 400:
+                return out
+            step *= 2
+
+    def export_image(self):
+        """Export: a dialog for what to save (the whole image or the view, the resolution, a scale bar, the format), then a file name,
+        then it is written in the background (see _run_export)."""
+        if self.img is None or not self.img.entry.width:
+            messagebox.showinfo("Export", "Show an image first.", parent=self.root)
+            return
+        if not any(st["on"] for st in self.ch_settings):
+            messagebox.showinfo("Export", "Switch on at least one channel: the picture is of the channels switched on.", parent=self.root)
+            return
+        if getattr(self, "export_job", None) is not None:
+            messagebox.showinfo("Export", "A picture is being exported already.", parent=self.root)
+            return
+        e = self.img.entry
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"Export {e.name}")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        body = ttk.Frame(dlg, padding=14)
+        body.pack(fill=tk.BOTH, expand=True)
+        area = tk.StringVar(dlg, self.settings.get("export_area", "view"))
+        bar = tk.BooleanVar(dlg, bool(e.pixel_um) and self.settings.get("export_scale_bar", True))
+        fmt = tk.StringVar(dlg, self.settings.get("export_format", "png"))
+        if fmt.get() not in dict(self.EXPORT_FORMATS):
+            fmt.set("png")
+        shown = [f"{c + 1} {ch.name}" for c, (ch, st) in enumerate(zip(e.channels, self.ch_settings)) if st["on"]]
+        what = self._layer_words() if e.nz > 1 or self._z_kind() != "plane" else ""
+        ttk.Label(body, text=f"Channels switched on, in their colors and contrast: {', '.join(shown)}" + (f".  {what}." if what else "."),
+                  wraplength=420, justify=tk.LEFT, style="Muted.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ttk.Label(body, text="Area").grid(row=1, column=0, sticky="nw", padx=(0, 12))
+        area_box = ttk.Frame(body)
+        area_box.grid(row=1, column=1, sticky="w")
+        ttk.Radiobutton(area_box, text="The view on screen", variable=area, value="view").pack(anchor="w")
+        ttk.Radiobutton(area_box, text="The whole image", variable=area, value="whole").pack(anchor="w")
+        ttk.Label(body, text="Resolution").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=(8, 0))
+        res = ttk.Combobox(body, state="readonly", width=44)
+        res.grid(row=2, column=1, sticky="w", pady=(8, 0))
+        bar_check = ttk.Checkbutton(body, text="Scale bar (bottom left)", variable=bar)
+        bar_check.grid(row=3, column=1, sticky="w", pady=(8, 0))
+        if not e.pixel_um:
+            bar_check.configure(state=tk.DISABLED)
+            Tooltip(bar_check, "This image's pixel size isn't known, so it can't have a scale bar.")
+        ttk.Label(body, text="Format").grid(row=4, column=0, sticky="nw", padx=(0, 12), pady=(8, 0))
+        fmt_box = ttk.Frame(body)
+        fmt_box.grid(row=4, column=1, sticky="w", pady=(8, 0))
+        fmt_buttons = {}
+        for key, label in self.EXPORT_FORMATS:
+            b = ttk.Radiobutton(fmt_box, text=label, variable=fmt, value=key)
+            b.pack(anchor="w")
+            fmt_buttons[key] = b
+        Tooltip(fmt_buttons["svg"], "The picture with the scale bar and its label as vector graphics (a line and text that stay sharp "
+                                    "and can be edited, e.g. in Illustrator or Inkscape). Needs Scale bar ticked.")
+        Tooltip(fmt_buttons["tiff"], "Uncompressed, with the pixel size in it; any size (written straight into the file: a whole "
+                                     "slide at full resolution too).")
+        note = ttk.Label(body, text="", wraplength=420, justify=tk.LEFT)
+        note.grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        buttons = ttk.Frame(body)
+        buttons.grid(row=6, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        state = {"steps": [], "area": None}
+
+        def choices():
+            """The resolution list for the area (again when it changes): each step's size, the one nearest the screen's marked."""
+            steps = self._export_steps(area.get())
+            screen = max(1, 1 / self.scale) if self.scale else 1
+            near = min(range(len(steps)), key=lambda i: abs(np.log2(steps[i][0] / screen)))
+            labels = []
+            for i, (step, _, _, w, h) in enumerate(steps):
+                name = "Full resolution" if step == 1 else f"1/{step}"
+                um = f", {e.pixel_um * step:.3g} µm/px" if e.pixel_um else ""
+                labels.append(f"{name}: {w:,} x {h:,} px{um}" + ("  (about as on screen)" if area.get() == "view" and i == near else ""))
+            res.configure(values=labels)
+            if area.get() == "view":
+                pick = near
+            else:
+                pick = next((i for i, s in enumerate(steps) if max(s[3], s[4]) <= 8000), len(steps) - 1)
+            state["steps"] = steps
+            res.current(pick)
+
+        def update(*_):
+            if state["area"] != area.get():
+                state["area"] = area.get()
+                choices()
+            if not bar.get() and fmt.get() == "svg":
+                fmt.set("png")
+            fmt_buttons["svg"].configure(state=tk.NORMAL if bar.get() and e.pixel_um else tk.DISABLED)
+            step, _, _, w, h = state["steps"][res.current()]
+            q = self._quarter()
+            fw, fh = (h, w) if q % 2 else (w, h)
+            why = image_export.fits(fmt.get(), fw, fh)
+            mb = fw * fh * 3 / 1e6
+            size = f"{mb / 1000:.1f} GB" if mb >= 1000 else f"{mb:.0f} MB"
+            text = f"{fw:,} x {fh:,} pixels ({size} uncompressed), turned and flipped as on screen."
+            note.configure(text=text + (f"\n⚠ {why}." if why else ""), style="Warn.TLabel" if why else "TLabel")
+            export_button.configure(state=tk.DISABLED if why else tk.NORMAL)
+
+        def go():
+            step, x0, y0, w, h = state["steps"][res.current()]
+            ext = image_export.FORMATS[fmt.get()]
+            suffix = "" if area.get() == "whole" else "_view"
+            folder = self.settings.get("export_folder") or os.path.dirname(getattr(e, "xlif_path", "") or "") or None
+            path = filedialog.asksaveasfilename(parent=dlg, title="Export as", defaultextension=ext, initialdir=folder,
+                                                initialfile=f"{file_stem(e.name)}{suffix}{ext}",
+                                                filetypes=[(dict(self.EXPORT_FORMATS)[fmt.get()], "*" + ext)])
+            if not path:
+                return
+            self.settings.update(export_area=area.get(), export_scale_bar=bar.get(), export_format=fmt.get(),
+                                 export_folder=os.path.dirname(path))
+            self._save_settings()
+            dlg.destroy()
+            self._run_export(path, fmt.get(), step, x0, y0, w, h, bar.get() and bool(e.pixel_um))
+
+        export_button = ttk.Button(buttons, text="Export...", command=go)
+        export_button.pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT, padx=(0, 6))
+        area.trace_add("write", update)
+        bar.trace_add("write", update)
+        fmt.trace_add("write", update)
+        res.bind("<<ComboboxSelected>>", update)
+        update()
+        dlg.bind("<Escape>", lambda ev: dlg.destroy())
+        dlg.geometry(f"+{self.root.winfo_rootx() + 200}+{self.root.winfo_rooty() + 120}")
+        self._keep_on_screen(dlg)
+        self.export_dialog = dlg                # (for tests)
+        return dlg
+
+    def _run_export(self, path, fmt, step, x0, y0, w, h, scale_bar):
+        """Write the export in a thread, with a window showing how far it has got and a Cancel button: the channels switched on read a
+        band of rows at a time at `step` (each from the shown plane, max projection or extended focus: see OpenImage.row_reader), mixed
+        in their colors and contrast, turned and mirrored as on screen (see image_export.export)."""
+        img, z, e = self.img, self.z, self.img.entry
+        on = [c for c, st in enumerate(self.ch_settings) if st["on"]]
+        luts = make_luts(e.channels, self.ch_settings)
+        quarter, flipped = self._quarter(), self._flipped()
+        stop = threading.Event()
+        state = {"done": 0, "total": h, "error": None, "finished": False, "result": None}
+        readers = {}
+
+        def read_band(r0, r1):
+            arrays = [None] * len(e.channels)
+            for c in on:
+                if c not in readers:
+                    readers[c] = img.row_reader(z, c)
+                reader = readers[c]
+                if reader is not None:
+                    futures = [_READ_POOL.submit(reader.row, y0 + k * step, x0, w, step) for k in range(r0, r1)]
+                    a = np.empty((r1 - r0, w), reader.out_dtype)
+                    for i, f in enumerate(futures):
+                        a[i] = f.result()
+                else:                               # (a compressed plane: decoded whole, see OpenImage.plane)
+                    p = img.plane(z, c, keep=False)
+                    if p is None:
+                        raise OSError(f"channel {c + 1} can't be read")
+                    a = np.ascontiguousarray(p[y0 + r0 * step:y0 + r1 * step:step, x0:x0 + w * step:step])
+                arrays[c] = a
+            return composite(arrays, luts)
+
+        def work():
+            try:
+                state["result"] = image_export.export(path, fmt, w, h, read_band, quarter, flipped,
+                                                      e.pixel_um * step if e.pixel_um else None, scale_bar,
+                                                      progress=lambda d, t: state.update(done=d, total=t), cancel=stop.is_set)
+            except image_export.Cancelled:
+                pass
+            except Exception as ex:
+                state["error"] = ex
+            finally:
+                for r in readers.values():
+                    if r is not None:
+                        r.close()
+                state["finished"] = True
+
+        self.export_job = stop
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Exporting")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        body = ttk.Frame(dlg, padding=14)
+        body.pack(fill=tk.BOTH, expand=True)
+        label = ttk.Label(body, text=f"Exporting {os.path.basename(path)} ...", width=60)
+        label.pack(anchor=tk.W)
+        progress = ttk.Progressbar(body, length=420, maximum=1000)
+        progress.pack(fill=tk.X, pady=(8, 8))
+        ttk.Button(body, text="Cancel", command=stop.set).pack(side=tk.RIGHT)
+        dlg.protocol("WM_DELETE_WINDOW", stop.set)
+        dlg.geometry(f"+{self.root.winfo_rootx() + 220}+{self.root.winfo_rooty() + 160}")
+        self._keep_on_screen(dlg)
+        started = time.monotonic()
+        threading.Thread(target=work, daemon=True).start()
+
+        def poll():
+            if not state["finished"]:
+                progress["value"] = 1000 * state["done"] / max(1, state["total"])
+                if stop.is_set():
+                    label.configure(text="Stopping ...")
+                self.root.after(150, poll)
+                return
+            dlg.destroy()
+            self.export_job = None
+            if state["error"] is not None:
+                self.status.config(text="Export failed")
+                messagebox.showerror("Export", f"The picture could not be exported:\n\n{state['error']}", parent=self.root)
+                return
+            if state["result"] is None:
+                self.status.config(text="Export stopped; nothing was kept")
+                return
+            self.status.config(text=f"Exported {path} ({time.monotonic() - started:.0f} s)")
+            if ask_choice(self.root, "Exported", f"Saved:\n\n{path}", [(REVEAL_LABEL, "show"), ("Close", None)]) == "show":
+                reveal_in_file_manager(path)
+        poll()
 
     def save_view(self):
         if self.last_view_rgb is None:

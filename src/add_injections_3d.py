@@ -18,9 +18,10 @@ From stereotaxic coordinates to the CCF (all approximate; there is no exact mapp
     "adjusted intersection point (~0.4 mm behind Paxinos bregma)"), that is subtracted.
   * ML: the side column picks the hemisphere; bilateral rows give two balls. A row with no
     side is drawn on the left (the lab's usual side) and says so when hovered.
-  * DV: zeroed at bregma (or with no zero given): measured down from bregma's height. Zeroed at
-    the skull, dura or brain surface: measured down from the top of the CCF brain at the entry
-    point (the CCF has no skull, so skull-zeroed sites land a little too deep).
+  * DV: zeroed at bregma: measured down from bregma's height. Zeroed at the skull, dura or brain
+    surface: measured down from the top of the CCF brain at the entry point (the CCF has no skull,
+    so skull-zeroed sites land a little too deep). No zero given: the brain surface, the lab's
+    usual, except for people who usually use bregma (BREGMA_DV_PEOPLE: Seung-Chan).
   * Angle: AP/ML are where the needle enters and DV is the distance along the tilted track,
     tilted in the coronal plane toward the midline (as in the lab's standard coordinates: VTA
     entered at ML 1.3, 4.8 mm at 10 degrees, ends near ML 0.5).
@@ -133,6 +134,14 @@ def dv_zero_kind(text):
     return None
 
 
+BREGMA_DV_PEOPLE = {'seung-chan'}    # people who usually zero DV at bregma: a blank zero in their rows means bregma
+
+
+def default_dv_zero(person):
+    """The DV zero of a row that gives none: the brain surface (the lab's usual), or bregma for BREGMA_DV_PEOPLE."""
+    return 'bregma' if str(person or '').strip().lower() in BREGMA_DV_PEOPLE else 'surface'
+
+
 def sides_of(side, ml_text=''):
     s = str(side or '').strip().lower()
     if s.startswith('bi') or re.search(r'±|\+/-', str(ml_text or '')):
@@ -212,7 +221,9 @@ def site_balls(r, ap, ml, dv, site_angle, site_side, target, site_note, bregma, 
         notes.append(f"AP zero {shift:g} mm behind bregma: AP {ap_b:+.2f} from bregma")
     zero = dv_zero_kind(r.get('dv_zero'))
     if zero is None:
-        notes.append('DV zero not given: taken as bregma')
+        zero = default_dv_zero(r.get('person'))
+        notes.append(f"DV zero not given: taken as {'bregma' if zero == 'bregma' else 'the brain surface'}"
+                     f"{' (as this person usually writes)' if zero == 'bregma' else ''}")
     angles = [site_angle] if site_angle is not None else (cell_values(r.get('angle')) or [0.0])
     if site_side:
         sides = [site_side]
@@ -244,7 +255,7 @@ def site_balls(r, ap, ml, dv, site_angle, site_side, target, site_note, bregma, 
         head = f"<b>{r.get('animal_id') or '?'}</b>  {r.get('person', '')}  {r.get('surgery_date', '')}"
         what = ' · '.join(one_line(v) for v in (target, r.get('substance'), r.get('procedure')) if v)
         coords = (f"AP {ap:g}  ML {abs(ml):g}  DV {dv:g}{'  angle ' + format(angle, 'g') if angle else ''}  ({side}"
-                  f"{', DV from ' + one_line(r.get('dv_zero')) if zero else ''})")
+                  f"{', DV from ' + one_line(r.get('dv_zero')) if str(r.get('dv_zero') or '').strip() else ''})")
         balls.append((round(tip_ml, 3), round(ccf_ap, 3), round(float(ccf_dv), 3),
                       '<br>'.join([head, what, coords] + notes + side_notes),
                       round(entry_ml, 3), round(float(top), 3)))

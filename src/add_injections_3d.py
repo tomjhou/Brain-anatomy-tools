@@ -415,6 +415,7 @@ EXTRAS_JS = r"""
     var gd = document.querySelector('.plotly-graph-div');
     if (!window.Plotly || !gd || !gd._fullLayout || !gd._fullLayout.scene) return setTimeout(draw, 200);
     var peer = panelPeer();
+    busy(true);   // (until the page has settled: settled() below)
     if (e.viewer && window.__injectionData && !peer) installClick(gd, window.__injectionData, e.viewer);
     if (gd._context) gd._context.showTips = false;   // (no plotly tips, for pages written before the page turned them off: its hint to double-click the legend to isolate an entry is wrong here)
     var traces = [], have = {}, firstOwn = gd._fullData.length;
@@ -487,10 +488,48 @@ EXTRAS_JS = r"""
       traces.push({type: 'scatter3d', mode: 'markers', x: [null], y: [null], z: [null], name: spacer, showlegend: true, hoverinfo: 'skip',
                    marker: {size: 1, color: 'rgba(0,0,0,0)'}, legendrank: 4});
     }
+    if (peer && window.__injectionData) {   // the 3D panel's marked sites (see installPanel): added now, as each addition redraws the whole scene
+      traces.push(
+        {type: 'mesh3d', x: [], y: [], z: [], i: [], j: [], k: [], color: '#ffd400', opacity: 1, name: 'marked sites', showlegend: false, hoverinfo: 'skip', visible: false,
+         lighting: {ambient: 0.7, diffuse: 0.8, specular: 0.3, roughness: 0.5}},
+        {type: 'scatter3d', mode: 'lines', x: [], y: [], z: [], line: {color: '#ffd400', width: 8}, connectgaps: false, name: 'marked tracks', showlegend: false,
+         hoverinfo: 'skip', visible: false});
+    }
     Plotly.addTraces(gd, traces).then(function () {
       makeSliceable(gd, firstOwn); groupLegend(gd, 40); fixSwatches(gd); installSliders();
-      freezeAxes(gd, 40, function () { if (peer && window.__injectionData) installPanel(gd, window.__injectionData, peer, 40); });
+      freezeAxes(gd, 40, function () {
+        if (peer && window.__injectionData) installPanel(gd, window.__injectionData, peer, 40);   // (it says when it has settled: after the viewer's first list)
+        else settled(gd);
+      });
     });
+  }
+
+  // While the page sets itself up after it opens (several redraws of the whole scene, a second or two with large pages) it hardly answers the mouse: the
+  // pointer is an hourglass until it has been quiet for a moment.
+  var busyStyle = null, busyLimit = 0;
+  function busy(on) {
+    clearTimeout(busyLimit);
+    if (on) {
+      if (!busyStyle) {
+        busyStyle = document.createElement('style');
+        busyStyle.textContent = 'html, body, body * { cursor: wait !important; }';
+        document.head.appendChild(busyStyle);
+      }
+      busyLimit = setTimeout(function () { busy(false); }, 15000);   // (never left on)
+    } else if (busyStyle) {
+      busyStyle.remove();
+      busyStyle = null;
+    }
+  }
+
+  function settled(gd) {
+    var timer = 0;
+    function arm() {
+      clearTimeout(timer);
+      timer = setTimeout(function () { gd.removeListener('plotly_afterplot', arm); busy(false); }, 300);
+    }
+    gd.on('plotly_afterplot', arm);
+    arm();
   }
 
   // The page's axes fit whatever is drawn (autorange, and aspect from the data), so switching an object on or off in the legend, or the 3D panel's filter
@@ -578,31 +617,43 @@ EXTRAS_JS = r"""
       sites.forEach(function (s) { t.x.push(s[4], s[0], null); t.y.push(s[1], s[1], null); t.z.push(s[5], s[2], null); t.text.push(s[3], s[3], null); });
       return t;
     }
-    var mark = gd._fullData.length;   // the marked sites: a mesh and a line, not in the legend, not hovered (the balls under them answer)
-    Plotly.addTraces(gd, [
-      {type: 'mesh3d', x: [], y: [], z: [], i: [], j: [], k: [], color: '#ffd400', opacity: 1, name: 'marked sites', showlegend: false, hoverinfo: 'skip', visible: false,
-       lighting: {ambient: 0.7, diffuse: 0.8, specular: 0.3, roughness: 0.5}},
-      {type: 'scatter3d', mode: 'lines', x: [], y: [], z: [], line: {color: '#ffd400', width: 8}, connectgaps: false, name: 'marked tracks', showlegend: false,
-       hoverinfo: 'skip', visible: false}]);
-    var shownKeys = null, marked = [];
+    // the marked sites: a mesh and a line, not in the legend, not hovered (the balls under them answer); added with the page's other objects (draw)
+    var mark = -1;
+    gd._fullData.forEach(function (t, index) { if (t.name === 'marked sites') mark = index; });
+    var marked = [], markOn = false;
+    // Each change of the plot redraws the whole scene (with large pages a noticeable moment), so a list that draws the same sites changes nothing, and the
+    // balls and tracks are changed together, in one go.
     function show(keys) {
-      shownKeys = keys ? new Set(keys) : null;
-      var m = {x: [], y: [], z: [], i: [], j: [], k: [], text: [], name: []}, mIds = [], l = {x: [], y: [], z: [], text: []}, lIds = [], counts = {};
+      var wanted = keys ? new Set(keys) : null, changed = false, counts = {};
       groups.forEach(function (G) {
-        G.shown = shownKeys ? G.all.filter(function (s) { return shownKeys.has(s[10]); }) : G.all;
-        counts[G.g.kind] = G.shown.length;
-        var b = balls(G.shown, G.g.radius), t = tracks(G.shown);
-        ['x', 'y', 'z', 'i', 'j', 'k', 'text'].forEach(function (a) { m[a].push(b[a]); });
-        m.name.push(G.g.name + ' (' + G.shown.length + ')');
-        mIds.push(G.mesh);
-        ['x', 'y', 'z', 'text'].forEach(function (a) { l[a].push(t[a]); });
-        lIds.push(G.line);
+        var now = wanted ? G.all.filter(function (s) { return wanted.has(s[10]); }) : G.all;
+        if (now.length !== G.shown.length || now.some(function (s, n) { return s !== G.shown[n]; })) changed = true;
+        G.shown = now;
+        counts[G.g.kind] = now.length;
       });
-      Promise.all([Plotly.restyle(gd, m, mIds), Plotly.restyle(gd, l, lIds)]).then(function () {
-        if (gd.__extrasForget) gd.__extrasForget(mIds.concat(lIds));   // (the slice cut starts again from the new sites)
-      });
-      highlight(marked);
       peer.postMessage({type: 'jhoulab-3d', event: 'shown', counts: counts}, location.origin);
+      if (!changed) { highlight(marked); return settled(gd); }
+      busy(true);
+      var ids = [], u = {x: [], y: [], z: [], text: [], i: [], j: [], k: [], name: []};
+      groups.forEach(function (G) {   // the balls (meshes) first, then the tracks (lines: no i, j, k or new name, left as they are: undefined)
+        var b = balls(G.shown, G.g.radius);
+        ['x', 'y', 'z', 'text', 'i', 'j', 'k'].forEach(function (a) { u[a].push(b[a]); });
+        u.name.push(G.g.name + ' (' + G.shown.length + ')');
+        ids.push(G.mesh);
+      });
+      groups.forEach(function (G) {
+        var t = tracks(G.shown);
+        ['x', 'y', 'z', 'text'].forEach(function (a) { u[a].push(t[a]); });
+        ['i', 'j', 'k', 'name'].forEach(function (a) { u[a].push(undefined); });
+        ids.push(G.line);
+      });
+      setTimeout(function () {   // (a moment for the hourglass to show first)
+        Plotly.restyle(gd, u, ids).then(function () {
+          if (gd.__extrasForget) gd.__extrasForget(ids);   // (the slice cut starts again from the new sites)
+          highlight(marked);
+          settled(gd);
+        }, function () { settled(gd); });
+      }, 30);
     }
     function highlight(keys) {
       marked = keys || [];
@@ -615,8 +666,9 @@ EXTRAS_JS = r"""
         ['i', 'j', 'k'].forEach(function (a) { b[a] = b[a].concat(nb[a].map(function (v) { return v + base; })); });
       });
       var on = b.x.length > 0;
-      Plotly.restyle(gd, {x: [b.x], y: [b.y], z: [b.z], i: [b.i], j: [b.j], k: [b.k], visible: on}, [mark]);
-      Plotly.restyle(gd, {x: [t.x], y: [t.y], z: [t.z], visible: on}, [mark + 1]);
+      if (mark < 0 || (!on && !markOn)) return;   // (nothing marked, and nothing was)
+      markOn = on;
+      Plotly.restyle(gd, {x: [b.x, t.x], y: [b.y, t.y], z: [b.z, t.z], i: [b.i, undefined], j: [b.j, undefined], k: [b.k, undefined], visible: on}, [mark, mark + 1]);
     }
     gd.on('plotly_click', function (ev) {
       var p = ev && ev.points && ev.points[0];
@@ -629,8 +681,10 @@ EXTRAS_JS = r"""
     window.addEventListener('message', function (ev) {
       var d = ev.data;
       if (ev.source !== peer || ev.origin !== location.origin || !d || d.type !== 'jhoulab-3d') return;
-      if ('show' in d) show(d.show);
-      if ('highlight' in d) highlight(d.highlight);
+      if ('show' in d) {   // (with the mark, if any, in the same redraw)
+        if ('highlight' in d) marked = d.highlight || [];
+        show(d.show);
+      } else if ('highlight' in d) highlight(d.highlight);
     });
     peer.postMessage({type: 'jhoulab-3d', event: 'ready'}, location.origin);
   }

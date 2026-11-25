@@ -244,7 +244,7 @@ def split_sites(r):
 
 
 def injection_sites(rows, bregma, brain_top):
-    """[(x, y, z, hover, entry x, entry z, kind, zero)] in the page's axes (CCF ML, AP, DV in mm; see site_balls; kind
+    """[(x, y, z, hover, entry x, entry z, kind, zero, animal id, surgery date)] in the page's axes (CCF ML, AP, DV in mm; see site_balls; kind
     'injection' or 'fiber', see site_kinds; zero 'surface' or 'bregma': what the DV was measured from) and a dict of what was left out."""
     sites, skipped = [], {'rat': 0, 'no coordinates': 0, 'other species': 0}
     for r in rows:
@@ -340,7 +340,8 @@ def site_balls(r, ap, ml, dv, site_angle, site_side, target, site_note, bregma, 
                   f"{', DV from ' + one_line(r.get('dv_zero')) if str(r.get('dv_zero') or '').strip() else ''})")
         balls.append((round(tip_ml, 3), round(ccf_ap, 3), round(float(ccf_dv), 3),
                       '<br>'.join([head, what, coords] + notes + side_notes),
-                      round(entry_ml, 3), round(float(top), 3), zero))
+                      round(entry_ml, 3), round(float(top), 3), zero,
+                      str(r.get('animal_id') or '').strip(), str(r.get('surgery_date') or '').strip()))
     return balls
 
 
@@ -411,6 +412,7 @@ EXTRAS_JS = r"""
   function draw() {
     var gd = document.querySelector('.plotly-graph-div');
     if (!window.Plotly || !gd || !gd._fullLayout || !gd._fullLayout.scene) return setTimeout(draw, 200);
+    if (e.viewer && window.__injectionData) installClick(gd, window.__injectionData, e.viewer);
     if (gd._context) gd._context.showTips = false;   // (no plotly tips, for pages written before the page turned them off: its hint to double-click the legend to isolate an entry is wrong here)
     var traces = [], have = {}, firstOwn = gd._fullData.length;
     gd._fullData.forEach(function (t) { have[t.name] = true; });   // (an export from the ABC browser may already have the cubes, and its own spacer)
@@ -483,6 +485,27 @@ EXTRAS_JS = r"""
                    marker: {size: 1, color: 'rgba(0,0,0,0)'}, legendrank: 4});
     }
     Plotly.addTraces(gd, traces).then(function () { makeSliceable(gd, firstOwn); groupLegend(gd, 40); fixSwatches(gd); installSliders(); });
+  }
+
+  // A click on a ball or a needle track opens the surgery viewer's page at that animal (index.html#animal=ID&date=DATE: the viewer opens its details and marks the
+  // row). The page's own balls are one mesh per kind, a fixed number of vertices for each site, in the order of the side file's sites of that kind; the tracks
+  // are three points for each. Clicking again reuses the tab that was opened.
+  function installClick(gd, data, viewer) {
+    if (!/^http:[/][/](localhost|127[.]0[.]0[.]1)(:[0-9]+)?[/]/.test(viewer)) return;
+    var perBall = data.sphere.v.length / 3, kinds = {};
+    data.groups.forEach(function (g) {
+      var sites = data.sites.filter(function (s) { return s[6] === g.kind; });
+      if (!sites.length) return;
+      kinds[g.name + ' (' + sites.length + ')'] = {sites: sites, per: perBall};
+      kinds[g.trackName] = {sites: sites, per: 3};
+    });
+    gd.on('plotly_click', function (ev) {
+      var p = ev && ev.points && ev.points[0], trace = p && gd._fullData[p.curveNumber], kind = trace && kinds[trace.name];
+      if (!kind) return;
+      var site = kind.sites[Math.floor(p.pointNumber / kind.per)];
+      if (!site || !site[8]) return;
+      window.open(viewer + '#animal=' + encodeURIComponent(site[8]) + (site[9] ? '&date=' + encodeURIComponent(site[9]) : ''), 'jhoulab-surgery-viewer');
+    });
   }
 
   // The slice sliders' drag, and the diagnostics when they are on (Settings > Troubleshooting): the same as the page's own, for pages written before them. Each
@@ -627,7 +650,7 @@ def landmark_cubes(bregma):
              'text': f"<b>lambda</b> (approximate)<br>{LAMBDA_BEHIND_BREGMA_MM:g} mm behind bregma, at bregma's height<br>CCF: AP {lam_ap:g}, DV {dv:g}, ML {ml:g} mm"}]
 
 
-def write_side_file(sites, radius, label, folder=None, bregma=None, skull=None, diagnostics=False):
+def write_side_file(sites, radius, label, folder=None, bregma=None, skull=None, diagnostics=False, viewer=None):
     """Writes the sites as a side file: a script that calls window.__injectionSites({...}), which the page's loader defines (see injection_loader.py), and
     (given `bregma`, as bregma_in_ccf gives it) draws the red cubes at bregma and lambda, and (given `skull`, a SkullSurface) the estimated skull sheet.
     Written through a temporary file, so that a page never reads half of it. A new name every time. Returns its path."""
@@ -639,11 +662,12 @@ def write_side_file(sites, radius, label, folder=None, bregma=None, skull=None, 
         n += 1
         path = folder / f"{stem}-{n}.js"
     temporary = path.with_name(path.name + '.part')
-    text = 'window.__injectionSites(' + json.dumps(side_file_data(sites, radius, label)).replace('</', '<\\/') + ');\n'
+    text = ('window.__injectionData = ' + json.dumps(side_file_data(sites, radius, label)).replace('</', '<\\/') + ';\n'
+            'window.__injectionSites(window.__injectionData);\n')
     if bregma or skull:
         tops = [[s[4], s[1], s[5]] for s in sites if len(s) > 7 and s[7] == 'surface']      # where the tracks zeroed on the skull, dura or brain surface start
         extras = {'cubes': landmark_cubes(bregma) if bregma else [], 'cubesName': 'bregma and lambda', 'skull': skull.sheet() if skull else None, 'skullColor': SKULL_SHEET_COLOR,
-                  'discs': {'points': tops, 'diameter': LANDMARK_CUBE_MM, 'thickness': SKULL_DISC_THICKNESS_MM, 'color': SKULL_DISC_COLOR,
+                  'viewer': viewer, 'discs': {'points': tops, 'diameter': LANDMARK_CUBE_MM, 'thickness': SKULL_DISC_THICKNESS_MM, 'color': SKULL_DISC_COLOR,
                             'name': 'DV from the skull or dura',
                             'text': "DV measured from the skull, dura or brain surface here, not from bregma (the estimated skull underside is used)"}}
         text += EXTRAS_JS.replace('__EXTRAS__', json.dumps(extras).replace('</', '<\\/')).replace('__SLIDER_SCRIPTS__', slice_slider_scripts.page_js(diagnostics))
@@ -658,9 +682,20 @@ def view_address(page, side_file):
     return Path(page).resolve().as_uri() + '#sites=' + urllib.parse.quote(Path(side_file).resolve().as_uri(), safe='')
 
 
-def make_view(page, surgeries, radius=DEFAULT_RADIUS_MM, upgrade=False, skull_span=SKULL_SPAN_MM):
+VIEWER_ADDRESS = re.compile(r'^http://(localhost|127\.0\.0\.1)(:\d+)?/[^\s"<>\'#?]*$')
+
+
+def viewer_address(url):
+    """`url` if it is the address of a surgery viewer on this computer (http://localhost:PORT/ ...), else None: a 3D page opens only that, never an address it was
+    handed from elsewhere."""
+    url = str(url or '').strip()
+    return url if len(url) < 200 and VIEWER_ADDRESS.match(url) else None
+
+
+def make_view(page, surgeries, radius=DEFAULT_RADIUS_MM, upgrade=False, skull_span=SKULL_SPAN_MM, viewer_url=None):
     """Write the side file for the surgery list. Returns (the address to open the page at, the lines to report); raises ValueError when there is nothing to draw or
-    the page is not a 3D page, and PageNeedsUpgrade when the page has no loader (with upgrade=True the page is upgraded first). `skull_span` (mm): see SkullSurface."""
+    the page is not a 3D page, and PageNeedsUpgrade when the page has no loader (with upgrade=True the page is upgraded first). `skull_span` (mm): see SkullSurface. `viewer_url`: where the surgery viewer's page is
+    (http://localhost:PORT/): given, a click on a ball or track in the 3D page opens the viewer at that animal."""
     page = Path(page)
     if not compressed_page.looks_like_3d_page(page):
         raise ValueError(f"{page.name} does not look like a 3D page from the ABC browser (no plotly in it).")
@@ -680,10 +715,13 @@ def make_view(page, surgeries, radius=DEFAULT_RADIUS_MM, upgrade=False, skull_sp
     if needs_upgrade:
         compressed_page.upgrade_page(page)
         report.append(f"{page.name} was changed so that it can show injection sites (it looks the same, and is stored compressed).")
+    viewer = viewer_address(viewer_url)
+    if viewer:      # (the hover text says that a click goes to the spreadsheet)
+        sites = [x[:3] + (x[3] + '<br><i>Click: show this animal in the spreadsheet</i>',) + x[4:] for x in sites]
     left_out = ', '.join(f"{n} {why}" for why, n in skipped.items() if n)
     fibers = sum(1 for s in sites if s[6] == 'fiber')
     label = f"{time.strftime('%H:%M')}, {len(sites) - fibers} injections" + (f", {fibers} fibers" if fibers else "")
-    side = write_side_file(sites, radius, label, bregma=bregma, skull=skull, diagnostics=slice_slider_scripts.diagnostics_enabled(SETTINGS_FILE))
+    side = write_side_file(sites, radius, label, bregma=bregma, skull=skull, diagnostics=slice_slider_scripts.diagnostics_enabled(SETTINGS_FILE), viewer=viewer)
     report.insert(0, f"{len(sites) - fibers} injection sites and {fibers} optic fibers written to {side.name}"
                   + (f" (left out: {left_out})" if left_out else ""))
     report.append(f"Bregma in the CCF: AP {bregma[0]:g}, DV {bregma[1]:g}, ML {bregma[2]:g} mm")
@@ -769,7 +807,7 @@ def open_in_browser(address):
         return False
 
 
-def open_window(surgeries=None):
+def open_window(surgeries=None, viewer_url=None):
     """The window. `surgeries` (a CSV path) fills in the surgery list, as the surgery viewer's Show in 3D button does;
     otherwise the newest export in Downloads or the last list used."""
     import threading
@@ -850,7 +888,7 @@ def open_window(surgeries=None):
 
         def work():
             try:
-                address, report = make_view(page, surgeries, radius=radius, upgrade=upgrade, skull_span=span)
+                address, report = make_view(page, surgeries, radius=radius, upgrade=upgrade, skull_span=span, viewer_url=viewer_url)
                 result = ('ok', address, report)
             except PageNeedsUpgrade as e:
                 result = ('upgrade', None, [str(e)])
@@ -893,17 +931,20 @@ def main(argv=None):
     if argv[0] == '--window':      # the surgery viewer: --window --surgeries LIST.csv
         w = argparse.ArgumentParser(prog='add_injections_3d.py --window')
         w.add_argument('--surgeries', help="the surgery list to fill in")
-        return open_window(w.parse_args(argv[1:]).surgeries)
+        w.add_argument('--viewer', help="the address of the surgery viewer's page (http://localhost:PORT/): a click on a ball in the 3D page opens it at that animal")
+        given = w.parse_args(argv[1:])
+        return open_window(given.surgeries, given.viewer)
     p = argparse.ArgumentParser(description="Show the surgery viewer's injection sites in an ABC browser 3D page "
                                             "(with no arguments: a window to choose the files).")
     p.add_argument('page', help="a 3D page (.html) written by the ABC atlas browser")
     p.add_argument('surgeries', help="the surgery viewer's Export CSV file")
     p.add_argument('--radius', type=float, default=DEFAULT_RADIUS_MM, help=f"ball radius in mm (default {DEFAULT_RADIUS_MM})")
     p.add_argument('--skull-span', type=float, default=SKULL_SPAN_MM, help=f"dips in the brain's top narrower than twice this (mm) are bridged when the skull's underside is estimated (default {SKULL_SPAN_MM:g})")
+    p.add_argument('--viewer', help="the address of the surgery viewer's page (http://localhost:PORT/): a click on a ball in the 3D page opens it at that animal")
     p.add_argument('--no-open', action='store_true', help="only write the side file and print the address")
     a = p.parse_args(argv)
     try:
-        address, report = make_view(a.page, a.surgeries, a.radius, upgrade=True, skull_span=a.skull_span)
+        address, report = make_view(a.page, a.surgeries, a.radius, upgrade=True, skull_span=a.skull_span, viewer_url=a.viewer)
     except ValueError as e:
         sys.exit(str(e))
     print('\n'.join(report))

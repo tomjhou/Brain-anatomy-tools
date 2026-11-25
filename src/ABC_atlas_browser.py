@@ -2337,8 +2337,8 @@ THREED_WEB_SLICE_SCRIPT = """
   // What makes a drag quick: (1) each shell's face centres are computed once; (2) an object that is not drawn (switched off in
   // the legend) is skipped, and brought up to date when it is switched on; (3) an object whose kept set did not change (the
   // plane is not crossing it) is not sent to plotly at all, since pushing a mesh to the graphics card is the slow part;
-  // (4) the shells are brought up to date on every pass along with the cells (the cells' own mesh is filtered by
-  // THREED_WEB_MESH_SCRIPT through gd.__sliceCut); while a pass is under way, slider moves are collected into one more pass.
+  // (4) while a thumb is moving only the cells (their own mesh is filtered by THREED_WEB_MESH_SCRIPT through gd.__sliceCut) and the lines follow; the
+  // shells are brought up to date when it has paused for 200 ms (sliderMoved); while a pass is under way, slider moves are collected into one more pass.
   var active = false, busy = false, pending = false, timer = 0, heavyReady = true, heavyTimer = 0;
   var cutState = {lo: [0, 0, 0], hi: [0, 0, 0]};   // (an end at the end of the whole range is no limit at all)
   function centres(t) {
@@ -2415,8 +2415,10 @@ THREED_WEB_SLICE_SCRIPT = """
   }
   function run() { timer = 0; if (!active) return; if (busy) { pending = true; return; } apply(false, heavyReady); }
   function request() { if (active && !timer) timer = setTimeout(run, 40); }
-  function sliderMoved() {   // the shells follow the slider along with the cells (one pass at a time, newest position wins)
-    heavyReady = true;
+  function sliderMoved() {   // while the thumb moves only the cells and lines follow (one pass at a time, newest position wins); the shells, which are huge
+    heavyReady = false;      // meshes, catch up when it pauses: redrawing them on every move made a fast drag lag, the thumb stalling between redraws
+    clearTimeout(heavyTimer);
+    heavyTimer = setTimeout(function () { heavyReady = true; request(); }, 200);
     request();
   }
   gd.__sliceReload = function (indices) {   // some meshes were given new geometry: take it as their original
@@ -2442,6 +2444,114 @@ THREED_WEB_SLICE_SCRIPT = """
   });
   gd.style.position = 'relative';
   gd.appendChild(box);
+  // Which renderer draws the 3D scene: the sliders are only as quick as it is, and a browser can fall back to software drawing (about ten times slower) after
+  // its graphics process has had trouble, which makes a page opened later slow although an earlier one was not. Shown under the sliders.
+  (function () {
+    if (document.querySelector('.renderer-note')) return;
+    var name = '';
+    try {
+      var canvas = document.createElement('canvas'), gl = canvas.getContext('webgl'), info = gl && gl.getExtension('WEBGL_debug_renderer_info');
+      name = gl ? String(gl.getParameter(info ? info.UNMASKED_RENDERER_WEBGL : gl.RENDERER)) : 'WebGL unavailable';
+      var lose = gl && gl.getExtension('WEBGL_lose_context');
+      if (lose) lose.loseContext();
+    } catch (err) { name = 'unknown'; }
+    var software = /swiftshader|llvmpipe|software|basic render/i.test(name);
+    var note = document.createElement('div');
+    note.className = 'renderer-note';
+    note.textContent = (software ? 'Software 3D, slow: ' : '3D drawn by: ') + name;
+    note.style.cssText = 'margin-top:6px;font:10px sans-serif;max-width:170px;word-wrap:break-word;color:' + (software ? '#e0a24f' : '#8b93a6') + ';';
+    box.appendChild(note);
+  })();
+  // The slice sliders' drag. The browser's own drag of a slider's thumb can be dropped part-way (the thumb stops following while the pointer goes on), so this takes
+  // the press itself: the pointer is captured by the slider and its value is set from the pointer's position at every move, for as long as the button is down.
+  // The page's own 'input' handlers run as before. If the thumb still falls well behind the pointer (more than 8% of the track, for over 0.6 s) or a press on a
+  // slider is taken by something else, an amber note says so under the sliders and the details are kept in window.__sliderLog (F12, Console).
+  (function () {
+    if (window.__sliderDiag) return;
+    window.__sliderDiag = true;
+    var panel = document.querySelector('.slice-box');
+    if (!panel) return;
+    window.__sliderLog = [];
+    var drag = null, line = null, THUMB = 7;   // (half the width of a thumb)
+    Array.prototype.forEach.call(panel.querySelectorAll('input.slice-dual'), function (input) { input.style.touchAction = 'none'; });
+    function describe(el) { return el ? (el.tagName + (el.className && el.className.baseVal === undefined && el.className ? '.' + String(el.className).split(' ')[0] : '')) : 'nothing'; }
+    function report(why, e) {
+      var found = {why: why, afterMs: Math.round(performance.now() - drag.t0), moves: drag.moves, inputEvents: drag.inputEvents, longestGapMs: Math.round(drag.maxGap),
+                   msSinceLastMove: Math.round(performance.now() - drag.last), buttons: e ? e.buttons : null, pointerType: drag.type,
+                   under: describe(document.elementFromPoint(drag.x, drag.y)), windowFocused: document.hasFocus(), offBy: Math.round(100 * drag.offBy) + '%'};
+      window.__sliderLog.push(found);
+      console.warn('slice slider lost the pointer', found);
+      if (!line) {
+        line = document.createElement('div');
+        line.style.cssText = 'margin-top:6px;font:10px sans-serif;max-width:170px;word-wrap:break-word;color:#e0a24f;';
+        panel.appendChild(line);
+      }
+      line.textContent = 'Slider fell behind the pointer: ' + found.why + '; page blocked at most ' + found.longestGapMs + ' ms; under the pointer: ' + found.under +
+                         '; ' + found.moves + ' moves, ' + found.inputEvents + ' slider events (' + found.pointerType + '; details: __sliderLog in the console)';
+    }
+    function valueAt(input, x, offset) {   // the slider's value for a pointer at x (the pointer keeps its place on the thumb)
+      var r = input.getBoundingClientRect(), min = +input.min, span = +input.max - min;
+      var frac = Math.min(1, Math.max(0, (x - offset - r.x - THUMB) / ((r.width - 2 * THUMB) || 1)));
+      return min + frac * span;
+    }
+    function newDrag(input, e, offset) {
+      return {t0: performance.now(), last: performance.now(), maxGap: 0, moves: 0, inputEvents: 0, input: input, type: e.pointerType, x: e.clientX, y: e.clientY,
+              offSince: 0, offBy: 0, reported: false, offset: offset || 0, id: e.pointerId};
+    }
+    document.addEventListener('pointerdown', function (e) {
+      var t = e.target;
+      if (!t || !t.classList || !t.classList.contains('slice-dual')) {
+        // a press that lands on a slider's track but is taken by something else (a cover over the slider, or the plot itself) would not move the thumb at all
+        var tracks = panel.querySelectorAll('input.slice-dual');
+        for (var q = 0; q < tracks.length; q++) {
+          var box = tracks[q].getBoundingClientRect();
+          if (box.width > 0 && e.clientX >= box.x && e.clientX <= box.right && e.clientY >= box.y - 2 && e.clientY <= box.bottom + 2 && !(t && panel.contains(t) && t !== panel)) {
+            drag = newDrag(tracks[q], e, 0);
+            report('a press on a slider was taken by ' + describe(t), e);
+            drag = null;
+            break;
+          }
+        }
+        return;
+      }
+      if (e.button !== 0) return;
+      var r = t.getBoundingClientRect(), min = +t.min, span = (+t.max - min) || 1;
+      var thumbX = r.x + THUMB + ((+t.value - min) / span) * (r.width - 2 * THUMB);
+      drag = newDrag(t, e, e.clientX - thumbX);
+      e.preventDefault();                       // (no drag by the browser: it is done here, below)
+      try { t.setPointerCapture(e.pointerId); } catch (err) { /* the document-level handlers below still follow the pointer */ }
+    }, true);
+    document.addEventListener('input', function (e) { if (drag && e.target === drag.input) drag.inputEvents++; }, true);
+    document.addEventListener('pointermove', function (e) {
+      if (!drag) return;
+      var now = performance.now();
+      drag.maxGap = Math.max(drag.maxGap, now - drag.last); drag.last = now; drag.moves++; drag.x = e.clientX; drag.y = e.clientY;
+      var want = valueAt(drag.input, e.clientX, drag.offset);
+      if (e.buttons & 1) {   // (a move with the button no longer down is ignored: the release will end the drag)
+        if (+drag.input.value !== want) {
+          drag.input.value = want;
+          drag.input.dispatchEvent(new Event('input', {bubbles: true}));
+        }
+      }
+      var span = (+drag.input.max - +drag.input.min) || 1;
+      drag.offBy = Math.abs(+drag.input.value - want) / span;
+      if (drag.offBy > 0.08) { if (!drag.offSince) drag.offSince = now; } else drag.offSince = 0;
+      if (drag.offSince && now - drag.offSince > 600 && !drag.reported) { drag.reported = true; report('thumb behind the pointer', e); }
+    }, true);
+    window.setInterval(function () {   // (the pointer may stop moving, with the thumb still behind it)
+      if (drag && drag.offSince && !drag.reported && performance.now() - drag.offSince > 600) { drag.reported = true; report('thumb behind a pointer that stopped', null); }
+    }, 200);
+    function finish(e, cancelled) {
+      if (!drag) return;
+      var input = drag.input;
+      if (cancelled) { drag.reported = true; report('pointercancel (the browser ended the press)', e); }
+      try { input.releasePointerCapture(drag.id); } catch (err) { /* it was not held */ }
+      input.dispatchEvent(new Event('change', {bubbles: true}));
+      drag = null;
+    }
+    document.addEventListener('pointerup', function (e) { finish(e, false); }, true);
+    document.addEventListener('pointercancel', function (e) { finish(e, true); }, true);
+  })();
 })();
 """
 

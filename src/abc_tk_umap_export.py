@@ -1096,7 +1096,8 @@ class ExportsMixin:
     def ask_3d_jitter(self):
         """Ask how to make the 3D page: whether to jitter the section-axis coordinate of the cells (they sit on the planes of the sections, which looks
         layered), and whether to add envelope surfaces (they make the file much bigger). (the spread in mm (0 = none), the envelopes' smoothness 1 to 6 or
-        None for no envelopes, the landmarks to mark: 'bregma' and/or 'lambda'), or None if cancelled. The last answers are the defaults."""
+        None for no envelopes, the landmarks to mark: 'bregma' and/or 'lambda', whether to add the outlines and surfaces of the regions the cells are in), or None
+        if cancelled. The last answers are the defaults."""
         import tkinter as tk
         from tkinter import ttk
         top = tk.Toplevel(self.root)
@@ -1108,6 +1109,7 @@ class ExportsMixin:
         envelopes_on = tk.BooleanVar(top, getattr(self, "envelopes_3d_on", False))
         smoothness = tk.StringVar(top, getattr(self, "envelope_smoothness_3d", "3"))
         landmarks_on = tk.BooleanVar(top, getattr(self, "landmarks_3d_on", True))
+        regions_on = tk.BooleanVar(top, getattr(self, "regions_3d_on", False))
         body = ttk.Frame(top, padding=12)
         body.pack()
         ttk.Checkbutton(body, text="Randomly jitter the section-axis (z) position of the cells", variable=on).grid(row=0, column=0, columnspan=3, sticky="w")
@@ -1130,6 +1132,11 @@ class ExportsMixin:
         ttk.Label(body, foreground="#555555", wraplength=300, justify="left",
                   text="Bregma as set in Settings; lambda about 4.2 mm behind it. Only when the cells have CCF coordinates."
                   ).grid(row=9, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        ttk.Separator(body).grid(row=10, column=0, columnspan=3, sticky="ew", pady=(10, 6))
+        ttk.Checkbutton(body, text="Add outlines and surfaces of the regions the cells are in", variable=regions_on).grid(row=11, column=0, columnspan=3, sticky="w")
+        ttk.Label(body, foreground="#555555", wraplength=300, justify="left",
+                  text="The brain, ventricles and white-matter tracts are always shown."
+                  ).grid(row=12, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
         def show_smoothness(*_):
             smooth_box.configure(state="normal" if envelopes_on.get() else "disabled")
@@ -1152,11 +1159,11 @@ class ExportsMixin:
             self.envelopes_3d_on = envelopes_on.get()
             if step is not None:
                 self.envelope_smoothness_3d = str(step)
-            self.landmarks_3d_on = landmarks_on.get()
-            result.append((mm, step, ("bregma", "lambda") if landmarks_on.get() else ()))
+            self.landmarks_3d_on, self.regions_3d_on = landmarks_on.get(), regions_on.get()
+            result.append((mm, step, ("bregma", "lambda") if landmarks_on.get() else (), regions_on.get()))
             top.destroy()
         buttons = ttk.Frame(body)
-        buttons.grid(row=10, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        buttons.grid(row=13, column=0, columnspan=3, sticky="e", pady=(10, 0))
         ttk.Button(buttons, text="Cancel", command=top.destroy).pack(side="right")
         ttk.Button(buttons, text="Open", command=ok).pack(side="right", padx=(0, 6))
         top.bind("<Return>", lambda e: ok())
@@ -1230,7 +1237,7 @@ class ExportsMixin:
         choice = self.ask_3d_jitter()
         if choice is None:
             return
-        jitter, envelope_smoothness, landmarks = choice
+        jitter, envelope_smoothness, landmarks, with_regions = choice
         self.root.config(cursor="watch")
         self.var_status.set("Preparing the 3D view...")
         self.root.update()
@@ -1247,7 +1254,8 @@ class ExportsMixin:
                 path = Path(path)
                 target = path.parent
                 self.root.config(cursor="watch")
-                edges = h["build_3d_edges"](self.abc_cache, p["structures"], self.root) if p["have_ccf"] else None
+                # (no regions asked for: none are chosen, so none are built)
+                edges = h["build_3d_edges"](self.abc_cache, p["structures"] if with_regions else None, self.root) if p["have_ccf"] else None
                 self.var_status.set("Writing the 3D page...")
                 self.root.update()
                 h["write_3d_group_html"](p["groups"], p["shell_xyz"], p["outline"], p["axis_labels"], p["title"], path, edges=edges,

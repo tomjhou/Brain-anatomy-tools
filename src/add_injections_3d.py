@@ -480,7 +480,120 @@ EXTRAS_JS = r"""
       traces.push({type: 'scatter3d', mode: 'markers', x: [null], y: [null], z: [null], name: spacer, showlegend: true, hoverinfo: 'skip',
                    marker: {size: 1, color: 'rgba(0,0,0,0)'}, legendrank: 4});
     }
-    Plotly.addTraces(gd, traces).then(function () { makeSliceable(gd, firstOwn); groupLegend(gd, 40); fixSwatches(gd); });
+    Plotly.addTraces(gd, traces).then(function () { makeSliceable(gd, firstOwn); groupLegend(gd, 40); fixSwatches(gd); showRenderer(); });
+  }
+
+  // (the same note as the page's own, for pages written before it)
+  function showRenderer() {
+  // Which renderer draws the 3D scene: the sliders are only as quick as it is, and a browser can fall back to software drawing (about ten times slower) after
+  // its graphics process has had trouble, which makes a page opened later slow although an earlier one was not. Shown under the sliders.
+  (function () {
+    var box = document.querySelector('.slice-box');
+    if (!box || document.querySelector('.renderer-note')) return;
+    var name = '';
+    try {
+      var canvas = document.createElement('canvas'), gl = canvas.getContext('webgl'), info = gl && gl.getExtension('WEBGL_debug_renderer_info');
+      name = gl ? String(gl.getParameter(info ? info.UNMASKED_RENDERER_WEBGL : gl.RENDERER)) : 'WebGL unavailable';
+      var lose = gl && gl.getExtension('WEBGL_lose_context');
+      if (lose) lose.loseContext();
+    } catch (err) { name = 'unknown'; }
+    var software = /swiftshader|llvmpipe|software|basic render/i.test(name);
+    var note = document.createElement('div');
+    note.className = 'renderer-note';
+    note.textContent = (software ? 'Software 3D, slow: ' : '3D drawn by: ') + name;
+    note.style.cssText = 'margin-top:6px;font:10px sans-serif;max-width:170px;word-wrap:break-word;color:' + (software ? '#e0a24f' : '#8b93a6') + ';';
+    box.appendChild(note);
+  })();
+  // The slice sliders' drag. The browser's own drag of a slider's thumb can be dropped part-way (the thumb stops following while the pointer goes on), so this takes
+  // the press itself: the pointer is captured by the slider and its value is set from the pointer's position at every move, for as long as the button is down.
+  // The page's own 'input' handlers run as before. If the thumb still falls well behind the pointer (more than 8% of the track, for over 0.6 s) or a press on a
+  // slider is taken by something else, an amber note says so under the sliders and the details are kept in window.__sliderLog (F12, Console).
+  (function () {
+    if (window.__sliderDiag) return;
+    window.__sliderDiag = true;
+    var panel = document.querySelector('.slice-box');
+    if (!panel) return;
+    window.__sliderLog = [];
+    var drag = null, line = null, THUMB = 7;   // (half the width of a thumb)
+    Array.prototype.forEach.call(panel.querySelectorAll('input.slice-dual'), function (input) { input.style.touchAction = 'none'; });
+    function describe(el) { return el ? (el.tagName + (el.className && el.className.baseVal === undefined && el.className ? '.' + String(el.className).split(' ')[0] : '')) : 'nothing'; }
+    function report(why, e) {
+      var found = {why: why, afterMs: Math.round(performance.now() - drag.t0), moves: drag.moves, inputEvents: drag.inputEvents, longestGapMs: Math.round(drag.maxGap),
+                   msSinceLastMove: Math.round(performance.now() - drag.last), buttons: e ? e.buttons : null, pointerType: drag.type,
+                   under: describe(document.elementFromPoint(drag.x, drag.y)), windowFocused: document.hasFocus(), offBy: Math.round(100 * drag.offBy) + '%'};
+      window.__sliderLog.push(found);
+      console.warn('slice slider lost the pointer', found);
+      if (!line) {
+        line = document.createElement('div');
+        line.style.cssText = 'margin-top:6px;font:10px sans-serif;max-width:170px;word-wrap:break-word;color:#e0a24f;';
+        panel.appendChild(line);
+      }
+      line.textContent = 'Slider fell behind the pointer: ' + found.why + '; page blocked at most ' + found.longestGapMs + ' ms; under the pointer: ' + found.under +
+                         '; ' + found.moves + ' moves, ' + found.inputEvents + ' slider events (' + found.pointerType + '; details: __sliderLog in the console)';
+    }
+    function valueAt(input, x, offset) {   // the slider's value for a pointer at x (the pointer keeps its place on the thumb)
+      var r = input.getBoundingClientRect(), min = +input.min, span = +input.max - min;
+      var frac = Math.min(1, Math.max(0, (x - offset - r.x - THUMB) / ((r.width - 2 * THUMB) || 1)));
+      return min + frac * span;
+    }
+    function newDrag(input, e, offset) {
+      return {t0: performance.now(), last: performance.now(), maxGap: 0, moves: 0, inputEvents: 0, input: input, type: e.pointerType, x: e.clientX, y: e.clientY,
+              offSince: 0, offBy: 0, reported: false, offset: offset || 0, id: e.pointerId};
+    }
+    document.addEventListener('pointerdown', function (e) {
+      var t = e.target;
+      if (!t || !t.classList || !t.classList.contains('slice-dual')) {
+        // a press that lands on a slider's track but is taken by something else (a cover over the slider, or the plot itself) would not move the thumb at all
+        var tracks = panel.querySelectorAll('input.slice-dual');
+        for (var q = 0; q < tracks.length; q++) {
+          var box = tracks[q].getBoundingClientRect();
+          if (box.width > 0 && e.clientX >= box.x && e.clientX <= box.right && e.clientY >= box.y - 2 && e.clientY <= box.bottom + 2 && !(t && panel.contains(t) && t !== panel)) {
+            drag = newDrag(tracks[q], e, 0);
+            report('a press on a slider was taken by ' + describe(t), e);
+            drag = null;
+            break;
+          }
+        }
+        return;
+      }
+      if (e.button !== 0) return;
+      var r = t.getBoundingClientRect(), min = +t.min, span = (+t.max - min) || 1;
+      var thumbX = r.x + THUMB + ((+t.value - min) / span) * (r.width - 2 * THUMB);
+      drag = newDrag(t, e, e.clientX - thumbX);
+      e.preventDefault();                       // (no drag by the browser: it is done here, below)
+      try { t.setPointerCapture(e.pointerId); } catch (err) { /* the document-level handlers below still follow the pointer */ }
+    }, true);
+    document.addEventListener('input', function (e) { if (drag && e.target === drag.input) drag.inputEvents++; }, true);
+    document.addEventListener('pointermove', function (e) {
+      if (!drag) return;
+      var now = performance.now();
+      drag.maxGap = Math.max(drag.maxGap, now - drag.last); drag.last = now; drag.moves++; drag.x = e.clientX; drag.y = e.clientY;
+      var want = valueAt(drag.input, e.clientX, drag.offset);
+      if (e.buttons & 1) {   // (a move with the button no longer down is ignored: the release will end the drag)
+        if (+drag.input.value !== want) {
+          drag.input.value = want;
+          drag.input.dispatchEvent(new Event('input', {bubbles: true}));
+        }
+      }
+      var span = (+drag.input.max - +drag.input.min) || 1;
+      drag.offBy = Math.abs(+drag.input.value - want) / span;
+      if (drag.offBy > 0.08) { if (!drag.offSince) drag.offSince = now; } else drag.offSince = 0;
+      if (drag.offSince && now - drag.offSince > 600 && !drag.reported) { drag.reported = true; report('thumb behind the pointer', e); }
+    }, true);
+    window.setInterval(function () {   // (the pointer may stop moving, with the thumb still behind it)
+      if (drag && drag.offSince && !drag.reported && performance.now() - drag.offSince > 600) { drag.reported = true; report('thumb behind a pointer that stopped', null); }
+    }, 200);
+    function finish(e, cancelled) {
+      if (!drag) return;
+      var input = drag.input;
+      if (cancelled) { drag.reported = true; report('pointercancel (the browser ended the press)', e); }
+      try { input.releasePointerCapture(drag.id); } catch (err) { /* it was not held */ }
+      input.dispatchEvent(new Event('change', {bubbles: true}));
+      drag = null;
+    }
+    document.addEventListener('pointerup', function (e) { finish(e, false); }, true);
+    document.addEventListener('pointercancel', function (e) { finish(e, true); }, true);
+  })();
   }
 
   // Pages written before the page's own legend script cleared it can leave an entry without its icon: plotly re-uses a legend row for another entry when the
@@ -495,8 +608,10 @@ EXTRAS_JS = r"""
         if (layers && layers.style.display === 'none') layers.style.removeProperty('display');
       });
     }
-    gd.on('plotly_afterplot', function () { setTimeout(fix, 0); });
-    gd.on('plotly_restyle', function () { setTimeout(fix, 30); });
+    var waiting = 0;   // (one check after a burst of redraws, not one for each)
+    function soon() { clearTimeout(waiting); waiting = setTimeout(fix, 60); }
+    gd.on('plotly_afterplot', soon);
+    gd.on('plotly_restyle', soon);
     setTimeout(fix, 300);
   }
 
@@ -528,9 +643,23 @@ EXTRAS_JS = r"""
     var mine = /^(injection sites|optic fibers|needle tracks|fiber tracks|DV from the skull|bregma|lambda|estimated skull)/;
     var known = {};
     var previous = gd.__rebuildCells;
-    gd.__rebuildCells = function () { if (previous) previous(); try { cutExtras(); } catch (err) { /* the page's own cut still works */ } };
+    // The page calls this after every slider move, and does not wait for what it starts, and each update of the plot costs about as much as one of the page's
+    // own (a fraction of a second with the brain's shells). So the cut here waits until the slider has paused for a moment (during a fast drag only the page's own
+    // objects follow; these catch up when the thumb slows or stops), is done one pass at a time, and takes at most two updates of the plot per pass, one for all
+    // the meshes and one for all the lines.
+    var working = false, again = false, timer = 0;
+    gd.__rebuildCells = function () { if (previous) previous(); clearTimeout(timer); timer = setTimeout(schedule, 150); };
+    function schedule() {
+      if (working) { again = true; return; }
+      working = true;
+      var jobs = [];
+      try { jobs = cutExtras(); } catch (err) { /* the page's own cut still works */ }
+      function done() { working = false; if (again) { again = false; schedule(); } }
+      Promise.all(jobs).then(done, done);
+    }
     function cutExtras() {
       var cut = gd.__sliceCut;
+      var meshes = {i: [], j: [], k: []}, meshIds = [], lines = {x: [], y: [], z: [], text: []}, lineIds = [];
       gd._fullData.forEach(function (t, index) {
         if (!mine.test(t.name || '') || (t.type !== 'mesh3d' && t.type !== 'scatter3d')) return;
         if (index < firstOwn && /^(bregma|lambda|estimated skull)/.test(t.name)) return;   // (the page's own: its slice script cuts those)
@@ -540,11 +669,12 @@ EXTRAS_JS = r"""
                               text: t.text && t.type === 'scatter3d' ? Array.from(t.text) : null};
           if (r.mesh) { r.i = Int32Array.from(t.i); r.j = Int32Array.from(t.j); r.k = Int32Array.from(t.k); }
         }
+        function putMesh(ni, nj, nk) { meshes.i.push(ni); meshes.j.push(nj); meshes.k.push(nk); meshIds.push(index); }
+        function putLine(nx, ny, nz, nt) { lines.x.push(nx); lines.y.push(ny); lines.z.push(nz); lines.text.push(nt); lineIds.push(index); }
         if (!cut) {   // the checkbox is off: put back what was cut
           if (!r.modified) return;
           r.modified = false; r.last = -1;
-          if (r.mesh) Plotly.restyle(gd, {i: [r.i], j: [r.j], k: [r.k]}, [index]);
-          else Plotly.restyle(gd, {x: [r.x], y: [r.y], z: [r.z], text: [r.text]}, [index]);
+          if (r.mesh) putMesh(r.i, r.j, r.k); else putLine(r.x, r.y, r.z, r.text);
           return;
         }
         if (t.visible !== true) { r.last = -1; return; }   // not drawn: brought up to date when it is switched on
@@ -562,7 +692,7 @@ EXTRAS_JS = r"""
           r.last = keep.length; r.modified = true;
           var ni = new Int32Array(keep.length), nj = new Int32Array(keep.length), nk = new Int32Array(keep.length);
           for (var m = 0; m < keep.length; m++) { ni[m] = r.i[keep[m]]; nj[m] = r.j[keep[m]]; nk[m] = r.k[keep[m]]; }
-          Plotly.restyle(gd, {i: [ni], j: [nj], k: [nk]}, [index]);
+          putMesh(ni, nj, nk);
         } else {
           var nx = [], ny = [], nz = [], nt = r.text ? [] : null, out = 0;
           for (var q = 0; q < r.x.length; q++) {
@@ -575,9 +705,13 @@ EXTRAS_JS = r"""
           if (out === 0 && !r.modified) { r.last = 0; return; }
           if (out === r.last) return;
           r.last = out; r.modified = true;
-          Plotly.restyle(gd, {x: [nx], y: [ny], z: [nz], text: [nt]}, [index]);
+          putLine(nx, ny, nz, nt);
         }
       });
+      var jobs = [];
+      if (meshIds.length) jobs.push(Plotly.restyle(gd, meshes, meshIds));
+      if (lineIds.length) jobs.push(Plotly.restyle(gd, lines, lineIds));
+      return jobs;
     }
   }
   draw();

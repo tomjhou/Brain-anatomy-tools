@@ -649,6 +649,7 @@ EXTRAS_JS = r"""
   // 'TAB:ROW' keys, site[10]) and which to mark (highlight: the row under the pointer); only those balls and tracks are drawn, and the marked ones again, larger
   // and yellow. A click on a ball asks the viewer to open its row (event 'open'); 'ready' says the page can take messages, 'shown' how many sites are drawn.
   function panelPeer() {
+    if (/[#&]solo=1/.test(location.hash)) return null;   // (the panel's 📌 copy: on its own, as opened from the injection window)
     try { if (window.parent !== window && window.parent.location.origin === location.origin) return window.parent; } catch (err) { /* another site's frame */ }
     try { if (window.opener && window.opener.location.origin === location.origin) return window.opener; } catch (err) { /* opened from another site */ }
     return null;

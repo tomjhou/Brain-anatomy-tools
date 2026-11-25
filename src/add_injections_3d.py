@@ -9,7 +9,7 @@ go in a small side file (injections-DATE-TIME.js in Brain-anatomy-tools/tmp/inje
 in a NEW browser tab with the side file named after a # in its address. The page reads it as it opens (see injection_loader.py), so each export gets its own tab
 that keeps what it was opened with, a refresh included, and the tabs can be compared; close the ones you do not want. Two more legend entries come with it:
 "injection sites", the balls, and "needle tracks", a white line from where each DV was measured from (the brain surface, or bregma's height) down to its ball,
-at the injection angle. Optic fibers (see site_kinds) are drawn in blue, with a smaller ball and a thicker rod, as "optic fibers" and "fiber tracks".
+at the injection angle. Optic fibers (see site_kinds) are drawn in blue, with a smaller ball and a rod that is a tube half as thick as that ball, as "optic fibers" and "fiber tracks".
 Hovering any of them shows the animal, target, substance and coordinates. Opened without the # part, the page shows no sites.
 A page written before it carried the loader is upgraded once, in place (it looks the same, and is stored compressed); see compressed_page.py.
 
@@ -62,7 +62,8 @@ BALL_COLOR = '#ffffff'
 TRACK_WIDTH_PX = 3
 FIBER_COLOR = '#3d8bff'      # optic fibers: blue, a smaller ball, a thicker rod
 FIBER_RADIUS_SCALE = 0.5
-FIBER_WIDTH_PX = 5
+FIBER_WIDTH_PX = 5           # (the rod as the page's loader first draws it: a line; the side file then makes it a tube, see FIBER_TUBE_SCALE)
+FIBER_TUBE_SCALE = 0.5       # the fiber's rod: a tube (a real size, so it grows when zoomed in) half as thick as the fiber's ball
 SIDE_FOLDER = SRC.parent / 'tmp' / 'injection_sites'      # (git ignores tmp/)
 KEEP_SIDE_FILES = 30
 
@@ -389,7 +390,7 @@ def side_file_data(sites, radius, label):
                 {'kind': 'injection', 'name': "injection sites", 'trackName': "needle tracks", 'color': BALL_COLOR,
                  'radius': radius, 'width': TRACK_WIDTH_PX},
                 {'kind': 'fiber', 'name': "optic fibers", 'trackName': "fiber tracks", 'color': FIBER_COLOR,
-                 'radius': radius * FIBER_RADIUS_SCALE, 'width': FIBER_WIDTH_PX}],
+                 'radius': radius * FIBER_RADIUS_SCALE, 'width': FIBER_WIDTH_PX, 'tube': radius * FIBER_RADIUS_SCALE * FIBER_TUBE_SCALE}],
             'sphere': {'v': verts.ravel().tolist(), 'f': faces.ravel().tolist()}}
 
 
@@ -573,8 +574,64 @@ EXTRAS_JS = r"""
       var ratio = sc.glplot.getAspectratio ? sc.glplot.getAspectratio() : scene.aspectratio;   // (as drawn)
       update['scene.aspectratio'] = {x: ratio.x, y: ratio.y, z: ratio.z};
       if (sc.getCamera) update['scene.camera'] = sc.getCamera();   // (where the view is now: it may have been turned already)
-      try { Plotly.relayout(gd, update).then(done, done); } catch (err) { done(); }
+      var tubes = tubeUpdate(gd);   // (in the same redraw)
+      try {
+        (tubes ? Plotly.update(gd, tubes.update, update, tubes.ids) : Plotly.relayout(gd, update)).then(function () {
+          if (tubes && gd.__extrasForget) gd.__extrasForget(tubes.ids);   // (the slice cut works on the tubes from now on)
+          done();
+        }, done);
+      } catch (err) { done(); }
     }
+  }
+
+  // Optic fibers' rods as tubes of a real thickness (the group's 'tube' radius, mm), not lines a fixed number of pixels wide: the page's loader draws every
+  // track as a line, and the fiber tracks are made tubes here. A tube is TUBE_SIDES faces round, from where the DV was zeroed down to the ball, closed at both
+  // ends: TUBE_VERTS vertices for each site, in the order of the sites (so a click finds its site).
+  var TUBE_SIDES = 12, TUBE_VERTS = 2 * TUBE_SIDES + 2;
+  function tubeMesh(sites, r) {
+    var m = {x: [], y: [], z: [], i: [], j: [], k: [], text: []};
+    sites.forEach(function (s, n) {
+      var a = [s[4], s[1], s[5]], b = [s[0], s[1], s[2]], d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+      var len = Math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) || 1;
+      d = [d[0] / len, d[1] / len, d[2] / len];
+      var h = Math.abs(d[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];   // (any direction not along the tube)
+      var u = [d[1] * h[2] - d[2] * h[1], d[2] * h[0] - d[0] * h[2], d[0] * h[1] - d[1] * h[0]], ul = Math.sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+      u = [u[0] / ul, u[1] / ul, u[2] / ul];
+      var v = [d[1] * u[2] - d[2] * u[1], d[2] * u[0] - d[0] * u[2], d[0] * u[1] - d[1] * u[0]];
+      var base = n * TUBE_VERTS;
+      [a, b].forEach(function (end) {
+        for (var q = 0; q < TUBE_SIDES; q++) {
+          var t = 2 * Math.PI * q / TUBE_SIDES, c = Math.cos(t) * r, sn = Math.sin(t) * r;
+          m.x.push(end[0] + c * u[0] + sn * v[0]); m.y.push(end[1] + c * u[1] + sn * v[1]); m.z.push(end[2] + c * u[2] + sn * v[2]); m.text.push(s[3]);
+        }
+      });
+      m.x.push(a[0], b[0]); m.y.push(a[1], b[1]); m.z.push(a[2], b[2]); m.text.push(s[3], s[3]);   // (the ends' centres)
+      var top = base + 2 * TUBE_SIDES, bottom = top + 1;
+      for (var q = 0; q < TUBE_SIDES; q++) {
+        var p0 = base + q, p1 = base + (q + 1) % TUBE_SIDES, q0 = p0 + TUBE_SIDES, q1 = p1 + TUBE_SIDES;
+        m.i.push(p0, p1, top, bottom); m.j.push(q0, q1, p1, q0); m.k.push(p1, q0, p0, q1);
+      }
+    });
+    return m;
+  }
+
+  // The restyle that makes the loader's fiber lines tubes: {update, ids}, or null when there is nothing to change.
+  function tubeUpdate(gd) {
+    var data = window.__injectionData;
+    if (!data) return null;
+    var u = {type: [], x: [], y: [], z: [], i: [], j: [], k: [], text: [], color: [], opacity: [], flatshading: [], lighting: [], hoverinfo: []}, ids = [];
+    data.groups.forEach(function (g) {
+      if (!g.tube) return;
+      var index = -1;
+      gd._fullData.forEach(function (t, n) { if (t.name === g.trackName && t.type === 'scatter3d') index = n; });
+      if (index < 0) return;
+      var m = tubeMesh(data.sites.filter(function (s) { return s[6] === g.kind; }), g.tube);
+      ['x', 'y', 'z', 'i', 'j', 'k', 'text'].forEach(function (a) { u[a].push(m[a]); });
+      u.type.push('mesh3d'); u.color.push(g.color); u.opacity.push(1); u.flatshading.push(false); u.hoverinfo.push('text');
+      u.lighting.push({ambient: 0.55, diffuse: 0.8, specular: 0.3, roughness: 0.5});
+      ids.push(index);
+    });
+    return ids.length ? {update: u, ids: ids} : null;
   }
 
   // The surgery viewer's 3D panel (the page in a frame of the viewer, or in a window it opened, from the viewer's own server): the page talks with it by
@@ -595,7 +652,7 @@ EXTRAS_JS = r"""
       var mesh = -1, line = -1;
       gd._fullData.forEach(function (t, index) {
         if (t.type === 'mesh3d' && (t.name || '').indexOf(g.name + ' (') === 0) mesh = index;
-        if (t.type === 'scatter3d' && t.name === g.trackName) line = index;
+        if (t.name === g.trackName && (t.type === 'scatter3d' || t.type === 'mesh3d')) line = index;   // (a line, or a tube: tubeUpdate)
       });
       if (mesh < 0 || line < 0) missing = true;
       groups.push({g: g, all: all, shown: all, mesh: mesh, line: line});
@@ -642,9 +699,15 @@ EXTRAS_JS = r"""
         ids.push(G.mesh);
       });
       groups.forEach(function (G) {
-        var t = tracks(G.shown);
-        ['x', 'y', 'z', 'text'].forEach(function (a) { u[a].push(t[a]); });
-        ['i', 'j', 'k', 'name'].forEach(function (a) { u[a].push(undefined); });
+        if (G.g.tube) {   // (the fibers' rods are tubes: meshes)
+          var m = tubeMesh(G.shown, G.g.tube);
+          ['x', 'y', 'z', 'text', 'i', 'j', 'k'].forEach(function (a) { u[a].push(m[a]); });
+        } else {
+          var t = tracks(G.shown);
+          ['x', 'y', 'z', 'text'].forEach(function (a) { u[a].push(t[a]); });
+          ['i', 'j', 'k'].forEach(function (a) { u[a].push(undefined); });
+        }
+        u.name.push(undefined);
         ids.push(G.line);
       });
       setTimeout(function () {   // (a moment for the hourglass to show first)
@@ -674,7 +737,7 @@ EXTRAS_JS = r"""
       var p = ev && ev.points && ev.points[0];
       if (!p) return;
       groups.forEach(function (G) {
-        var site = p.curveNumber === G.mesh ? G.shown[Math.floor(p.pointNumber / per)] : p.curveNumber === G.line ? G.shown[Math.floor(p.pointNumber / 3)] : null;
+        var site = p.curveNumber === G.mesh ? G.shown[Math.floor(p.pointNumber / per)] : p.curveNumber === G.line ? G.shown[Math.floor(p.pointNumber / (G.g.tube ? TUBE_VERTS : 3))] : null;
         if (site) peer.postMessage({type: 'jhoulab-3d', event: 'open', key: site[10], animal: site[8], date: site[9]}, location.origin);
       });
     });
@@ -699,7 +762,7 @@ EXTRAS_JS = r"""
       var sites = data.sites.filter(function (s) { return s[6] === g.kind; });
       if (!sites.length) return;
       kinds[g.name + ' (' + sites.length + ')'] = {sites: sites, per: perBall};
-      kinds[g.trackName] = {sites: sites, per: 3};
+      kinds[g.trackName] = {sites: sites, per: g.tube ? TUBE_VERTS : 3};   // (a tube's vertices, or a line's three points)
     });
     gd.on('plotly_click', function (ev) {
       var p = ev && ev.points && ev.points[0], trace = p && gd._fullData[p.curveNumber], kind = trace && kinds[trace.name];

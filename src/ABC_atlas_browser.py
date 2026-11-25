@@ -2781,6 +2781,23 @@ THREED_WEB_SLIDER_ROW_PX = 36   # height of one slider row at the bottom of the 
 # 0.5 x 0.2 = 10%); Cell opacity sets the cells' traces and also scales the cell groups' envelope surfaces, which have
 # their own Envelope opacity slider (up to 100%) and two sliders, cells inside and smoothness, that swap in another
 # precomputed surface. Changes are batched (at most one redraw every few dozen ms).
+THREED_WEB_HOVER_SCRIPT = """
+(function () {
+  var gd = document.getElementById('{plot_id}');
+  var lines = __LINES__, perCell = __PER_CELL__, width = __WIDTH__;
+  var raw = atob('__CODES__'), bytes = new Uint8Array(raw.length);
+  for (var q = 0; q < raw.length; q++) bytes[q] = raw.charCodeAt(q);
+  var codes = width === 2 ? new Uint16Array(bytes.buffer) : new Uint32Array(bytes.buffer);
+  var text = new Array(codes.length * perCell);
+  for (var c = 0; c < codes.length; c++) {
+    var line = lines[codes[c]], start = c * perCell;
+    for (var v = 0; v < perCell; v++) text[start + v] = line;
+  }
+  Plotly.restyle(gd, {text: [text]}, [__MESH_INDEX__]);
+})();
+"""
+
+
 THREED_WEB_OPACITY_SCRIPT = """
 (function () {
   var gd = document.getElementById('{plot_id}');
@@ -2843,14 +2860,29 @@ THREED_WEB_OPACITY_SCRIPT = """
   // or a surface is swapped. The Slice cut, if on, takes the re-listed mesh as its own starting point (gd.__sliceReload).
   var shapes = [], offsets = [], shown = env ? env.colors.map(function () { return false; }) : [];
   var merged = null, sortTimer = 0;
+  function words(text, bytes, signed) {   // base64 text to the numbers it holds (little-endian 16- or 32-bit)
+    var raw = atob(text), buffer = new Uint8Array(raw.length);
+    for (var q = 0; q < raw.length; q++) buffer[q] = raw.charCodeAt(q);
+    if (bytes === 2) return signed ? new Int16Array(buffer.buffer) : new Uint16Array(buffer.buffer);
+    return signed ? new Int32Array(buffer.buffer) : new Uint32Array(buffer.buffer);
+  }
+  function unpack(mesh) {   // a surface as the page stores it (see pack_envelope_mesh): vertices in hundredths of a mm, triangles as indices; read once
+    if (mesh.shape) return mesh.shape;
+    var coords = words(mesh.v, mesh.vw, true), corners = words(mesh.f, mesh.fw, false), n = mesh.n, m = corners.length / 3;
+    var shape = {x: new Float64Array(n), y: new Float64Array(n), z: new Float64Array(n), i: new Int32Array(m), j: new Int32Array(m), k: new Int32Array(m)};
+    for (var v = 0; v < n; v++) { shape.x[v] = coords[3 * v] / 100; shape.y[v] = coords[3 * v + 1] / 100; shape.z[v] = coords[3 * v + 2] / 100; }
+    for (var f = 0; f < m; f++) { shape.i[f] = corners[3 * f]; shape.j[f] = corners[3 * f + 1]; shape.k[f] = corners[3 * f + 2]; }
+    mesh.shape = shape;
+    return shape;
+  }
   function loadShapes() {   // every envelope's surface at the chosen coverage and smoothness, merged into one set of vertices
     var x = [], y = [], z = [], color = [];
     offsets = [];
     shapes = env.levels.map(function (rows, g) {
-      var row = rows[Math.min(state.smooth, rows.length - 1)], mesh = row[Math.min(state.coverage, row.length - 1)];
+      var row = rows[Math.min(state.smooth, rows.length - 1)], mesh = unpack(row[Math.min(state.coverage, row.length - 1)]);
       offsets.push(x.length);
       for (var v = 0; v < mesh.x.length; v++) { x.push(mesh.x[v]); y.push(mesh.y[v]); z.push(mesh.z[v]); color.push(env.colors[g]); }
-      return {x: mesh.x, y: mesh.y, z: mesh.z, i: Int32Array.from(mesh.i), j: Int32Array.from(mesh.j), k: Int32Array.from(mesh.k)};
+      return mesh;
     });
     merged = {x: x, y: y, z: z, color: color};
   }
@@ -3214,13 +3246,27 @@ THREED_ENVELOPE_MIN_CELLS = 30         # a group with fewer cells has no meaning
 THREED_ENVELOPE_COVERAGES = (0.80, 0.88, 0.92, 0.95, 0.97, 0.99)   # shares of the cells inside, ascending (tightest first)
 THREED_ENVELOPE_SMOOTHNESS = (0.4, 0.5, 0.6, 0.7, 1.0, 1.5)                 # blur widths, roughest first
 THREED_ENVELOPE_DEFAULT_COVERAGE = 3   # (95%) indexes of the starting positions of the page's two sliders
-THREED_ENVELOPE_DEFAULT_SMOOTHNESS = 1
+THREED_ENVELOPE_DEFAULT_SMOOTH_STEP = 3   # the export dialog's smoothness, 1 (roughest) to 6, where it starts; one is built (the page has no smoothness slider)
 THREED_ENVELOPE_OPACITY = 1.0          # where the page's envelope opacity slider starts (it goes up to 100%)
 
 
-def group_envelope_meshes(points):
-    """Surfaces enveloping a group of cells, for every smoothness and coverage of the settings above: a list over
-    smoothness of lists over coverage of (vertices (n, 3) float32 in the points' own axis order, faces (m, 3) int32), or
+def pack_envelope_mesh(vertices, faces):
+    """A surface in the small form the page reads (see loadShapes in THREED_WEB_OPACITY_SCRIPT): vertices in hundredths of a mm (the CCF's own 10 um
+    grid) as 16-bit integers (32-bit if they will not fit), triangles as 16-bit indices (32-bit past 65,535 vertices), both as base64: about a quarter of
+    the size of the same numbers as text."""
+    import base64
+    scaled = np.round(np.asarray(vertices, dtype=np.float64) * 100)
+    wide = bool(len(scaled)) and float(np.abs(scaled).max()) >= 32000
+    narrow_faces = len(vertices) < 65536
+    return {'n': int(len(vertices)),
+            'v': base64.b64encode(scaled.astype('<i4' if wide else '<i2').tobytes()).decode('ascii'), 'vw': 4 if wide else 2,
+            'f': base64.b64encode(np.asarray(faces).astype('<u2' if narrow_faces else '<u4').ravel().tobytes()).decode('ascii'),
+            'fw': 2 if narrow_faces else 4}
+
+
+def group_envelope_meshes(points, smoothness=None):
+    """Surfaces enveloping a group of cells, for every coverage of the settings above, and for every smoothness (or only for the blur
+    width `smoothness`, if given): a list over smoothness of lists over coverage of (vertices (n, 3) float32 in the points' own axis order, faces (m, 3) int32), or
     None when there is not enough to wrap. Each is an iso-surface of the cells' smoothed density, drawn at the level that
     keeps that share of the cells inside (so it hugs the cloud and ignores stragglers, unlike a convex hull, which a few
     outliers would stretch). A surface that cannot be made repeats a neighbour; the convex hull (a single surface)
@@ -3242,7 +3288,7 @@ def group_envelope_meshes(points):
     grid = []
     try:
         from skimage import measure
-        for sigma in THREED_ENVELOPE_SMOOTHNESS:
+        for sigma in (THREED_ENVELOPE_SMOOTHNESS if smoothness is None else (smoothness,)):
             density = ndimage.gaussian_filter(counts, sigma)
             row = []
             for share in THREED_ENVELOPE_COVERAGES:
@@ -3565,10 +3611,11 @@ def open_3d_group_view(groups, shell_xyz, outline, axis_labels, title, invert_z=
 
 
 def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, invert_z=True,
-                        max_points=THREED_WEB_MAX_POINTS, edges=None):
+                        max_points=THREED_WEB_MAX_POINTS, edges=None, envelope_smoothness=None):
     """The same view as open_3d_group_view as one self-contained interactive HTML file (plotly, WebGL), written to
     `path`: true depth handling, smooth with hundreds of thousands of points, hover text per cell where a group
-    gives 'hover' strings, and the legend toggles each group. Raises ImportError if plotly is not installed."""
+    gives 'hover' strings, and the legend toggles each group. `envelope_smoothness` (1 to 6, or None for none) adds a surface around each of the biggest
+    groups, at that smoothness: they add a good deal to the file. Raises ImportError if plotly is not installed."""
     import plotly.graph_objects as go
     from matplotlib.colors import to_hex
     rng = np.random.default_rng(0)
@@ -3666,7 +3713,8 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
     # An envelope surface for each of the biggest cell groups, in the legend like the other surfaces but off until its
     # entry is clicked (not part of the Background radio group, so switching that never shows or hides them).
     import re
-    by_size = sorted(range(len(cleaned)), key=lambda i: -len(cleaned[i][0]))[:THREED_ENVELOPE_MAX_GROUPS]
+    by_size = sorted(range(len(cleaned)), key=lambda i: -len(cleaned[i][0]))[:THREED_ENVELOPE_MAX_GROUPS] if envelope_smoothness else []
+    envelope_sigma = THREED_ENVELOPE_SMOOTHNESS[min(max(int(envelope_smoothness or 1), 1), len(THREED_ENVELOPE_SMOOTHNESS)) - 1]
     def add_legend_spacer(count):
         """An empty legend row (an invisible stand-in trace with a blank name; the page hides it): one line of space between
         the legend's groups, which plotly has no way to ask for. `count` makes each spacer's name different."""
@@ -3676,10 +3724,10 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
     envelope_levels, envelope_colors, envelope_names = [], [], []   # per envelope: its [smoothness][coverage] surfaces etc.
     envelope_pieces = []   # the default surfaces, merged below into ONE mesh
     for group_index in sorted(by_size):
-        levels = group_envelope_meshes(cleaned[group_index][0])
+        levels = group_envelope_meshes(cleaned[group_index][0], envelope_sigma)
         if levels is None:
             continue
-        smooth_row = levels[min(THREED_ENVELOPE_DEFAULT_SMOOTHNESS, len(levels) - 1)]
+        smooth_row = levels[0]
         envelope_pieces.append(smooth_row[min(THREED_ENVELOPE_DEFAULT_COVERAGE, len(smooth_row) - 1)])
         try:
             envelope_color = to_hex(groups[group_index]['color'])
@@ -3687,9 +3735,7 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
             envelope_color = '#ff0000'
         envelope_colors.append([int(envelope_color[n:n + 2], 16) for n in (1, 3, 5)])
         envelope_names.append(re.sub(r'\s*\([\d,]+\)\s*$', '', str(groups[group_index]['label'])) + ' envelope')
-        envelope_levels.append([[{'x': np.round(v[:, 0], 2).tolist(), 'y': np.round(v[:, 1], 2).tolist(),
-                                  'z': np.round(v[:, 2], 2).tolist(), 'i': f[:, 0].tolist(), 'j': f[:, 1].tolist(),
-                                  'k': f[:, 2].tolist()} for v, f in row] for row in levels])
+        envelope_levels.append([[pack_envelope_mesh(v, f) for v, f in row] for row in levels])
     envelope_mesh = None       # trace index of the merged mesh; its triangles are listed by THREED_WEB_OPACITY_SCRIPT
     envelope_stand_ins = []    # trace indices of the legend entries (empty stand-in traces, the page script drives them)
     if envelope_pieces:
@@ -3700,9 +3746,9 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
         offsets = np.cumsum([0] + [len(v) for v, _f in envelope_pieces])[:-1]
         envelope_mesh = len(figure.data)
         figure.add_trace(go.Mesh3d(
-            x=np.round(np.concatenate([v[:, 0] for v, _f in envelope_pieces]), 2),
-            y=np.round(np.concatenate([v[:, 1] for v, _f in envelope_pieces]), 2),
-            z=np.round(np.concatenate([v[:, 2] for v, _f in envelope_pieces]), 2),
+            x=np.round(np.concatenate([v[:, 0] for v, _f in envelope_pieces]).astype(np.float64), 2),
+            y=np.round(np.concatenate([v[:, 1] for v, _f in envelope_pieces]).astype(np.float64), 2),
+            z=np.round(np.concatenate([v[:, 2] for v, _f in envelope_pieces]).astype(np.float64), 2),
             i=np.zeros(0, dtype=np.int32), j=np.zeros(0, dtype=np.int32), k=np.zeros(0, dtype=np.int32),
             vertexcolor=np.concatenate([np.tile(color, (len(v), 1)) for (v, _f), color in
                                         zip(envelope_pieces, envelope_colors)]).astype(int),
@@ -3757,21 +3803,32 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
             name=group['label'],
             text=None if text is None else list(text), hoverinfo='name+text' if text is not None else 'name'))
     post_script = None
+    hover_script = None
     if mesh_groups:
         # One mesh for every group (see THREED_WEB_MESH_SCRIPT for why); a group's colour rides on a per-vertex
         # intensity through a stepped colour scale, so the spheres stay flat-coloured and lit.
-        pieces, vertex_starts, vertex_total = [], [], 0
+        pieces, vertex_starts, vertex_total, cell_texts = [], [], 0, []
         for group_index, (label, color, points, text) in enumerate(mesh_groups):
             xs, ys, zs, face_i, face_j, face_k = sphere_mesh_at(points, sphere_radius, unit_vertices, unit_faces)
             vertex_starts.append(vertex_total)
+            short_label = re.sub(r'\s*\([\d,]+\)\s*$', '', str(label))      # (no count: that is in the legend)
             if text is not None:
-                hover_text = np.char.add(label + '<br>', np.asarray(text, dtype=str)).astype(object)
+                hover_text = np.char.add(short_label + ', ', np.asarray(text, dtype=str)).astype(object)
             else:
-                hover_text = np.full(len(points), label, dtype=object)
+                hover_text = np.full(len(points), short_label, dtype=object)
+            cell_texts.append(hover_text)
             pieces.append((xs, ys, zs, face_i + vertex_total, face_j + vertex_total, face_k + vertex_total,
-                           np.full(len(xs), group_index, dtype=np.int8),
-                           np.repeat(hover_text, len(unit_vertices))))
+                           np.full(len(xs), group_index, dtype=np.int8)))
             vertex_total += len(xs)
+        # The hover text of a mesh is one string per vertex, so a cell's would be written once for each of the sphere's vertices. Instead the page
+        # gets each different line once, and a number per cell; THREED_WEB_HOVER_SCRIPT writes the text out for the vertices when the page opens.
+        import base64
+        line_table, line_codes = np.unique(np.concatenate(cell_texts).astype(str), return_inverse=True)
+        code_type = '<u2' if len(line_table) < 65536 else '<u4'
+        hover_script = (THREED_WEB_HOVER_SCRIPT.replace('__MESH_INDEX__', str(len(figure.data)))
+                        .replace('__PER_CELL__', str(len(unit_vertices))).replace('__WIDTH__', str(2 if code_type == '<u2' else 4))
+                        .replace('__LINES__', json.dumps(line_table.tolist()))
+                        .replace('__CODES__', base64.b64encode(line_codes.astype(code_type).tobytes()).decode('ascii')))
         n_groups = len(mesh_groups)
         colorscale = []
         for group_index, (_label, color, _points, _text) in enumerate(mesh_groups):
@@ -3784,7 +3841,7 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
             intensity=np.concatenate([p[6] for p in pieces]), intensitymode='vertex', colorscale=colorscale,
             cmin=-0.5, cmax=n_groups - 0.5, showscale=False, opacity=1.0, flatshading=False,
             lighting=dict(ambient=0.45, diffuse=0.9, specular=0.35, roughness=0.5, fresnel=0.15),
-            name='cells', showlegend=False, text=list(np.concatenate([p[7] for p in pieces])), hoverinfo='text'))
+            name='cells', showlegend=False, hoverinfo='text'))
         group_traces.append(mesh_index)
         legend_indices = []
         for label, color, _points, _text in mesh_groups:  # empty stand-in traces: the legend entries the script drives
@@ -3813,7 +3870,8 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
         title=title if shown >= total else f"{title}  (showing {shown:,} of {total:,} cells)",
         legend=dict(itemsizing='constant'))
     # (the pinch script first, and apart: a failure in one of the scripts below it must not stop it)
-    scripts = [THREED_WEB_PINCH_SCRIPT, THREED_WEB_LEGEND_ROUTER_SCRIPT] + ([post_script] if post_script else [])
+    # (the hover text second: the scripts after it read the mesh's text as it stands when they run)
+    scripts = [THREED_WEB_PINCH_SCRIPT] + ([hover_script] if hover_script else []) + [THREED_WEB_LEGEND_ROUTER_SCRIPT] + ([post_script] if post_script else [])
     if roles['lines'] or roles['surfaces']:
         scripts.append(THREED_WEB_EDGE_SCRIPT.replace('__ROLES__', json.dumps(roles)).replace('__OFF__', json.dumps(legend_off)).replace('__DEFAULT__', default_mode))
     if slider_rows or envelope_mesh is not None:
@@ -3824,7 +3882,7 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
                            'coverages': [round(100 * c) for c in THREED_ENVELOPE_COVERAGES][:len(envelope_levels[0][0])],
                            'smoothSteps': len(envelope_levels[0]),
                            'defaultCoverage': min(THREED_ENVELOPE_DEFAULT_COVERAGE, len(envelope_levels[0][0]) - 1),
-                           'defaultSmooth': min(THREED_ENVELOPE_DEFAULT_SMOOTHNESS, len(envelope_levels[0]) - 1)}
+                           'defaultSmooth': 0}
                           if envelope_mesh is not None else None),
             'background': ({'indices': list(background_base), 'bases': [background_base[i] for i in background_base],
                             'value': THREED_WEB_BACKGROUND_DEFAULT} if background_base else None),
@@ -6372,8 +6430,7 @@ def read_coordinates_for_3d(path):
     if have_ccf and 'ccf_structure' in table.columns:
         section = (table['brain_section_label'].astype(str).str.rsplit('.', n=1).str[-1]
                    if 'brain_section_label' in table.columns else '')
-        hover = (table['ccf_structure'].fillna('?').astype(str) + ' | section ' + section
-                 + ' | ' + table['cell_label'].astype(str)).to_numpy() if 'cell_label' in table.columns else None
+        hover = (table['ccf_structure'].fillna('?').astype(str) + ' | section ' + section).to_numpy()
     if 'group_id' in table.columns:
         ids = list(pd.unique(table['group_id'].dropna()))
     else:

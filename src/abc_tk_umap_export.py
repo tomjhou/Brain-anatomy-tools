@@ -1094,8 +1094,9 @@ class ExportsMixin:
         self.root.config(cursor="")
 
     def ask_3d_jitter(self):
-        """Ask whether to jitter the section-axis coordinate of the cells (they sit on the planes of the sections, which looks layered): the
-        spread in mm (0 = none), or None if cancelled. The last answer is the default."""
+        """Ask how to make the 3D page: whether to jitter the section-axis coordinate of the cells (they sit on the planes of the sections, which looks
+        layered), and whether to add envelope surfaces (they make the file much bigger). (the spread in mm (0 = none), the envelopes' smoothness 1 to 6 or
+        None for no envelopes), or None if cancelled. The last answers are the defaults."""
         import tkinter as tk
         from tkinter import ttk
         top = tk.Toplevel(self.root)
@@ -1104,6 +1105,8 @@ class ExportsMixin:
         top.resizable(False, False)
         on = tk.BooleanVar(top, getattr(self, "jitter_3d_on", True))
         spread = tk.StringVar(top, getattr(self, "jitter_3d_mm", "0.15"))
+        envelopes_on = tk.BooleanVar(top, getattr(self, "envelopes_3d_on", False))
+        smoothness = tk.StringVar(top, getattr(self, "envelope_smoothness_3d", "3"))
         body = ttk.Frame(top, padding=12)
         body.pack()
         ttk.Checkbutton(body, text="Randomly jitter the section-axis (z) position of the cells", variable=on).grid(row=0, column=0, columnspan=3, sticky="w")
@@ -1112,6 +1115,20 @@ class ExportsMixin:
         ttk.Label(body, foreground="#555555", wraplength=300, justify="left",
                   text="The cells lie on the planes of the sections, which gives a layered look. Jitter spreads them out along that axis "
                        "(by default +/- 0.15 mm). Only the picture changes.").grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Separator(body).grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 6))
+        ttk.Checkbutton(body, text="Add envelope surfaces around the biggest groups", variable=envelopes_on).grid(row=4, column=0, columnspan=3, sticky="w")
+        ttk.Label(body, text="Smoothness, 1 to 6:").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        smooth_box = ttk.Spinbox(body, from_=1, to=6, textvariable=smoothness, width=4, state="normal")
+        smooth_box.grid(row=5, column=1, sticky="w", padx=4, pady=(6, 0))
+        ttk.Label(body, foreground="#555555", wraplength=300, justify="left",
+                  text="A surface around the cells of each of the 8 biggest groups, switched on in the legend, with a slider for how many of the cells it "
+                       "takes in. Note: this makes the file bigger (about 1 MB for each group) and a little slower to open."
+                  ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        def show_smoothness(*_):
+            smooth_box.configure(state="normal" if envelopes_on.get() else "disabled")
+        envelopes_on.trace_add("write", show_smoothness)
+        show_smoothness()
         result = []
 
         def ok():
@@ -1120,11 +1137,19 @@ class ExportsMixin:
             except ValueError:
                 spread.set("0.15")
                 return
+            try:
+                step = min(6, max(1, int(float(smoothness.get())))) if envelopes_on.get() else None
+            except ValueError:
+                smoothness.set("3")
+                return
             self.jitter_3d_on, self.jitter_3d_mm = on.get(), spread.get()
-            result.append(mm)
+            self.envelopes_3d_on = envelopes_on.get()
+            if step is not None:
+                self.envelope_smoothness_3d = str(step)
+            result.append((mm, step))
             top.destroy()
         buttons = ttk.Frame(body)
-        buttons.grid(row=3, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        buttons.grid(row=7, column=0, columnspan=3, sticky="e", pady=(10, 0))
         ttk.Button(buttons, text="Cancel", command=top.destroy).pack(side="right")
         ttk.Button(buttons, text="Open", command=ok).pack(side="right", padx=(0, 6))
         top.bind("<Return>", lambda e: ok())
@@ -1171,8 +1196,7 @@ class ExportsMixin:
             rows = table[table["group_id"] == (self.unit_group_id(t) if mixed else core.group_id_value(t))]
             hover = None
             if have_ccf and "ccf_structure" in rows.columns:
-                hover = (rows["ccf_structure"].fillna("?").astype(str) + " | section " + rows["brain_section_label"].astype(str).str.rsplit(".", n=1).str[-1]
-                         + " | " + rows["cell_label"].astype(str)).to_numpy()
+                hover = (rows["ccf_structure"].fillna("?").astype(str) + " | section " + rows["brain_section_label"].astype(str).str.rsplit(".", n=1).str[-1]).to_numpy()
             color = selection["colors"].get(t)
             xyz = rows[list(columns)].to_numpy(dtype=float)
             if jitter_mm > 0:                    # (the middle column is the one across the sections)
@@ -1196,9 +1220,10 @@ class ExportsMixin:
             return
         if self.group_selection("opening the 3D view") is None:
             return
-        jitter = self.ask_3d_jitter()
-        if jitter is None:
+        choice = self.ask_3d_jitter()
+        if choice is None:
             return
+        jitter, envelope_smoothness = choice
         self.root.config(cursor="watch")
         self.var_status.set("Preparing the 3D view...")
         self.root.update()
@@ -1218,7 +1243,8 @@ class ExportsMixin:
                 edges = h["build_3d_edges"](self.abc_cache, p["structures"], self.root) if p["have_ccf"] else None
                 self.var_status.set("Writing the 3D page...")
                 self.root.update()
-                h["write_3d_group_html"](p["groups"], p["shell_xyz"], p["outline"], p["axis_labels"], p["title"], path, edges=edges)
+                h["write_3d_group_html"](p["groups"], p["shell_xyz"], p["outline"], p["axis_labels"], p["title"], path, edges=edges,
+                                       envelope_smoothness=envelope_smoothness)
                 h["open_with_default_viewer"](path)
                 self.var_status.set(f"Opened {path.name} in your browser (saved in {target}).")
         except Exception as e:

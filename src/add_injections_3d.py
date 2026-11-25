@@ -245,7 +245,7 @@ def split_sites(r):
 
 
 def injection_sites(rows, bregma, brain_top):
-    """[(x, y, z, hover, entry x, entry z, kind, zero, animal id, surgery date)] in the page's axes (CCF ML, AP, DV in mm; see site_balls; kind
+    """[(x, y, z, hover, entry x, entry z, kind, zero, animal id, surgery date, 'TAB:ROW' of the sheet)] in the page's axes (CCF ML, AP, DV in mm; see site_balls; kind
     'injection' or 'fiber', see site_kinds; zero 'surface' or 'bregma': what the DV was measured from) and a dict of what was left out."""
     sites, skipped = [], {'rat': 0, 'no coordinates': 0, 'other species': 0}
     for r in rows:
@@ -342,7 +342,8 @@ def site_balls(r, ap, ml, dv, site_angle, site_side, target, site_note, bregma, 
         balls.append((round(tip_ml, 3), round(ccf_ap, 3), round(float(ccf_dv), 3),
                       '<br>'.join([head, what, coords] + notes + side_notes),
                       round(entry_ml, 3), round(float(top), 3), zero,
-                      str(r.get('animal_id') or '').strip(), str(r.get('surgery_date') or '').strip()))
+                      str(r.get('animal_id') or '').strip(), str(r.get('surgery_date') or '').strip(),
+                      f"{str(r.get('tab') or '').strip()}:{str(r.get('row') or '').strip()}"))     # (the sheet row: the surgery viewer's 3D panel finds the row's balls by it)
     return balls
 
 
@@ -413,7 +414,8 @@ EXTRAS_JS = r"""
   function draw() {
     var gd = document.querySelector('.plotly-graph-div');
     if (!window.Plotly || !gd || !gd._fullLayout || !gd._fullLayout.scene) return setTimeout(draw, 200);
-    if (e.viewer && window.__injectionData) installClick(gd, window.__injectionData, e.viewer);
+    var peer = panelPeer();
+    if (e.viewer && window.__injectionData && !peer) installClick(gd, window.__injectionData, e.viewer);
     if (gd._context) gd._context.showTips = false;   // (no plotly tips, for pages written before the page turned them off: its hint to double-click the legend to isolate an entry is wrong here)
     var traces = [], have = {}, firstOwn = gd._fullData.length;
     gd._fullData.forEach(function (t) { have[t.name] = true; });   // (an export from the ABC browser may already have the cubes, and its own spacer)
@@ -485,7 +487,107 @@ EXTRAS_JS = r"""
       traces.push({type: 'scatter3d', mode: 'markers', x: [null], y: [null], z: [null], name: spacer, showlegend: true, hoverinfo: 'skip',
                    marker: {size: 1, color: 'rgba(0,0,0,0)'}, legendrank: 4});
     }
-    Plotly.addTraces(gd, traces).then(function () { makeSliceable(gd, firstOwn); groupLegend(gd, 40); fixSwatches(gd); installSliders(); });
+    Plotly.addTraces(gd, traces).then(function () {
+      makeSliceable(gd, firstOwn); groupLegend(gd, 40); fixSwatches(gd); installSliders();
+      if (peer && window.__injectionData) installPanel(gd, window.__injectionData, peer, 40);
+    });
+  }
+
+  // The surgery viewer's 3D panel (the page in a frame of the viewer, or in a window it opened, from the viewer's own server): the page talks with it by
+  // messages {type: 'jhoulab-3d', ...}. The side file then has the sites of every row of the sheet, and the viewer says which rows are listed (show: their
+  // 'TAB:ROW' keys, site[10]) and which to mark (highlight: the row under the pointer); only those balls and tracks are drawn, and the marked ones again, larger
+  // and yellow. A click on a ball asks the viewer to open its row (event 'open'); 'ready' says the page can take messages, 'shown' how many sites are drawn.
+  function panelPeer() {
+    try { if (window.parent !== window && window.parent.location.origin === location.origin) return window.parent; } catch (err) { /* another site's frame */ }
+    try { if (window.opener && window.opener.location.origin === location.origin) return window.opener; } catch (err) { /* opened from another site */ }
+    return null;
+  }
+
+  function installPanel(gd, data, peer, tries) {
+    var uv = data.sphere.v, uf = data.sphere.f, per = uv.length / 3, groups = [], missing = false;
+    data.groups.forEach(function (g) {
+      var all = data.sites.filter(function (s) { return s[6] === g.kind; });
+      if (!all.length) return;
+      var mesh = -1, line = -1;
+      gd._fullData.forEach(function (t, index) {
+        if (t.type === 'mesh3d' && (t.name || '').indexOf(g.name + ' (') === 0) mesh = index;
+        if (t.type === 'scatter3d' && t.name === g.trackName) line = index;
+      });
+      if (mesh < 0 || line < 0) missing = true;
+      groups.push({g: g, all: all, shown: all, mesh: mesh, line: line});
+    });
+    if (missing) {   // (the loader draws the sites, perhaps a moment after this)
+      if (tries > 0) setTimeout(function () { installPanel(gd, data, peer, tries - 1); }, 250);
+      return;
+    }
+    function balls(sites, r) {
+      var b = {x: [], y: [], z: [], i: [], j: [], k: [], text: []};
+      sites.forEach(function (s, n) {
+        for (var v = 0; v < per; v++) { b.x.push(s[0] + r * uv[3 * v]); b.y.push(s[1] + r * uv[3 * v + 1]); b.z.push(s[2] + r * uv[3 * v + 2]); b.text.push(s[3]); }
+        for (var f = 0; f < uf.length; f += 3) { b.i.push(n * per + uf[f]); b.j.push(n * per + uf[f + 1]); b.k.push(n * per + uf[f + 2]); }
+      });
+      return b;
+    }
+    function tracks(sites) {
+      var t = {x: [], y: [], z: [], text: []};
+      sites.forEach(function (s) { t.x.push(s[4], s[0], null); t.y.push(s[1], s[1], null); t.z.push(s[5], s[2], null); t.text.push(s[3], s[3], null); });
+      return t;
+    }
+    var mark = gd._fullData.length;   // the marked sites: a mesh and a line, not in the legend, not hovered (the balls under them answer)
+    Plotly.addTraces(gd, [
+      {type: 'mesh3d', x: [], y: [], z: [], i: [], j: [], k: [], color: '#ffd400', opacity: 1, name: 'marked sites', showlegend: false, hoverinfo: 'skip', visible: false,
+       lighting: {ambient: 0.7, diffuse: 0.8, specular: 0.3, roughness: 0.5}},
+      {type: 'scatter3d', mode: 'lines', x: [], y: [], z: [], line: {color: '#ffd400', width: 8}, connectgaps: false, name: 'marked tracks', showlegend: false,
+       hoverinfo: 'skip', visible: false}]);
+    var shownKeys = null, marked = [];
+    function show(keys) {
+      shownKeys = keys ? new Set(keys) : null;
+      var m = {x: [], y: [], z: [], i: [], j: [], k: [], text: [], name: []}, mIds = [], l = {x: [], y: [], z: [], text: []}, lIds = [], counts = {};
+      groups.forEach(function (G) {
+        G.shown = shownKeys ? G.all.filter(function (s) { return shownKeys.has(s[10]); }) : G.all;
+        counts[G.g.kind] = G.shown.length;
+        var b = balls(G.shown, G.g.radius), t = tracks(G.shown);
+        ['x', 'y', 'z', 'i', 'j', 'k', 'text'].forEach(function (a) { m[a].push(b[a]); });
+        m.name.push(G.g.name + ' (' + G.shown.length + ')');
+        mIds.push(G.mesh);
+        ['x', 'y', 'z', 'text'].forEach(function (a) { l[a].push(t[a]); });
+        lIds.push(G.line);
+      });
+      Promise.all([Plotly.restyle(gd, m, mIds), Plotly.restyle(gd, l, lIds)]).then(function () {
+        if (gd.__extrasForget) gd.__extrasForget(mIds.concat(lIds));   // (the slice cut starts again from the new sites)
+      });
+      highlight(marked);
+      peer.postMessage({type: 'jhoulab-3d', event: 'shown', counts: counts}, location.origin);
+    }
+    function highlight(keys) {
+      marked = keys || [];
+      var want = new Set(marked), b = {x: [], y: [], z: [], i: [], j: [], k: []}, t = {x: [], y: [], z: []};
+      groups.forEach(function (G) {
+        var sites = G.shown.filter(function (s) { return want.has(s[10]); });
+        if (!sites.length) return;
+        var nb = balls(sites, G.g.radius * 2.2), nt = tracks(sites), base = b.x.length;
+        ['x', 'y', 'z'].forEach(function (a) { b[a] = b[a].concat(nb[a]); t[a] = t[a].concat(nt[a]); });
+        ['i', 'j', 'k'].forEach(function (a) { b[a] = b[a].concat(nb[a].map(function (v) { return v + base; })); });
+      });
+      var on = b.x.length > 0;
+      Plotly.restyle(gd, {x: [b.x], y: [b.y], z: [b.z], i: [b.i], j: [b.j], k: [b.k], visible: on}, [mark]);
+      Plotly.restyle(gd, {x: [t.x], y: [t.y], z: [t.z], visible: on}, [mark + 1]);
+    }
+    gd.on('plotly_click', function (ev) {
+      var p = ev && ev.points && ev.points[0];
+      if (!p) return;
+      groups.forEach(function (G) {
+        var site = p.curveNumber === G.mesh ? G.shown[Math.floor(p.pointNumber / per)] : p.curveNumber === G.line ? G.shown[Math.floor(p.pointNumber / 3)] : null;
+        if (site) peer.postMessage({type: 'jhoulab-3d', event: 'open', key: site[10], animal: site[8], date: site[9]}, location.origin);
+      });
+    });
+    window.addEventListener('message', function (ev) {
+      var d = ev.data;
+      if (ev.source !== peer || ev.origin !== location.origin || !d || d.type !== 'jhoulab-3d') return;
+      if ('show' in d) show(d.show);
+      if ('highlight' in d) highlight(d.highlight);
+    });
+    peer.postMessage({type: 'jhoulab-3d', event: 'ready'}, location.origin);
   }
 
   // A click on a ball or a needle track opens the surgery viewer's page at that animal (index.html#animal=ID&date=DATE: the viewer opens its details and marks the
@@ -567,6 +669,8 @@ EXTRAS_JS = r"""
     // the meshes and one for all the lines.
     var working = false, again = false, timer = 0;
     gd.__rebuildCells = function () { if (previous) previous(); clearTimeout(timer); timer = setTimeout(schedule, 150); };
+    // The 3D panel replaced the sites of these traces (installPanel): what was kept of them is stale, so they are cut again from what they are now.
+    gd.__extrasForget = function (ids) { ids.forEach(function (id) { delete known[id]; }); clearTimeout(timer); timer = setTimeout(schedule, 0); };
     function schedule() {
       if (working) { again = true; return; }
       working = true;

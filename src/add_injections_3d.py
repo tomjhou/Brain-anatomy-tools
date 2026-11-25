@@ -1,17 +1,16 @@
-"""Add the lab's injection sites to a 3D page written by the ABC atlas browser, as white balls.
+"""Show the lab's injection sites (and optic fibers) in a 3D page written by the ABC atlas browser, as white balls.
 
-    python add_injections_3d.py PAGE.html SURGERIES.csv [-o OUT.html] [--radius 0.15]
+    python add_injections_3d.py PAGE.html SURGERIES.csv [--radius 0.15] [--no-open]
 
-PAGE.html is a 3D page from the ABC browser (its axes are CCF millimetres). SURGERIES.csv is the
-surgery viewer's "Export CSV" file (JhouLab-surgery-viewer), so filter the list there first (by
-target, person, dates...) to choose which injections are drawn. The result is a copy of the page
-(PAGE_injections.html in Brain-anatomy-tools/tmp/injection_pages, on this computer, unless -o is
-given) with two more legend entries: "injection sites", the
-balls, and "needle tracks", a white line from where each DV was measured from (the brain surface,
-or bregma's height) down to its ball, at the injection angle. Optic fibers (see site_kinds) are
-drawn in blue, with a smaller ball and a thicker rod, as "optic fibers" and "fiber tracks".
-Hovering any of them shows the animal, target, substance and coordinates.
-Running it again on its own output replaces the balls rather than adding a second set.
+PAGE.html is a 3D page from the ABC browser (its axes are CCF millimetres). SURGERIES.csv is the surgery viewer's "Export CSV" file
+(JhouLab-surgery-viewer), so filter the list there first (by target, person, dates...) to choose which injections are drawn. The page is not copied: the sites
+go in a small side file (injections-DATE-TIME.js in Brain-anatomy-tools/tmp/injection_sites, on this computer; the newest 30 are kept), and the page is opened
+in a NEW browser tab with the side file named after a # in its address. The page reads it as it opens (see injection_loader.py), so each export gets its own tab
+that keeps what it was opened with, a refresh included, and the tabs can be compared; close the ones you do not want. Two more legend entries come with it:
+"injection sites", the balls, and "needle tracks", a white line from where each DV was measured from (the brain surface, or bregma's height) down to its ball,
+at the injection angle. Optic fibers (see site_kinds) are drawn in blue, with a smaller ball and a thicker rod, as "optic fibers" and "fiber tracks".
+Hovering any of them shows the animal, target, substance and coordinates. Opened without the # part, the page shows no sites.
+A page written before it carried the loader is upgraded once, in place (it looks the same, and is stored compressed); see compressed_page.py.
 
 From stereotaxic coordinates to the CCF (all approximate; there is no exact mapping):
   * Bregma is placed in the CCF where the ABC browser's Settings put it (viewer_settings.json;
@@ -38,12 +37,17 @@ import csv
 import gzip
 import json
 import math
+import os
 import re
 import struct
 import sys
+import time
+import urllib.parse
 from pathlib import Path
 
 import numpy as np
+
+import compressed_page
 
 SRC = Path(__file__).resolve().parent
 SETTINGS_FILE = SRC / 'viewer_settings.json'                              # the ABC browser's (bregma position)
@@ -57,7 +61,8 @@ TRACK_WIDTH_PX = 3
 FIBER_COLOR = '#3d8bff'      # optic fibers: blue, a smaller ball, a thicker rod
 FIBER_RADIUS_SCALE = 0.5
 FIBER_WIDTH_PX = 5
-START, END = '<!-- injection-sites:start -->', '<!-- injection-sites:end -->'
+SIDE_FOLDER = SRC.parent / 'tmp' / 'injection_sites'      # (git ignores tmp/)
+KEEP_SIDE_FILES = 30
 
 
 # ---------- the CCF side ----------
@@ -321,107 +326,61 @@ def unit_sphere(subdivisions=2):
     return np.round(np.array(verts), 4), np.array(faces)
 
 
-PAGE_SCRIPT = """
-<script>
-(function () {
-  var data = __DATA__;
-  function add() {
-    var gd = document.querySelector('.plotly-graph-div');
-    if (!window.Plotly || !gd || !gd._fullLayout || !gd._fullLayout.scene) return setTimeout(add, 200);
-    var uv = data.sphere.v, uf = data.sphere.f, n = uv.length / 3;
-    var traces = [];
-    data.groups.forEach(function (g) {
-      var sites = data.sites.filter(function (s) { return s[6] === g.kind; });
-      if (!sites.length) return;
-      var r = g.radius, x = [], y = [], z = [], i = [], j = [], k = [], text = [];
-      sites.forEach(function (s, b) {
-        for (var v = 0; v < n; v++) {
-          x.push(s[0] + r * uv[3 * v]); y.push(s[1] + r * uv[3 * v + 1]); z.push(s[2] + r * uv[3 * v + 2]);
-          text.push(s[3]);
-        }
-        for (var f = 0; f < uf.length; f += 3) { i.push(b * n + uf[f]); j.push(b * n + uf[f + 1]); k.push(b * n + uf[f + 2]); }
-      });
-      // the tracks: from where the DV was zeroed (brain surface, or bregma's height) down to the ball
-      var tx = [], ty = [], tz = [], ttext = [];
-      sites.forEach(function (s) {
-        tx.push(s[4], s[0], null); ty.push(s[1], s[1], null); tz.push(s[5], s[2], null); ttext.push(s[3], s[3], null);
-      });
-      traces.push(
-        {type: 'mesh3d', x: x, y: y, z: z, i: i, j: j, k: k, color: g.color, opacity: 1,
-         flatshading: false, lighting: {ambient: 0.55, diffuse: 0.8, specular: 0.3, roughness: 0.5},
-         name: g.name + ' (' + sites.length + ')', showlegend: true, text: text, hoverinfo: 'text'},
-        {type: 'scatter3d', mode: 'lines', x: tx, y: ty, z: tz, line: {color: g.color, width: g.width},
-         connectgaps: false, name: g.trackName, showlegend: true, text: ttext, hoverinfo: 'text'});
-    });
-    Plotly.addTraces(gd, traces);
-    if (!gd.__hoverPassThrough) passThrough(gd);   // (newer pages do this themselves)
-  }
-  // Hover through the background, for pages written before the ABC browser did it (the same code as its
-  // THREED_WEB_LEGEND_ROUTER_SCRIPT): objects whose trace skips hover are left out of plotly's pick pass, so the
-  // translucent brain surface no longer hides the balls and cells inside it from the pointer.
-  function passThrough(gd) {
-    gd.__hoverPassThrough = function () {
-      var scene = gd._fullLayout && gd._fullLayout.scene && gd._fullLayout.scene._scene;
-      if (!scene || !scene.traces || !scene.glplot) return;
-      var changed = false;
-      Object.keys(scene.traces).forEach(function (uid) {
-        var trace = scene.traces[uid];
-        if (!trace || !trace.data || trace.data.hoverinfo !== 'skip') return;
-        Object.keys(trace).forEach(function (key) {
-          var object = trace[key];
-          if (object && typeof object === 'object' && typeof object.drawPick === 'function') { object.drawPick = null; changed = true; }
-        });
-      });
-      if (changed) scene.glplot.update();
-    };
-    ['plotly_afterplot', 'plotly_restyle'].forEach(function (name) {
-      gd.on(name, function () { setTimeout(gd.__hoverPassThrough, 0); });
-    });
-    gd.__hoverPassThrough();
-  }
-  add();
-})();
-</script>
-"""
+class PageNeedsUpgrade(ValueError):
+    """The page was written before 3D pages carried the loader that shows injection sites: compressed_page.upgrade_page adds it."""
 
 
-def add_to_page(page_text, sites, radius, color=BALL_COLOR):
-    """The page's HTML with the balls' script in it (replacing an earlier one)."""
-    page_text = re.sub(re.escape(START) + r'.*?' + re.escape(END) + r'\n?', '', page_text, flags=re.S)
+def side_file_data(sites, radius, label):
     verts, faces = unit_sphere(2)
-    data = {'sites': sites, 'groups': [
-                {'kind': 'injection', 'name': "injection sites", 'trackName': "needle tracks", 'color': color,
+    return {'label': label, 'sites': sites, 'groups': [
+                {'kind': 'injection', 'name': "injection sites", 'trackName': "needle tracks", 'color': BALL_COLOR,
                  'radius': radius, 'width': TRACK_WIDTH_PX},
                 {'kind': 'fiber', 'name': "optic fibers", 'trackName': "fiber tracks", 'color': FIBER_COLOR,
                  'radius': radius * FIBER_RADIUS_SCALE, 'width': FIBER_WIDTH_PX}],
             'sphere': {'v': verts.ravel().tolist(), 'f': faces.ravel().tolist()}}
-    script = START + PAGE_SCRIPT.replace('__DATA__', json.dumps(data).replace('</', '<\\/')) + END + '\n'
-    at = page_text.rfind('</body>')
-    if at < 0:
-        return page_text + script
-    return page_text[:at] + script + page_text[at:]
 
 
-OUTPUT_FOLDER = SRC.parent / 'tmp' / 'injection_pages'   # (git ignores tmp/)
+def clean_side_files(folder, keep=KEEP_SIDE_FILES):
+    """Deletes all but the newest `keep` side files in `folder` (a tab open on a deleted one shows a note that it is gone)."""
+    files = sorted(Path(folder).glob('injections-*.js'), key=lambda f: f.stat().st_mtime, reverse=True)
+    for old in files[keep:] + sorted(Path(folder).glob('injections-open-*.html'), key=lambda f: f.stat().st_mtime, reverse=True)[keep:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
 
 
-def output_path(page, folder=None):
-    """Where the page with the balls goes: PAGE_injections.html in OUTPUT_FOLDER, on this computer, since the 3D pages are
-    often on a network drive, slow to write to and to open (a page is self-contained, so its copy works anywhere).
-    PAGE itself if it already is one. A page of the same name from another folder is overwritten."""
+def write_side_file(sites, radius, label, folder=None):
+    """Writes the sites as a side file: a script that calls window.__injectionSites({...}), which the page's loader defines (see injection_loader.py). Written
+    through a temporary file, so that a page never reads half of it. A new name every time. Returns its path."""
+    folder = Path(folder or SIDE_FOLDER)
+    folder.mkdir(parents=True, exist_ok=True)
+    stem = 'injections-' + time.strftime('%Y%m%d-%H%M%S')
+    path, n = folder / (stem + '.js'), 1
+    while path.exists():
+        n += 1
+        path = folder / f"{stem}-{n}.js"
+    temporary = path.with_name(path.name + '.part')
+    temporary.write_text('window.__injectionSites(' + json.dumps(side_file_data(sites, radius, label)).replace('</', '<\\/') + ');\n', encoding='utf-8')
+    os.replace(temporary, path)
+    clean_side_files(folder)
+    return path
+
+
+def view_address(page, side_file):
+    """The address that opens `page` showing the sites of `side_file`: the page's file address, then  #sites=  and the side file's, percent-encoded."""
+    return Path(page).resolve().as_uri() + '#sites=' + urllib.parse.quote(Path(side_file).resolve().as_uri(), safe='')
+
+
+def make_view(page, surgeries, radius=DEFAULT_RADIUS_MM, upgrade=False):
+    """Write the side file for the surgery list. Returns (the address to open the page at, the lines to report); raises ValueError when there is nothing to draw or
+    the page is not a 3D page, and PageNeedsUpgrade when the page has no loader (with upgrade=True the page is upgraded first)."""
     page = Path(page)
-    return Path(folder or OUTPUT_FOLDER) / (re.sub(r'_injections$', '', page.stem) + '_injections.html')
-
-
-def make_page(page, surgeries, out=None, radius=DEFAULT_RADIUS_MM):
-    """Write the page with the balls. Returns (out path, the lines to report); raises ValueError when there is nothing
-    to draw or the page is not a 3D page."""
-    page = Path(page)
-    out = Path(out) if out else output_path(page)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    text = page.read_text(encoding='utf-8')
-    if 'plotly' not in text[:20000].lower():
+    if not compressed_page.looks_like_3d_page(page):
         raise ValueError(f"{page.name} does not look like a 3D page from the ABC browser (no plotly in it).")
+    needs_upgrade = not compressed_page.has_loader(page)
+    if needs_upgrade and not upgrade:
+        raise PageNeedsUpgrade(f"{page.name} was made before 3D pages could show injection sites: it needs a small one-time change (it will look the same).")
     bregma = bregma_in_ccf()
     volume_path = find_annotation_volume()
     brain_top = BrainTop(read_nifti_volume(volume_path)) if volume_path else None
@@ -431,13 +390,17 @@ def make_page(page, surgeries, out=None, radius=DEFAULT_RADIUS_MM):
     sites, skipped = injection_sites(read_csv(surgeries), bregma, brain_top)
     if not sites:
         raise ValueError("No mouse injection sites with coordinates in that surgery list.")
-    out.write_text(add_to_page(text, sites, radius), encoding='utf-8')
+    if needs_upgrade:
+        compressed_page.upgrade_page(page)
+        report.append(f"{page.name} was changed so that it can show injection sites (it looks the same, and is stored compressed).")
     left_out = ', '.join(f"{n} {why}" for why, n in skipped.items() if n)
     fibers = sum(1 for s in sites if s[6] == 'fiber')
-    report.insert(0, f"{len(sites) - fibers} injection sites and {fibers} optic fibers written to {out}"
+    label = f"{time.strftime('%H:%M')}, {len(sites) - fibers} injections" + (f", {fibers} fibers" if fibers else "")
+    side = write_side_file(sites, radius, label)
+    report.insert(0, f"{len(sites) - fibers} injection sites and {fibers} optic fibers written to {side.name}"
                   + (f" (left out: {left_out})" if left_out else ""))
     report.append(f"Bregma in the CCF: AP {bregma[0]:g}, DV {bregma[1]:g}, ML {bregma[2]:g} mm")
-    return out, report
+    return view_address(page, side), report
 
 
 # ---------- the window (run-add-injections.bat / .command) ----------
@@ -479,17 +442,6 @@ def default_surgeries(last_used):
     return last or ''
 
 
-def open_output_folder():
-    """Shows OUTPUT_FOLDER (the pages made) in Explorer / Finder."""
-    import os
-    import subprocess
-    OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
-    if sys.platform == 'win32':
-        os.startfile(OUTPUT_FOLDER)
-    else:
-        subprocess.Popen(['open' if sys.platform == 'darwin' else 'xdg-open', str(OUTPUT_FOLDER)])
-
-
 def bring_forward(root):
     """Puts the window in the middle of the monitor the pointer is on and in front of the others. Started by the surgery
     viewer's server (a background program), it would otherwise open behind the browser: Windows only lets the program in
@@ -508,6 +460,25 @@ def bring_forward(root):
     root.focus_force()
 
 
+def open_in_browser(address):
+    """Opens `address` (a file address with a # part) in the default browser, in a new tab; whether that worked.
+    Windows drops the # part of a file address when it launches the browser (the page then opens with no sites), so the browser is given a tiny launcher
+    page (a plain file path, nothing to drop) that sends it on to `address`."""
+    import html
+    import webbrowser
+    try:
+        SIDE_FOLDER.mkdir(parents=True, exist_ok=True)
+        launcher = SIDE_FOLDER / f"injections-open-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.html"
+        launcher.write_text(
+            '<!doctype html><meta charset="utf-8"><title>Opening the 3D page...</title>'
+            f'<script>location.replace({json.dumps(address)});</script>'
+            f'<body style="font:14px sans-serif">Opening the 3D page... if nothing happens, <a href="{html.escape(address)}">click here</a>.</body>',
+            encoding='utf-8')
+        return bool(webbrowser.open(launcher.resolve().as_uri(), new=2))
+    except Exception:
+        return False
+
+
 def open_window(surgeries=None):
     """The window. `surgeries` (a CSV path) fills in the surgery list, as the surgery viewer's Show in 3D button does;
     otherwise the newest export in Downloads or the last list used."""
@@ -524,12 +495,6 @@ def open_window(surgeries=None):
     csv_var = tk.StringVar(root, str(surgeries) if surgeries else default_surgeries(last))
     radius_var = tk.StringVar(root, f"{last.get('radius', DEFAULT_RADIUS_MM):g}")
     status_var = tk.StringVar(root, "")
-    out_var = tk.StringVar(root, "")
-
-    def show_out(*_args):
-        out_var.set(f"Writes {output_path(page_var.get()).name} in {OUTPUT_FOLDER} (this computer)." if page_var.get().strip() else "")
-    page_var.trace_add('write', show_out)
-    show_out()
 
     def browse(var, title, types):
         current = Path(var.get()) if var.get().strip() else None
@@ -538,11 +503,10 @@ def open_window(surgeries=None):
         if path:
             var.set(path)
 
-    ttk.Label(frame, text="3D page").grid(row=0, column=0, sticky='w', pady=4)
+    ttk.Label(frame, text="3D source page").grid(row=0, column=0, sticky='w', pady=4)
     ttk.Entry(frame, textvariable=page_var, width=70).grid(row=0, column=1, sticky='ew', padx=6)
     ttk.Button(frame, text="Browse...", command=lambda: browse(
         page_var, "Choose a 3D page from the ABC browser", [("3D page", "*.html"), ("All files", "*.*")])).grid(row=0, column=2)
-    ttk.Label(frame, textvariable=out_var, foreground='#555555').grid(row=1, column=1, sticky='w', padx=6)
 
     ttk.Label(frame, text="Surgery list").grid(row=2, column=0, sticky='w', pady=(10, 4))
     ttk.Entry(frame, textvariable=csv_var, width=70).grid(row=2, column=1, sticky='ew', padx=6, pady=(10, 4))
@@ -560,14 +524,13 @@ def open_window(surgeries=None):
 
     buttons = ttk.Frame(frame)
     buttons.grid(row=5, column=0, columnspan=3, sticky='e', pady=(14, 0))
-    make = ttk.Button(buttons, text="Make page")
+    make = ttk.Button(buttons, text="Show in 3D")
     make.pack(side='left')
-    ttk.Button(buttons, text="Open folder", command=open_output_folder).pack(side='left', padx=(8, 0))
     ttk.Button(buttons, text="Close", command=root.destroy).pack(side='left', padx=(8, 0))
     status = ttk.Label(frame, textvariable=status_var, wraplength=620, justify='left')
     status.grid(row=6, column=0, columnspan=3, sticky='w', pady=(10, 0))
 
-    def run():
+    def run(upgrade=False):
         page, surgeries = page_var.get().strip().strip('"'), csv_var.get().strip().strip('"')
         try:
             radius = float(radius_var.get())
@@ -576,38 +539,46 @@ def open_window(surgeries=None):
         except ValueError:
             status_var.set("Enter the ball radius as a number of mm (e.g. 0.15).")
             return
-        for label, path in (("3D page", page), ("surgery list", surgeries)):
+        for label, path in (("3D source page", page), ("surgery list", surgeries)):
             if not path or not Path(path).is_file():
                 status_var.set(f"Choose the {label} first (no file at '{path}')." if path else f"Choose the {label} first.")
                 return
         make.state(['disabled'])
         root.config(cursor='watch')
-        status_var.set("Working... (a large page takes a few seconds)")
+        status_var.set("Working..." + (" (changing the page takes a few seconds)" if upgrade else ""))
         save_last_used({'page': page, 'surgeries': surgeries, 'radius': radius})
 
         def work():
             try:
-                out, report = make_page(page, surgeries, radius=radius)
-                result = ('ok', out, report)
+                address, report = make_view(page, surgeries, radius=radius, upgrade=upgrade)
+                result = ('ok', address, report)
+            except PageNeedsUpgrade as e:
+                result = ('upgrade', None, [str(e)])
             except Exception as e:
                 result = ('error', None, [str(e)])
             root.after(0, lambda: finished(*result))
         threading.Thread(target=work, daemon=True).start()
 
-    def finished(kind, out, report):
+    def finished(kind, address, report):
         make.state(['!disabled'])
         root.config(cursor='')
-        if kind == 'ok':
-            status_var.set('\n'.join(report) + "\nOpening it in your browser.")
+        if kind == 'upgrade':
+            from tkinter import messagebox
+            if messagebox.askyesno("Change the page?", report[0] + "\n\nThe file is rewritten in place (through a temporary file, so a failure "
+                                   "leaves it as it was). Change it now?", parent=root):
+                run(upgrade=True)
+            else:
+                status_var.set("Not changed: the page can not show injection sites until it is.")
+        elif kind == 'ok':
+            status_var.set('\n'.join(report) + "\nOpening it in a new tab.")
             if sys.stdout:                # (kept in the log once the window has closed; pythonw may have no stdout)
                 print('\n'.join(report))
-            import webbrowser
-            if webbrowser.open(Path(out).resolve().as_uri()):
+            if open_in_browser(address):
                 root.after(800, root.destroy)   # the page is open: the window isn't needed any more
             else:
-                status_var.set('\n'.join(report) + f"\nCould not open a browser: open {out} yourself.")
+                status_var.set('\n'.join(report) + f"\nCould not open a browser: open this address yourself:\n{address}")
         else:
-            status_var.set("Could not make the page: " + report[0])
+            status_var.set("Could not show the sites: " + report[0])
 
     make.config(command=run)
     root.bind('<Return>', lambda _e: run())
@@ -623,19 +594,22 @@ def main(argv=None):
         w = argparse.ArgumentParser(prog='add_injections_3d.py --window')
         w.add_argument('--surgeries', help="the surgery list to fill in")
         return open_window(w.parse_args(argv[1:]).surgeries)
-    p = argparse.ArgumentParser(description="Draw the surgery viewer's injection sites as white balls in an ABC browser 3D page "
+    p = argparse.ArgumentParser(description="Show the surgery viewer's injection sites in an ABC browser 3D page "
                                             "(with no arguments: a window to choose the files).")
     p.add_argument('page', help="a 3D page (.html) written by the ABC atlas browser")
     p.add_argument('surgeries', help="the surgery viewer's Export CSV file")
-    p.add_argument('-o', '--out', help=f"the page to write (default: PAGE_injections.html in {OUTPUT_FOLDER})")
     p.add_argument('--radius', type=float, default=DEFAULT_RADIUS_MM, help=f"ball radius in mm (default {DEFAULT_RADIUS_MM})")
+    p.add_argument('--no-open', action='store_true', help="only write the side file and print the address")
     a = p.parse_args(argv)
     try:
-        out, report = make_page(a.page, a.surgeries, a.out, a.radius)
+        address, report = make_view(a.page, a.surgeries, a.radius, upgrade=True)
     except ValueError as e:
         sys.exit(str(e))
     print('\n'.join(report))
-    return out
+    print(address)
+    if not a.no_open and not open_in_browser(address):
+        print("Could not open a browser: open the address above yourself.")
+    return address
 
 
 if __name__ == '__main__':

@@ -398,6 +398,8 @@ import_mark('sklearn')
 import numba
 import_mark('numba')
 import screen_area
+import compressed_page
+import injection_loader
 import scanpy as sc
 import_mark('scanpy (the rest)')
 
@@ -3611,10 +3613,10 @@ def open_3d_group_view(groups, shell_xyz, outline, axis_labels, title, invert_z=
 
 
 def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, invert_z=True,
-                        max_points=THREED_WEB_MAX_POINTS, edges=None, envelope_smoothness=None):
+                        max_points=THREED_WEB_MAX_POINTS, edges=None, envelope_smoothness=None, compress=True):
     """The same view as open_3d_group_view as one self-contained interactive HTML file (plotly, WebGL), written to
     `path`: true depth handling, smooth with hundreds of thousands of points, hover text per cell where a group
-    gives 'hover' strings, and the legend toggles each group. `envelope_smoothness` (1 to 6, or None for none) adds a surface around each of the biggest
+    gives 'hover' strings, and the legend toggles each group. `compress` stores the page deflated (see compressed_page.py). `envelope_smoothness` (1 to 6, or None for none) adds a surface around each of the biggest
     groups, at that smoothness: they add a good deal to the file. Raises ImportError if plotly is not installed."""
     import plotly.graph_objects as go
     from matplotlib.colors import to_hex
@@ -3872,6 +3874,7 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
     # (the pinch script first, and apart: a failure in one of the scripts below it must not stop it)
     # (the hover text second: the scripts after it read the mesh's text as it stands when they run)
     scripts = [THREED_WEB_PINCH_SCRIPT] + ([hover_script] if hover_script else []) + [THREED_WEB_LEGEND_ROUTER_SCRIPT] + ([post_script] if post_script else [])
+    scripts_end = [injection_loader.LOADER_JS]    # (draws the injection sites a #sites= in the page's address names: see injection_loader; last, after the page's own scripts)
     if roles['lines'] or roles['surfaces']:
         scripts.append(THREED_WEB_EDGE_SCRIPT.replace('__ROLES__', json.dumps(roles)).replace('__OFF__', json.dumps(legend_off)).replace('__DEFAULT__', default_mode))
     if slider_rows or envelope_mesh is not None:
@@ -3894,7 +3897,13 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
     scripts.append(THREED_WEB_SPIN_SCRIPT)
     scripts.append(THREED_WEB_LEGEND_MARK_SCRIPT)
     figure.write_html(str(path), include_plotlyjs=True, full_html=True, config={'displaylogo': False},
-                      post_script='\n'.join(scripts) or None)
+                      post_script='\n'.join(scripts + scripts_end) or None)
+    if compress:
+        try:
+            before, after = compressed_page.pack_file(path)
+            print(f"3D page: {before / 1e6:.1f} MB, stored as {after / 1e6:.1f} MB compressed.", flush=True)
+        except Exception as e:
+            print(f"The 3D page could not be compressed ({e}); it is stored as it is.", flush=True)
     return Path(path)
 
 

@@ -26,7 +26,13 @@ APPS = {   # program: (app ID, icon files' name: .ico for Windows, .png for macO
 
 def use_app_identity(program):
     """Call before the program's first window. Not for the packaged .exe: its pinned shortcut has no app ID, so declaring one would split
-    the running window from the pinned button, and the .exe has its own icon."""
+    the running window from the pinned button, and the .exe has its own icon.
+    Also tells the surgery viewer where this folder is (anatomy_pointer.register), as every program calls this at start-up."""
+    try:
+        import anatomy_pointer
+        anatomy_pointer.register()
+    except Exception:
+        pass
     if getattr(sys, "frozen", False):
         return
     app_id, icon = APPS[program]

@@ -7,8 +7,9 @@ surgery viewer's "Export CSV" file (JhouLab-surgery-viewer), so filter the list 
 target, person, dates...) to choose which injections are drawn. The result is a copy of the page
 (PAGE_injections.html unless -o is given) with two more legend entries: "injection sites", the
 balls, and "needle tracks", a white line from where each DV was measured from (the brain surface,
-or bregma's height) down to its ball, at the injection angle. Hovering either shows the animal,
-target, substance and coordinates.
+or bregma's height) down to its ball, at the injection angle. Optic fibers (see site_kinds) are
+drawn in blue, with a smaller ball and a thicker rod, as "optic fibers" and "fiber tracks".
+Hovering any of them shows the animal, target, substance and coordinates.
 Running it again on its own output replaces the balls rather than adding a second set.
 
 From stereotaxic coordinates to the CCF (all approximate; there is no exact mapping):
@@ -52,6 +53,9 @@ VOXEL_MM = 0.025
 DEFAULT_RADIUS_MM = 0.15
 BALL_COLOR = '#ffffff'
 TRACK_WIDTH_PX = 3
+FIBER_COLOR = '#3d8bff'      # optic fibers: blue, a smaller ball, a thicker rod
+FIBER_RADIUS_SCALE = 0.5
+FIBER_WIDTH_PX = 5
 START, END = '<!-- injection-sites:start -->', '<!-- injection-sites:end -->'
 
 
@@ -184,8 +188,8 @@ def split_sites(r):
 
 
 def injection_sites(rows, bregma, brain_top):
-    """[(x, y, z, hover, entry x, entry z)] in the page's axes (CCF ML, AP, DV in mm; see site_balls) and a dict of
-    what was left out."""
+    """[(x, y, z, hover, entry x, entry z, kind)] in the page's axes (CCF ML, AP, DV in mm; see site_balls; kind
+    'injection' or 'fiber', see site_kinds) and a dict of what was left out."""
     sites, skipped = [], {'rat': 0, 'no coordinates': 0, 'other species': 0}
     for r in rows:
         species = (r.get('species') or '').strip().lower()
@@ -200,9 +204,31 @@ def injection_sites(rows, bregma, brain_top):
         except (KeyError, TypeError, ValueError):
             skipped['no coordinates'] += 1
             continue
-        for site in row_sites:
-            sites.extend(site_balls(r, *site, bregma=bregma, brain_top=brain_top))
+        kinds = site_kinds(r, row_sites)
+        for site, (kind, note) in zip(row_sites, kinds):
+            if note:
+                site = site[:6] + ('; '.join(n for n in (site[6], note) if n),)
+            sites.extend(b + (kind,) for b in site_balls(r, *site, bregma=bregma, brain_top=brain_top))
     return sites, skipped
+
+
+FIBER_SUBSTANCE = re.compile(r'optic(al)?\s*fib(er|re)|fib(er|re)\s*optic', re.I)
+
+
+def site_kinds(r, row_sites):
+    """('fiber' or 'injection', note) for each site of a row. A fiber: the substance says optic fiber, or the
+    procedure is a fiber placement. An "Infusion + Fiber" row with one AP and ML and two depths (Nick's '-4.3/-4.1')
+    is the injection and the fiber above it: the shallower site is the fiber. (When its AP or ML differ too, which
+    site is which can't be told, and both are drawn as injections.)"""
+    procedure = str(r.get('procedure') or '')
+    if FIBER_SUBSTANCE.search(str(r.get('substance') or '')) or re.search(r'fib(er|re)\s*placement', procedure, re.I):
+        return [('fiber', '')] * len(row_sites)
+    if (re.search(r'\+\s*fib(er|re)', procedure, re.I) and len(row_sites) == 2
+            and len(cell_values(r.get('ap'))) <= 1 and len(cell_values(r.get('ml'))) <= 1):
+        fiber = min(range(2), key=lambda m: abs(row_sites[m][2]))
+        return [('fiber', 'the fiber: the shallower depth of an Infusion + Fiber row') if m == fiber else
+                ('injection', '') for m in range(2)]
+    return [('injection', '')] * len(row_sites)
 
 
 def one_line(text):
@@ -301,26 +327,32 @@ PAGE_SCRIPT = """
   function add() {
     var gd = document.querySelector('.plotly-graph-div');
     if (!window.Plotly || !gd || !gd._fullLayout || !gd._fullLayout.scene) return setTimeout(add, 200);
-    var uv = data.sphere.v, uf = data.sphere.f, n = uv.length / 3, r = data.radius;
-    var x = [], y = [], z = [], i = [], j = [], k = [], text = [];
-    data.sites.forEach(function (s, b) {
-      for (var v = 0; v < n; v++) {
-        x.push(s[0] + r * uv[3 * v]); y.push(s[1] + r * uv[3 * v + 1]); z.push(s[2] + r * uv[3 * v + 2]);
-        text.push(s[3]);
-      }
-      for (var f = 0; f < uf.length; f += 3) { i.push(b * n + uf[f]); j.push(b * n + uf[f + 1]); k.push(b * n + uf[f + 2]); }
+    var uv = data.sphere.v, uf = data.sphere.f, n = uv.length / 3;
+    var traces = [];
+    data.groups.forEach(function (g) {
+      var sites = data.sites.filter(function (s) { return s[6] === g.kind; });
+      if (!sites.length) return;
+      var r = g.radius, x = [], y = [], z = [], i = [], j = [], k = [], text = [];
+      sites.forEach(function (s, b) {
+        for (var v = 0; v < n; v++) {
+          x.push(s[0] + r * uv[3 * v]); y.push(s[1] + r * uv[3 * v + 1]); z.push(s[2] + r * uv[3 * v + 2]);
+          text.push(s[3]);
+        }
+        for (var f = 0; f < uf.length; f += 3) { i.push(b * n + uf[f]); j.push(b * n + uf[f + 1]); k.push(b * n + uf[f + 2]); }
+      });
+      // the tracks: from where the DV was zeroed (brain surface, or bregma's height) down to the ball
+      var tx = [], ty = [], tz = [], ttext = [];
+      sites.forEach(function (s) {
+        tx.push(s[4], s[0], null); ty.push(s[1], s[1], null); tz.push(s[5], s[2], null); ttext.push(s[3], s[3], null);
+      });
+      traces.push(
+        {type: 'mesh3d', x: x, y: y, z: z, i: i, j: j, k: k, color: g.color, opacity: 1,
+         flatshading: false, lighting: {ambient: 0.55, diffuse: 0.8, specular: 0.3, roughness: 0.5},
+         name: g.name + ' (' + sites.length + ')', showlegend: true, text: text, hoverinfo: 'text'},
+        {type: 'scatter3d', mode: 'lines', x: tx, y: ty, z: tz, line: {color: g.color, width: g.width},
+         connectgaps: false, name: g.trackName, showlegend: true, text: ttext, hoverinfo: 'text'});
     });
-    // the needle tracks: from where the DV was zeroed (brain surface, or bregma's height) down to the ball
-    var tx = [], ty = [], tz = [], ttext = [];
-    data.sites.forEach(function (s) {
-      tx.push(s[4], s[0], null); ty.push(s[1], s[1], null); tz.push(s[5], s[2], null); ttext.push(s[3], s[3], null);
-    });
-    Plotly.addTraces(gd, [
-      {type: 'mesh3d', x: x, y: y, z: z, i: i, j: j, k: k, color: data.color, opacity: 1,
-       flatshading: false, lighting: {ambient: 0.55, diffuse: 0.8, specular: 0.3, roughness: 0.5},
-       name: data.name, showlegend: true, text: text, hoverinfo: 'text'},
-      {type: 'scatter3d', mode: 'lines', x: tx, y: ty, z: tz, line: {color: data.color, width: data.trackWidth},
-       connectgaps: false, name: data.trackName, showlegend: true, text: ttext, hoverinfo: 'text'}]);
+    Plotly.addTraces(gd, traces);
     if (!gd.__hoverPassThrough) passThrough(gd);   // (newer pages do this themselves)
   }
   // Hover through the background, for pages written before the ABC browser did it (the same code as its
@@ -356,8 +388,11 @@ def add_to_page(page_text, sites, radius, color=BALL_COLOR):
     """The page's HTML with the balls' script in it (replacing an earlier one)."""
     page_text = re.sub(re.escape(START) + r'.*?' + re.escape(END) + r'\n?', '', page_text, flags=re.S)
     verts, faces = unit_sphere(2)
-    data = {'sites': sites, 'radius': radius, 'color': color, 'name': f"injection sites ({len(sites)})",
-            'trackName': "needle tracks", 'trackWidth': TRACK_WIDTH_PX,
+    data = {'sites': sites, 'groups': [
+                {'kind': 'injection', 'name': "injection sites", 'trackName': "needle tracks", 'color': color,
+                 'radius': radius, 'width': TRACK_WIDTH_PX},
+                {'kind': 'fiber', 'name': "optic fibers", 'trackName': "fiber tracks", 'color': FIBER_COLOR,
+                 'radius': radius * FIBER_RADIUS_SCALE, 'width': FIBER_WIDTH_PX}],
             'sphere': {'v': verts.ravel().tolist(), 'f': faces.ravel().tolist()}}
     script = START + PAGE_SCRIPT.replace('__DATA__', json.dumps(data).replace('</', '<\\/')) + END + '\n'
     at = page_text.rfind('</body>')
@@ -391,7 +426,9 @@ def make_page(page, surgeries, out=None, radius=DEFAULT_RADIUS_MM):
         raise ValueError("No mouse injection sites with coordinates in that surgery list.")
     out.write_text(add_to_page(text, sites, radius), encoding='utf-8')
     left_out = ', '.join(f"{n} {why}" for why, n in skipped.items() if n)
-    report.insert(0, f"{len(sites)} balls written to {out}" + (f" (left out: {left_out})" if left_out else ""))
+    fibers = sum(1 for s in sites if s[6] == 'fiber')
+    report.insert(0, f"{len(sites) - fibers} injection sites and {fibers} optic fibers written to {out}"
+                  + (f" (left out: {left_out})" if left_out else ""))
     report.append(f"Bregma in the CCF: AP {bregma[0]:g}, DV {bregma[1]:g}, ML {bregma[2]:g} mm")
     return out, report
 

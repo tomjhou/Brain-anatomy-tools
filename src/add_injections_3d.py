@@ -1,6 +1,7 @@
 """Show the lab's injection sites (and optic fibers) in a 3D page written by the ABC atlas browser, as white balls.
 
     python add_injections_3d.py PAGE.html SURGERIES.csv [--radius 0.15] [--no-open]
+    python add_injections_3d.py PAGE.html SURGERIES.csv --json [--no-upgrade]    (the surgery viewer's 3D panel: it serves the page and side file itself)
 
 PAGE.html is a 3D page from the ABC browser (its axes are CCF millimetres). SURGERIES.csv is the surgery viewer's "Export CSV" file
 (JhouLab-surgery-viewer), so filter the list there first (by target, person, dates...) to choose which injections are drawn. The page is not copied: the sites
@@ -696,6 +697,13 @@ def make_view(page, surgeries, radius=DEFAULT_RADIUS_MM, upgrade=False, skull_sp
     """Write the side file for the surgery list. Returns (the address to open the page at, the lines to report); raises ValueError when there is nothing to draw or
     the page is not a 3D page, and PageNeedsUpgrade when the page has no loader (with upgrade=True the page is upgraded first). `skull_span` (mm): see SkullSurface. `viewer_url`: where the surgery viewer's page is
     (http://localhost:PORT/): given, a click on a ball or track in the 3D page opens the viewer at that animal."""
+    side, report = make_side_file(page, surgeries, radius, upgrade, skull_span, viewer_url)
+    return view_address(page, side), report
+
+
+def make_side_file(page, surgeries, radius=DEFAULT_RADIUS_MM, upgrade=False, skull_span=SKULL_SPAN_MM, viewer_url=None):
+    """make_view without the address: (the side file's path, the lines to report). The surgery viewer's 3D panel uses this (--json), as it serves the page and
+    the side file itself."""
     page = Path(page)
     if not compressed_page.looks_like_3d_page(page):
         raise ValueError(f"{page.name} does not look like a 3D page from the ABC browser (no plotly in it).")
@@ -728,7 +736,7 @@ def make_view(page, surgeries, radius=DEFAULT_RADIUS_MM, upgrade=False, skull_sp
     if skull is not None:
         report.append(f"DV zeroed on the dura or brain surface is measured from the estimated underside of the skull (dips in the brain's top narrower "
                       f"than about {2 * skull_span:g} mm are bridged); it is drawn as a translucent sheet.")
-    return view_address(page, side), report
+    return side, report
 
 
 # ---------- the window (run-add-injections.bat / .command) ----------
@@ -942,7 +950,20 @@ def main(argv=None):
     p.add_argument('--skull-span', type=float, default=SKULL_SPAN_MM, help=f"dips in the brain's top narrower than twice this (mm) are bridged when the skull's underside is estimated (default {SKULL_SPAN_MM:g})")
     p.add_argument('--viewer', help="the address of the surgery viewer's page (http://localhost:PORT/): a click on a ball in the 3D page opens it at that animal")
     p.add_argument('--no-open', action='store_true', help="only write the side file and print the address")
+    p.add_argument('--json', action='store_true', help="for the surgery viewer's 3D panel: only write the side file, and print one line of JSON: "
+                                                       "{ok, side_file, report}, {needs_upgrade}, or {error}")
+    p.add_argument('--no-upgrade', action='store_true', help="with --json: do not change a page made before 3D pages could show injection sites (say so instead)")
     a = p.parse_args(argv)
+    if a.json:
+        try:
+            side, report = make_side_file(a.page, a.surgeries, a.radius, upgrade=not a.no_upgrade, skull_span=a.skull_span, viewer_url=a.viewer)
+            result = {'ok': True, 'side_file': str(side), 'report': report}
+        except PageNeedsUpgrade as e:
+            result = {'needs_upgrade': str(e)}
+        except Exception as e:      # (anything: the viewer shows it)
+            result = {'error': str(e) or type(e).__name__}
+        print(json.dumps(result))
+        return result
     try:
         address, report = make_view(a.page, a.surgeries, a.radius, upgrade=True, skull_span=a.skull_span, viewer_url=a.viewer)
     except ValueError as e:

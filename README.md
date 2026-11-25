@@ -73,8 +73,8 @@ C57BL6J-638850):
 - Export the cells' coordinates, e.g. to plot them in the CCF browser.
 - Add the lab's injection sites to a 3D page as white balls, each with its needle track (from where its DV was
   measured, at its angle; optic fibers in blue): in the JhouLab surgery viewer, filter the
-  list and click Show in 3D (or Export CSV, then double-click `extra-tools/run-add-injections.bat`,
-  `.command` on a Mac). In the window, choose the page and click Show in 3D. The page itself is not copied: the
+  list and click Show in 3D, which shows the page in a panel beside the list (or Export CSV, then double-click `extra-tools/run-add-injections.bat`,
+  `.command` on a Mac, and in its window choose the page and click Show in 3D). The page itself is not copied: the
   sites go in a small side file in `tmp/injection_sites` here, and the page opens in a new browser tab that reads
   it (a refresh keeps the same sites; each Show in 3D opens its own tab, so sets can be compared). A page from
   before this existed is upgraded once, in place (after asking; it looks the same and is stored compressed).

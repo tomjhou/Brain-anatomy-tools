@@ -586,8 +586,9 @@ EXTRAS_JS = r"""
 
   // Optic fibers' rods as tubes of a real thickness (the group's 'tube' radius, mm), not lines a fixed number of pixels wide: the page's loader draws every
   // track as a line, and the fiber tracks are made tubes here. A tube is TUBE_SIDES faces round, from where the DV was zeroed down to the ball, closed at both
-  // ends: TUBE_VERTS vertices for each site, in the order of the sites (so a click finds its site).
-  var TUBE_SIDES = 12, TUBE_VERTS = 2 * TUBE_SIDES + 2;
+  // ends: TUBE_VERTS vertices for each site, in the order of the sites (so a click finds its site). Every face is wound to face outward, and the ends have
+  // their own copies of the rims, so the smooth shading (which averages the faces at each vertex) shows a round tube, not stripes.
+  var TUBE_SIDES = 16, TUBE_VERTS = 4 * TUBE_SIDES + 2;
   function tubeMesh(sites, r) {
     var m = {x: [], y: [], z: [], i: [], j: [], k: [], text: []};
     sites.forEach(function (s, n) {
@@ -598,18 +599,20 @@ EXTRAS_JS = r"""
       var u = [d[1] * h[2] - d[2] * h[1], d[2] * h[0] - d[0] * h[2], d[0] * h[1] - d[1] * h[0]], ul = Math.sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
       u = [u[0] / ul, u[1] / ul, u[2] / ul];
       var v = [d[1] * u[2] - d[2] * u[1], d[2] * u[0] - d[0] * u[2], d[0] * u[1] - d[1] * u[0]];
-      var base = n * TUBE_VERTS;
-      [a, b].forEach(function (end) {
-        for (var q = 0; q < TUBE_SIDES; q++) {
-          var t = 2 * Math.PI * q / TUBE_SIDES, c = Math.cos(t) * r, sn = Math.sin(t) * r;
+      var base = n * TUBE_VERTS, N = TUBE_SIDES;
+      [a, b, a, b].forEach(function (end) {   // the side's two rims, then the ends' own copies of them
+        for (var q = 0; q < N; q++) {
+          var t = 2 * Math.PI * q / N, c = Math.cos(t) * r, sn = Math.sin(t) * r;
           m.x.push(end[0] + c * u[0] + sn * v[0]); m.y.push(end[1] + c * u[1] + sn * v[1]); m.z.push(end[2] + c * u[2] + sn * v[2]); m.text.push(s[3]);
         }
       });
       m.x.push(a[0], b[0]); m.y.push(a[1], b[1]); m.z.push(a[2], b[2]); m.text.push(s[3], s[3]);   // (the ends' centres)
-      var top = base + 2 * TUBE_SIDES, bottom = top + 1;
-      for (var q = 0; q < TUBE_SIDES; q++) {
-        var p0 = base + q, p1 = base + (q + 1) % TUBE_SIDES, q0 = p0 + TUBE_SIDES, q1 = p1 + TUBE_SIDES;
-        m.i.push(p0, p1, top, bottom); m.j.push(q0, q1, p1, q0); m.k.push(p1, q0, p0, q1);
+      var top = base + 4 * N, bottom = top + 1;
+      for (var q = 0; q < N; q++) {
+        var p0 = base + q, p1 = base + (q + 1) % N, q0 = p0 + N, q1 = p1 + N;   // the side: p at the top rim, q at the bottom rim
+        m.i.push(p0, p1); m.j.push(p1, q1); m.k.push(q0, q0);                     // (p0, p1, q0) and (p1, q1, q0): both facing out
+        var e0 = p0 + 2 * N, e1 = p1 + 2 * N, f0 = q0 + 2 * N, f1 = q1 + 2 * N;  // the ends' rims
+        m.i.push(top, bottom); m.j.push(e1, f0); m.k.push(e0, f1);               // (top, e1, e0) faces up the track, (bottom, f0, f1) down it
       }
     });
     return m;

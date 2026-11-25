@@ -48,7 +48,7 @@ class GroupTree:
         self.var_search.trace_add("write", lambda *a: self.search_soon())
         ttk.Label(top, padding=(10, 0, 10, 4), foreground="gray30", wraplength=600, justify=tk.LEFT, text=(
             "Click a box to color a group (all its cells one color). Open a group with its arrow, or press Split to give each of its subgroups its own color. "
-            "Where groups overlap, the cells take the finer one.")).pack(anchor="w")
+            "Where groups overlap, the cells take the finer one. Ctrl+click a box (or press Uncheck below) to uncheck a group and everything below it.")).pack(anchor="w")
         body = ttk.Frame(top, padding=(8, 0))
         body.pack(fill=tk.BOTH, expand=True)
         self.tree = ttk.Treeview(body, show="tree", selectmode="browse")
@@ -66,6 +66,7 @@ class GroupTree:
                 ("Split", self.split_selected, "Replace the selected colored group by its subgroups, each with its own color."),
                 ("Merge", self.merge_selected, "Color the selected group as one, in place of whatever is colored below it."),
                 ("Color...", self.color_selected, "Choose the color of the selected colored group."),
+                ("Uncheck below", self.clear_below_selected, "Uncheck the selected group and every group below it (the same as Ctrl+click on its box)."),
                 ("Clear all", self.clear_all, "Remove every group."),
                 ("Close", self.close, "Close this window (the same as its X).")):
             b = ttk.Button(buttons, text=text, command=command)
@@ -278,7 +279,10 @@ class GroupTree:
             return
         iid = self.tree.identify_row(event.y)
         if iid and not iid.endswith("|..."):
-            self.toggle(self.node_of(iid))
+            if event.state & 0x0004:                      # (Ctrl held: this group and everything below it are unchecked)
+                self.clear_below(self.node_of(iid))
+            else:
+                self.toggle(self.node_of(iid))
 
     def selected(self):
         iid = self.tree.focus() or (self.tree.selection() or [""])[0]
@@ -296,6 +300,24 @@ class GroupTree:
         else:
             units.append(node)
         self.apply(units)
+
+    def clear_below(self, node):
+        """Uncheck `node` and every checked group below it (its subgroups, their subgroups...)."""
+        units = list(self.units())
+        kept = [u for u in units if u != node and not (u in self.nodes and node in set(self.ancestors(u)))]
+        if len(kept) == len(units):
+            self.status.config(text="Nothing at or below that group is checked.")
+            return
+        removed = len(units) - len(kept)
+        self.apply(kept)
+        self.status.config(text=f"Unchecked {removed} group{'' if removed == 1 else 's'}.")
+
+    def clear_below_selected(self):
+        node = self.selected()
+        if node is None:
+            self.status.config(text="Select the group to uncheck, with everything below it.")
+            return
+        self.clear_below(node)
 
     def split_selected(self):
         node = self.selected()

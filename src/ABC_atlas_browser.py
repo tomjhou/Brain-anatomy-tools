@@ -3962,7 +3962,7 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
                    .replace('__SLIDER_SCRIPTS__', slice_slider_scripts.page_js(bool(COORD_SETTINGS.get('diagnostics_3d')))))
     scripts.append(THREED_WEB_SPIN_SCRIPT)
     scripts.append(THREED_WEB_LEGEND_MARK_SCRIPT)
-    figure.write_html(str(path), include_plotlyjs=True, full_html=True, config={'displaylogo': False},
+    figure.write_html(str(path), include_plotlyjs=True, full_html=True, config={'displaylogo': False, 'showTips': False},   # (no tips: plotly's hint to double-click the legend to isolate an entry is wrong here, the page turns that off)
                       post_script='\n'.join(scripts + scripts_end) or None)
     if compress:
         try:

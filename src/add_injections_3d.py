@@ -411,6 +411,7 @@ EXTRAS_JS = r"""
   function draw() {
     var gd = document.querySelector('.plotly-graph-div');
     if (!window.Plotly || !gd || !gd._fullLayout || !gd._fullLayout.scene) return setTimeout(draw, 200);
+    if (gd._context) gd._context.showTips = false;   // (no plotly tips, for pages written before the page turned them off: its hint to double-click the legend to isolate an entry is wrong here)
     var traces = [], have = {}, firstOwn = gd._fullData.length;
     gd._fullData.forEach(function (t) { have[t.name] = true; });   // (an export from the ABC browser may already have the cubes, and its own spacer)
     var haveCubes = gd._fullData.some(function (t) { return /^(bregma|lambda)/.test(t.name || ''); });

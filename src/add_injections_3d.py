@@ -438,29 +438,9 @@ EXTRAS_JS = r"""
         name: e.cubesName, showlegend: true, text: text, hoverinfo: 'text', legendrank: 1});
     }
     if (e.discs && e.discs.points.length) {   // a small flat disc where each skull-referenced track starts (all in one mesh)
-      var dx = [], dy = [], dz = [], di = [], dj = [], dk = [], dt = [], sides = 16, rad = e.discs.diameter / 2, half = e.discs.thickness / 2;
-      function face(a, b, c) { di.push(a); dj.push(b); dk.push(c); }
-      e.discs.points.forEach(function (pt) {
-        var top = dx.length, bottom = top + sides + 1;   // vertices: the top's centre then its ring, the bottom's centre then its ring
-        (half > 0 ? [-half, half] : [0]).forEach(function (dzv) {   // (no thickness: one flat face, drawn from both sides)
-          dx.push(pt[0]); dy.push(pt[1]); dz.push(pt[2] + dzv); dt.push(e.discs.text);
-          for (var s = 0; s < sides; s++) {
-            var ang = 2 * Math.PI * s / sides;
-            dx.push(pt[0] + rad * Math.cos(ang)); dy.push(pt[1] + rad * Math.sin(ang)); dz.push(pt[2] + dzv); dt.push(e.discs.text);
-          }
-        });
-        for (var m = 0; m < sides; m++) {
-          var next = (m + 1) % sides;
-          face(top, top + 1 + m, top + 1 + next);                                  // the top
-          if (half > 0) {
-            face(bottom, bottom + 1 + next, bottom + 1 + m);                       // the bottom
-            face(top + 1 + m, bottom + 1 + m, bottom + 1 + next);                 // the rim
-            face(top + 1 + m, bottom + 1 + next, top + 1 + next);
-          }
-        }
-      });
-      traces.push({type: 'mesh3d', x: dx, y: dy, z: dz, i: di, j: dj, k: dk, color: e.discs.color, opacity: 1, flatshading: true,
-        lighting: {ambient: 0.7, diffuse: 0.7, specular: 0.1, roughness: 0.8}, name: e.discs.name, showlegend: true, text: dt, hoverinfo: 'text'});
+      var dm = discMesh(e.discs.points);
+      traces.push({type: 'mesh3d', x: dm.x, y: dm.y, z: dm.z, i: dm.i, j: dm.j, k: dm.k, color: e.discs.color, opacity: 1, flatshading: true,
+        lighting: {ambient: 0.7, diffuse: 0.7, specular: 0.1, roughness: 0.8}, name: e.discs.name, showlegend: true, text: dm.text, hoverinfo: 'text'});
     }
     if (e.skull) {   // the sheet as a mesh (so that the slice cut can trim it like the other surfaces): two triangles per grid cell, none over gaps
       var s = e.skull, id = [], vx = [], vy = [], vz = [], fi = [], fj = [], fk = [];
@@ -503,6 +483,33 @@ EXTRAS_JS = r"""
         else settled(gd);
       });
     });
+  }
+
+  // The skull discs of `points` ([x, y, z, 'TAB:ROW'] each: where a track zeroed on the skull starts) as one mesh, {x, y, z, i, j, k, text}. The 3D panel
+  // draws again only those of the rows listed (installPanel).
+  function discMesh(points) {
+    var m = {x: [], y: [], z: [], i: [], j: [], k: [], text: []}, sides = 16, rad = e.discs.diameter / 2, half = e.discs.thickness / 2;
+    function face(a, b, c) { m.i.push(a); m.j.push(b); m.k.push(c); }
+    points.forEach(function (pt) {
+      var top = m.x.length, bottom = top + sides + 1;   // vertices: the top's centre then its ring, the bottom's centre then its ring
+      (half > 0 ? [-half, half] : [0]).forEach(function (dzv) {   // (no thickness: one flat face, drawn from both sides)
+        m.x.push(pt[0]); m.y.push(pt[1]); m.z.push(pt[2] + dzv); m.text.push(e.discs.text);
+        for (var s = 0; s < sides; s++) {
+          var ang = 2 * Math.PI * s / sides;
+          m.x.push(pt[0] + rad * Math.cos(ang)); m.y.push(pt[1] + rad * Math.sin(ang)); m.z.push(pt[2] + dzv); m.text.push(e.discs.text);
+        }
+      });
+      for (var q = 0; q < sides; q++) {
+        var next = (q + 1) % sides;
+        face(top, top + 1 + q, top + 1 + next);                                  // the top
+        if (half > 0) {
+          face(bottom, bottom + 1 + next, bottom + 1 + q);                       // the bottom
+          face(top + 1 + q, bottom + 1 + q, bottom + 1 + next);                 // the rim
+          face(top + 1 + q, bottom + 1 + next, top + 1 + next);
+        }
+      }
+    });
+    return m;
   }
 
   // While the page sets itself up after it opens (several redraws of the whole scene, a second or two with large pages) it hardly answers the mouse: the
@@ -678,8 +685,11 @@ EXTRAS_JS = r"""
       return t;
     }
     // the marked sites: a mesh and a line, not in the legend, not hovered (the balls under them answer); added with the page's other objects (draw)
-    var mark = -1;
-    gd._fullData.forEach(function (t, index) { if (t.name === 'marked sites') mark = index; });
+    var mark = -1, discs = -1;
+    gd._fullData.forEach(function (t, index) {
+      if (t.name === 'marked sites') mark = index;
+      if (e.discs && t.name === e.discs.name && t.type === 'mesh3d') discs = index;   // (the skull discs: they follow the list too)
+    });
     var marked = [], markOn = false;
     // Each change of the plot redraws the whole scene (with large pages a noticeable moment), so a list that draws the same sites changes nothing, and the
     // balls and tracks are changed together, in one go.
@@ -713,6 +723,12 @@ EXTRAS_JS = r"""
         u.name.push(undefined);
         ids.push(G.line);
       });
+      if (discs >= 0) {   // the skull discs of the rows listed (a disc without a row, from an older side file, stays)
+        var dm = discMesh(e.discs.points.filter(function (p) { return !wanted || p.length < 4 || wanted.has(p[3]); }));
+        ['x', 'y', 'z', 'text', 'i', 'j', 'k'].forEach(function (a) { u[a].push(dm[a]); });
+        u.name.push(undefined);
+        ids.push(discs);
+      }
       setTimeout(function () {   // (a moment for the hourglass to show first)
         Plotly.restyle(gd, u, ids).then(function () {
           if (gd.__extrasForget) gd.__extrasForget(ids);   // (the slice cut starts again from the new sites)
@@ -935,7 +951,7 @@ def write_side_file(sites, radius, label, folder=None, bregma=None, skull=None, 
     text = ('window.__injectionData = ' + json.dumps(side_file_data(sites, radius, label)).replace('</', '<\\/') + ';\n'
             'window.__injectionSites(window.__injectionData);\n')
     if bregma or skull:
-        tops = [[s[4], s[1], s[5]] for s in sites if len(s) > 7 and s[7] == 'surface']      # where the tracks zeroed on the skull, dura or brain surface start
+        tops = [[s[4], s[1], s[5]] + list(s[10:11]) for s in sites if len(s) > 7 and s[7] == 'surface']   # where the tracks zeroed on the skull, dura or brain surface start (and the row)
         extras = {'cubes': landmark_cubes(bregma) if bregma else [], 'cubesName': 'bregma and lambda', 'skull': skull.sheet() if skull else None, 'skullColor': SKULL_SHEET_COLOR,
                   'viewer': viewer, 'discs': {'points': tops, 'diameter': LANDMARK_CUBE_MM, 'thickness': SKULL_DISC_THICKNESS_MM, 'color': SKULL_DISC_COLOR,
                             'name': 'DV from the skull or dura',

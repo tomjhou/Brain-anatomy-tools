@@ -66,7 +66,8 @@ class GroupTree:
                 ("Split", self.split_selected, "Replace the selected colored group by its subgroups, each with its own color."),
                 ("Merge", self.merge_selected, "Color the selected group as one, in place of whatever is colored below it."),
                 ("Color...", self.color_selected, "Choose the color of the selected colored group."),
-                ("Clear all", self.clear_all, "Remove every group.")):
+                ("Clear all", self.clear_all, "Remove every group."),
+                ("Close", self.close, "Close this window (the same as its X).")):
             b = ttk.Button(buttons, text=text, command=command)
             b.pack(side=tk.LEFT, padx=(0, 6))
         self.status = ttk.Label(buttons, foreground="gray30")

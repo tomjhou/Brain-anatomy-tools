@@ -71,6 +71,9 @@ DEFAULT_BREGMA_CCF_AP_MM = 5.40
 # the default above. Offsets only: no scaling or tilt between the two brains, so the values are approximate, more so far from bregma.
 BREGMA_CCF_ML_MM = 5.739                 # (the midline: fixed)
 DEFAULT_BREGMA_CCF_DV_MM = 0.332
+# Where lambda is drawn when the 3D view marks it: this far behind bregma, on the midline and at bregma's height (the head is levelled so that the two are
+# at the same height). A typical adult mouse; there is no exact value for the CCF brain (add_injections_3d.py has its own copy of this number).
+LAMBDA_BEHIND_BREGMA_MM = 4.2
 
 
 # (these settings are always kept in viewer_settings.json, whether or not the viewer's own settings persist)

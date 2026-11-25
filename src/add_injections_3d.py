@@ -122,6 +122,55 @@ class BrainTop:
         return self.top[i, k] * VOXEL_MM
 
 
+SKULL_SPAN_MM = 4.0       # dips in the brain's top narrower than about twice this are bridged when the skull's underside is estimated (see SkullSurface)
+SKULL_STEP = 4            # the estimate is made on a grid of this many voxels (0.1 mm)
+
+
+def _window_reduce(grid, offsets, reduce, fill, radius):
+    """`reduce` (np.maximum or np.minimum) of `grid` shifted by each of `offsets` (a disk of cells): a dilation or an erosion; `fill` beyond the edges."""
+    rows, cols = grid.shape
+    padded = np.pad(grid, radius, mode='constant', constant_values=fill)
+    out = padded[radius:radius + rows, radius:radius + cols].copy()
+    for di, dj in offsets:
+        reduce(out, padded[radius + di:radius + di + rows, radius + dj:radius + dj + cols], out=out)
+    return out
+
+
+class SkullSurface:
+    """The depth (CCF DV, mm) of the underside of the skull, where the surgeon zeroed DV on the dura or brain surface, estimated from the top of the brain.
+    The brain's top is not always right under the skull: behind the visual cortex, in front of the cerebellum, it dips about a millimetre while the skull does
+    not. The estimate is the top of the brain with such dips bridged (a morphological closing of the height map by a flat disk of radius `span_mm`: dips
+    narrower than that are filled to the height of their surroundings, the rest of the surface is left as it is). It is never lower than the brain's top.
+    Call it like BrainTop. sheet() gives the surface for drawing."""
+
+    def __init__(self, brain_top, span_mm=SKULL_SPAN_MM, step=SKULL_STEP):
+        self.brain_top = brain_top
+        self.step_mm = step * VOXEL_MM
+        coarse = brain_top.top[::step, ::step]
+        valid = coarse >= 0
+        height = np.where(valid, -coarse * VOXEL_MM, -1e6)                       # (up is larger; outside the brain is far down)
+        radius = max(1, int(round(span_mm / self.step_mm)))
+        offsets = [(di, dj) for di in range(-radius, radius + 1) for dj in range(-radius, radius + 1) if di * di + dj * dj <= radius * radius]
+        closed = _window_reduce(_window_reduce(height, offsets, np.maximum, -1e6, radius), offsets, np.minimum, 1e6, radius)
+        self.depth = np.where(valid, -np.maximum(closed, height), np.nan)         # (CCF DV: smaller is higher)
+
+    def __call__(self, ccf_ap, ccf_ml):
+        raw = self.brain_top(ccf_ap, ccf_ml)
+        if raw is None:
+            return None
+        i, k = int(round(ccf_ap / self.step_mm)), int(round(ccf_ml / self.step_mm))
+        if 0 <= i < self.depth.shape[0] and 0 <= k < self.depth.shape[1] and np.isfinite(self.depth[i, k]):
+            return min(raw, float(self.depth[i, k]))
+        return raw
+
+    def sheet(self, every=2):
+        """The estimated surface as {'x': ML values, 'y': AP values, 'z': depth rows (None outside the brain)} for a Plotly surface, every `every` grid cells."""
+        depth = self.depth[::every, ::every]
+        step = self.step_mm * every
+        z = [[None if not np.isfinite(v) else round(float(v), 3) for v in row] for row in depth]
+        return {'x': [round(k * step, 3) for k in range(depth.shape[1])], 'y': [round(i * step, 3) for i in range(depth.shape[0])], 'z': z}
+
+
 # ---------- the surgery side ----------
 def ap_shift_mm(reference):
     """How far behind bregma the row's AP zero is (mm), from text like 'adjusted intersection point (~0.4 mm behind
@@ -194,8 +243,8 @@ def split_sites(r):
 
 
 def injection_sites(rows, bregma, brain_top):
-    """[(x, y, z, hover, entry x, entry z, kind)] in the page's axes (CCF ML, AP, DV in mm; see site_balls; kind
-    'injection' or 'fiber', see site_kinds) and a dict of what was left out."""
+    """[(x, y, z, hover, entry x, entry z, kind, zero)] in the page's axes (CCF ML, AP, DV in mm; see site_balls; kind
+    'injection' or 'fiber', see site_kinds; zero 'surface' or 'bregma': what the DV was measured from) and a dict of what was left out."""
     sites, skipped = [], {'rat': 0, 'no coordinates': 0, 'other species': 0}
     for r in rows:
         species = (r.get('species') or '').strip().lower()
@@ -214,7 +263,7 @@ def injection_sites(rows, bregma, brain_top):
         for site, (kind, note) in zip(row_sites, kinds):
             if note:
                 site = site[:6] + ('; '.join(n for n in (site[6], note) if n),)
-            sites.extend(b + (kind,) for b in site_balls(r, *site, bregma=bregma, brain_top=brain_top))
+            sites.extend(b[:6] + (kind,) + b[6:] for b in site_balls(r, *site, bregma=bregma, brain_top=brain_top))   # (the loader reads the kind at index 6)
     return sites, skipped
 
 
@@ -242,7 +291,7 @@ def one_line(text):
 
 
 def site_balls(r, ap, ml, dv, site_angle, site_side, target, site_note, bregma, brain_top):
-    """The ball(s) of one site of a row, (x, y, z, hover, entry x, entry z) each: one, or one per side when bilateral.
+    """The ball(s) of one site of a row, (x, y, z, hover, entry x, entry z, zero) each ('surface' or 'bregma': what the DV was measured from): one, or one per side when bilateral.
     x, y, z is the tip; the entry point (same y: tracks tilt only in the coronal plane) is where the DV was zeroed,
     on the brain surface or at bregma's height."""
     bregma_ap, bregma_dv, midline = bregma
@@ -290,7 +339,7 @@ def site_balls(r, ap, ml, dv, site_angle, site_side, target, site_note, bregma, 
                   f"{', DV from ' + one_line(r.get('dv_zero')) if str(r.get('dv_zero') or '').strip() else ''})")
         balls.append((round(tip_ml, 3), round(ccf_ap, 3), round(float(ccf_dv), 3),
                       '<br>'.join([head, what, coords] + notes + side_notes),
-                      round(entry_ml, 3), round(float(top), 3)))
+                      round(entry_ml, 3), round(float(top), 3), zero))
     return balls
 
 
@@ -350,41 +399,210 @@ def clean_side_files(folder, keep=KEEP_SIDE_FILES):
             pass
 
 
-BREGMA_COLOR = '#e01818'
-BREGMA_CUBE_MM = 0.15     # the cube's edge: half the width of an injection ball
+LANDMARK_COLOR = '#e01818'
+LANDMARK_CUBE_MM = 0.15       # the cubes' edge: half the width of an injection ball
+LAMBDA_BEHIND_BREGMA_MM = 4.2  # lambda's place: a typical adult mouse (approximate; the head is leveled so that lambda is at bregma's height)
 
-# Draws a small cube centered at bregma (the page's axes: x = ML, y = AP, z = DV). It is part of the side file, not of the page's loader, so that pages that
-# already have the loader show it too. Waits for the plot the same way the loader does.
-BREGMA_JS = r"""
-(function (b) {
+# Draws the red cubes at bregma and lambda and, when there is one, the estimated skull sheet (the page's axes: x = ML, y = AP, z = DV). It is part of the side
+# file, not of the page's loader, so that pages that already have the loader show it too. Waits for the plot the same way the loader does.
+EXTRAS_JS = r"""
+(function (e) {
   function draw() {
     var gd = document.querySelector('.plotly-graph-div');
     if (!window.Plotly || !gd || !gd._fullLayout || !gd._fullLayout.scene) return setTimeout(draw, 200);
-    var h = b.edge / 2, x = [], y = [], z = [];
-    [[-1, -1, -1], [-1, 1, -1], [1, 1, -1], [1, -1, -1], [-1, -1, 1], [-1, 1, 1], [1, 1, 1], [1, -1, 1]].forEach(function (c) {
-      x.push(b.x + c[0] * h); y.push(b.y + c[1] * h); z.push(b.z + c[2] * h);
+    var traces = [], have = {}, firstOwn = gd._fullData.length;
+    gd._fullData.forEach(function (t) { have[t.name] = true; });   // (an export from the ABC browser may already have the cubes, and its own spacer)
+    var haveCubes = gd._fullData.some(function (t) { return /^(bregma|lambda)/.test(t.name || ''); });
+    if (e.cubes.length && !haveCubes) {   // both cubes are ONE object (one legend entry, switched on and off together)
+      var x = [], y = [], z = [], fi = [], fj = [], fk = [], text = [];
+      e.cubes.forEach(function (b, n) {
+        var h = b.edge / 2;
+        [[-1, -1, -1], [-1, 1, -1], [1, 1, -1], [1, -1, -1], [-1, -1, 1], [-1, 1, 1], [1, 1, 1], [1, -1, 1]].forEach(function (c) {
+          x.push(b.x + c[0] * h); y.push(b.y + c[1] * h); z.push(b.z + c[2] * h); text.push(b.text);
+        });
+        [7, 0, 0, 0, 4, 4, 2, 6, 4, 0, 3, 7].forEach(function (v, q) {
+          fi.push(v + 8 * n); fj.push([3, 4, 1, 2, 5, 6, 5, 5, 0, 1, 2, 2][q] + 8 * n); fk.push([0, 7, 2, 3, 6, 7, 1, 2, 5, 5, 7, 6][q] + 8 * n);
+        });
+      });
+      traces.push({type: 'mesh3d', x: x, y: y, z: z, i: fi, j: fj, k: fk, color: e.cubes[0].color, opacity: 1, flatshading: true,
+        lighting: {ambient: 0.6, diffuse: 0.8, specular: 0.2, roughness: 0.6},
+        name: e.cubesName, showlegend: true, text: text, hoverinfo: 'text', legendrank: 1});
+    }
+    if (e.discs && e.discs.points.length) {   // a small flat disc where each skull-referenced track starts (all in one mesh)
+      var dx = [], dy = [], dz = [], di = [], dj = [], dk = [], dt = [], sides = 16, rad = e.discs.diameter / 2, half = e.discs.thickness / 2;
+      function face(a, b, c) { di.push(a); dj.push(b); dk.push(c); }
+      e.discs.points.forEach(function (pt) {
+        var top = dx.length, bottom = top + sides + 1;   // vertices: the top's centre then its ring, the bottom's centre then its ring
+        (half > 0 ? [-half, half] : [0]).forEach(function (dzv) {   // (no thickness: one flat face, drawn from both sides)
+          dx.push(pt[0]); dy.push(pt[1]); dz.push(pt[2] + dzv); dt.push(e.discs.text);
+          for (var s = 0; s < sides; s++) {
+            var ang = 2 * Math.PI * s / sides;
+            dx.push(pt[0] + rad * Math.cos(ang)); dy.push(pt[1] + rad * Math.sin(ang)); dz.push(pt[2] + dzv); dt.push(e.discs.text);
+          }
+        });
+        for (var m = 0; m < sides; m++) {
+          var next = (m + 1) % sides;
+          face(top, top + 1 + m, top + 1 + next);                                  // the top
+          if (half > 0) {
+            face(bottom, bottom + 1 + next, bottom + 1 + m);                       // the bottom
+            face(top + 1 + m, bottom + 1 + m, bottom + 1 + next);                 // the rim
+            face(top + 1 + m, bottom + 1 + next, top + 1 + next);
+          }
+        }
+      });
+      traces.push({type: 'mesh3d', x: dx, y: dy, z: dz, i: di, j: dj, k: dk, color: e.discs.color, opacity: 1, flatshading: true,
+        lighting: {ambient: 0.7, diffuse: 0.7, specular: 0.1, roughness: 0.8}, name: e.discs.name, showlegend: true, text: dt, hoverinfo: 'text'});
+    }
+    if (e.skull) {   // the sheet as a mesh (so that the slice cut can trim it like the other surfaces): two triangles per grid cell, none over gaps
+      var s = e.skull, id = [], vx = [], vy = [], vz = [], fi = [], fj = [], fk = [];
+      for (var r = 0; r < s.y.length; r++) {
+        id.push([]);
+        for (var c = 0; c < s.x.length; c++) {
+          if (s.z[r][c] === null) { id[r].push(-1); continue; }
+          id[r].push(vx.length); vx.push(s.x[c]); vy.push(s.y[r]); vz.push(s.z[r][c]);
+        }
+      }
+      function tri(a, b, d) { if (a >= 0 && b >= 0 && d >= 0) { fi.push(a); fj.push(b); fk.push(d); } }
+      for (var r2 = 0; r2 < s.y.length - 1; r2++) {
+        for (var c2 = 0; c2 < s.x.length - 1; c2++) {
+          var p = id[r2][c2], q = id[r2][c2 + 1], u = id[r2 + 1][c2], w = id[r2 + 1][c2 + 1];
+          tri(p, q, w); tri(p, w, u);
+        }
+      }
+      traces.push({type: 'mesh3d', x: vx, y: vy, z: vz, i: fi, j: fj, k: fk, color: e.skullColor, opacity: 0.3, flatshading: false,
+        lighting: {ambient: 0.8, diffuse: 0.3, specular: 0, roughness: 1}, name: 'estimated skull underside', showlegend: true, hoverinfo: 'skip',
+        legendrank: 3});
+    }
+    // bregma, lambda and the skull estimate are first in the legend (rank), then one blank line (a blank-named stand-in trace, which the page hides), as in
+    // the page's own legend; the page's other entries have the default rank, 1000
+    var spacer = '​​​';
+    if (traces.length && !have[spacer]) {
+      traces.push({type: 'scatter3d', mode: 'markers', x: [null], y: [null], z: [null], name: spacer, showlegend: true, hoverinfo: 'skip',
+                   marker: {size: 1, color: 'rgba(0,0,0,0)'}, legendrank: 4});
+    }
+    Plotly.addTraces(gd, traces).then(function () { makeSliceable(gd, firstOwn); groupLegend(gd, 40); fixSwatches(gd); });
+  }
+
+  // Pages written before the page's own legend script cleared it can leave an entry without its icon: plotly re-uses a legend row for another entry when the
+  // legend is rebuilt (as it is when these objects are added), and a row that was a surface's still has its swatch hidden by that script. Unhide the swatch of
+  // every entry that is not a surface, edges or envelope (those are drawn by the script itself), after each redraw.
+  function fixSwatches(gd) {
+    function fix() {
+      Array.prototype.forEach.call(gd.querySelectorAll('.legend g.traces'), function (group) {
+        var data = group.__data__, trace = data && data[0] && data[0].trace;
+        if (!trace || / (surface|edges|envelope)$/.test(trace.name || '')) return;
+        var layers = group.querySelector('.layers');
+        if (layers && layers.style.display === 'none') layers.style.removeProperty('display');
+      });
+    }
+    gd.on('plotly_afterplot', function () { setTimeout(fix, 0); });
+    gd.on('plotly_restyle', function () { setTimeout(fix, 30); });
+    setTimeout(fix, 300);
+  }
+
+  // The injection sites, their tracks, the optic fibers and the skull discs are one legend group, with a small space above it. A legend group's title row has
+  // a font of its own, so a blank title in a tiny font is the space. The injection traces are drawn
+  // by the page's loader, perhaps a moment after these, so this looks again until they are there. Clicking an entry still switches only that entry.
+  function groupLegend(gd, tries) {
+    var groups = [['injections', /^(injection sites|needle tracks|optic fibers|fiber tracks|DV from the skull)/]];
+    var found = groups.map(function (g) {
+      var ids = [];
+      gd._fullData.forEach(function (t, index) { if (g[1].test(t.name || '')) ids.push(index); });
+      return ids;
     });
-    Plotly.addTraces(gd, [{type: 'mesh3d', x: x, y: y, z: z, color: b.color, opacity: 1, flatshading: true,
-      i: [7, 0, 0, 0, 4, 4, 2, 6, 4, 0, 3, 7], j: [3, 4, 1, 2, 5, 6, 5, 5, 0, 1, 2, 2], k: [0, 7, 2, 3, 6, 7, 1, 2, 5, 5, 7, 6],
-      lighting: {ambient: 0.6, diffuse: 0.8, specular: 0.2, roughness: 0.6},
-      name: 'bregma', showlegend: true, text: b.text, hoverinfo: 'text'}]);
+    if (!found[0].length && tries > 0) return setTimeout(function () { groupLegend(gd, tries - 1); }, 250);
+    try {
+      Plotly.relayout(gd, {'legend.groupclick': 'toggleitem'});
+      groups.forEach(function (g, n) {
+        if (found[n].length) Plotly.restyle(gd, {legendgroup: g[0], 'legendgrouptitle.text': ' ', 'legendgrouptitle.font.size': 4}, found[n]);
+      });
+    } catch (err) { /* the legend stays as it was */ }
+  }
+
+  // The page's Slice checkbox and sliders cut the objects that were in the page when it opened. These were added later (as were the injection sites the
+  // loader drew), so they are cut here, with the same rule (a face is kept when its centre is inside the box; a point of a line is blanked outside it).
+  // The page's slice script calls gd.__rebuildCells() after every slider move and leaves the box in gd.__sliceCut (absent when the checkbox is off).
+  function makeSliceable(gd, firstOwn) {
+    if (gd.__extrasSliceable) return;
+    gd.__extrasSliceable = true;
+    var mine = /^(injection sites|optic fibers|needle tracks|fiber tracks|DV from the skull|bregma|lambda|estimated skull)/;
+    var known = {};
+    var previous = gd.__rebuildCells;
+    gd.__rebuildCells = function () { if (previous) previous(); try { cutExtras(); } catch (err) { /* the page's own cut still works */ } };
+    function cutExtras() {
+      var cut = gd.__sliceCut;
+      gd._fullData.forEach(function (t, index) {
+        if (!mine.test(t.name || '') || (t.type !== 'mesh3d' && t.type !== 'scatter3d')) return;
+        if (index < firstOwn && /^(bregma|lambda|estimated skull)/.test(t.name)) return;   // (the page's own: its slice script cuts those)
+        var r = known[index];
+        if (!r) {
+          r = known[index] = {mesh: t.type === 'mesh3d', x: Array.from(t.x), y: Array.from(t.y), z: Array.from(t.z), modified: false, last: -1,
+                              text: t.text && t.type === 'scatter3d' ? Array.from(t.text) : null};
+          if (r.mesh) { r.i = Int32Array.from(t.i); r.j = Int32Array.from(t.j); r.k = Int32Array.from(t.k); }
+        }
+        if (!cut) {   // the checkbox is off: put back what was cut
+          if (!r.modified) return;
+          r.modified = false; r.last = -1;
+          if (r.mesh) Plotly.restyle(gd, {i: [r.i], j: [r.j], k: [r.k]}, [index]);
+          else Plotly.restyle(gd, {x: [r.x], y: [r.y], z: [r.z], text: [r.text]}, [index]);
+          return;
+        }
+        if (t.visible !== true) { r.last = -1; return; }   // not drawn: brought up to date when it is switched on
+        function inside(x, y, z) {
+          return x >= cut.lo[0] && x <= cut.hi[0] && y >= cut.lo[1] && y <= cut.hi[1] && z >= cut.lo[2] && z <= cut.hi[2];
+        }
+        if (r.mesh) {
+          var keep = [];
+          for (var f = 0; f < r.i.length; f++) {
+            var a = r.i[f], b = r.j[f], d = r.k[f];
+            if (inside((r.x[a] + r.x[b] + r.x[d]) / 3, (r.y[a] + r.y[b] + r.y[d]) / 3, (r.z[a] + r.z[b] + r.z[d]) / 3)) keep.push(f);
+          }
+          if (keep.length === r.i.length && !r.modified) { r.last = keep.length; return; }
+          if (keep.length === r.last) return;
+          r.last = keep.length; r.modified = true;
+          var ni = new Int32Array(keep.length), nj = new Int32Array(keep.length), nk = new Int32Array(keep.length);
+          for (var m = 0; m < keep.length; m++) { ni[m] = r.i[keep[m]]; nj[m] = r.j[keep[m]]; nk[m] = r.k[keep[m]]; }
+          Plotly.restyle(gd, {i: [ni], j: [nj], k: [nk]}, [index]);
+        } else {
+          var nx = [], ny = [], nz = [], nt = r.text ? [] : null, out = 0;
+          for (var q = 0; q < r.x.length; q++) {
+            var gap = r.x[q] === null || r.y[q] === null || r.z[q] === null;
+            var away = !gap && !inside(r.x[q], r.y[q], r.z[q]);
+            if (away) out++;
+            nx.push(gap || away ? null : r.x[q]); ny.push(gap || away ? null : r.y[q]); nz.push(gap || away ? null : r.z[q]);
+            if (nt) nt.push(r.text[q]);
+          }
+          if (out === 0 && !r.modified) { r.last = 0; return; }
+          if (out === r.last) return;
+          r.last = out; r.modified = true;
+          Plotly.restyle(gd, {x: [nx], y: [ny], z: [nz], text: [nt]}, [index]);
+        }
+      });
+    }
   }
   draw();
-})(__BREGMA__);
+})(__EXTRAS__);
 """
+SKULL_SHEET_COLOR = '#c9b27c'
+SKULL_DISC_COLOR = '#6b3f12'     # darker than the sheet, so that both show
+SKULL_DISC_THICKNESS_MM = 0      # a flat disc (0), drawn from both sides; a number makes it a thin cylinder
 
 
-def bregma_marker(bregma):
-    """The bregma cube's data for BREGMA_JS, from bregma_in_ccf's (AP, DV, ML)."""
+def landmark_cubes(bregma):
+    """The cubes at bregma and lambda, for EXTRAS_JS, from bregma_in_ccf's (AP, DV, ML). In the CCF, AP grows backward, so lambda is behind bregma at a larger AP;
+    it is put at bregma's height (the usual leveling of the head) and on the midline."""
     ap, dv, ml = bregma
-    return {'x': round(ml, 3), 'y': round(ap, 3), 'z': round(dv, 3), 'edge': BREGMA_CUBE_MM, 'color': BREGMA_COLOR,
-            'text': f"<b>bregma</b><br>CCF: AP {ap:g}, DV {dv:g}, ML {ml:g} mm"}
+    lam_ap = ap + LAMBDA_BEHIND_BREGMA_MM
+    return [{'name': 'bregma', 'rank': 1, 'x': round(ml, 3), 'y': round(ap, 3), 'z': round(dv, 3), 'edge': LANDMARK_CUBE_MM, 'color': LANDMARK_COLOR,
+             'text': f"<b>bregma</b><br>CCF: AP {ap:g}, DV {dv:g}, ML {ml:g} mm"},
+            {'name': 'lambda', 'rank': 2, 'x': round(ml, 3), 'y': round(lam_ap, 3), 'z': round(dv, 3), 'edge': LANDMARK_CUBE_MM, 'color': LANDMARK_COLOR,
+             'text': f"<b>lambda</b> (approximate)<br>{LAMBDA_BEHIND_BREGMA_MM:g} mm behind bregma, at bregma's height<br>CCF: AP {lam_ap:g}, DV {dv:g}, ML {ml:g} mm"}]
 
 
-def write_side_file(sites, radius, label, folder=None, bregma=None):
+def write_side_file(sites, radius, label, folder=None, bregma=None, skull=None):
     """Writes the sites as a side file: a script that calls window.__injectionSites({...}), which the page's loader defines (see injection_loader.py), and
-    (given `bregma`, as bregma_in_ccf gives it) draws the red cube at bregma. Written through a temporary file, so that a page never reads half of it. A new
-    name every time. Returns its path."""
+    (given `bregma`, as bregma_in_ccf gives it) draws the red cubes at bregma and lambda, and (given `skull`, a SkullSurface) the estimated skull sheet.
+    Written through a temporary file, so that a page never reads half of it. A new name every time. Returns its path."""
     folder = Path(folder or SIDE_FOLDER)
     folder.mkdir(parents=True, exist_ok=True)
     stem = 'injections-' + time.strftime('%Y%m%d-%H%M%S')
@@ -394,8 +612,13 @@ def write_side_file(sites, radius, label, folder=None, bregma=None):
         path = folder / f"{stem}-{n}.js"
     temporary = path.with_name(path.name + '.part')
     text = 'window.__injectionSites(' + json.dumps(side_file_data(sites, radius, label)).replace('</', '<\\/') + ');\n'
-    if bregma:
-        text += BREGMA_JS.replace('__BREGMA__', json.dumps(bregma_marker(bregma)).replace('</', '<\\/'))
+    if bregma or skull:
+        tops = [[s[4], s[1], s[5]] for s in sites if len(s) > 7 and s[7] == 'surface']      # where the tracks zeroed on the skull, dura or brain surface start
+        extras = {'cubes': landmark_cubes(bregma) if bregma else [], 'cubesName': 'bregma and lambda', 'skull': skull.sheet() if skull else None, 'skullColor': SKULL_SHEET_COLOR,
+                  'discs': {'points': tops, 'diameter': LANDMARK_CUBE_MM, 'thickness': SKULL_DISC_THICKNESS_MM, 'color': SKULL_DISC_COLOR,
+                            'name': 'DV from the skull or dura',
+                            'text': "DV measured from the skull, dura or brain surface here, not from bregma (the estimated skull underside is used)"}}
+        text += EXTRAS_JS.replace('__EXTRAS__', json.dumps(extras).replace('</', '<\\/'))
     temporary.write_text(text, encoding='utf-8')
     os.replace(temporary, path)
     clean_side_files(folder)
@@ -407,9 +630,9 @@ def view_address(page, side_file):
     return Path(page).resolve().as_uri() + '#sites=' + urllib.parse.quote(Path(side_file).resolve().as_uri(), safe='')
 
 
-def make_view(page, surgeries, radius=DEFAULT_RADIUS_MM, upgrade=False):
+def make_view(page, surgeries, radius=DEFAULT_RADIUS_MM, upgrade=False, skull_span=SKULL_SPAN_MM):
     """Write the side file for the surgery list. Returns (the address to open the page at, the lines to report); raises ValueError when there is nothing to draw or
-    the page is not a 3D page, and PageNeedsUpgrade when the page has no loader (with upgrade=True the page is upgraded first)."""
+    the page is not a 3D page, and PageNeedsUpgrade when the page has no loader (with upgrade=True the page is upgraded first). `skull_span` (mm): see SkullSurface."""
     page = Path(page)
     if not compressed_page.looks_like_3d_page(page):
         raise ValueError(f"{page.name} does not look like a 3D page from the ABC browser (no plotly in it).")
@@ -422,7 +645,8 @@ def make_view(page, surgeries, radius=DEFAULT_RADIUS_MM, upgrade=False):
     report = []
     if brain_top is None:
         report.append("The CCF annotation volume was not found in the atlas cache: surface-zeroed DVs are taken from bregma.")
-    sites, skipped = injection_sites(read_csv(surgeries), bregma, brain_top)
+    skull = SkullSurface(brain_top, span_mm=skull_span) if brain_top is not None else None   # (where DV is zeroed on the dura or brain surface)
+    sites, skipped = injection_sites(read_csv(surgeries), bregma, skull)
     if not sites:
         raise ValueError("No mouse injection sites with coordinates in that surgery list.")
     if needs_upgrade:
@@ -431,10 +655,13 @@ def make_view(page, surgeries, radius=DEFAULT_RADIUS_MM, upgrade=False):
     left_out = ', '.join(f"{n} {why}" for why, n in skipped.items() if n)
     fibers = sum(1 for s in sites if s[6] == 'fiber')
     label = f"{time.strftime('%H:%M')}, {len(sites) - fibers} injections" + (f", {fibers} fibers" if fibers else "")
-    side = write_side_file(sites, radius, label, bregma=bregma)
+    side = write_side_file(sites, radius, label, bregma=bregma, skull=skull)
     report.insert(0, f"{len(sites) - fibers} injection sites and {fibers} optic fibers written to {side.name}"
                   + (f" (left out: {left_out})" if left_out else ""))
     report.append(f"Bregma in the CCF: AP {bregma[0]:g}, DV {bregma[1]:g}, ML {bregma[2]:g} mm")
+    if skull is not None:
+        report.append(f"DV zeroed on the dura or brain surface is measured from the estimated underside of the skull (dips in the brain's top narrower "
+                      f"than about {2 * skull_span:g} mm are bridged); it is drawn as a translucent sheet.")
     return view_address(page, side), report
 
 
@@ -529,6 +756,7 @@ def open_window(surgeries=None):
     page_var = tk.StringVar(root, last.get('page', ''))
     csv_var = tk.StringVar(root, str(surgeries) if surgeries else default_surgeries(last))
     radius_var = tk.StringVar(root, f"{last.get('radius', DEFAULT_RADIUS_MM):g}")
+    span_var = tk.StringVar(root, f"{last.get('skull_span', SKULL_SPAN_MM):g}")
     status_var = tk.StringVar(root, "")
 
     def browse(var, title, types):
@@ -556,6 +784,8 @@ def open_window(surgeries=None):
     row.grid(row=4, column=1, sticky='w', padx=6, pady=(12, 0))
     ttk.Label(row, text="Ball radius (mm)").pack(side='left')
     ttk.Spinbox(row, textvariable=radius_var, from_=0.02, to=1.0, increment=0.05, width=6).pack(side='left', padx=6)
+    ttk.Label(row, text="Skull estimate span (mm)").pack(side='left', padx=(18, 0))
+    ttk.Spinbox(row, textvariable=span_var, from_=0.5, to=8.0, increment=0.5, width=6).pack(side='left', padx=6)
 
     buttons = ttk.Frame(frame)
     buttons.grid(row=5, column=0, columnspan=3, sticky='e', pady=(14, 0))
@@ -574,6 +804,13 @@ def open_window(surgeries=None):
         except ValueError:
             status_var.set("Enter the ball radius as a number of mm (e.g. 0.15).")
             return
+        try:
+            span = float(span_var.get())
+            if not 0.2 <= span <= 10:
+                raise ValueError
+        except ValueError:
+            status_var.set("Enter the skull estimate span as a number of mm between 0.2 and 10 (e.g. 4).")
+            return
         for label, path in (("3D source page", page), ("surgery list", surgeries)):
             if not path or not Path(path).is_file():
                 status_var.set(f"Choose the {label} first (no file at '{path}')." if path else f"Choose the {label} first.")
@@ -581,11 +818,11 @@ def open_window(surgeries=None):
         make.state(['disabled'])
         root.config(cursor='watch')
         status_var.set("Working..." + (" (changing the page takes a few seconds)" if upgrade else ""))
-        save_last_used({'page': page, 'surgeries': surgeries, 'radius': radius})
+        save_last_used({'page': page, 'surgeries': surgeries, 'radius': radius, 'skull_span': span})
 
         def work():
             try:
-                address, report = make_view(page, surgeries, radius=radius, upgrade=upgrade)
+                address, report = make_view(page, surgeries, radius=radius, upgrade=upgrade, skull_span=span)
                 result = ('ok', address, report)
             except PageNeedsUpgrade as e:
                 result = ('upgrade', None, [str(e)])
@@ -634,10 +871,11 @@ def main(argv=None):
     p.add_argument('page', help="a 3D page (.html) written by the ABC atlas browser")
     p.add_argument('surgeries', help="the surgery viewer's Export CSV file")
     p.add_argument('--radius', type=float, default=DEFAULT_RADIUS_MM, help=f"ball radius in mm (default {DEFAULT_RADIUS_MM})")
+    p.add_argument('--skull-span', type=float, default=SKULL_SPAN_MM, help=f"dips in the brain's top narrower than twice this (mm) are bridged when the skull's underside is estimated (default {SKULL_SPAN_MM:g})")
     p.add_argument('--no-open', action='store_true', help="only write the side file and print the address")
     a = p.parse_args(argv)
     try:
-        address, report = make_view(a.page, a.surgeries, a.radius, upgrade=True)
+        address, report = make_view(a.page, a.surgeries, a.radius, upgrade=True, skull_span=a.skull_span)
     except ValueError as e:
         sys.exit(str(e))
     print('\n'.join(report))

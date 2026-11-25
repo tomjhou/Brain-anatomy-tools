@@ -379,7 +379,7 @@ import_mark('abc_atlas_access')
 import abc_project
 import_mark('abc_project')
 from abc_core import (
-    BREGMA_CCF_ML_MM,
+    BREGMA_CCF_ML_MM, LAMBDA_BEHIND_BREGMA_MM,
     CACHE_DIR, CCF_COORDS_FILE_NAME, CCF_DIRECTORY, CCF_FILES, CCF_PARCELLATION_DIRECTORY, CCF_PARCELLATION_FILE_NAME, COORD_SETTINGS,
     DEFAULT_BREGMA_CCF_AP_MM, DEFAULT_BREGMA_CCF_DV_MM, DEFAULT_GREY_RGBA, FRAME_STATE, RECON_FILES, coordinate_frame_name,
     file_complete, reconstructed_in_use, record_run_opened as core_record_run_opened, IMPUTED_DATASET_DIRECTORY,
@@ -2712,6 +2712,12 @@ THREED_WEB_LEGEND_MARK_SCRIPT = """
         group.style.setProperty('visibility', 'hidden');
         return;
       }
+      if (!(trace && / (surface|edges|envelope)$/.test(trace.name || ''))) {
+        // (plotly re-uses a legend row for another entry when the legend is rebuilt, e.g. after objects are added: a row that was a surface's still has its
+        // own swatch hidden, which would leave the new entry without an icon)
+        var ownSwatch = group.querySelector('.layers');
+        if (ownSwatch) ownSwatch.style.removeProperty('display');
+      }
       if (trace && pending[trace.index] !== undefined) {
         if (pending[trace.index] === trace.visible) delete pending[trace.index];   // the real state has caught up
         else group.style.opacity = pending[trace.index] === 'legendonly' ? 0.5 : 1;
@@ -3612,8 +3618,35 @@ def open_3d_group_view(groups, shell_xyz, outline, axis_labels, title, invert_z=
     return fig
 
 
+THREED_LANDMARK_COLOR = '#e01818'
+THREED_LANDMARK_CUBE_MM = 0.15       # the cubes' edge
+
+
+def add_landmark_cubes(figure, go, landmarks):
+    """Adds a small red cube at bregma and/or lambda (`landmarks`: 'bregma', 'lambda'), as one object with one legend entry, to a 3D page's figure, in the page's axes (x = ML, y = AP, z = DV, CCF mm), first in
+    the legend (legendrank). Bregma is where Settings put it; lambda is LAMBDA_BEHIND_BREGMA_MM behind it, on the midline and at bregma's height."""
+    ap, dv, ml = COORD_SETTINGS['bregma_ap_mm'], COORD_SETTINGS['bregma_dv_mm'], BREGMA_CCF_ML_MM
+    where = {'bregma': (ap, "<b>bregma</b>"),
+             'lambda': (ap + LAMBDA_BEHIND_BREGMA_MM, f"<b>lambda</b> (approximate)<br>{LAMBDA_BEHIND_BREGMA_MM:g} mm behind bregma, at bregma's height")}
+    corners = np.array([[-1, -1, -1], [-1, 1, -1], [1, 1, -1], [1, -1, -1], [-1, -1, 1], [-1, 1, 1], [1, 1, 1], [1, -1, 1]]) * (THREED_LANDMARK_CUBE_MM / 2)
+    faces = np.array([[7, 0, 0, 0, 4, 4, 2, 6, 4, 0, 3, 7], [3, 4, 1, 2, 5, 6, 5, 5, 0, 1, 2, 2], [0, 7, 2, 3, 6, 7, 1, 2, 5, 5, 7, 6]])
+    names = [n for n in ("bregma", "lambda") if n in landmarks]
+    if not names:
+        return
+    # one object for both (one legend entry, switched on and off together), a cube each
+    xs, ys, zs, fi, fj, fk, texts = [], [], [], [], [], [], []
+    for n, name in enumerate(names):
+        at_ap, label = where[name]
+        xs += list(ml + corners[:, 0]); ys += list(at_ap + corners[:, 1]); zs += list(dv + corners[:, 2])
+        fi += list(faces[0] + 8 * n); fj += list(faces[1] + 8 * n); fk += list(faces[2] + 8 * n)
+        texts += [f"{label}<br>CCF: AP {at_ap:g}, DV {dv:g}, ML {ml:g} mm"] * 8
+    figure.add_trace(go.Mesh3d(x=xs, y=ys, z=zs, i=fi, j=fj, k=fk, color=THREED_LANDMARK_COLOR, opacity=1.0, flatshading=True,
+                               lighting=dict(ambient=0.6, diffuse=0.8, specular=0.2, roughness=0.6),
+                               name=' and '.join(names), showlegend=True, hovertext=texts, hoverinfo='text', legendrank=1))
+
+
 def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, invert_z=True,
-                        max_points=THREED_WEB_MAX_POINTS, edges=None, envelope_smoothness=None, compress=True):
+                        max_points=THREED_WEB_MAX_POINTS, edges=None, envelope_smoothness=None, compress=True, landmarks=()):
     """The same view as open_3d_group_view as one self-contained interactive HTML file (plotly, WebGL), written to
     `path`: true depth handling, smooth with hundreds of thousands of points, hover text per cell where a group
     gives 'hover' strings, and the legend toggles each group. `compress` stores the page deflated (see compressed_page.py). `envelope_smoothness` (1 to 6, or None for none) adds a surface around each of the biggest
@@ -3853,6 +3886,10 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
         post_script = (THREED_WEB_MESH_SCRIPT.replace('__MESH_INDEX__', str(mesh_index))
                        .replace('__LEGEND_INDICES__', json.dumps(legend_indices))
                        .replace('__VERTEX_STARTS__', json.dumps(vertex_starts)))
+    if landmarks:
+        add_landmark_cubes(figure, go, landmarks)
+        add_legend_spacer(3)   # one blank line after them (they are ranked first in the legend)
+        figure.data[-1].legendrank = 4
     scene = dict(aspectmode='data', xaxis_title=axis_labels[0], yaxis_title=axis_labels[1], zaxis_title=axis_labels[2])
     if invert_z:
         scene['zaxis'] = dict(autorange='reversed', title=axis_labels[2])

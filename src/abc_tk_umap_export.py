@@ -1096,7 +1096,7 @@ class ExportsMixin:
     def ask_3d_jitter(self):
         """Ask how to make the 3D page: whether to jitter the section-axis coordinate of the cells (they sit on the planes of the sections, which looks
         layered), and whether to add envelope surfaces (they make the file much bigger). (the spread in mm (0 = none), the envelopes' smoothness 1 to 6 or
-        None for no envelopes), or None if cancelled. The last answers are the defaults."""
+        None for no envelopes, the landmarks to mark: 'bregma' and/or 'lambda'), or None if cancelled. The last answers are the defaults."""
         import tkinter as tk
         from tkinter import ttk
         top = tk.Toplevel(self.root)
@@ -1107,6 +1107,7 @@ class ExportsMixin:
         spread = tk.StringVar(top, getattr(self, "jitter_3d_mm", "0.15"))
         envelopes_on = tk.BooleanVar(top, getattr(self, "envelopes_3d_on", False))
         smoothness = tk.StringVar(top, getattr(self, "envelope_smoothness_3d", "3"))
+        landmarks_on = tk.BooleanVar(top, getattr(self, "landmarks_3d_on", True))
         body = ttk.Frame(top, padding=12)
         body.pack()
         ttk.Checkbutton(body, text="Randomly jitter the section-axis (z) position of the cells", variable=on).grid(row=0, column=0, columnspan=3, sticky="w")
@@ -1116,14 +1117,19 @@ class ExportsMixin:
                   text="The cells lie on the planes of the sections, which gives a layered look. Jitter spreads them out along that axis "
                        "(by default +/- 0.15 mm). Only the picture changes.").grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Separator(body).grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 6))
-        ttk.Checkbutton(body, text="Add envelope surfaces around the biggest groups", variable=envelopes_on).grid(row=4, column=0, columnspan=3, sticky="w")
+        ttk.Checkbutton(body, text="Add a surface around the 8 biggest groups", variable=envelopes_on).grid(row=4, column=0, columnspan=3, sticky="w")
         ttk.Label(body, text="Smoothness, 1 to 6:").grid(row=5, column=0, sticky="w", pady=(6, 0))
         smooth_box = ttk.Spinbox(body, from_=1, to=6, textvariable=smoothness, width=4, state="normal")
         smooth_box.grid(row=5, column=1, sticky="w", padx=4, pady=(6, 0))
         ttk.Label(body, foreground="#555555", wraplength=300, justify="left",
-                  text="A surface around the cells of each of the 8 biggest groups, switched on in the legend, with a slider for how many of the cells it "
-                       "takes in. Note: this makes the file bigger (about 1 MB for each group) and a little slower to open."
+                  text="Note: this makes the file bigger (about 1 MB for each group) and a little slower to open."
                   ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        ttk.Separator(body).grid(row=7, column=0, columnspan=3, sticky="ew", pady=(10, 6))
+        ttk.Checkbutton(body, text="Mark bregma and lambda with small red cubes", variable=landmarks_on).grid(row=8, column=0, columnspan=3, sticky="w")
+        ttk.Label(body, foreground="#555555", wraplength=300, justify="left",
+                  text="Bregma as set in Settings; lambda about 4.2 mm behind it. Only when the cells have CCF coordinates."
+                  ).grid(row=9, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
         def show_smoothness(*_):
             smooth_box.configure(state="normal" if envelopes_on.get() else "disabled")
@@ -1146,10 +1152,11 @@ class ExportsMixin:
             self.envelopes_3d_on = envelopes_on.get()
             if step is not None:
                 self.envelope_smoothness_3d = str(step)
-            result.append((mm, step))
+            self.landmarks_3d_on = landmarks_on.get()
+            result.append((mm, step, ("bregma", "lambda") if landmarks_on.get() else ()))
             top.destroy()
         buttons = ttk.Frame(body)
-        buttons.grid(row=7, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        buttons.grid(row=10, column=0, columnspan=3, sticky="e", pady=(10, 0))
         ttk.Button(buttons, text="Cancel", command=top.destroy).pack(side="right")
         ttk.Button(buttons, text="Open", command=ok).pack(side="right", padx=(0, 6))
         top.bind("<Return>", lambda e: ok())
@@ -1223,7 +1230,7 @@ class ExportsMixin:
         choice = self.ask_3d_jitter()
         if choice is None:
             return
-        jitter, envelope_smoothness = choice
+        jitter, envelope_smoothness, landmarks = choice
         self.root.config(cursor="watch")
         self.var_status.set("Preparing the 3D view...")
         self.root.update()
@@ -1244,7 +1251,7 @@ class ExportsMixin:
                 self.var_status.set("Writing the 3D page...")
                 self.root.update()
                 h["write_3d_group_html"](p["groups"], p["shell_xyz"], p["outline"], p["axis_labels"], p["title"], path, edges=edges,
-                                       envelope_smoothness=envelope_smoothness)
+                                       envelope_smoothness=envelope_smoothness, landmarks=landmarks if p["have_ccf"] else ())
                 h["open_with_default_viewer"](path)
                 self.var_status.set(f"Opened {path.name} in your browser (saved in {target}).")
         except Exception as e:

@@ -399,6 +399,7 @@ import numba
 import_mark('numba')
 import screen_area
 import compressed_page
+import slice_slider_scripts
 import injection_loader
 import scanpy as sc
 import_mark('scanpy (the rest)')
@@ -555,7 +556,8 @@ def save_viewer_settings(settings):
     worth interrupting the session over."""
     to_write = {'persist_settings': bool(settings.get('persist_settings', False)),
                 'bregma_ap_mm': COORD_SETTINGS['bregma_ap_mm'], 'bregma_dv_mm': COORD_SETTINGS['bregma_dv_mm'],
-                'reconstructed_coords': bool(COORD_SETTINGS['reconstructed_coords'])}   # (always kept: see COORD_SETTINGS)
+                'reconstructed_coords': bool(COORD_SETTINGS['reconstructed_coords']),
+                'diagnostics_3d': bool(COORD_SETTINGS.get('diagnostics_3d', False))}   # (always kept: see COORD_SETTINGS)
     if COORD_SETTINGS['use_imputed'] is not None:
         to_write['use_imputed'] = bool(COORD_SETTINGS['use_imputed'])
     if to_write['persist_settings']:
@@ -762,6 +764,29 @@ def build_common_settings_tab(tab):
         if bool(imputed_var.get()) != bool(imputed_before):        # (left alone, "not asked yet" stays so: the question is still asked at start-up)
             values['use_imputed'] = bool(imputed_var.get())
         return values
+
+    return read
+
+
+def build_troubleshooting_settings_tab(tab):
+    """The "Troubleshooting" tab of the Settings window: whether the 3D pages carry diagnostics (see slice_slider_scripts.py). Fills the frame `tab`; returns read(),
+    which gives {'diagnostics_3d': bool}."""
+    import tkinter as tk
+    from tkinter import ttk
+    frame = ttk.Frame(tab, padding=14)
+    frame.pack(fill=tk.BOTH)
+    diagnostics_var = tk.BooleanVar(tab, bool(COORD_SETTINGS.get('diagnostics_3d', False)))
+    ttk.Checkbutton(frame, text="Show diagnostics in 3D pages", variable=diagnostics_var).pack(anchor="w")
+    ttk.Label(frame, foreground="gray35", justify=tk.LEFT, wraplength=460, text=(
+        "For finding out why a 3D page misbehaves, for example sliders that lose the pointer. Adds two things under the slice sliders: a line saying which "
+        "graphics the browser draws the 3D scene with (amber when it is software drawing, which is slow), and an amber note when a slider thumb falls behind the "
+        "pointer or a press on a slider is taken by something else, with the details kept in the browser's console (F12, then Console: type __sliderLog). "
+        "Leave it off otherwise.")).pack(anchor="w", pady=(2, 0))
+    ttk.Label(frame, foreground="gray35", justify=tk.LEFT, wraplength=460, text=(
+        "Applies to the 3D pages made after you click OK, and to the injection sites you show in 3D after that (including in older pages).")).pack(anchor="w", pady=(6, 0))
+
+    def read():
+        return {'diagnostics_3d': bool(diagnostics_var.get())}
 
     return read
 
@@ -2444,114 +2469,7 @@ THREED_WEB_SLICE_SCRIPT = """
   });
   gd.style.position = 'relative';
   gd.appendChild(box);
-  // Which renderer draws the 3D scene: the sliders are only as quick as it is, and a browser can fall back to software drawing (about ten times slower) after
-  // its graphics process has had trouble, which makes a page opened later slow although an earlier one was not. Shown under the sliders.
-  (function () {
-    if (document.querySelector('.renderer-note')) return;
-    var name = '';
-    try {
-      var canvas = document.createElement('canvas'), gl = canvas.getContext('webgl'), info = gl && gl.getExtension('WEBGL_debug_renderer_info');
-      name = gl ? String(gl.getParameter(info ? info.UNMASKED_RENDERER_WEBGL : gl.RENDERER)) : 'WebGL unavailable';
-      var lose = gl && gl.getExtension('WEBGL_lose_context');
-      if (lose) lose.loseContext();
-    } catch (err) { name = 'unknown'; }
-    var software = /swiftshader|llvmpipe|software|basic render/i.test(name);
-    var note = document.createElement('div');
-    note.className = 'renderer-note';
-    note.textContent = (software ? 'Software 3D, slow: ' : '3D drawn by: ') + name;
-    note.style.cssText = 'margin-top:6px;font:10px sans-serif;max-width:170px;word-wrap:break-word;color:' + (software ? '#e0a24f' : '#8b93a6') + ';';
-    box.appendChild(note);
-  })();
-  // The slice sliders' drag. The browser's own drag of a slider's thumb can be dropped part-way (the thumb stops following while the pointer goes on), so this takes
-  // the press itself: the pointer is captured by the slider and its value is set from the pointer's position at every move, for as long as the button is down.
-  // The page's own 'input' handlers run as before. If the thumb still falls well behind the pointer (more than 8% of the track, for over 0.6 s) or a press on a
-  // slider is taken by something else, an amber note says so under the sliders and the details are kept in window.__sliderLog (F12, Console).
-  (function () {
-    if (window.__sliderDiag) return;
-    window.__sliderDiag = true;
-    var panel = document.querySelector('.slice-box');
-    if (!panel) return;
-    window.__sliderLog = [];
-    var drag = null, line = null, THUMB = 7;   // (half the width of a thumb)
-    Array.prototype.forEach.call(panel.querySelectorAll('input.slice-dual'), function (input) { input.style.touchAction = 'none'; });
-    function describe(el) { return el ? (el.tagName + (el.className && el.className.baseVal === undefined && el.className ? '.' + String(el.className).split(' ')[0] : '')) : 'nothing'; }
-    function report(why, e) {
-      var found = {why: why, afterMs: Math.round(performance.now() - drag.t0), moves: drag.moves, inputEvents: drag.inputEvents, longestGapMs: Math.round(drag.maxGap),
-                   msSinceLastMove: Math.round(performance.now() - drag.last), buttons: e ? e.buttons : null, pointerType: drag.type,
-                   under: describe(document.elementFromPoint(drag.x, drag.y)), windowFocused: document.hasFocus(), offBy: Math.round(100 * drag.offBy) + '%'};
-      window.__sliderLog.push(found);
-      console.warn('slice slider lost the pointer', found);
-      if (!line) {
-        line = document.createElement('div');
-        line.style.cssText = 'margin-top:6px;font:10px sans-serif;max-width:170px;word-wrap:break-word;color:#e0a24f;';
-        panel.appendChild(line);
-      }
-      line.textContent = 'Slider fell behind the pointer: ' + found.why + '; page blocked at most ' + found.longestGapMs + ' ms; under the pointer: ' + found.under +
-                         '; ' + found.moves + ' moves, ' + found.inputEvents + ' slider events (' + found.pointerType + '; details: __sliderLog in the console)';
-    }
-    function valueAt(input, x, offset) {   // the slider's value for a pointer at x (the pointer keeps its place on the thumb)
-      var r = input.getBoundingClientRect(), min = +input.min, span = +input.max - min;
-      var frac = Math.min(1, Math.max(0, (x - offset - r.x - THUMB) / ((r.width - 2 * THUMB) || 1)));
-      return min + frac * span;
-    }
-    function newDrag(input, e, offset) {
-      return {t0: performance.now(), last: performance.now(), maxGap: 0, moves: 0, inputEvents: 0, input: input, type: e.pointerType, x: e.clientX, y: e.clientY,
-              offSince: 0, offBy: 0, reported: false, offset: offset || 0, id: e.pointerId};
-    }
-    document.addEventListener('pointerdown', function (e) {
-      var t = e.target;
-      if (!t || !t.classList || !t.classList.contains('slice-dual')) {
-        // a press that lands on a slider's track but is taken by something else (a cover over the slider, or the plot itself) would not move the thumb at all
-        var tracks = panel.querySelectorAll('input.slice-dual');
-        for (var q = 0; q < tracks.length; q++) {
-          var box = tracks[q].getBoundingClientRect();
-          if (box.width > 0 && e.clientX >= box.x && e.clientX <= box.right && e.clientY >= box.y - 2 && e.clientY <= box.bottom + 2 && !(t && panel.contains(t) && t !== panel)) {
-            drag = newDrag(tracks[q], e, 0);
-            report('a press on a slider was taken by ' + describe(t), e);
-            drag = null;
-            break;
-          }
-        }
-        return;
-      }
-      if (e.button !== 0) return;
-      var r = t.getBoundingClientRect(), min = +t.min, span = (+t.max - min) || 1;
-      var thumbX = r.x + THUMB + ((+t.value - min) / span) * (r.width - 2 * THUMB);
-      drag = newDrag(t, e, e.clientX - thumbX);
-      e.preventDefault();                       // (no drag by the browser: it is done here, below)
-      try { t.setPointerCapture(e.pointerId); } catch (err) { /* the document-level handlers below still follow the pointer */ }
-    }, true);
-    document.addEventListener('input', function (e) { if (drag && e.target === drag.input) drag.inputEvents++; }, true);
-    document.addEventListener('pointermove', function (e) {
-      if (!drag) return;
-      var now = performance.now();
-      drag.maxGap = Math.max(drag.maxGap, now - drag.last); drag.last = now; drag.moves++; drag.x = e.clientX; drag.y = e.clientY;
-      var want = valueAt(drag.input, e.clientX, drag.offset);
-      if (e.buttons & 1) {   // (a move with the button no longer down is ignored: the release will end the drag)
-        if (+drag.input.value !== want) {
-          drag.input.value = want;
-          drag.input.dispatchEvent(new Event('input', {bubbles: true}));
-        }
-      }
-      var span = (+drag.input.max - +drag.input.min) || 1;
-      drag.offBy = Math.abs(+drag.input.value - want) / span;
-      if (drag.offBy > 0.08) { if (!drag.offSince) drag.offSince = now; } else drag.offSince = 0;
-      if (drag.offSince && now - drag.offSince > 600 && !drag.reported) { drag.reported = true; report('thumb behind the pointer', e); }
-    }, true);
-    window.setInterval(function () {   // (the pointer may stop moving, with the thumb still behind it)
-      if (drag && drag.offSince && !drag.reported && performance.now() - drag.offSince > 600) { drag.reported = true; report('thumb behind a pointer that stopped', null); }
-    }, 200);
-    function finish(e, cancelled) {
-      if (!drag) return;
-      var input = drag.input;
-      if (cancelled) { drag.reported = true; report('pointercancel (the browser ended the press)', e); }
-      try { input.releasePointerCapture(drag.id); } catch (err) { /* it was not held */ }
-      input.dispatchEvent(new Event('change', {bubbles: true}));
-      drag = null;
-    }
-    document.addEventListener('pointerup', function (e) { finish(e, false); }, true);
-    document.addEventListener('pointercancel', function (e) { finish(e, true); }, true);
-  })();
+  __SLIDER_SCRIPTS__
 })();
 """
 
@@ -4040,7 +3958,8 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
                       if brain_surface_index is not None else None)}
         scripts.append(THREED_WEB_OPACITY_SCRIPT.replace('__CONFIG__', json.dumps(opacity_config))
                        .replace('__ROW__', str(row)))
-    scripts.append(THREED_WEB_SLICE_SCRIPT.replace('__MESH_INDEX__', str(mesh_index if mesh_groups else -1)))
+    scripts.append(THREED_WEB_SLICE_SCRIPT.replace('__MESH_INDEX__', str(mesh_index if mesh_groups else -1))
+                   .replace('__SLIDER_SCRIPTS__', slice_slider_scripts.page_js(bool(COORD_SETTINGS.get('diagnostics_3d')))))
     scripts.append(THREED_WEB_SPIN_SCRIPT)
     scripts.append(THREED_WEB_LEGEND_MARK_SCRIPT)
     figure.write_html(str(path), include_plotlyjs=True, full_html=True, config={'displaylogo': False},
@@ -6219,8 +6138,9 @@ def build_viewer_settings_tab(tab, current_settings, umap_params=None, n_cells=N
 
 
 def prompt_viewer_settings_dialog(parent_window, current_settings, umap_params=None, n_cells=None, abc_cache=None, tab="Project browser"):
-    """The Settings window of the launcher and of the project browser (the interactive viewer): one dialog with two tabs, "Common" (build_common_settings_tab:
-    bregma and the coordinates, applied and saved here) and "Project browser" (build_viewer_settings_tab), opened on `tab`. Same modal-child pattern as
+    """The Settings window of the launcher and of the project browser (the interactive viewer): one dialog with three tabs, "Common" (build_common_settings_tab:
+    bregma and the coordinates, applied and saved here), "Project browser" (build_viewer_settings_tab) and "Troubleshooting" (build_troubleshooting_settings_tab:
+    diagnostics in the 3D pages, applied and saved here like the common ones), opened on `tab`. Same modal-child pattern as
     prompt_deg_comparison_mode — see its own docstring for why a real Toplevel rather than tkinter.messagebox, and why transient()/grab_set()/wait_window()
     rather than a second, competing Tk() root; `parent_window` None (the launcher has no window to hang it on) makes a hidden root of its own.
 
@@ -6247,18 +6167,20 @@ def prompt_viewer_settings_dialog(parent_window, current_settings, umap_params=N
 
     notebook = ttk.Notebook(dialog)
     notebook.pack(fill='both', padx=8, pady=(8, 0))
-    common_tab, viewer_tab = tk.Frame(notebook), tk.Frame(notebook)
+    common_tab, viewer_tab, trouble_tab = tk.Frame(notebook), tk.Frame(notebook), tk.Frame(notebook)
     notebook.add(common_tab, text="Common")
     notebook.add(viewer_tab, text="Project browser")
+    notebook.add(trouble_tab, text="Troubleshooting")
     read_common = build_common_settings_tab(common_tab)
     read_viewer = build_viewer_settings_tab(viewer_tab, current_settings, umap_params, n_cells)
+    read_trouble = build_troubleshooting_settings_tab(trouble_tab)
     notebook.select(common_tab if tab == "Common" else viewer_tab)
 
     button_frame = tk.Frame(dialog)
     button_frame.pack(pady=12)
 
     def on_ok():
-        for tab_frame, read in ((common_tab, read_common), (viewer_tab, read_viewer)):
+        for tab_frame, read in ((common_tab, read_common), (viewer_tab, read_viewer), (trouble_tab, read_trouble)):
             try:
                 result[tab_frame] = read()
             except ValueError as problem:
@@ -6267,6 +6189,7 @@ def prompt_viewer_settings_dialog(parent_window, current_settings, umap_params=N
                 return
         result['value'] = result.pop(viewer_tab)
         common = result.pop(common_tab)
+        common.update(result.pop(trouble_tab))
         import app_update
         app_update.set_auto_update(common.pop('auto_update'))         # (not a coordinate setting: kept by the updater, for all the apps)
         COORD_SETTINGS.update(common)

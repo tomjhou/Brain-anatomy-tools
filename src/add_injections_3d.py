@@ -5,8 +5,10 @@
 PAGE.html is a 3D page from the ABC browser (its axes are CCF millimetres). SURGERIES.csv is the
 surgery viewer's "Export CSV" file (JhouLab-surgery-viewer), so filter the list there first (by
 target, person, dates...) to choose which injections are drawn. The result is a copy of the page
-(PAGE_injections.html unless -o is given) with one more legend entry, "injection sites", which
-shows or hides the balls; hovering a ball shows the animal, target, substance and coordinates.
+(PAGE_injections.html unless -o is given) with two more legend entries: "injection sites", the
+balls, and "needle tracks", a white line from where each DV was measured from (the brain surface,
+or bregma's height) down to its ball, at the injection angle. Hovering either shows the animal,
+target, substance and coordinates.
 Running it again on its own output replaces the balls rather than adding a second set.
 
 From stereotaxic coordinates to the CCF (all approximate; there is no exact mapping):
@@ -48,6 +50,7 @@ DEFAULT_BREGMA_AP_MM, DEFAULT_BREGMA_DV_MM, BREGMA_ML_MM = 5.40, 0.332, 5.739   
 VOXEL_MM = 0.025
 DEFAULT_RADIUS_MM = 0.15
 BALL_COLOR = '#ffffff'
+TRACK_WIDTH_PX = 3
 START, END = '<!-- injection-sites:start -->', '<!-- injection-sites:end -->'
 
 
@@ -172,7 +175,8 @@ def split_sites(r):
 
 
 def injection_sites(rows, bregma, brain_top):
-    """[(x, y, z, hover)] in the page's axes (CCF ML, AP, DV in mm) and a dict of what was left out."""
+    """[(x, y, z, hover, entry x, entry z)] in the page's axes (CCF ML, AP, DV in mm; see site_balls) and a dict of
+    what was left out."""
     sites, skipped = [], {'rat': 0, 'no coordinates': 0, 'other species': 0}
     for r in rows:
         species = (r.get('species') or '').strip().lower()
@@ -197,7 +201,9 @@ def one_line(text):
 
 
 def site_balls(r, ap, ml, dv, site_angle, site_side, target, site_note, bregma, brain_top):
-    """The ball(s) of one site of a row, (x, y, z, hover) each: one, or one per side when bilateral."""
+    """The ball(s) of one site of a row, (x, y, z, hover, entry x, entry z) each: one, or one per side when bilateral.
+    x, y, z is the tip; the entry point (same y: tracks tilt only in the coronal plane) is where the DV was zeroed,
+    on the brain surface or at bregma's height."""
     bregma_ap, bregma_dv, midline = bregma
     notes = [site_note] if site_note else []
     shift = ap_shift_mm(r.get('ap_reference'))
@@ -230,9 +236,9 @@ def site_balls(r, ap, ml, dv, site_angle, site_side, target, site_note, bregma, 
             if top is None:
                 side_notes.append('no CCF brain at the entry point: DV taken from bregma')
                 top = bregma_dv
-            ccf_dv = top + down
         else:
-            ccf_dv = bregma_dv + down
+            top = bregma_dv                          # DV zeroed at bregma: the track starts at bregma's height
+        ccf_dv = top + down
         if angle:
             side_notes.append(f"{angle:g} deg: enters at ML {abs(ml):g}, tip at ML {abs(ml) - depth * math.sin(theta):.2f}")
         head = f"<b>{r.get('animal_id') or '?'}</b>  {r.get('person', '')}  {r.get('surgery_date', '')}"
@@ -240,7 +246,8 @@ def site_balls(r, ap, ml, dv, site_angle, site_side, target, site_note, bregma, 
         coords = (f"AP {ap:g}  ML {abs(ml):g}  DV {dv:g}{'  angle ' + format(angle, 'g') if angle else ''}  ({side}"
                   f"{', DV from ' + one_line(r.get('dv_zero')) if zero else ''})")
         balls.append((round(tip_ml, 3), round(ccf_ap, 3), round(float(ccf_dv), 3),
-                      '<br>'.join([head, what, coords] + notes + side_notes)))
+                      '<br>'.join([head, what, coords] + notes + side_notes),
+                      round(entry_ml, 3), round(float(top), 3)))
     return balls
 
 
@@ -292,9 +299,17 @@ PAGE_SCRIPT = """
       }
       for (var f = 0; f < uf.length; f += 3) { i.push(b * n + uf[f]); j.push(b * n + uf[f + 1]); k.push(b * n + uf[f + 2]); }
     });
-    Plotly.addTraces(gd, {type: 'mesh3d', x: x, y: y, z: z, i: i, j: j, k: k, color: data.color, opacity: 1,
-                          flatshading: false, lighting: {ambient: 0.55, diffuse: 0.8, specular: 0.3, roughness: 0.5},
-                          name: data.name, showlegend: true, text: text, hoverinfo: 'text'});
+    // the needle tracks: from where the DV was zeroed (brain surface, or bregma's height) down to the ball
+    var tx = [], ty = [], tz = [], ttext = [];
+    data.sites.forEach(function (s) {
+      tx.push(s[4], s[0], null); ty.push(s[1], s[1], null); tz.push(s[5], s[2], null); ttext.push(s[3], s[3], null);
+    });
+    Plotly.addTraces(gd, [
+      {type: 'mesh3d', x: x, y: y, z: z, i: i, j: j, k: k, color: data.color, opacity: 1,
+       flatshading: false, lighting: {ambient: 0.55, diffuse: 0.8, specular: 0.3, roughness: 0.5},
+       name: data.name, showlegend: true, text: text, hoverinfo: 'text'},
+      {type: 'scatter3d', mode: 'lines', x: tx, y: ty, z: tz, line: {color: data.color, width: data.trackWidth},
+       connectgaps: false, name: data.trackName, showlegend: true, text: ttext, hoverinfo: 'text'}]);
     if (!gd.__hoverPassThrough) passThrough(gd);   // (newer pages do this themselves)
   }
   // Hover through the background, for pages written before the ABC browser did it (the same code as its
@@ -331,6 +346,7 @@ def add_to_page(page_text, sites, radius, color=BALL_COLOR):
     page_text = re.sub(re.escape(START) + r'.*?' + re.escape(END) + r'\n?', '', page_text, flags=re.S)
     verts, faces = unit_sphere(2)
     data = {'sites': sites, 'radius': radius, 'color': color, 'name': f"injection sites ({len(sites)})",
+            'trackName': "needle tracks", 'trackWidth': TRACK_WIDTH_PX,
             'sphere': {'v': verts.ravel().tolist(), 'f': faces.ravel().tolist()}}
     script = START + PAGE_SCRIPT.replace('__DATA__', json.dumps(data).replace('</', '<\\/')) + END + '\n'
     at = page_text.rfind('</body>')

@@ -489,8 +489,53 @@ EXTRAS_JS = r"""
     }
     Plotly.addTraces(gd, traces).then(function () {
       makeSliceable(gd, firstOwn); groupLegend(gd, 40); fixSwatches(gd); installSliders();
-      if (peer && window.__injectionData) installPanel(gd, window.__injectionData, peer, 40);
+      freezeAxes(gd, 40, function () { if (peer && window.__injectionData) installPanel(gd, window.__injectionData, peer, 40); });
     });
+  }
+
+  // The page's axes fit whatever is drawn (autorange, and aspect from the data), so switching an object on or off in the legend, or the 3D panel's filter
+  // changing which sites are drawn, made the view jump in or out. Once the sites are drawn, the axes are held where they are: everything stays in place.
+  function freezeAxes(gd, tries, then) {
+    var drawn = gd._fullData.some(function (t) { return /^(injection sites|optic fibers)/.test(t.name || ''); });
+    if (!drawn && tries > 0 && window.__injectionData && window.__injectionData.sites.length) {   // (the loader draws them, perhaps a moment after this)
+      return setTimeout(function () { freezeAxes(gd, tries - 1, then); }, 250);
+    }
+    // The ranges plotly fitted are written into the scene's layout only when it draws, and the layout is rebuilt before each drawing, so they are read once
+    // the page has been quiet for a moment (after its own and these scripts' changes).
+    var timer = 0, finished = false;
+    function soon() { clearTimeout(timer); timer = setTimeout(hold, 400); }
+    gd.on('plotly_afterplot', soon);
+    soon();
+    function hold() {
+      if (finished) return;
+      // The extent is worked out as plotly's autorange does (the layout's own range is not kept up to date): the drawn objects' bounds over the scene's data
+      // scale, then a 32nd of the span added at each end.
+      var scene = gd._fullLayout.scene, sc = scene._scene, update = {}, ok = !!(sc && sc.glplot && sc.dataScale);
+      ['xaxis', 'yaxis', 'zaxis'].forEach(function (a, o) {
+        if (!ok) return;
+        var lo = Infinity, hi = -Infinity;
+        sc.glplot.objects.forEach(function (obj) {
+          var b = obj.bounds, pad = (obj._trace && obj._trace.data && obj._trace.data._pad) || 0;
+          if (!b) return;
+          lo = Math.min(lo, b[0][o] / sc.dataScale[o] - pad); hi = Math.max(hi, b[1][o] / sc.dataScale[o] + pad);
+        });
+        if (!isFinite(lo) || !isFinite(hi) || hi <= lo) { ok = false; return; }
+        var span = hi - lo;
+        lo -= span / 32; hi += span / 32;
+        // a reversed axis (depth: dorsal at the top) keeps its direction by a range from high to low, as autorange 'reversed' gave it
+        update['scene.' + a + '.range'] = scene[a].autorange === 'reversed' ? [hi, lo] : [lo, hi];
+        update['scene.' + a + '.autorange'] = false;
+      });
+      if (!ok && tries-- > 0) return soon();
+      finished = true;
+      var done = function () { if (then) then(); };
+      if (!ok) return done();
+      update['scene.aspectmode'] = 'manual';
+      var ratio = sc.glplot.getAspectratio ? sc.glplot.getAspectratio() : scene.aspectratio;   // (as drawn)
+      update['scene.aspectratio'] = {x: ratio.x, y: ratio.y, z: ratio.z};
+      if (sc.getCamera) update['scene.camera'] = sc.getCamera();   // (where the view is now: it may have been turned already)
+      try { Plotly.relayout(gd, update).then(done, done); } catch (err) { done(); }
+    }
   }
 
   // The surgery viewer's 3D panel (the page in a frame of the viewer, or in a window it opened, from the viewer's own server): the page talks with it by

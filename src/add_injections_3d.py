@@ -599,8 +599,13 @@ def open_window(surgeries=None):
         root.config(cursor='')
         if kind == 'ok':
             status_var.set('\n'.join(report) + "\nOpening it in your browser.")
+            if sys.stdout:                # (kept in the log once the window has closed; pythonw may have no stdout)
+                print('\n'.join(report))
             import webbrowser
-            webbrowser.open(Path(out).resolve().as_uri())
+            if webbrowser.open(Path(out).resolve().as_uri()):
+                root.after(800, root.destroy)   # the page is open: the window isn't needed any more
+            else:
+                status_var.set('\n'.join(report) + f"\nCould not open a browser: open {out} yourself.")
         else:
             status_var.set("Could not make the page: " + report[0])
 

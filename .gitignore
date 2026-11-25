@@ -17,3 +17,6 @@ src/packaging/dist/
 
 # macOS Finder's per-folder view settings
 .DS_Store
+
+# Pages made by src/add_injections_3d.py, and other local scratch output
+/tmp/

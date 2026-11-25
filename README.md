@@ -75,7 +75,8 @@ C57BL6J-638850):
   measured, at its angle; optic fibers in blue): in the JhouLab surgery viewer, filter the
   list and click Show in 3D (or Export CSV, then double-click `extra-tools/run-add-injections.bat`,
   `.command` on a Mac). In the window, choose the page and click Make page. It writes `PAGE_injections.html`
-  and opens it. (Or from a terminal: `python src/add_injections_3d.py PAGE.html SURGERIES.csv`.)
+  in `tmp/injection_pages` here (on this computer, since the 3D pages are often on a slower network drive;
+  **Open folder** shows it) and opens it. (Or from a terminal: `python src/add_injections_3d.py PAGE.html SURGERIES.csv`.)
   The stereotaxic-to-CCF conversion is approximate; the script's docstring says exactly how each column is used.
 
 The first time, it asks where to keep the atlas download. Choose a drive with plenty of room: the download can reach about 80 GB (9 GB for the core atlas, 50 GB for the imputed gene dataset, and room for newer atlas releases).

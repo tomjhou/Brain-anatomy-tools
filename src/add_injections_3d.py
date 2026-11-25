@@ -5,7 +5,8 @@
 PAGE.html is a 3D page from the ABC browser (its axes are CCF millimetres). SURGERIES.csv is the
 surgery viewer's "Export CSV" file (JhouLab-surgery-viewer), so filter the list there first (by
 target, person, dates...) to choose which injections are drawn. The result is a copy of the page
-(PAGE_injections.html unless -o is given) with two more legend entries: "injection sites", the
+(PAGE_injections.html in Brain-anatomy-tools/tmp/injection_pages, on this computer, unless -o is
+given) with two more legend entries: "injection sites", the
 balls, and "needle tracks", a white line from where each DV was measured from (the brain surface,
 or bregma's height) down to its ball, at the injection angle. Optic fibers (see site_kinds) are
 drawn in blue, with a smaller ball and a thicker rod, as "optic fibers" and "fiber tracks".
@@ -401,10 +402,15 @@ def add_to_page(page_text, sites, radius, color=BALL_COLOR):
     return page_text[:at] + script + page_text[at:]
 
 
-def output_path(page):
-    """Where the page with the balls goes: PAGE_injections.html beside PAGE (PAGE itself if it already is one)."""
+OUTPUT_FOLDER = SRC.parent / 'tmp' / 'injection_pages'   # (git ignores tmp/)
+
+
+def output_path(page, folder=None):
+    """Where the page with the balls goes: PAGE_injections.html in OUTPUT_FOLDER, on this computer, since the 3D pages are
+    often on a network drive, slow to write to and to open (a page is self-contained, so its copy works anywhere).
+    PAGE itself if it already is one. A page of the same name from another folder is overwritten."""
     page = Path(page)
-    return page.with_name(re.sub(r'_injections$', '', page.stem) + '_injections.html')
+    return Path(folder or OUTPUT_FOLDER) / (re.sub(r'_injections$', '', page.stem) + '_injections.html')
 
 
 def make_page(page, surgeries, out=None, radius=DEFAULT_RADIUS_MM):
@@ -412,6 +418,7 @@ def make_page(page, surgeries, out=None, radius=DEFAULT_RADIUS_MM):
     to draw or the page is not a 3D page."""
     page = Path(page)
     out = Path(out) if out else output_path(page)
+    out.parent.mkdir(parents=True, exist_ok=True)
     text = page.read_text(encoding='utf-8')
     if 'plotly' not in text[:20000].lower():
         raise ValueError(f"{page.name} does not look like a 3D page from the ABC browser (no plotly in it).")
@@ -472,6 +479,17 @@ def default_surgeries(last_used):
     return last or ''
 
 
+def open_output_folder():
+    """Shows OUTPUT_FOLDER (the pages made) in Explorer / Finder."""
+    import os
+    import subprocess
+    OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
+    if sys.platform == 'win32':
+        os.startfile(OUTPUT_FOLDER)
+    else:
+        subprocess.Popen(['open' if sys.platform == 'darwin' else 'xdg-open', str(OUTPUT_FOLDER)])
+
+
 def bring_forward(root):
     """Puts the window in the middle of the monitor the pointer is on and in front of the others. Started by the surgery
     viewer's server (a background program), it would otherwise open behind the browser: Windows only lets the program in
@@ -509,7 +527,7 @@ def open_window(surgeries=None):
     out_var = tk.StringVar(root, "")
 
     def show_out(*_args):
-        out_var.set(f"Writes {output_path(page_var.get()).name} beside the page." if page_var.get().strip() else "")
+        out_var.set(f"Writes {output_path(page_var.get()).name} in {OUTPUT_FOLDER} (this computer)." if page_var.get().strip() else "")
     page_var.trace_add('write', show_out)
     show_out()
 
@@ -544,6 +562,7 @@ def open_window(surgeries=None):
     buttons.grid(row=5, column=0, columnspan=3, sticky='e', pady=(14, 0))
     make = ttk.Button(buttons, text="Make page")
     make.pack(side='left')
+    ttk.Button(buttons, text="Open folder", command=open_output_folder).pack(side='left', padx=(8, 0))
     ttk.Button(buttons, text="Close", command=root.destroy).pack(side='left', padx=(8, 0))
     status = ttk.Label(frame, textvariable=status_var, wraplength=620, justify='left')
     status.grid(row=6, column=0, columnspan=3, sticky='w', pady=(10, 0))
@@ -603,7 +622,7 @@ def main(argv=None):
                                             "(with no arguments: a window to choose the files).")
     p.add_argument('page', help="a 3D page (.html) written by the ABC atlas browser")
     p.add_argument('surgeries', help="the surgery viewer's Export CSV file")
-    p.add_argument('-o', '--out', help="the page to write (default: PAGE_injections.html beside PAGE)")
+    p.add_argument('-o', '--out', help=f"the page to write (default: PAGE_injections.html in {OUTPUT_FOLDER})")
     p.add_argument('--radius', type=float, default=DEFAULT_RADIUS_MM, help=f"ball radius in mm (default {DEFAULT_RADIUS_MM})")
     a = p.parse_args(argv)
     try:

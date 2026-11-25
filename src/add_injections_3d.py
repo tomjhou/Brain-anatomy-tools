@@ -350,9 +350,41 @@ def clean_side_files(folder, keep=KEEP_SIDE_FILES):
             pass
 
 
-def write_side_file(sites, radius, label, folder=None):
-    """Writes the sites as a side file: a script that calls window.__injectionSites({...}), which the page's loader defines (see injection_loader.py). Written
-    through a temporary file, so that a page never reads half of it. A new name every time. Returns its path."""
+BREGMA_COLOR = '#e01818'
+BREGMA_CUBE_MM = 0.15     # the cube's edge: half the width of an injection ball
+
+# Draws a small cube centered at bregma (the page's axes: x = ML, y = AP, z = DV). It is part of the side file, not of the page's loader, so that pages that
+# already have the loader show it too. Waits for the plot the same way the loader does.
+BREGMA_JS = r"""
+(function (b) {
+  function draw() {
+    var gd = document.querySelector('.plotly-graph-div');
+    if (!window.Plotly || !gd || !gd._fullLayout || !gd._fullLayout.scene) return setTimeout(draw, 200);
+    var h = b.edge / 2, x = [], y = [], z = [];
+    [[-1, -1, -1], [-1, 1, -1], [1, 1, -1], [1, -1, -1], [-1, -1, 1], [-1, 1, 1], [1, 1, 1], [1, -1, 1]].forEach(function (c) {
+      x.push(b.x + c[0] * h); y.push(b.y + c[1] * h); z.push(b.z + c[2] * h);
+    });
+    Plotly.addTraces(gd, [{type: 'mesh3d', x: x, y: y, z: z, color: b.color, opacity: 1, flatshading: true,
+      i: [7, 0, 0, 0, 4, 4, 2, 6, 4, 0, 3, 7], j: [3, 4, 1, 2, 5, 6, 5, 5, 0, 1, 2, 2], k: [0, 7, 2, 3, 6, 7, 1, 2, 5, 5, 7, 6],
+      lighting: {ambient: 0.6, diffuse: 0.8, specular: 0.2, roughness: 0.6},
+      name: 'bregma', showlegend: true, text: b.text, hoverinfo: 'text'}]);
+  }
+  draw();
+})(__BREGMA__);
+"""
+
+
+def bregma_marker(bregma):
+    """The bregma cube's data for BREGMA_JS, from bregma_in_ccf's (AP, DV, ML)."""
+    ap, dv, ml = bregma
+    return {'x': round(ml, 3), 'y': round(ap, 3), 'z': round(dv, 3), 'edge': BREGMA_CUBE_MM, 'color': BREGMA_COLOR,
+            'text': f"<b>bregma</b><br>CCF: AP {ap:g}, DV {dv:g}, ML {ml:g} mm"}
+
+
+def write_side_file(sites, radius, label, folder=None, bregma=None):
+    """Writes the sites as a side file: a script that calls window.__injectionSites({...}), which the page's loader defines (see injection_loader.py), and
+    (given `bregma`, as bregma_in_ccf gives it) draws the red cube at bregma. Written through a temporary file, so that a page never reads half of it. A new
+    name every time. Returns its path."""
     folder = Path(folder or SIDE_FOLDER)
     folder.mkdir(parents=True, exist_ok=True)
     stem = 'injections-' + time.strftime('%Y%m%d-%H%M%S')
@@ -361,7 +393,10 @@ def write_side_file(sites, radius, label, folder=None):
         n += 1
         path = folder / f"{stem}-{n}.js"
     temporary = path.with_name(path.name + '.part')
-    temporary.write_text('window.__injectionSites(' + json.dumps(side_file_data(sites, radius, label)).replace('</', '<\\/') + ');\n', encoding='utf-8')
+    text = 'window.__injectionSites(' + json.dumps(side_file_data(sites, radius, label)).replace('</', '<\\/') + ');\n'
+    if bregma:
+        text += BREGMA_JS.replace('__BREGMA__', json.dumps(bregma_marker(bregma)).replace('</', '<\\/'))
+    temporary.write_text(text, encoding='utf-8')
     os.replace(temporary, path)
     clean_side_files(folder)
     return path
@@ -396,7 +431,7 @@ def make_view(page, surgeries, radius=DEFAULT_RADIUS_MM, upgrade=False):
     left_out = ', '.join(f"{n} {why}" for why, n in skipped.items() if n)
     fibers = sum(1 for s in sites if s[6] == 'fiber')
     label = f"{time.strftime('%H:%M')}, {len(sites) - fibers} injections" + (f", {fibers} fibers" if fibers else "")
-    side = write_side_file(sites, radius, label)
+    side = write_side_file(sites, radius, label, bregma=bregma)
     report.insert(0, f"{len(sites) - fibers} injection sites and {fibers} optic fibers written to {side.name}"
                   + (f" (left out: {left_out})" if left_out else ""))
     report.append(f"Bregma in the CCF: AP {bregma[0]:g}, DV {bregma[1]:g}, ML {bregma[2]:g} mm")

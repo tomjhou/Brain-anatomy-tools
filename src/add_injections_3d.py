@@ -460,7 +460,7 @@ EXTRAS_JS = r"""
       }
       traces.push({type: 'mesh3d', x: vx, y: vy, z: vz, i: fi, j: fj, k: fk, color: e.skullColor, opacity: 0.3, flatshading: false,
         lighting: {ambient: 0.8, diffuse: 0.3, specular: 0, roughness: 1}, name: 'estimated skull underside', showlegend: true, hoverinfo: 'skip',
-        legendrank: 3});
+        legendrank: 3, visible: 'legendonly'});   // (off at first: a click on its legend entry shows it)
     }
     // bregma, lambda and the skull estimate are first in the legend (rank), then one blank line (a blank-named stand-in trace, which the page hides), as in
     // the page's own legend; the page's other entries have the default rank, 1000
@@ -1021,7 +1021,7 @@ def make_side_file(page, surgeries, radius=DEFAULT_RADIUS_MM, upgrade=False, sku
     report.append(f"Bregma in the CCF: AP {bregma[0]:g}, DV {bregma[1]:g}, ML {bregma[2]:g} mm")
     if skull is not None:
         report.append(f"DV zeroed on the dura or brain surface is measured from the estimated underside of the skull (dips in the brain's top narrower "
-                      f"than about {2 * skull_span:g} mm are bridged); it is drawn as a translucent sheet.")
+                      f"than about {2 * skull_span:g} mm are bridged); its legend entry shows it as a translucent sheet (off at first).")
     return side, report
 
 

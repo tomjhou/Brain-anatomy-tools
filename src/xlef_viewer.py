@@ -328,6 +328,123 @@ def is_online_only(path):
         return False
 
 
+SPEED_TEST_URL = "https://speed.cloudflare.com/__down?bytes={}"   # (Cloudflare's speed test: a download of that many bytes)
+SPEED_TEST_DAYS = 7          # a download speed measured longer ago than this is measured again (see XlefViewer._download_estimate)
+SPEED_KEEP = 5               # OneDrive downloads timed, the latest kept (their middle value is the estimate)
+
+
+def measure_internet_speed(max_bytes=25e6, seconds=2.0):
+    """This computer's download speed from Cloudflare's speed-test servers (a site near it): {"rate": bytes/s, "latency": s,
+    "when": time}. About `seconds` of downloading (at most max_bytes), plus three empty requests for the latency. Sends nothing but
+    the requests (a generic User-Agent). Raises OSError (urllib's URLError is one) if it can't be reached."""
+    import urllib.request
+
+    def get(n):
+        return urllib.request.urlopen(urllib.request.Request(SPEED_TEST_URL.format(int(n)), headers={"User-Agent": "xlef-viewer"}),
+                                      timeout=10)
+    lat = []
+    for _ in range(3):
+        t = time.perf_counter()
+        with get(0) as r:
+            r.read()
+        lat.append(time.perf_counter() - t)
+    got, first = 0, None
+    with get(max_bytes) as r:
+        while True:
+            chunk = r.read(256 * 1024)
+            now = time.perf_counter()
+            if not chunk:
+                break
+            if first is None:
+                first = now               # (timed from the first bytes: the wait before them is the latency)
+            else:
+                got += len(chunk)
+            if now - first > seconds:
+                break
+    if first is None or now <= first or got <= 0:
+        raise OSError("the speed test gave no data")
+    return {"rate": got / (now - first), "latency": min(lat), "when": time.time()}
+
+
+def duration_text(seconds):
+    """A download's estimated time, roughly: "under 10 s", "40 s", "3 min", "1.5 h"."""
+    if seconds < 10:
+        return "under 10 s"
+    if seconds < 90:
+        return f"{round(seconds / 5) * 5:.0f} s"
+    if seconds < 5400:
+        return f"{round(seconds / 60):.0f} min"
+    return f"{seconds / 3600:.1f} h"
+
+
+def pyramid_levels(entry):
+    """[(step, level)] of LAS X's pyramid of an image, finest first (_pmd_0 = 1/2 size, ...). Reads only the levels' small .xlif files
+    (remembered: see _pyramid_entry)."""
+    out, path = [], entry.pyramid
+    try:
+        for _ in range(16):
+            if not path:
+                break
+            level = _pyramid_entry(path)
+            if not isinstance(level, ImageEntry) or level.problem or not level.width:
+                break
+            out.append((max(1, round(entry.width / level.width)), level))
+            path = level.pyramid
+    except (OSError, ET.ParseError):
+        pass
+    return out
+
+
+def missing_files(entry, listings=None):
+    """The image's full-resolution files that aren't there (only its metadata, or its pyramid, was copied?). Each folder is listed
+    once (listings: folder -> its file names, shared between the images of a project), not each file asked about: on a network drive
+    each question is a round trip to the server. An online-only file is there."""
+    listings = {} if listings is None else listings
+    gone = []
+    for f in entry.all_files():
+        folder = os.path.normcase(os.path.dirname(f))
+        if folder not in listings:
+            try:
+                listings[folder] = {os.path.normcase(n) for n in os.listdir(folder)}
+            except OSError:
+                listings[folder] = set()
+        if os.path.normcase(os.path.basename(f)) not in listings[folder]:
+            gone.append(f)
+    return gone
+
+
+def cloud_state(path):
+    """(state, size) of a file from ONE look at it (os.stat: no download): "here" (on this computer), "auto" (online-only, small enough
+    to download when needed without asking) or "download" (online-only and larger: asked first), as for the file alone (a section's
+    resolution may be several files: see files_state). One look, so the state and the size agree even while OneDrive is changing
+    the file (asking whether it is online-only, then its size, separately could get two different answers, e.g. as it downloads it)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return "here", 0
+    drive = os.path.splitdrive(os.path.abspath(path))[0]
+    online = (not (drive and _network_drive(drive.rstrip("\\/") + "\\"))
+              and bool(getattr(st, "st_file_attributes", 0) & _CLOUD_ONLY_ATTRS))
+    return ("download" if st.st_size > AUTO_DOWNLOAD_MAX else "auto") if online else "here", st.st_size
+
+
+def files_state(files):
+    """(state, bytes online-only, how many online-only) of a set of files (one resolution of a section: e.g. a file per channel), each
+    looked at once (see cloud_state): "download" when the online-only ones come to more than AUTO_DOWNLOAD_MAX in all (asked
+    first), "auto" when some are online-only but less (downloaded when needed, without asking), "here" when none are."""
+    looks = [cloud_state(f) for f in sorted(set(f for f in files if f))]
+    online = [n for st, n in looks if st != "here"]
+    total = sum(online)
+    return ("download" if total > AUTO_DOWNLOAD_MAX else "auto" if online else "here"), total, len(online)
+
+
+def needs_asking_all(files):
+    """These files (one resolution of a section) may only be read after asking: their online-only ones come to more than
+    AUTO_DOWNLOAD_MAX in all (see files_state). (Per file, a pyramid copy saved as a file per channel, 3 x 45 MB, would be
+    downloaded without asking.)"""
+    return files_state(files)[0] == "download"
+
+
 def stored_bytes(path):
     """How much of a file is actually stored on this computer (for an online-only OneDrive file: 0, growing as it is downloaded),
     asked of Windows without opening the file (so no download is started). None if it can't be told."""
@@ -346,7 +463,8 @@ def stored_bytes(path):
         return None
 
 
-AUTO_DOWNLOAD_MAX = 50e6     # an online-only file up to this size (bytes) is downloaded when needed without asking (pyramid levels are)
+AUTO_DOWNLOAD_MAX = 50e6     # online-only files up to this size (bytes) IN ALL are downloaded when needed without asking: the files of one
+                             # resolution of a section (a pyramid copy's, or its full resolution's), which may be a file per channel
 
 
 def size_text(n_bytes):
@@ -446,15 +564,6 @@ def total_memory():
     status = MemoryStatus()
     status.dwLength = ctypes.sizeof(status)
     return status.ullTotalPhys if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)) else None
-
-
-def needs_asking(path):
-    """True for a file that may only be read after asking: online-only AND bigger than AUTO_DOWNLOAD_MAX (reading any of it makes
-    OneDrive download all of it). os.stat only: no download."""
-    try:
-        return is_online_only(path) and os.path.getsize(path) > AUTO_DOWNLOAD_MAX
-    except OSError:
-        return False
 
 
 # ---------------------------------------------------------------------------------------------------------------------- metadata
@@ -2291,11 +2400,21 @@ class OpenImage:
             if step < 2 or step & (step - 1) or e.width // step != level.width or e.height // step != level.height:
                 return None
             files = [level.files.get((0, c)) for c in range(len(e.channels))]
-            if not all(files) or any(needs_asking(f) for f in files):
+            if not all(files) or needs_asking_all(level.files.values()):
                 return None
             return level, step
         except (OSError, ET.ParseError):
             return None
+
+    def usable_at_most(self, size):
+        """As usable_level(size), but when that level can't be used (e.g. it is online-only and too large to download without asking),
+        the next coarser one that can: (level, step), or None if none can."""
+        for _ in range(16):
+            found = self.usable_level(size)
+            if found is not None or size < 1:
+                return found
+            size /= 2
+        return None
 
     def plane(self, z, c, stale=None, keep=True):
         """Plane (z, c), whole. One that can't be memory-mapped (compressed) is decoded here, one at a time (_DECODE_LOCK; a zoom starts
@@ -2508,15 +2627,16 @@ class OpenImage:
             return self._combined_reader(z, readers)
         if self.raw_layout(z, c) is None:
             return None
-        readers = [_RowReader(self.entry.files[(k, c)], *self.raw_layout(k, c), self.entry.width) for k in self.layers(z)]
+        readers = [_RowReader(self.entry.files[(k, c)], *self.raw_layout(k, c)[:2], self.entry.width, self.raw_layout(k, c)[2])
+                   for k in self.layers(z)]
         return self._combined_reader(z, readers)
 
     def level_reader(self, level, z, c, step):
         """As row_reader, from a pyramid level (see _LevelRowReader)."""
         if self.level_layout(level, z, c) is None or len(self.files_of(z, c, level.files)) != len(self.layers(z)):
             return None
-        readers = [_LevelRowReader(level.files[(k, c)], *self.level_layout(level, k, c), level.width, step,
-                                   self.entry.channels[c].max_value) for k in self.layers(z)]
+        readers = [_LevelRowReader(level.files[(k, c)], *self.level_layout(level, k, c)[:2], level.width, step,
+                                   self.entry.channels[c].max_value, self.level_layout(level, k, c)[2]) for k in self.layers(z)]
         return self._combined_reader(z, readers)
 
     def close(self):
@@ -2697,23 +2817,31 @@ READ_THREADS = 8
 _READ_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=READ_THREADS)     # (reads of rows for a sharp view: see _RowReader)
 
 
-def plain_tiff(path):
-    """Where a plain TIFF keeps its pixels: (offset, dtype, (rows, columns)) when the file holds one uncompressed, untiled 2-D image,
-    stored in one run of bytes, so that any row can be read straight from the file; else None (compressed, tiled, a z stack in one
-    file, ...). Reads only the file's header."""
+def plain_tiff(path, sample=None):
+    """Where a plain TIFF keeps its pixels: (offset, dtype, (rows, columns), stride) when the file holds one uncompressed, untiled 2-D
+    image, stored in one run of bytes, so that any row can be read straight from the file; else None (compressed, tiled, a z stack in
+    one file, ...). sample: one colour of an RGB TIFF whose colours are interleaved (each pixel's together, as in LAS X's pyramid of
+    a colour image): its offset is that colour's first value, and stride the number of values per pixel (1 for a grey TIFF).
+    Reads only the file's header."""
     try:
         with tifffile.TiffFile(path) as t:
             if len(t.pages) != 1:
                 return None
             p = t.pages[0]
-            if p.compression != 1 or p.is_tiled or p.samplesperpixel != 1 or len(p.shape) != 2:
+            k = p.samplesperpixel
+            if p.compression != 1 or p.is_tiled:
                 return None
-            shape = tuple(p.shape)
+            if k == 1 and len(p.shape) == 2:
+                shape = tuple(p.shape)
+            elif sample is not None and 0 <= sample < k and p.planarconfig == 1 and len(p.shape) == 3 and p.shape[2] == k:
+                shape = tuple(p.shape[:2])                  # (rows, columns, samples: interleaved)
+            else:
+                return None
             offs, counts = list(p.dataoffsets), list(p.databytecounts)
             dtype = np.dtype(p.dtype).newbyteorder(t.byteorder)
-            if any(o + n != nxt for o, n, nxt in zip(offs, counts, offs[1:])) or sum(counts) != shape[0] * shape[1] * dtype.itemsize:
+            if any(o + n != nxt for o, n, nxt in zip(offs, counts, offs[1:])) or sum(counts) != shape[0] * shape[1] * k * dtype.itemsize:
                 return None
-            return offs[0], dtype, shape
+            return offs[0] + (sample or 0) * dtype.itemsize, dtype, shape, k
     except (OSError, ValueError, IndexError, tifffile.TiffFileError):
         return None
 
@@ -2740,15 +2868,18 @@ def raw_start(path, page):
 
 
 def plain_layout(path, page=None):
-    """(offset, dtype, (rows, columns)) of a plane whose rows can be read straight from its file: a plain TIFF (see plain_tiff), or a
-    channel in a .lof or .lif (page: a RawPlane); else None (also an OME-TIFF's page)."""
+    """(offset, dtype, (rows, columns), stride) of a plane whose rows can be read straight from its file: a plain TIFF, or one colour
+    of an RGB TIFF's (page: a TiffSample of its image; see plain_tiff), or a channel in a .lof or .lif (page: a RawPlane); else None
+    (also an OME-TIFF's page)."""
     if path is None:
         return None
     if isinstance(page, RawPlane):
         try:
-            return raw_start(path, page), page.dtype, page.shape
+            return raw_start(path, page), page.dtype, page.shape, 1
         except (OSError, ValueError):
             return None
+    if isinstance(page, TiffSample):
+        return plain_tiff(path, page.sample) if page.page is None else None
     return plain_tiff(path) if page is None else None
 
 
@@ -2774,10 +2905,10 @@ def read_whole(path, page=None):
 
 
 def raw_layout(path, page, shape):
-    """(offset, dtype) of a plane that can be read row by row (see plain_layout) holding an image of `shape` (rows, columns); else
-    None."""
+    """(offset, dtype, stride) of a plane that can be read row by row (see plain_layout) holding an image of `shape` (rows, columns);
+    else None."""
     found = plain_layout(path, page)
-    return found[:2] if found is not None and found[2] == tuple(shape) else None
+    return (found[0], found[1], found[3]) if found is not None and found[2] == tuple(shape) else None
 
 
 class _RowReader:
@@ -2786,8 +2917,8 @@ class _RowReader:
     pixels through a memory map fetched them a small piece at a time, one after another: 4-6 times slower on the network drive.)
     Each thread opens the file once; close() closes them all."""
 
-    def __init__(self, path, offset, dtype, width):
-        self.path, self.offset, self.dtype, self.width = path, offset, dtype, width
+    def __init__(self, path, offset, dtype, width, stride=1):
+        self.path, self.offset, self.dtype, self.width, self.stride = path, offset, dtype, width, stride    # (stride: see plain_tiff)
         self.out_dtype = dtype.newbyteorder("=")
         self.local, self.opened, self.lock = threading.local(), [], threading.Lock()
 
@@ -2798,16 +2929,16 @@ class _RowReader:
             fh = self.local.fh = open(self.path, "rb", buffering=0)
             with self.lock:
                 self.opened.append(fh)
-        size = ((n - 1) * step + 1) * self.dtype.itemsize
-        fh.seek(self.offset + (r * self.width + x0) * self.dtype.itemsize)
+        size = _RowReader.cost(self, n, step)        # (not a subclass's: its step is the level's by now)
+        fh.seek(self.offset + (r * self.width + x0) * self.stride * self.dtype.itemsize)
         data = fh.read(size)
         if len(data) != size:
             raise OSError(f"{os.path.basename(self.path)} ends early")
-        return np.frombuffer(data, self.dtype)[::step]
+        return np.frombuffer(data, self.dtype)[::step * self.stride]
 
     def cost(self, n, step):
         """Bytes read from the file for row(r, x0, n, step)."""
-        return ((n - 1) * step + 1) * self.dtype.itemsize
+        return ((n - 1) * step * self.stride + 1) * self.dtype.itemsize
 
     def close(self):
         with self.lock:
@@ -2821,8 +2952,8 @@ class _LevelRowReader(_RowReader):
     _RowReader does, and given as the image's own values (see pyramid_to_original): a sharp view read from the level instead of the
     image's files (on slow storage, see XlefViewer._read_plan)."""
 
-    def __init__(self, path, offset, dtype, width, level_step, max_value):
-        super().__init__(path, offset, dtype, width)
+    def __init__(self, path, offset, dtype, width, level_step, max_value, stride=1):
+        super().__init__(path, offset, dtype, width, stride)
         self.level_step, self.lut = level_step, pyramid_lut(max_value)
         self.out_dtype = self.lut.dtype
 
@@ -2910,8 +3041,8 @@ def read_plain_rows(path, step, wait=None, progress=None, chunk=64, page=None):
     found = plain_layout(path, page)
     if found is None:
         return None
-    offset, dtype, (h, w) = found
-    reader = _RowReader(path, offset, dtype, w)
+    offset, dtype, (h, w), stride = found
+    reader = _RowReader(path, offset, dtype, w, stride)
     try:
         rows, cols = -(-h // step), -(-w // step)
         out = np.empty((rows, cols), reader.out_dtype)
@@ -3346,10 +3477,12 @@ class HistogramView(tk.Canvas):
 class RangeSlider(tk.Canvas):
     """One slider with two handles: black level and white level (left/right, or bottom/top when vertical). Drag a handle to move it,
     drag the bar between them to shift both, click elsewhere on the track to bring the nearer handle there. Shift while dragging moves
-    10x slower. command(lo, hi) is called on every change made with the mouse (not on set())."""
+    10x slower. Vertical: click the number above or below the track to type the white or black level (see edit). command(lo, hi) is
+    called on every change made with the mouse or typed (not on set())."""
 
     HANDLE_W = 7
     MIN_GAP = 12             # (px: the handles are drawn at least this far apart; their values may still meet)
+    typing = None            # (the level being typed, in any slider: its commit function; see edit)
 
     def __init__(self, parent, max_value, lo, hi, color, command=None, vertical=False):
         bg = PAL["bg"]
@@ -3365,6 +3498,12 @@ class RangeSlider(tk.Canvas):
         self.bind("<ButtonPress-1>", self._press)
         self.bind("<B1-Motion>", self._motion)
         self.bind("<ButtonRelease-1>", lambda e: setattr(self, "drag", None))
+        if vertical:
+            self.bind("<Motion>", lambda e: self.configure(cursor="xterm" if self._number_at(e) else "sb_v_double_arrow"))
+            root = self._root()
+            if not getattr(root, "slider_clicks_bound", False):     # (once per window: a click anywhere else ends the typing)
+                root.slider_clicks_bound = True
+                self.bind_all("<ButtonPress-1>", RangeSlider._click_elsewhere, add="+")
 
     def set(self, lo, hi):
         self.lo, self.hi = int(lo), int(hi)
@@ -3443,7 +3582,66 @@ class RangeSlider(tk.Canvas):
             self.create_text(a0, 1, anchor=tk.NW, text=f"black {self.lo}", fill=text_color)
             self.create_text(a1, 1, anchor=tk.NE, text=f"white {self.hi}", fill=text_color)
 
+    def _number_at(self, event):
+        """Vertical: "hi" for a point on the white level's number (above the track), "lo" on the black level's (below it), else None."""
+        if not self.vertical:
+            return None
+        return "hi" if event.y < self.pad else "lo" if event.y > self._length() - self.pad else None
+
+    @staticmethod
+    def _click_elsewhere(event):
+        """A click anywhere while a level is being typed, but in its box: the typed level is set (as Return would)."""
+        commit = RangeSlider.typing
+        if commit is not None and event.widget is not commit.box and not isinstance(event.widget, RangeSlider):
+            commit(True)                    # (a slider's own press does this itself, before what the press does)
+
+    def edit(self, which):
+        """A box over the white ("hi") or black ("lo") level's number to type it in: Return, Tab or clicking elsewhere sets it (one step
+        of Undo; kept within 0 and the maximum, and not past the other level), Escape leaves it as it was."""
+        if RangeSlider.typing is not None:
+            RangeSlider.typing(True)
+        box = tk.Entry(self, justify=tk.CENTER, font=("Segoe UI", 8), bd=1, relief=tk.SOLID, background=PAL["field"],
+                       foreground=PAL["field_fg"], insertbackground=PAL["field_fg"])
+        box.insert(0, str(getattr(self, which)))
+        box.select_range(0, tk.END)
+        top = which == "hi"
+        box.place(x=self.winfo_width() / 2, y=0 if top else self._length(), anchor=tk.N if top else tk.S, width=self.winfo_width())
+
+        def commit(keep):
+            if RangeSlider.typing is not commit:
+                return
+            RangeSlider.typing = None
+            try:
+                text = box.get().strip()
+                box.destroy()
+            except tk.TclError:             # (the slider is gone: another section's sliders were built)
+                return
+            try:
+                value = round(float(text))
+            except ValueError:
+                return
+            if keep and self.winfo_exists():
+                self.before_press = (self.lo, self.hi)
+                self.presses = getattr(self, "presses", 0) + 1     # (its own step of Undo, as a click)
+                self._apply(which, value - getattr(self, which))
+        commit.box = box
+        RangeSlider.typing = commit
+        box.bind("<Return>", lambda e: (commit(True), "break")[1])
+        box.bind("<KP_Enter>", lambda e: (commit(True), "break")[1])
+        box.bind("<Tab>", lambda e: (commit(True), "break")[1])
+        box.bind("<Escape>", lambda e: (commit(False), "break")[1])
+        box.bind(f"<{SHORTCUT}-z>", lambda e: "break")      # (not the viewer's Undo while typing)
+        box.bind("<FocusOut>", lambda e: commit(True))
+        box.focus_set()
+
     def _press(self, event):
+        if RangeSlider.typing is not None:
+            RangeSlider.typing(True)
+        which = self._number_at(event)
+        if which:
+            self.drag = None
+            self.edit(which)
+            return
         x = self._along(event)
         self.before_press = (self.lo, self.hi)
         self.presses = getattr(self, "presses", 0) + 1         # (the viewer makes each press one step of Undo)
@@ -3547,8 +3745,11 @@ def _thumb_cache_path(entry, size):
     if any(c.max_value > 4095 for c in entry.channels):  # (an image of more than 12 bits: those saved before 2026-11-24 used the
         h.update(b"|gamma-by-depth")                     # 12-bit gamma for its pyramid, too bright; see xlef_pyramids.gamma_for)
     for f in entry.all_files():
-        st = os.stat(f)
-        h.update(f"{os.path.normcase(f)}|{st.st_size}|{st.st_mtime_ns}".encode())
+        try:
+            st = os.stat(f)
+            h.update(f"{os.path.normcase(f)}|{st.st_size}|{st.st_mtime_ns}".encode())
+        except FileNotFoundError:        # (only its metadata and pyramid were copied: the thumbnail comes from the pyramid, and is
+            h.update(f"{os.path.normcase(f)}|missing".encode())     # made again if the file comes back)
     if entry.lif_block:              # (the images of a .lif share its one file)
         h.update(f"|{entry.lif_block}".encode())
     if entry.vsi:                    # (and the scenes of a .vsi)
@@ -3601,12 +3802,12 @@ def pyramid_level(entry, size):
 
 def _thumb_source(entry, size):
     """What to make the thumbnail from: the pyramid level for `size` when its files can be read without asking (on this computer, or
-    online-only but small: see needs_asking), else the image itself if its files can; (None, "cloud") when neither can."""
+    online-only but small: see needs_asking_all), else the image itself if its files can; (None, "cloud") when neither can."""
     for source in (pyramid_level(entry, size), entry):
         if source is None or not source.files:
             continue
         files = [source.files.get((0, c)) for c in range(len(source.channels))]
-        if not any(f and needs_asking(f) for f in files):
+        if not needs_asking_all(files):
             return source, files
     return None, "cloud"
 
@@ -3868,7 +4069,7 @@ class ThumbGrid(ttk.Frame):
 
     GAP, NAME_H = 8, 30
 
-    def __init__(self, parent, on_click, size=THUMB_SIZE, on_menu=None, on_drop=None, name_tip=None, is_unsaved=None, orient=None):
+    def __init__(self, parent, on_click, size=THUMB_SIZE, on_menu=None, on_drop=None, name_tip=None, mark_text=None, orient=None):
         super().__init__(parent)
         self.on_click, self.size, self.on_menu, self.on_drop = on_click, size, on_menu, on_drop
         # (orient(item): (mirrored left-right, mirrored top-bottom, badge text) for an image's thumbnail, as the view shows it: see
@@ -3876,7 +4077,7 @@ class ThumbGrid(ttk.Frame):
         self.orient = orient
         self.drawn_orient = {}    # item -> the orient() its picture was last drawn with
         self.name_tip, self.tip = name_tip, None     # (name_tip(item): the note on an image's tile or a heading (its list item), or None)
-        self.is_unsaved = is_unsaved  # (is_unsaved(item): a red * after its name or heading, as in the list: see place_unsaved_marks)
+        self.mark_text = mark_text    # (mark_text(item): the red mark after its name or heading, "*", "!" or "", as in the list: see place_unsaved_marks)
         self.press = None         # (a thumbnail pressed: (item, x, y, dragging yet); dropped on another: on_drop(item, target, after))
         self.canvas = tk.Canvas(self, highlightthickness=0, background=PAL["grid"], takefocus=True)
         sb = ttk.Scrollbar(self, orient=tk.VERTICAL, command=self.canvas.yview)
@@ -3945,29 +4146,34 @@ class ThumbGrid(ttk.Frame):
         items = {r[1] for r in rows if r[0] == "image"}
         thumbs = {i: t for i, t in self.thumbs.items() if i in items} if keep else {}
         selected = self.selected if keep and self.selected in items else None
-        self.rows, self.thumbs, self.selected, self.message, self.progress = rows, thumbs, selected, message, {}
+        progress = {i: p for i, p in getattr(self, "progress", {}).items() if i in items} if keep else {}
+        self.rows, self.thumbs, self.selected, self.message, self.progress = rows, thumbs, selected, message, progress
         if not keep:
             self.canvas.yview_moveto(0)
         self.layout()
 
-    def set_progress(self, item, fraction):
-        """A thin blue bar along the bottom of the item's tile, while it loads in the background (fraction None: no bar)."""
-        if fraction is None:
+    def set_progress(self, item, fraction, color="#3a8fff"):
+        """A thin bar along the bottom of the item's tile, as under its name in the list: blue while its preview is read, white while
+        its full resolution is downloaded (fraction None: no bar)."""
+        new = None if fraction is None else (fraction, color)
+        if self.progress.get(item) == new:
+            return
+        if new is None:
             self.progress.pop(item, None)
         else:
-            self.progress[item] = fraction
+            self.progress[item] = new
         self._draw_progress(item)
 
     def _draw_progress(self, item):
         c = self.canvas
         c.delete(f"prog:{item}")
-        frac = getattr(self, "progress", {}).get(item)
+        frac, color = getattr(self, "progress", {}).get(item) or (None, None)
         box = c.coords(f"bg:{item}")
         if frac is None or not box:
             return
         x0, y0, x1, y1 = box
         c.create_rectangle(x0 + 4, y1 - 6, x1 - 4, y1 - 3, fill=PAL["placeholder"], outline="", tags=(f"prog:{item}",))
-        c.create_rectangle(x0 + 4, y1 - 6, x0 + 4 + (x1 - x0 - 8) * frac, y1 - 3, fill="#3a8fff", outline="", tags=(f"prog:{item}",))
+        c.create_rectangle(x0 + 4, y1 - 6, x0 + 4 + (x1 - x0 - 8) * frac, y1 - 3, fill=color, outline="", tags=(f"prog:{item}",))
 
     def set_thumb(self, item, image, state):
         o = self._orient(item)
@@ -4092,7 +4298,7 @@ class ThumbGrid(ttk.Frame):
         image's is centred under its tile): the * follows its last line, found from the character Tk draws at that line's left end."""
         c = self.canvas
         c.delete("unsaved")
-        if self.is_unsaved is None:
+        if self.mark_text is None:
             return
         for row in self.rows:
             if row[0] == "loading":
@@ -4100,7 +4306,8 @@ class ThumbGrid(ttk.Frame):
             item = row[1] if row[0] == "image" else row[2]
             tag = f"name:{item}" if row[0] == "image" else f"proj:{item}" if row[0] == "project" else f"fold:{item}"
             t = c.find_withtag(tag)
-            if not t or not self.is_unsaved(item):
+            mark = self.mark_text(item) if t else ""
+            if not mark:
                 continue
             t = t[0]
             box = c.bbox(t)
@@ -4115,7 +4322,7 @@ class ThumbGrid(ttk.Frame):
                 right = c.coords(t)[0] + last / 2
             else:
                 right = box[0] + 1 + last
-            c.create_text(right + 1, box[3] - line_h // 2, anchor=tk.W, text="*", fill=PAL["warn"],
+            c.create_text(right + 1, box[3] - line_h // 2, anchor=tk.W, text=mark, fill=PAL["warn"],
                                  font=("Segoe UI", 12, "bold"), tags=("unsaved",) + tuple(g for g in c.gettags(t) if g != tag))
 
     def _draw_picture(self, item, x=None, y=None):
@@ -4300,6 +4507,7 @@ class XlefViewer:
         self.drawing_bands = False                       # (a sharp view's bands being drawn as they come in: the fast way)
         self.folders = {}            # list item -> FolderEntry (the list's folders; images are in self.entries)
         self.item_cloud = set()      # list items of images with online-only files (a cloud after the name)
+        self.item_missing = set()    # list items of images whose full-resolution files aren't there (a red ! after the name)
         self.rename_job = self.rename_box = None
         self.preload_progress = {}   # list item -> percent, while the background loader reads it
         self.open_progress = None    # (list item, percent) while the preview of the image opened is read
@@ -4318,6 +4526,9 @@ class XlefViewer:
         self.overview_token = 0
         self.prefetch_full = None    # the view whose layers did not all fit in the memory for kept views (not tried again until it changes)
         self.download_queue = []     # list items whose full resolution is to be downloaded from OneDrive (see download_full_res)
+        self.download_what = {}      # list item -> the files to download for it, and the pyramid step (None: full resolution)
+        self.download_eta = {}       # list item -> seconds left of its download (from the rate so far), or None
+        self.speed_testing = False   # (the internet speed test is running: see _maybe_test_speed)
         self.download_progress = {}  # list item -> "waiting" or percent, while it is queued or downloading
         self.loading_rows = {}       # project -> its "Loading..." row in the list, while its experiment is read (see open_xlef)
         self.download_thread = self.download_stop = None
@@ -4430,7 +4641,7 @@ class XlefViewer:
         self.tree.bind("<Double-Button-1>", lambda e: self._cancel_rename_job(), add="+")
         self.thumb_grid = ThumbGrid(tree_frame, on_click=self.select_item, on_menu=lambda item, x, y: self._item_menu(item, x, y),
                                     on_drop=self._grid_drop,
-                                    name_tip=self._grid_tip_text, is_unsaved=self._is_unsaved, orient=self._thumb_orient)
+                                    name_tip=self._grid_tip_text, mark_text=self._mark_text, orient=self._thumb_orient)
         self.grid_marks_job = None   # (the grid's red *s redrawn once, after a change to what is unsaved: see _place_unsaved_mark)
         self.thumb_gen = 0           # bumped for each experiment opened: thumbnails made for an earlier one are dropped
         self.channels_on = {}        # channel names -> on/off: the switches last set for images of those channels (see show_entry)
@@ -4579,6 +4790,11 @@ class XlefViewer:
         ttk.Button(btns, text="Auto contrast", command=self.auto_all).pack(side=tk.LEFT, expand=True, fill=tk.X)
         ttk.Button(btns, text="LAS X contrast", command=self.lasx_all).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(4, 0))
         self.contrast_buttons = btns
+        self.contrast_all_button = ttk.Button(side, text="Use these levels in all sections", command=self.contrast_to_all)
+        self.contrast_all_button.pack(fill=tk.X, pady=(4, 0))
+        Tooltip(self.contrast_all_button, "Give every other section of this project with the same channels this section's black and white "
+                                          "levels, channel by channel (e.g. after white-balancing one section). Undoable (Ctrl+Z, all "
+                                          "at once), and written by Save.")
         self.hist = HistogramView(side, command=self._hist_dragged, popout=self.toggle_hist_window, help=HIST_TIP)
         self.hist.pack(fill=tk.X, pady=(4, 0))
         self.hist_key, self.hist_cache, self.hist_window, self.hist_float = None, collections.OrderedDict(), None, None
@@ -4612,7 +4828,7 @@ class XlefViewer:
         self.root.bind("<Escape>", lambda e: (setattr(self, "selected", None), self.set_tool(None), self._draw_annotations()))
         self.set_tool(None)
         self.root.bind(f"<{SHORTCUT}-o>", lambda e: self.ask_open())
-        self.root.bind("<Home>", lambda e: self.fit())
+        self.root.bind("<Home>", lambda e: None if isinstance(e.widget, tk.Entry) else self.fit())
         for k in range(1, 10):
             self.root.bind(str(k), lambda e, k=k: self.toggle_channel(k - 1))
         if self.dnd_files:
@@ -5359,6 +5575,8 @@ class XlefViewer:
         self._measure_sizes(pid)
         mine = self._entries_of(pid)
         n_cloud = sum(1 for i in mine if i in self.item_cloud)        # (as _fill_tree found them: not asked of each file again)
+        if n_cloud:
+            self._maybe_test_speed()
         self.status.config(text=f"{self.projects[pid]['name']}: {len(mine)} image{'s' * (len(mine) != 1)}"
                                 + (f", {n_cloud} online-only" if n_cloud else "") + ". Click one to view it.")
         self._projects_changed()
@@ -5830,7 +6048,8 @@ class XlefViewer:
                 sizes = [total(child) for child in self.tree.get_children(node)]
                 b = sum(x for x in sizes if x is not None) if any(x is not None for x in sizes) else None
             if node:
-                self.tree.set(node, "size", size_text(b) if b is not None else "")
+                gone = node in self.item_missing and not b          # (none of its full-resolution files is there)
+                self.tree.set(node, "size", "missing" if gone else size_text(b) if b is not None else "")
             return b
         total("")
 
@@ -5934,6 +6153,7 @@ class XlefViewer:
             self.deleted.pop(i, None)
             self.home.pop(i, None)
             self.item_cloud.discard(i)
+            self.item_missing.discard(i)
             self.preload_progress.pop(i, None)
             self.download_progress.pop(i, None)
             if i in self.download_queue:
@@ -5971,7 +6191,10 @@ class XlefViewer:
             text += f"  {self.open_progress[1]}% preview"
         if item in self.download_progress:
             p = self.download_progress[item]
-            text += "  ⇣ waiting" if p == "waiting" else f"  ⇣ {p}%"
+            step = (self.download_what.get(item) or (None, None))[1]
+            eta = self.download_eta.get(item)
+            text += ("  ⇣ " + (f"1/{step}: " if step else "") + ("waiting" if p == "waiting" else f"{p}%")
+                     + (f", {duration_text(eta)} left" if eta is not None and p != "waiting" else ""))
         self.tree.item(item, text=text)
         self._place_list_bar(item)
         self._place_unsaved_mark(item)
@@ -5995,6 +6218,7 @@ class XlefViewer:
         resolution downloaded (white): a small canvas laid over the list, moved whenever the rows move (scrolling, folders opened or
         closed, resizing)."""
         frac, color = self._list_bar_fraction(item) if item in self.entries else (None, None)
+        self.thumb_grid.set_progress(item, frac, color)         # (the same bar along its thumbnail's bottom)
         bar = self.list_bars.get(item)
         box = self.tree.bbox(item, "#0") if frac is not None and self.tree.exists(item) else ""      # (the name's column)
         if not box:
@@ -6033,6 +6257,19 @@ class XlefViewer:
         widget.bind("<MouseWheel>", lambda e, w=widget: self.tree.event_generate(
             "<MouseWheel>", x=e.x + w.winfo_x(), y=e.y + w.winfo_y(), rootx=e.x_root, rooty=e.y_root, delta=e.delta))
 
+    def _mark_text(self, item):
+        """The red mark after a row's name: "!" when an image's full-resolution files are missing, "*" while it has unsaved changes."""
+        return ("!" if item in self.item_missing else "") + ("*" if self._is_unsaved(item) else "")
+
+    def _missing_files_note(self, item):
+        """The note on a red !: which full-resolution files aren't there."""
+        e = self.entries[item]
+        gone, n = len(missing_files(e)), len(e.all_files())
+        what = "Its full-resolution image file is missing" if n == 1 else (
+            "All of its full-resolution image files are missing" if gone >= n else f"{gone} of its {n} full-resolution image files are missing")
+        return what + (" (only its metadata and pyramid were copied?): zooming in stops at the pyramid's sharpest copy" if e.pyramid
+                       else " (only its metadata was copied?)")
+
     def _is_unsaved(self, item):
         if item in self.projects:
             root = self.projects[item].get("root")
@@ -6058,7 +6295,7 @@ class XlefViewer:
         return what
 
     def _unsaved_tip(self, item, event):
-        """The pointer on a row's red *: a note saying what isn't saved yet. True if it is on one."""
+        """The pointer on a row's red * (or !): a note saying what isn't saved yet (or what is missing). True if it is on one."""
         mark = self.unsaved_marks.get(item)
         if mark is None or not mark.winfo_manager():
             return False
@@ -6066,10 +6303,12 @@ class XlefViewer:
         if not left - 3 <= event.x <= left + mark.winfo_reqwidth() + 3:
             return False
         what = self._unsaved_what(item)
+        notes = [self._missing_files_note(item) + "."] if item in self.item_missing else []
+        if self._is_unsaved(item):
+            notes.append("Unsaved changes" + (": " + ", ".join(what) if what else "") + ".\nSave writes them into LAS X's files.")
         if self.tree_tip is None:
             self.tree_tip = PointerTip(self.tree)
-        self.tree_tip.show("Unsaved changes" + (": " + ", ".join(what) if what else "") +
-                           ".\nSave writes them into LAS X's files.", event.x_root, event.y_root)
+        self.tree_tip.show("\n".join(notes), event.x_root, event.y_root)
         return True
 
     def _place_unsaved_mark(self, item):
@@ -6079,16 +6318,18 @@ class XlefViewer:
         if self.grid_marks_job is None:         # (and the thumbnail grid's, all at once)
             self.grid_marks_job = self.root.after_idle(self._place_grid_marks)
         mark = self.unsaved_marks.get(item)
-        if not self.tree.exists(item) or not self._is_unsaved(item):
+        text = self._mark_text(item) if self.tree.exists(item) else ""
+        if not text:
             if mark is not None:
                 mark.destroy()
                 del self.unsaved_marks[item]
             return
         box = self.tree.bbox(item, "#0")
         if mark is None:
-            mark = self.unsaved_marks[item] = tk.Label(self.tree, text="*", bd=0, padx=1, pady=0, font=("Segoe UI", 12, "bold"))
+            mark = self.unsaved_marks[item] = tk.Label(self.tree, text=text, bd=0, padx=1, pady=0, font=("Segoe UI", 12, "bold"))
             mark.keep_colors = True
             self._pass_mouse_to_list(mark)
+        mark.configure(text=text)
         if not box:
             mark.place_forget()                 # (scrolled out of view, or in a closed folder)
             return
@@ -6109,14 +6350,15 @@ class XlefViewer:
         self.grid_marks_job = None
         self.thumb_grid.place_unsaved_marks()
 
-    def _fill_tree(self, parent, folder):
+    def _fill_tree(self, parent, folder, listings=None):
         """The folder's images and sub-folders, in LAS X's order (the order its file lists them in, which dragging changes)."""
+        listings = {} if listings is None else listings         # (the folders listed, for missing_files)
         for child in folder.children:
             if isinstance(child, FolderEntry):
                 item = self.tree.insert(parent, tk.END, text=child.name, open=True)
                 self.folders[item] = child
                 self.home[item] = self._project_of(parent)
-                self._fill_tree(item, child)
+                self._fill_tree(item, child, listings)
                 continue
             cloud = bool(child.online_only_files())
             tags = ("bad",) if child.problem else (("cloud",) if cloud else ())
@@ -6125,6 +6367,8 @@ class XlefViewer:
             self.home[item] = self._project_of(parent)
             if cloud:
                 self.item_cloud.add(item)
+            if not child.problem and child.files and missing_files(child, listings):
+                self.item_missing.add(item)
             self._label_item(item)
 
     # --- list / thumbnail view
@@ -6267,7 +6511,7 @@ class XlefViewer:
         order, and keep it with the recently viewed images: picking it then shows it at once. The thumbnails of images without a
         pyramid are made from these (see _start_thumbnails). It only fills memory that is free (the share set in Settings: see kept_limit), and stops when that is
         used up, saying so in the status bar. An image being opened comes first: the loader pauses, mid-file if need be, until that image is shown, then goes on where it stopped. Images
-        whose files would need asking (large and online-only: see needs_asking) are skipped."""
+        whose files would need asking (large and online-only: see needs_asking_all) are skipped."""
         gen, todo = self.thumb_gen, list(self.entries.items())
         cw, ch = self.canvas_size()
         self.preloading = gen
@@ -6311,7 +6555,7 @@ class XlefViewer:
                     else:
                         files, step, pages = [entry.files[(0, c)] for c in range(n)], img.ov_step, entry.pages
                         size = -(-entry.width // step) * -(-entry.height // step) * 2 * n
-                    if any(needs_asking(f) for f in files):
+                    if needs_asking_all(files):
                         continue                        # (large online-only files: only after asking, when opened)
                     if self.kept_bytes + size > self.kept_limit():
                         self.results.put(("preload_full", gen, [e for i, e in todo[todo.index((item, entry)):]]))
@@ -6352,7 +6596,6 @@ class XlefViewer:
         needed or there is no room."""
         self.preload_progress.pop(item, None)
         self._label_item(item)
-        self.thumb_grid.set_progress(item, None)
         if entry in self.kept_images or (self.img is not None and self.img.entry is entry):
             return
         img.use_step(step)
@@ -6466,8 +6709,6 @@ class XlefViewer:
         old, self.open_progress = self.open_progress, progress
         for item in {p[0] for p in (old, progress) if p is not None}:
             self._label_item(item)
-            if item not in self.preload_progress:
-                self.thumb_grid.set_progress(item, progress[1] / 100 if progress is not None and progress[0] == item else None)
 
     def _close_image(self):
         self.generation += 1
@@ -6569,16 +6810,18 @@ class XlefViewer:
                 "to open instead from then on).")
 
     def _files_to_ask(self, entry):
-        """The large online-only files (see needs_asking) that showing `entry` would read: none when its pyramid can be used (its
+        """The large online-only files (see needs_asking_all) that showing `entry` would read: none when its pyramid can be used (its
         full-resolution files are then read only when zooming in, and asked about then), else its own."""
         if entry.pyramid and OpenImage(entry).pyramid is not None:
             return []
-        return [f for f in entry.all_files() if needs_asking(f)]
+        files = entry.all_files()
+        return [f for f in files if is_online_only(f)] if needs_asking_all(files) else []
 
     def show_entry(self, entry, full_res_ok=None):
         """Show `entry`. full_res_ok: may its large online-only full-resolution files be downloaded when zooming in needs them (True:
         agreed to already; None: ask then; False: no)."""
         self.full_res_ok = full_res_ok
+        entry.full_res_declined = False        # (Cancel in the download question lasts until the section is opened again)
         self._probe_speed(entry)
         names = tuple(c.name for c in entry.channels)
         shown = list(self.channels_on.get(names, ())) or [True] * len(entry.channels)
@@ -6808,8 +7051,9 @@ class XlefViewer:
             slider.pack(fill=tk.Y, expand=True)
             for ev in RIGHT_CLICKS:
                 slider.bind(ev, lambda e, i=i: self.pick_channel_color(i))
-            slider.bind("<Double-Button-1>", lambda e, i=i, s=slider: (s.undo_press(), self.pick_channel_color(i)))
-            Tooltip(slider, name + "Right-click to change its color.", at_pointer=True)  # (as the swatch's, less showing and hiding; at the
+            slider.bind("<Double-Button-1>", lambda e, i=i, s=slider: None if s._number_at(e) else (s.undo_press(), self.pick_channel_color(i)))
+            Tooltip(slider, name + "Click the number above or below to type the white or black level.\nRight-click to change its color.",
+                    at_pointer=True)                                                     # (as the swatch's, less showing and hiding; at the
                                                                                          # pointer: the slider is tall)
             if labels is None:
                 labels = self._channel_labels(slider.winfo_reqwidth())
@@ -7015,6 +7259,37 @@ class XlefViewer:
         """Back to the contrast in the image's LAS X file (as last saved)."""
         if self.img:
             self._contrast_change([(i, ch.saved_black, ch.saved_white) for i, ch in enumerate(self.img.entry.channels)])
+
+    def contrast_to_all(self):
+        """ "Use these levels in all sections": the shown section's black and white levels for every other section of its project that has
+        the same channels (by name, in the same order: a section of other channels is left as it is), kept within each one's own
+        maximum. One step of Undo, written by Save."""
+        if self.img is None:
+            return
+        src = self.img.entry
+        names = [c.name for c in src.channels]
+        pid = self._project_of(self._item_of(src))
+        others = [e for e in (self._entries_of(pid).values() if pid else []) if e is not src]
+        alike = [e for e in others if [c.name for c in e.channels] == names]
+        changes = []
+        for e in alike:
+            for i, (ch, c) in enumerate(zip(src.channels, e.channels)):
+                lo, hi = min(ch.black, c.max_value), min(ch.white, c.max_value)
+                if (c.black, c.white) != (lo, hi):
+                    changes.append((e, i, c.black, c.white))
+                    c.black, c.white = lo, hi
+        skipped = len(others) - len(alike)
+        note = f" ({skipped} section{'s' * (skipped != 1)} with other channels left as {'it is' if skipped == 1 else 'they are'})" if skipped else ""
+        if not changes:
+            self.status.config(text=f"The other sections already have these levels{note}" if alike else
+                                    f"No other section of this project has the same channels{note}")
+            return
+        self.history = self.history[-199:] + [("range", changes)]
+        self.contrast_step = None
+        changed = {e for e, _, _, _ in changes}
+        self._contrast_settled(changed)
+        self.status.config(text=f"These levels used in {len(changed)} other section{'s' * (len(changed) != 1)}{note}: not saved yet "
+                                "(Save writes them; Ctrl+Z undoes it)")
 
     def _z_kind(self, img=None, z=None):
         """What plane z of the image shows: "plane", "max" (projection), "efi" (extended focus computed here) or "saved" (cellSens's)."""
@@ -8141,10 +8416,11 @@ class XlefViewer:
                 self.detail_pending = False
                 self._update_cursor()
             return
-        if level is None and not self._full_res_allowed():
-            # The full resolution isn't here (online-only: being downloaded, or not wanted): the pyramid's sharpest copy stands in, if
-            # it is sharper than the preview and not in already. The sharp view follows when the download is in (see _downloaded).
-            fin = self.img.usable_level(max(self.img.entry.width, self.img.entry.height) / 2 - 2)
+        if level is None and (self._full_res_gone(need) or not self._full_res_allowed()):
+            # The full resolution isn't here (missing; or online-only: being downloaded, or not wanted): the pyramid's sharpest copy
+            # stands in, if it is sharper than the preview and not in already. The sharp view follows when a download is in (see
+            # _downloaded).
+            fin = self.img.usable_at_most(max(self.img.entry.width, self.img.entry.height) / 2 - 2)     # (its sharpest that can be read)
             if fin is None or not step < fin[1] < s or self._covered_at(fin[1], need):
                 return
             level, step = fin
@@ -8251,7 +8527,14 @@ class XlefViewer:
                     if r is not None:
                         r.close()
 
-        threading.Thread(target=work, daemon=True).start()
+        thread = threading.Thread(target=work, daemon=True)
+        self.detail_thread = (gen, thread)          # (see _sharp_read_running)
+        thread.start()
+
+    def _sharp_read_running(self):
+        """A sharper view of the view on show is still being read (its thread, started by redraw, hasn't finished)."""
+        gen, thread = getattr(self, "detail_thread", None) or (None, None)
+        return gen == self.generation and thread is not None and thread.is_alive()
 
     def _interim_level(self, level, step, need):
         """(level, its step) of the pyramid's finest level when a view at `step` from the full-resolution files (level None) would have
@@ -8508,7 +8791,7 @@ class XlefViewer:
         if pyr is not None:
             # (A level of the pyramid that has the detail this zoom needs, if there is one, is the sharper copy to read from: 8-bit and
             # uncompressed, far less to read than the full-resolution files, which a compressed TIFF must decode whole.)
-            best = img.usable_level(max(img.entry.width, img.entry.height) / step)
+            best = img.usable_at_most(max(img.entry.width, img.entry.height) / step)
             if best is not None and best[1] < pyr[1]:
                 pyr = best
         shown = s
@@ -8708,7 +8991,7 @@ class XlefViewer:
                     layout = img.level_layout(level, z, c)
                     if layout is None:
                         return None          # (not a plain file: this layer is left out)
-                    reader = _LevelRowReader(level.files[(z, c)], layout[0], layout[1], level.width, step, e.channels[c].max_value)
+                    reader = _LevelRowReader(level.files[(z, c)], layout[0], layout[1], level.width, step, e.channels[c].max_value, layout[2])
                 else:
                     reader = img.row_reader(z, c)
                 if reader is not None:
@@ -8755,7 +9038,7 @@ class XlefViewer:
         e, level = img.entry, img.pyramid[0]
         n = len(e.channels)
         order = [z for d in range(1, e.nz) for z in (self.z - d, self.z + d) if 0 <= z < e.nz and not img.has_all(z)
-                 and all(level.files.get((z, c)) and not needs_asking(level.files[(z, c)]) for c in range(n))]
+                 and all(level.files.get((z, c)) for c in range(n)) and not needs_asking_all(level.files[(z, c)] for c in range(n))]
         if not order:
             return
         self.overview_token += 1
@@ -9215,8 +9498,26 @@ class XlefViewer:
                     break
         return None if best is None else self.img.entry.annotations[-best[1]]
 
+    def _full_res_gone(self, need):
+        """Zoomed in past the pyramid, and the full-resolution files of this plane's channels in `need` aren't there (only the
+        metadata and pyramid were copied?): said in the status line. Asked of the disk once per plane while the image is open."""
+        img = self.img
+        gone = img.__dict__.setdefault("gone", {})
+        key = (self.z, tuple(need))
+        if key not in gone:
+            gone[key] = any(not os.path.exists(f) for c in need for f in img.files_of(self.z, c)) or any(
+                len(img.files_of(self.z, c)) < len(img.layers(self.z)) for c in need)
+        if gone[key]:
+            if not self._sharp_read_running():      # (one still being read keeps its hourglass: see not_now)
+                self.detail_pending = False
+            self._update_cursor()
+            fin = img.usable_at_most(max(img.entry.width, img.entry.height) / 2 - 2)
+            self.status.config(text=f"{img.entry.name}: its full-resolution image is missing; zoomed in, "
+                                    + (f"the pyramid's sharpest copy ({_resolution_text(fin[1])}) is shown" if fin else "the preview is shown enlarged"))
+        return gone[key]
+
     def _full_res_allowed(self):
-        """Zoomed in past the pyramid: the full-resolution files are needed. If some are large and online-only (see needs_asking):
+        """Zoomed in past the pyramid: the full-resolution files are needed. If some are large and online-only (see needs_asking_all):
           - being downloaded already (or waiting to be): it goes to the front of the queue, and the sharp view is drawn when it is in;
           - else ask, once per image while the viewer runs (one question at a time: redraws while it is open don't ask again).
             Download (this section, or all) queues the download; Cancel is remembered: the view stays at the pyramid's sharpness
@@ -9224,13 +9525,17 @@ class XlefViewer:
         if self.full_res_ok is True:
             return True
         e = self.img.entry
-        ask = [f for f in {f for c in range(len(e.channels)) for f in self.img.files_of(self.z, c)} if needs_asking(f)]
+        plane = {f for c in range(len(e.channels)) for f in self.img.files_of(self.z, c)}
+        ask = [f for f in plane if is_online_only(f)] if needs_asking_all(plane) else []
         if not ask:
             return True
         item = next((i for i, x in self.entries.items() if x is e), None)
 
         def not_now(note):
-            self.detail_pending = False
+            # (a sharper view read before, e.g. as the image opened, may still be on its way: it keeps its hourglass and "Loading a
+            # sharper view..." until it is in)
+            if not self._sharp_read_running():
+                self.detail_pending = False
             self._update_cursor()
             self.status.config(text=note)
             return False
@@ -9239,25 +9544,153 @@ class XlefViewer:
                 self.download_queue.remove(item)
                 self.download_queue.insert(0, item)             # (the one being looked at comes next)
             return not_now(f"{e.name}: downloading its full resolution from OneDrive; the sharp view follows when it is in")
-        if getattr(e, "full_res_declined", False):
+        if getattr(e, "full_res_declined", False) or self._no_ask(e):
             return not_now(f"{e.name}: full resolution not downloaded (online-only; right-click it to download)")
         if self.asking_download:
             return False
+        choice = self._ask_download(item, f"Sharper views of {e.name} need files that are online-only. Pick the resolution to download:")
+        if choice in ("cancel", "never"):
+            e.full_res_declined = True          # (until the section is opened again: see show_entry)
+            return not_now(f"{e.name}: full resolution not downloaded (online-only; right-click it to download)")
+        step = choice[1]
+        if step is not None:
+            e.full_res_declined = True          # (a pyramid copy chosen: full resolution is asked about again when it is next opened)
+            return not_now(f"{e.name}: downloading its 1/{step} resolution copy from OneDrive; the sharper view follows when it is in")
+        return not_now(f"{e.name}: downloading its full resolution from OneDrive; the sharp view follows when it is in")
+
+    def _ask_download(self, item, message):
+        """The download question for a section (see ask_download), and what was picked done: the download queued (this section first,
+        then the others, for "all sections"), or "don't ask again" remembered. Returns ask_download's answer."""
+        e = self.entries[item]
         self.asking_download = True
         try:
-            size = size_text(sum(os.path.getsize(f) for f in ask))
-            cloud = [i for i in self._entries_of(self._project_of(item)) if i in self.item_cloud and i not in self.download_progress]
-            choice = ask_download(self.root, "Download from OneDrive?",
-                                  f"Highest resolution views require downloading files ({size} for this section) that are currently "
-                                  "online-only.",
-                                  all_label=f"Download for all sections ({size_text(self._cloud_bytes(cloud))})")
+            options = self._download_options(item)
+            all_cache = {}
+
+            def all_info(step):
+                if step not in all_cache:
+                    items = self._download_candidates(self._project_of(item), step)
+                    files = [f for i in items for f in self._download_files(i, step)]
+                    all_cache[step] = (len(items), sum(_size_or_0(f) for f in files), len(files))
+                return all_cache[step]
+            choice = ask_download(self.root, "Download from OneDrive?", message, options, self._download_estimate, all_info)
         finally:
             self.asking_download = False
-        if choice is None:
-            e.full_res_declined = True
-            return not_now(f"{e.name}: full resolution not downloaded (online-only; right-click it to download)")
-        self.download_full_res([item] if choice == "this" else [item] + [i for i in cloud if i != item])     # (this one first)
-        return not_now(f"{e.name}: downloading its full resolution from OneDrive; the sharp view follows when it is in")
+        if choice == "never":
+            self._set_no_ask(e, True)
+        elif choice != "cancel":
+            scope, step = choice
+            items = [item] if scope == "this" else [item] + [i for i in self._download_candidates(self._project_of(item), step) if i != item]
+            self.download_full_res(items, step)     # (this one first)
+        return choice
+
+    def download_higher_res(self, item):
+        """Right-click on a section: Download higher resolution images: the download question, for any of its resolutions. Asked
+        for, so its "don't ask again" (if it had one) is forgotten first; zooming in asks again unless Cancel, don't ask again is
+        picked here."""
+        e = self.entries.get(item)
+        if e is None or self.asking_download:
+            return
+        self._set_no_ask(e, False)
+        choice = self._ask_download(item, f"Pick the resolution of {e.name} to download from OneDrive:")
+        if choice not in ("cancel", "never") and self.img is not None and self.img.entry is e and choice[1] is not None:
+            e.full_res_declined = True          # (being looked at: a pyramid copy chosen, so zooming in doesn't ask about full resolution now)
+
+    def _no_ask_key(self, entry):
+        files = entry.all_files()
+        return os.path.normcase(files[0]) if files else None
+
+    def _no_ask(self, entry):
+        """The user said not to ask again about downloading this section (Cancel, don't ask again: remembered in the settings)."""
+        return self._no_ask_key(entry) in self.settings.get("no_download_ask", [])
+
+    def _set_no_ask(self, entry, on):
+        key = self._no_ask_key(entry)
+        keys = [k for k in self.settings.get("no_download_ask", []) if k != key]
+        if on and key:
+            keys.append(key)
+        self.settings["no_download_ask"] = keys
+        self._save_settings()
+
+    def _download_files(self, item, step):
+        """The online-only files to download for a section: its full resolution's (step None), or its pyramid's 1/step copy's."""
+        e = self.entries.get(item)
+        if e is None:
+            return []
+        if step is None:
+            return e.online_only_files()
+        level = next((lv for st, lv in pyramid_levels(e) if st == step), None)
+        return [] if level is None else [f for f in sorted(set(f for f in level.files.values() if f)) if is_online_only(f)]
+
+    def _download_candidates(self, pid, step):
+        """The project's sections with something to download at this resolution, not queued or downloading already."""
+        return [i for i in self._entries_of(pid) if i not in self.download_progress and (step is not None or i in self.item_cloud)
+                and self._download_files(i, step)]
+
+    def _download_options(self, item):
+        """The resolutions sharper than the preview that the download question lists (see ask_download): full resolution, then
+        each pyramid copy sharper than the preview's."""
+        e = self.entries[item]
+        full = sorted(set(f for f in e.all_files() if f))
+        state, nbytes, nfiles = files_state(full)           # (each file looked at once: see cloud_state)
+        opts = [{"label": "Full resolution", "step": None, "bytes": nbytes, "files": nfiles, "state": state,
+                 "total": sum(_size_or_0(f) for f in full) or e.full_bytes or 0}]
+        img = self.img if self.img is not None and self.img.entry is e else OpenImage(e)        # (reads only small .xlif files)
+        top = img.pyramid[1] if img.pyramid else None
+        for st, level in pyramid_levels(e):
+            if top is not None and st >= top:
+                break
+            files = sorted(set(f for f in level.files.values() if f))
+            state, nbytes, nfiles = files_state(files)
+            opts.append({"label": f"1/{st} resolution", "step": st, "bytes": nbytes, "files": nfiles or len(files), "state": state,
+                         "total": sum(_size_or_0(f) for f in files)})
+        return opts
+
+    def _download_estimate(self, nbytes, nfiles):
+        """(seconds, where the speed comes from) for downloading nbytes in nfiles files from OneDrive, or (None, None) if no speed
+        has been measured (lately: SPEED_TEST_DAYS). From the OneDrive downloads timed lately (each file's wait before its first bytes,
+        and the rate after: their middle values), else from the internet speed test (see measure_internet_speed)."""
+        sp = self.settings.get("download_speed") or {}
+        now = time.time()
+        recent = [m for m in sp.get("onedrive", []) if now - m.get("when", 0) < SPEED_TEST_DAYS * 86400 and m.get("rate")]
+        if recent:
+            mid = lambda xs: sorted(xs)[len(xs) // 2]
+            rate, wait, where = mid([m["rate"] for m in recent]), mid([m["latency"] for m in recent]), "from your recent OneDrive downloads"
+        else:
+            m = sp.get("internet")
+            if not m or now - m.get("when", 0) >= SPEED_TEST_DAYS * 86400 or not m.get("rate"):
+                return None, None
+            rate, wait, where = m["rate"], m["latency"], f"from an internet speed test ({m['rate'] * 8 / 1e6:.0f} Mbit/s)"
+        return max(1, nfiles) * wait + nbytes / rate, where
+
+    def _maybe_test_speed(self):
+        """Measure the download speed (see measure_internet_speed) in the background, if it hasn't been lately: the download
+        question's first estimates (OneDrive downloads, once timed, are used instead)."""
+        m = (self.settings.get("download_speed") or {}).get("internet")
+        if self.speed_testing or (m and time.time() - m.get("when", 0) < SPEED_TEST_DAYS * 86400):
+            return
+        self.speed_testing = True
+
+        def work():
+            try:
+                found = measure_internet_speed()
+            except Exception:
+                found = None            # (offline, blocked, ...: tried again when the next project with online-only files opens)
+            self.results.put(("internet_speed", None, found))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _speed_measured(self, kind, m):
+        """A download speed measured: the internet speed test's, or a OneDrive download's (the latest SPEED_KEEP kept)."""
+        sp = dict(self.settings.get("download_speed") or {})
+        if kind == "internet":
+            self.speed_testing = False
+            if m is None:
+                return
+            sp["internet"] = m
+        else:
+            sp["onedrive"] = (list(sp.get("onedrive", [])) + [m])[-SPEED_KEEP:]
+        self.settings["download_speed"] = sp
+        self._save_settings()
 
     def _update_cursor(self):
         """The pointer over the image: an hourglass while an image loads or a sharper view of it is read, a hand over an annotation's
@@ -9942,7 +10375,7 @@ class XlefViewer:
     def _size_note(self, item):
         """The size column of an image, folder or project (its full resolution, as _show_sizes put it there), as a line of a note."""
         size = self.tree.set(item, "size")
-        return f"{size} at full resolution" if size else None
+        return None if size == "missing" else f"{size} at full resolution" if size else None
 
     def _project_tip_text(self, pid):
         """The note on a project's name: its full path, how many images and how big, unsaved changes, how fast its drive is."""
@@ -9994,6 +10427,8 @@ class XlefViewer:
             if e.nz > 1:
                 lines.append(f"z-stack of {e.nz} layers, shown one at a time: the \"Z plane\" slider (left of the channels) picks which\n"
                              f"(it opens on the first, or on the layer last shown of another z-stack)")
+        if item in self.item_missing:
+            lines.append(self._missing_files_note(item))
         what = self._unsaved_what(item)
         lines.append("Unsaved changes: " + ", ".join(what) if what else "No unsaved changes")
         if item in self.item_cloud:
@@ -10008,18 +10443,26 @@ class XlefViewer:
     def _cloud_bytes(self, items):
         return sum(os.path.getsize(f) for i in items for f in self.entries[i].online_only_files())
 
-    def download_full_res(self, items):
-        """Download these sections' full-resolution files from OneDrive in the background, one section after another (progress after
-        the name in the list; the cloud goes when a section is done). OneDrive downloads a whole file as soon as any byte of it is
-        read, so the first byte of each file is read."""
-        items = [i for i in items if i in self.item_cloud and i not in self.download_queue and i not in self.download_progress]
+    def download_full_res(self, items, step=None):
+        """Download these sections' full-resolution files (or, given a step, their pyramid's 1/step copies) from OneDrive in the
+        background, one section after another (progress after the name in the list; the cloud goes when a section's full resolution
+        is done). OneDrive downloads a whole file as soon as any byte of it is read, so the first byte of each file is read."""
+        queued = []
         for i in items:
+            if i in self.download_queue or i in self.download_progress:
+                continue
+            files = self._download_files(i, step)
+            if not files:
+                continue
+            self.download_what[i] = (files, step)
             self.download_queue.append(i)
             self.download_progress[i] = "waiting"
             self._label_item(i)
+            queued.append(i)
         self._start_download_thread()
-        if items:
-            self.status.config(text=f"Downloading full resolution of {len(items)} section{'s' * (len(items) != 1)} from OneDrive ...")
+        if queued:
+            what = "full resolution" if step is None else f"the 1/{step} resolution copy"
+            self.status.config(text=f"Downloading {what} of {len(queued)} section{'s' * (len(queued) != 1)} from OneDrive ...")
 
     def _start_download_thread(self):
         if self.download_queue and self.download_thread is None:
@@ -10041,7 +10484,10 @@ class XlefViewer:
             while self.download_queue and not stop.is_set() and gen == self.download_gen:
                 item = self.download_queue.pop(0)
                 entry = self.entries.get(item)
-                files = entry.online_only_files() if entry is not None else []
+                files = (self.download_what.get(item) or (None,))[0]
+                if files is None:
+                    files = entry.online_only_files() if entry is not None else []
+                files = [f for f in files if is_online_only(f)]          # (downloaded meanwhile: nothing to do)
                 sizes = [os.path.getsize(f) for f in files]
                 done = 0
                 total, last = max(sum(sizes), 1), -1
@@ -10059,19 +10505,30 @@ class XlefViewer:
                         except OSError as e:
                             failed.append(e)
                     reader = threading.Thread(target=fetch, daemon=True)
+                    opened, first, first_here = time.monotonic(), None, 0
                     reader.start()
                     while True:
                         here = min(stored_bytes(f) or 0, size)
+                        now = time.monotonic()
+                        if first is None and here > 0:
+                            first, first_here = now, here        # (OneDrive's wait before the first bytes: the rest is the rate)
+                        eta = None
+                        if first is not None and now - first > 1 and here > first_here:
+                            eta = (total - done - here) / ((here - first_here) / (now - first))
                         pct = int(100 * (done + here) / total)
-                        if pct != last:
+                        if pct != last or eta is not None:
                             last = pct
-                            self.results.put(("download", gen, (item, pct)))
+                            self.results.put(("download", gen, (item, pct, eta)))
                         reader.join(0.25)
                         if not reader.is_alive():
                             break
                     if failed:
                         self.results.put(("download_error", gen, f"Couldn't download {os.path.basename(f)}: {failed[0]}"))
                         break
+                    end = time.monotonic()
+                    if first is not None and size >= 5e6 and end - first > 0.5:          # (timed: for the download question's estimates)
+                        self.results.put(("download_speed", gen, {"rate": (size - first_here) / (end - first),
+                                                                  "latency": first - opened, "when": time.time()}))
                     done += size
                 self.results.put(("downloaded", gen, item))
         finally:
@@ -10082,13 +10539,19 @@ class XlefViewer:
             self.download_stop.set()
         for i in self.download_queue:
             self.download_progress.pop(i, None)
+            self.download_eta.pop(i, None)
+            self.download_what.pop(i, None)
             self._label_item(i)
         self.download_queue.clear()
         self.status.config(text="Downloads stopped (the file being downloaded finishes first)")
 
     def _downloaded(self, item):
         self.download_progress.pop(item, None)
+        self.download_eta.pop(item, None)
+        what = self.download_what.pop(item, None)
         entry = self.entries.get(item)
+        if what is not None and what[1] is not None and self.img is not None and self.img.entry is entry:
+            self.schedule_redraw(0)              # (a pyramid copy: the sharper view can be read from it now)
         if entry is not None and not entry.online_only_files():
             self.item_cloud.discard(item)
             self.thumb_grid.rows = self._grid_rows_all()          # (its thumbnail's name: no longer blue, no cloud)
@@ -10120,28 +10583,21 @@ class XlefViewer:
             menu.add_command(label=f"Close project {self.projects[pid]['name']}", command=lambda: self.close_project(pid))
 
     def _item_menu(self, item, x_root, y_root):
-        """Right-click on a section (list or thumbnail): download its full resolution, or every section's."""
+        """Right-click on a section (list or thumbnail): download higher resolution images of it (or of every section: the
+        download question has both)."""
         self._hide_tree_tip()
         menu = tk.Menu(self.root, tearoff=0)
         if item in self.entries:
-            if item in self.item_cloud and item not in self.download_progress:
-                menu.add_command(label=f"Download full resolution this section ({size_text(self._cloud_bytes([item]))})",
-                                 command=lambda: self.download_full_res([item]))
+            # (Every resolution of it on this computer: greyed. Looks at the files (os.stat) and its pyramid's small .xlif files.)
+            here = item not in self.download_progress and all(o["state"] == "here" for o in self._download_options(item))
+            if item in self.download_progress or here:
+                menu.add_command(label="Download higher resolution images" + (" (downloading)" if item in self.download_progress
+                                                                               else " (all on this computer)"), state=tk.DISABLED)
             else:
-                menu.add_command(label="Download full resolution this section" + (" (downloading)" if item in self.download_progress
-                                                                                  else " (on this computer)"), state=tk.DISABLED)
+                menu.add_command(label="Download higher resolution images...", command=lambda: self.download_higher_res(item))
         pid = self._project_of(item)
-        if item in self.projects:                   # (a project's name: closing it, or downloading its sections)
+        if item in self.projects:                   # (a project's name: closing it, ...)
             self._project_menu(menu, pid)
-            menu.add_separator()
-        cloud = [i for i in self._entries_of(pid) if i in self.item_cloud and i not in self.download_progress]
-        if cloud:
-            menu.add_command(label=f"Download full resolution all sections ({len(cloud)} in the cloud, "
-                                   f"{size_text(self._cloud_bytes(cloud))})", command=lambda: self.download_full_res(cloud))
-        else:
-            queued = any(i in self.download_progress for i in self.entries)
-            menu.add_command(label="Download full resolution all sections (" + ("all already queued" if queued else "none in the cloud")
-                                   + ")", state=tk.DISABLED)
         if self.download_queue or self.download_thread is not None:
             menu.add_separator()
             menu.add_command(label="Stop downloading", command=self.stop_downloads)
@@ -10715,7 +11171,12 @@ class XlefViewer:
                             else:
                                 self.preload_progress[item] = pct
                             self._label_item(item)
-                            self.thumb_grid.set_progress(item, None if pct is None else pct / 100)
+                    continue
+                if kind == "internet_speed":
+                    self._speed_measured("internet", data)
+                    continue
+                if kind == "download_speed":
+                    self._speed_measured("onedrive", data)
                     continue
                 if kind in ("download", "downloaded", "download_error", "download_idle"):
                     if kind == "download_idle":
@@ -10726,6 +11187,7 @@ class XlefViewer:
                         pass
                     elif kind == "download":
                         self.download_progress[data[0]] = data[1]
+                        self.download_eta[data[0]] = data[2]
                         self._label_item(data[0])
                     elif kind == "downloaded":
                         self._downloaded(data)
@@ -11401,33 +11863,91 @@ def ask_choice(parent, title, message, choices):
     return result[0] if result else None
 
 
-def ask_download(parent, title, message, all_label="Download for all sections"):
-    """Ask about downloading full resolution: "this" (this section), "all" (all sections), or None (Cancel, Escape, closed)."""
+NO_ASK_TIP = ("Don't ask again about downloading this section: zooming in on it then stops at the sharpest copy on this computer. "
+              "Only this section; remembered after the viewer is closed. To download it later, right-click it and pick "
+              "Download higher resolution images.")
+
+
+def ask_download(parent, title, message, options, estimate, all_info):
+    """Ask which of a section's resolutions to download from OneDrive. options: [{"label", "step" (None: full resolution), "bytes",
+    "files" (how many), "total" (bytes of all its files, online-only or not), "state": "download" (online-only and large: may be picked), "auto" (online-only but small: downloaded
+    when needed, without asking) or "here" (on this computer)}], sharpest first. estimate(bytes, files): (seconds, where the speed
+    comes from) or (None, None). all_info(step): (sections, bytes, files) for "all sections" at that resolution.
+    Returns ("this" or "all", step), "cancel" (ask again next time: Cancel, Escape, closed) or "never" (Cancel, don't ask again)."""
     dlg = tk.Toplevel(parent)
     dlg.title(title)
     dlg.transient(parent)
     dlg.resizable(False, False)
     body = ttk.Frame(dlg, padding=14)
     body.pack(fill=tk.BOTH, expand=True)
-    ttk.Label(body, text=message, wraplength=440, justify=tk.LEFT).pack(anchor=tk.W)
-    bar = ttk.Frame(body)
-    bar.pack(fill=tk.X, pady=(14, 0))
+    ttk.Label(body, text=message, wraplength=460, justify=tk.LEFT).pack(anchor=tk.W)
+    choices = [o for o in options if o["state"] in ("download", "auto")]
+    chosen = tk.IntVar(dlg, value=options.index(choices[0]) if choices else -1)
+    source = []
+
+    def time_words(nbytes, nfiles):
+        secs, where = estimate(nbytes, nfiles)
+        if secs is None:
+            return ""
+        source.append(where)
+        return f", about {duration_text(secs)}"
+    box = ttk.Frame(body)
+    box.pack(fill=tk.X, pady=(10, 0))
+    for k, o in enumerate(options):
+        size = size_text(o["bytes"])
+        here = o.get("total", o["bytes"]) - o["bytes"]          # (some of its files may be on this computer already)
+        if o["state"] == "here":
+            text = f"{o['label']}: {size_text(here)}, on this computer"
+        else:
+            text = f"{o['label']}: {size}{time_words(o['bytes'], o['files'])}"
+            if here > 0:
+                text += f" ({size_text(here)} more already on this computer)"
+            if o["state"] == "auto":
+                text += f" (also downloaded without asking when zooming in needs it: up to {size_text(AUTO_DOWNLOAD_MAX)})"
+        rb = ttk.Radiobutton(box, text=text, variable=chosen, value=k, state=tk.NORMAL if o in choices else tk.DISABLED)
+        rb.pack(anchor=tk.W, pady=1)
+    note = (f"Times estimated {source[0]}." if source else
+            "Download times not known yet (the download speed is measured once a project with online-only files opens).")
+    ttk.Label(body, text=note, style="Muted.TLabel", wraplength=460, justify=tk.LEFT).pack(anchor=tk.W, pady=(8, 0))
     result = []
 
     def pick(value):
         result.append(value)
         dlg.destroy()
-    ttk.Button(bar, text="Cancel", command=lambda: pick(None)).pack(side=tk.RIGHT)
-    ttk.Button(bar, text=all_label, command=lambda: pick("all")).pack(side=tk.RIGHT, padx=(0, 6))
-    this = ttk.Button(bar, text="Download for this section", command=lambda: pick("this"))
-    this.pack(side=tk.RIGHT, padx=(0, 6))
+
+    def step():
+        return options[chosen.get()]["step"] if chosen.get() >= 0 else None
+    bar = ttk.Frame(body)
+    bar.pack(fill=tk.X, pady=(14, 0))
+    this = ttk.Button(bar, text="Download for this section", command=lambda: pick(("this", step())))
+    this.pack(side=tk.LEFT)
+    every = ttk.Button(bar, command=lambda: pick(("all", step())))
+    every.pack(side=tk.LEFT, padx=(6, 0))
+
+    def all_label(*_):
+        n, nbytes, nfiles = all_info(step())
+        secs, _ = estimate(nbytes, nfiles) if nbytes else (None, None)
+        every.configure(text=f"Download for all sections ({n} section{'s' * (n != 1)}, {size_text(nbytes)}" + (f", about {duration_text(secs)}" if secs else "") + ")",
+                        state=tk.NORMAL if n else tk.DISABLED)
+    chosen.trace_add("write", all_label)
+    all_label()
+    bar2 = ttk.Frame(body)
+    bar2.pack(fill=tk.X, pady=(6, 0))
+    never = ttk.Button(bar2, text="Cancel, don't ask again", command=lambda: pick("never"))
+    never.pack(side=tk.RIGHT)
+    Tooltip(never, NO_ASK_TIP)
+    cancel = ttk.Button(bar2, text="Cancel", command=lambda: pick("cancel"))
+    cancel.pack(side=tk.RIGHT, padx=(0, 6))
+    Tooltip(cancel, "Not now: asked again the next time this section is opened and zoomed into.")
+    if not choices:
+        this.configure(state=tk.DISABLED)
     this.focus_set()
-    dlg.bind("<Return>", lambda e: pick("this"))
-    dlg.bind("<Escape>", lambda e: pick(None))
+    dlg.bind("<Return>", lambda e: pick(("this", step())) if choices else None)
+    dlg.bind("<Escape>", lambda e: pick("cancel"))
     dlg.geometry(f"+{parent.winfo_rootx() + 160}+{parent.winfo_rooty() + 140}")
     dlg.grab_set()
     parent.wait_window(dlg)
-    return result[0] if result else None
+    return result[0] if result else "cancel"
 
 
 def ask_text(parent, title, initial, color=None):
